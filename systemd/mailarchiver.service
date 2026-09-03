@@ -1,0 +1,29 @@
+[Unit]
+Description=MailArchiver — резервное копирование почтовых ящиков по IMAP
+Documentation=file:@APPDIR@/docs/ru/01-introduction.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+Group=@GROUP@
+Environment=MAILARCHIVER_CONFIG=@CONFIG@
+WorkingDirectory=@APPDIR@
+ExecStart=@VENV@/bin/mailarchiver serve
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+# Усиление безопасности (systemd sandbox)
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=@DATADIR@
+
+[Install]
+WantedBy=multi-user.target

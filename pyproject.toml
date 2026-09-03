@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mailarchiver"
+version = "1.0.0"
+description = "Сервис резервного копирования почтовых ящиков по IMAP с веб-интерфейсом, очередью, планировщиком и экспортом в .pst"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "MailArchiver" }]
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "jinja2>=3.1",
+    "python-multipart>=0.0.20",
+    "apscheduler>=3.11,<4",
+    "IMAPClient>=3.0",
+    "cryptography>=44.0",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+pst = ["Aspose.Email-for-Python-via-NET>=24.0"]
+test = ["pytest>=8", "httpx>=0.28"]
+
+[project.scripts]
+mailarchiver = "mailarchiver.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["mailarchiver*"]
+
+[tool.setuptools.package-data]
+mailarchiver = ["web/static/**/*", "web/templates/**/*"]

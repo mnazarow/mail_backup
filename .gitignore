@@ -1,0 +1,27 @@
+# Виртуальное окружение и кэши
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Данные времени выполнения (никогда не коммитить!)
+data/
+*.db
+*.db-journal
+*.db-wal
+*.log
+secret.key
+config/config.yaml
+
+# Артефакты экспорта и временные файлы
+*.pst
+*.mbox
+exports/
+tmp/
+
+# ОС/редакторы
+.DS_Store
+.idea/
+.vscode/

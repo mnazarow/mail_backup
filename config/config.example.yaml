@@ -1,0 +1,74 @@
+# ============================================================================
+#  MailArchiver — файл конфигурации
+#  Скопируйте в /etc/mailarchiver/config.yaml (или config/config.yaml)
+#  и отредактируйте под себя. Все параметры имеют разумные значения по
+#  умолчанию — можно менять только нужное. Подробности по каждому параметру:
+#  docs/ru/05-parameters-reference.md
+# ============================================================================
+
+server:
+  host: "127.0.0.1"     # 0.0.0.0 — слушать на всех интерфейсах (за reverse proxy)
+  port: 8493
+  public_url: ""         # напр. "https://mail-backup.example.ru"
+  behind_proxy: false    # true, если стоите за nginx/traefik с TLS
+
+security:
+  auth_enabled: true
+  session_ttl_hours: 12
+  session_idle_minutes: 60
+  min_password_length: 8
+  max_login_attempts: 5
+  lockout_minutes: 15
+  secure_cookie: false   # true при работе только по HTTPS
+
+paths:
+  data_dir: ""           # пусто = /var/lib/mailarchiver (или ./data при запуске из исходников)
+
+storage:
+  layout: "maildir"
+  compress: false        # true — сжимать письма gzip (экономия места)
+  min_free_space_mb: 500
+  verify_after_write: true
+
+backup:
+  max_concurrent_jobs: 2
+  per_account_concurrency: 1
+  fetch_batch_size: 200
+  connect_timeout_s: 30
+  socket_timeout_s: 120
+  retry_attempts: 4
+  download_flags: true
+  skip_larger_than_mb: 0
+  folder_exclude: []     # напр. ["[Gmail]/Корзина", "Спам"]
+
+retention:
+  enabled: false
+  keep_days: 0           # 0 = хранить вечно
+  keep_last_runs: 30
+  delete_removed_from_server: false
+
+export:
+  default_engine: "auto"   # auto|aspose|native|mbox|eml|msg
+  pst_format: "unicode"    # unicode (Outlook 2003+) | ansi (Outlook 97–2002)
+  outlook_target: "2016+"
+  pst_split_size_mb: 0
+  aspose_license_path: ""
+
+scheduler:
+  enabled: true
+  timezone: "Europe/Moscow"
+
+logging:
+  level: "INFO"
+
+notifications:
+  enabled: false
+  smtp_host: ""
+  smtp_port: 587
+  smtp_security: "starttls"
+  smtp_user: ""
+  smtp_password: ""
+  mail_from: ""
+  mail_to: []
+  on_failure: true
+  on_success: false

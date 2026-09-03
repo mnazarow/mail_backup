@@ -1,0 +1,34 @@
+# ============================================================================
+#  MailArchiver — Docker Compose
+#  Быстрый запуск:  docker compose up -d
+#  Веб-интерфейс:   http://localhost:8493
+# ============================================================================
+services:
+  mailarchiver:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: mailarchiver:1.0.0
+    container_name: mailarchiver
+    restart: unless-stopped
+    ports:
+      - "8493:8493"           # веб-интерфейс (host:container)
+    volumes:
+      - mailarchiver-data:/data   # БД, локальные копии писем, экспорты
+      # Чтобы забирать экспортированные файлы напрямую, можно смонтировать хост-каталог:
+      # - ./exports:/data/exports
+    environment:
+      MA_HOST: "0.0.0.0"
+      MA_PORT: "8493"
+      # Автосоздание администратора при первом запуске (можно убрать после старта):
+      MA_ADMIN_USER: "admin"
+      MA_ADMIN_PASSWORD: "СменитеЭтотПароль123"
+      TZ: "Europe/Moscow"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8493/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  mailarchiver-data:

@@ -1,0 +1,485 @@
+# -*- coding: utf-8 -*-
+"""Шаблон HTML-документации (используется scripts/gen_docs.py)."""
+
+TEMPLATE = r"""<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MailArchiver — документация</title>
+<style>
+:root{--pri:#2f6fed;--bg:#fff;--soft:#f4f6fb;--bd:#e2e8f2;--tx:#1c2430;--dim:#5a6675;--ok:#1f9d55;--warn:#d98a00;--danger:#d64545;--radius:10px;}
+*{box-sizing:border-box}
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;color:var(--tx);background:var(--bg);line-height:1.62;font-size:16px}
+a{color:var(--pri);text-decoration:none}a:hover{text-decoration:underline}
+code{font-family:ui-monospace,"Cascadia Code",Consolas,monospace;background:var(--soft);padding:1.5px 6px;border-radius:5px;font-size:.88em}
+pre.cmd{background:#0d1017;color:#d7e0ee;padding:15px 18px;border-radius:var(--radius);overflow-x:auto;font-family:ui-monospace,Consolas,monospace;font-size:.86rem;line-height:1.55}
+pre.cmd .c{color:#6b7a90}
+.layout{display:flex;max-width:1200px;margin:0 auto;gap:32px;padding:0 20px}
+.toc{position:sticky;top:0;align-self:flex-start;height:100vh;overflow-y:auto;width:260px;flex:0 0 260px;padding:24px 0;border-right:1px solid var(--bd)}
+.toc .logo{display:flex;align-items:center;gap:10px;font-weight:800;font-size:1.15rem;margin-bottom:2px;padding:0 8px}
+.toc .logo .b{width:30px;height:30px;border-radius:8px;background:linear-gradient(135deg,#2f6fed,#7db0ff);color:#fff;display:flex;align-items:center;justify-content:center}
+.toc .ver{color:var(--dim);font-size:.78rem;padding:0 8px 14px;margin-left:40px;margin-top:-6px}
+.toc a{display:block;padding:6px 10px;color:var(--dim);border-radius:7px;font-size:.9rem}
+.toc a:hover{background:var(--soft);color:var(--tx);text-decoration:none}
+.toc a.h2{padding-left:22px;font-size:.85rem}
+.content{flex:1;min-width:0;padding:30px 0 90px;max-width:820px}
+h1{font-size:2rem;letter-spacing:-.02em;margin:.2em 0 .4em}
+h2{font-size:1.5rem;margin:1.9em 0 .5em;padding-top:12px;border-top:2px solid var(--soft);letter-spacing:-.01em}
+h3{font-size:1.18rem;margin:1.4em 0 .4em}
+h3.pg{margin-top:1.6em;color:var(--pri)}
+p{margin:.6em 0}
+ul,ol{margin:.5em 0 .9em;padding-left:1.4em}li{margin:.25em 0}
+img.shot{width:100%;border:1px solid var(--bd);border-radius:var(--radius);box-shadow:0 4px 18px rgba(20,30,50,.10);margin:12px 0 6px}
+.cap{color:var(--dim);font-size:.85rem;text-align:center;margin-bottom:14px}
+.lead{font-size:1.1rem;color:var(--dim)}
+.note,.warn,.tip{border-radius:var(--radius);padding:13px 16px;margin:14px 0;border-left:4px solid}
+.note{background:#eef4ff;border-color:var(--pri)}
+.warn{background:#fdf3df;border-color:var(--warn)}
+.tip{background:#e3f6ec;border-color:var(--ok)}
+.note b,.warn b,.tip b{display:block;margin-bottom:2px}
+table.t{width:100%;border-collapse:collapse;margin:12px 0;font-size:.92rem}
+table.t th{background:var(--soft);text-align:left;padding:9px 12px;border:1px solid var(--bd)}
+table.t td{padding:9px 12px;border:1px solid var(--bd);vertical-align:top}
+.steps{counter-reset:s;list-style:none;padding:0}
+.steps>li{counter-increment:s;position:relative;padding:2px 0 14px 44px;margin:0}
+.steps>li::before{content:counter(s);position:absolute;left:0;top:0;width:30px;height:30px;background:var(--pri);color:#fff;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:.9rem}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.card{border:1px solid var(--bd);border-radius:var(--radius);padding:16px;background:#fff}
+.diagram{background:var(--soft);border:1px solid var(--bd);border-radius:var(--radius);padding:18px;margin:16px 0;overflow-x:auto}
+.badge{display:inline-block;padding:1px 8px;border-radius:12px;font-size:.78rem;font-weight:600}
+.badge.ok{background:#e3f6ec;color:var(--ok)}.badge.exp{background:#fdf3df;color:var(--warn)}
+.ptable{border:1px solid var(--bd);border-radius:var(--radius);overflow:hidden;margin:10px 0 20px}
+.prow{display:grid;grid-template-columns:230px 1fr;border-top:1px solid var(--bd)}
+.prow:first-child{border-top:none}
+.pname{padding:12px 14px;background:var(--soft);border-right:1px solid var(--bd)}
+.ptitle{display:block;font-weight:650}.pname code{background:#fff;font-size:.76rem;color:var(--dim);display:inline-block;margin-top:4px}
+.pdesc{padding:12px 14px}.pdesc p{margin:.2em 0}
+.prec{color:var(--ok);font-size:.92rem}.pmeta{color:var(--dim);font-size:.86rem}
+@media(max-width:860px){.toc{display:none}.grid2{grid-template-columns:1fr}.prow{grid-template-columns:1fr}.pname{border-right:none;border-bottom:1px solid var(--bd)}}
+</style>
+</head>
+<body>
+<div class="layout">
+<nav class="toc">
+  <div class="logo"><span class="b">📥</span> MailArchiver</div>
+  <div class="ver">Документация · v%%VERSION%%</div>
+  <a href="#about">1. О программе</a>
+  <a href="#how">2. Как это работает</a>
+  <a href="#install">3. Установка</a>
+  <a href="#install" class="h2">— через скрипт (systemd)</a>
+  <a href="#docker" class="h2">— через Docker</a>
+  <a href="#firstrun">4. Первый вход</a>
+  <a href="#firstrun" class="h2">— вход по ящику</a>
+  <a href="#dashboard">5. Дашборд и мониторинг</a>
+  <a href="#mailview">6. Просмотр писем</a>
+  <a href="#accounts">7. Добавление ящика</a>
+  <a href="#providers" class="h2">— настройки провайдеров</a>
+  <a href="#backup">7. Резервное копирование</a>
+  <a href="#export">8. Экспорт в PST</a>
+  <a href="#restore">9. Восстановление</a>
+  <a href="#retention">— хранение копий (3 дня/неделя)</a>
+  <a href="#schedules">10. Расписания</a>
+  <a href="#settings">11. Настройки (все параметры)</a>
+  <a href="#jobs">12. Очередь и логи</a>
+  <a href="#security">13. Безопасность</a>
+  <a href="#trouble">14. Устранение неполадок</a>
+  <a href="#faq">15. Частые вопросы</a>
+  <a href="#api">16. API</a>
+</nav>
+<main class="content">
+
+<h1 id="about">MailArchiver — документация</h1>
+<p class="lead">Сервис резервного копирования почтовых ящиков по IMAP с веб-интерфейсом, очередью
+заданий, планировщиком, подробной статистикой и экспортом копий в формат <b>.pst</b> для Microsoft Outlook.</p>
+
+<p>Эта документация написана так, чтобы ей мог воспользоваться <b>даже не специалист</b>. Если вы
+умеете копировать команды в терминал и заполнять формы в браузере — вы справитесь. Сложные места
+снабжены пояснениями и подсказками.</p>
+
+<div class="tip"><b>💡 Что делает программа простыми словами</b>
+Она регулярно и автоматически «скачивает» все письма из ваших почтовых ящиков и хранит их локальную
+копию на вашем сервере. Из этой копии можно в любой момент получить файл <code>.pst</code> и открыть его
+в Outlook, либо «залить» письма обратно на почтовый сервер, если они пропали.</p></div>
+
+<h3>Ключевые возможности</h3>
+<ul>
+<li><b>Резервное копирование по IMAP</b> — инкрементальное (докачиваются только новые письма), с сохранением папок и флагов.</li>
+<li><b>Расписание</b> — копирование запускается автоматически (например, каждую ночь).</li>
+<li><b>Экспорт в .pst</b> для всех версий Outlook (ANSI для 97–2002, Unicode для 2003+), а также в <b>EML</b> и <b>MBOX</b>.</li>
+<li><b>Восстановление</b> писем из копии обратно на любой IMAP-сервер.</li>
+<li><b>Импорт из .pst</b> — залить существующий PST-файл на почтовый сервер.</li>
+<li><b>Просмотр писем</b> прямо в интерфейсе (папки, список, чтение с вложениями и HTML).</li>
+<li><b>Вход по ящику</b> — по email и паролю самого ящика; такой пользователь видит только свой ящик.</li>
+<li><b>Хранение копий за 3 дня / 1 неделю</b> от текущей даты (пресеты очистки на каждый ящик).</li>
+<li><b>Веб-интерфейс</b> с живой статистикой, очередью, логами и подсказкой к каждому параметру.</li>
+<li><b>Очередь заданий</b> с приоритетами, ограничением нагрузки и повторными попытками при сбоях.</li>
+<li><b>Безопасность</b> — вход по паролю, шифрование паролей ящиков, защита от подбора.</li>
+</ul>
+
+<h2 id="how">2. Как это работает (методология)</h2>
+<p>MailArchiver состоит из нескольких взаимодействующих частей. Понимание общей схемы поможет
+настроить сервис под ваши задачи.</p>
+
+<div class="diagram">
+<svg viewBox="0 0 760 300" width="760" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif" font-size="13">
+  <rect x="20" y="120" width="150" height="60" rx="8" fill="#e6efff" stroke="#2f6fed"/>
+  <text x="95" y="146" text-anchor="middle" font-weight="700">Веб-интерфейс</text>
+  <text x="95" y="164" text-anchor="middle" fill="#5a6675">браузер</text>
+
+  <rect x="220" y="30" width="150" height="55" rx="8" fill="#fff" stroke="#2f6fed"/>
+  <text x="295" y="54" text-anchor="middle" font-weight="700">Планировщик</text>
+  <text x="295" y="71" text-anchor="middle" fill="#5a6675">по расписанию</text>
+
+  <rect x="220" y="120" width="150" height="60" rx="8" fill="#fff" stroke="#2f6fed"/>
+  <text x="295" y="146" text-anchor="middle" font-weight="700">Очередь</text>
+  <text x="295" y="164" text-anchor="middle" fill="#5a6675">воркеры</text>
+
+  <rect x="220" y="215" width="150" height="55" rx="8" fill="#fff" stroke="#2f6fed"/>
+  <text x="295" y="239" text-anchor="middle" font-weight="700">База (SQLite)</text>
+  <text x="295" y="256" text-anchor="middle" fill="#5a6675">индекс, задания</text>
+
+  <rect x="430" y="120" width="150" height="60" rx="8" fill="#fff" stroke="#1f9d55"/>
+  <text x="505" y="146" text-anchor="middle" font-weight="700">IMAP-движок</text>
+  <text x="505" y="164" text-anchor="middle" fill="#5a6675">бэкап/восстан.</text>
+
+  <rect x="620" y="60" width="120" height="55" rx="8" fill="#e3f6ec" stroke="#1f9d55"/>
+  <text x="680" y="84" text-anchor="middle" font-weight="700">Почтовый</text>
+  <text x="680" y="101" text-anchor="middle">сервер</text>
+
+  <rect x="620" y="150" width="120" height="55" rx="8" fill="#f4f6fb" stroke="#5a6675"/>
+  <text x="680" y="174" text-anchor="middle" font-weight="700">Хранилище</text>
+  <text x="680" y="191" text-anchor="middle" fill="#5a6675">Maildir/.eml</text>
+
+  <line x1="170" y1="150" x2="220" y2="150" stroke="#5a6675" marker-end="url(#a)"/>
+  <line x1="295" y1="85" x2="295" y2="120" stroke="#5a6675" marker-end="url(#a)"/>
+  <line x1="295" y1="180" x2="295" y2="215" stroke="#5a6675" marker-end="url(#a)"/>
+  <line x1="370" y1="150" x2="430" y2="150" stroke="#5a6675" marker-end="url(#a)"/>
+  <line x1="580" y1="140" x2="620" y2="100" stroke="#1f9d55" marker-end="url(#a)"/>
+  <line x1="580" y1="160" x2="620" y2="178" stroke="#5a6675" marker-end="url(#a)"/>
+  <defs><marker id="a" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8" fill="#5a6675"/></marker></defs>
+</svg>
+</div>
+
+<h3>Резервное копирование: инкрементальный алгоритм</h3>
+<p>При копировании MailArchiver не скачивает всё заново каждый раз. Он использует стандартные
+механизмы IMAP:</p>
+<ul>
+<li>у каждого письма в папке есть уникальный номер <b>UID</b>;</li>
+<li>у папки есть признак <b>UIDVALIDITY</b> — если он изменился, папка перечитывается целиком (так требует протокол);</li>
+<li>сервис помнит, какие UID уже сохранены, и <b>докачивает только новые</b> письма.</li>
+</ul>
+<p>Каждое письмо сохраняется отдельным файлом в формате <b>Maildir</b> (стандарт, который понимают многие
+почтовые программы). Отдельный файл на письмо — это надёжно: повреждение одного файла не затрагивает
+остальные, копию легко просматривать и переносить. После записи размер и контрольная сумма (SHA-256)
+сверяются — это защищает от «тихой» порчи данных.</p>
+
+<div class="diagram">
+<svg viewBox="0 0 720 120" width="720" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif" font-size="13">
+  <rect x="10" y="35" width="140" height="50" rx="8" fill="#e3f6ec" stroke="#1f9d55"/><text x="80" y="65" text-anchor="middle" font-weight="700">Почтовый сервер</text>
+  <rect x="230" y="35" width="150" height="50" rx="8" fill="#fff" stroke="#2f6fed"/><text x="305" y="60" text-anchor="middle" font-weight="700">Воркер</text><text x="305" y="76" text-anchor="middle" fill="#5a6675" font-size="11">UID FETCH пакетами</text>
+  <rect x="460" y="10" width="150" height="45" rx="8" fill="#f4f6fb" stroke="#5a6675"/><text x="535" y="37" text-anchor="middle" font-weight="700">Maildir (.eml)</text>
+  <rect x="460" y="70" width="150" height="45" rx="8" fill="#f4f6fb" stroke="#5a6675"/><text x="535" y="97" text-anchor="middle" font-weight="700">Индекс (SQLite)</text>
+  <line x1="150" y1="60" x2="230" y2="60" stroke="#5a6675" marker-end="url(#b)"/><text x="190" y="52" text-anchor="middle" fill="#5a6675" font-size="11">только новые</text>
+  <line x1="380" y1="55" x2="460" y2="35" stroke="#5a6675" marker-end="url(#b)"/>
+  <line x1="380" y1="65" x2="460" y2="90" stroke="#5a6675" marker-end="url(#b)"/>
+  <defs><marker id="b" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8" fill="#5a6675"/></marker></defs>
+</svg>
+</div>
+
+<h3>Очередь и планировщик</h3>
+<p>Любая тяжёлая операция (копирование, экспорт, восстановление) ставится в <b>очередь</b> и выполняется
+фоновыми воркерами. Это позволяет: видеть прогресс в реальном времени, не перегружать почтовый сервер
+(лимит одновременных подключений на ящик), безопасно повторять при сбоях. Планировщик по расписанию сам
+ставит задания в очередь — например, «каждый день в 3:00 сделать бэкап всех ящиков».</p>
+
+<h2 id="install">3. Установка</h2>
+<p>Есть два способа. Выберите один.</p>
+
+<h3>Способ А. Установка скриптом (служба systemd) — рекомендуется для сервера</h3>
+<p>Подходит для обычного Linux-сервера (Debian/Ubuntu, RHEL/Rocky/Alma/Fedora, openSUSE, Arch).
+Скрипт сам определит дистрибутив, установит зависимости, создаст службу и настроит автозапуск.</p>
+<ol class="steps">
+<li>Скопируйте папку проекта на сервер (например, через <code>scp</code> или <code>git</code>) и зайдите в неё:
+<pre class="cmd">cd mail_backup</pre></li>
+<li>Запустите установку с правами администратора:
+<pre class="cmd">sudo bash scripts/install.sh</pre>
+Скрипт установит Python-зависимости в изолированное окружение, создаст пользователя <code>mailarchiver</code>,
+службу и файл настроек <code>/etc/mailarchiver/config.yaml</code>.</li>
+<li>В конце установки появится запрос на создание администратора — введите логин и пароль. Если установка
+шла без интерактивного ввода, создайте его вручную:
+<pre class="cmd">sudo -u mailarchiver /opt/mailarchiver/venv/bin/mailarchiver \
+  -c /etc/mailarchiver/config.yaml create-admin</pre></li>
+<li>Готово. Веб-интерфейс доступен на <code>http://127.0.0.1:8493</code>.</li>
+</ol>
+<div class="note"><b>Полезные команды службы</b>
+<pre class="cmd">systemctl status mailarchiver     <span class="c"># состояние</span>
+journalctl -u mailarchiver -f      <span class="c"># смотреть логи в реальном времени</span>
+systemctl restart mailarchiver     <span class="c"># перезапуск</span></pre></div>
+<div class="warn"><b>⚠ Доступ снаружи</b>
+По умолчанию сервис слушает только <code>127.0.0.1</code> (локально) — это безопасно. Чтобы открыть доступ
+из сети, настройте reverse proxy (nginx/traefik) с HTTPS (см. раздел «Безопасность»), а не открывайте порт напрямую.</p></div>
+
+<h3 id="docker">Способ Б. Docker Compose — самый простой</h3>
+<p>Если на сервере есть Docker, это самый быстрый путь: все зависимости уже внутри образа.</p>
+<ol class="steps">
+<li>Зайдите в папку <code>docker</code> проекта и при необходимости откройте <code>docker-compose.yml</code>,
+чтобы задать логин/пароль администратора (переменные <code>MA_ADMIN_USER</code> и <code>MA_ADMIN_PASSWORD</code>).</li>
+<li>Соберите и запустите контейнер:
+<pre class="cmd">cd docker
+docker compose up -d</pre></li>
+<li>Откройте <code>http://ВАШ_СЕРВЕР:8493</code> и войдите под заданными логином/паролем.</li>
+</ol>
+<div class="tip"><b>💡 Где хранятся данные</b>
+Все копии писем и настройки лежат в томе <code>mailarchiver-data</code> и переживают перезапуск и обновление
+контейнера. Экспортированные файлы можно забирать через веб-интерфейс (кнопка «Скачать») или смонтировать
+хост-каталог в <code>/data/exports</code>.</p></div>
+
+<h2 id="firstrun">4. Первый вход</h2>
+<p>При первом открытии веб-интерфейса вам предложат создать администратора (если он ещё не создан). Затем —
+обычная форма входа.</p>
+<img class="shot" src="img/01_login.png" alt="Экран входа">
+<div class="cap">Экран входа в веб-интерфейс</div>
+<div class="tip"><b>🔑 Два способа входа</b>
+<p><b>1. Администратор</b> — логин и пароль, заданные при первичной настройке; видит и настраивает всё.</p>
+<p><b>2. Пользователь-ящик</b> — вход по <b>email и паролю самого почтового ящика</b> (пароль проверяется прямым
+подключением к IMAP). Такой пользователь видит только свой ящик: может просматривать письма, запускать
+копирование, экспорт и восстановление своего ящика, но не имеет доступа к настройкам, другим ящикам и
+управлению пользователями. Ящик должен быть заранее добавлен администратором и включён.</p></div>
+
+<h2 id="dashboard">5. Дашборд и мониторинг</h2>
+<p>Главный экран показывает всё важное сразу: число ящиков, писем в архиве, что сейчас в очереди/работе,
+свободное место, живую ленту текущих операций с прогрессом, график активности и список ящиков с кнопкой
+быстрого копирования.</p>
+<img class="shot" src="img/02_dashboard.png" alt="Дашборд">
+<div class="cap">Дашборд: статистика и текущие операции обновляются в реальном времени</div>
+<p>Блок <b>«Текущие операции»</b> обновляется автоматически (через WebSocket). Для каждой операции виден
+процент выполнения, скорость, объём и кнопка отмены.</p>
+
+<h2 id="mailview">6. Просмотр писем</h2>
+<p>Раздел <b>«Почта»</b> — это встроенный почтовый клиент для чтения писем из локальной копии, без
+подключения к серверу. Слева — папки, посередине — список писем, справа — само письмо.</p>
+<img class="shot" src="img/13_mail.png" alt="Просмотр писем">
+<div class="cap">Просмотр писем: папки → список → чтение письма</div>
+<p>Возможности просмотра:</p>
+<ul>
+<li>чтение текста письма и HTML-версии (HTML открывается в изолированной «песочнице» — скрипты не выполняются, это безопасно);</li>
+<li>заголовки: от кого, кому, копия, дата;</li>
+<li>вложения — со скачиванием по клику;</li>
+<li>скачивание письма целиком в формате <code>.eml</code>;</li>
+<li>непрочитанные письма выделены жирным, помеченные — звёздочкой; постранично.</li>
+</ul>
+<div class="note"><b>Где взять письма для просмотра</b>
+Список формируется из локальной копии, поэтому сначала выполните резервное копирование ящика. Открыть
+просмотр можно из раздела «Почта» (администратор выбирает ящик сверху) или из меню ящика (⋯ →
+«Просмотр писем»). Пользователь, вошедший по учётным данным ящика, сразу попадает в просмотр своей почты.</div>
+
+<h2 id="accounts">7. Добавление почтового ящика</h2>
+<p>Раздел <b>«Почтовые ящики»</b> → кнопка <b>«Добавить ящик»</b>. Заполните форму. У каждого поля есть
+подсказка «?» — наведите на неё, чтобы прочитать описание, рекомендацию и пример.</p>
+<img class="shot" src="img/04_account_modal.png" alt="Форма добавления ящика">
+<div class="cap">Форма ящика. Наведение на «?» показывает подсказку к полю</div>
+<ol class="steps">
+<li>Введите <b>название</b> (любое понятное имя), <b>адрес IMAP-сервера</b> и <b>порт</b>.</li>
+<li>Выберите <b>шифрование</b> (обычно SSL/TLS, порт 993).</li>
+<li>Укажите <b>логин</b> и <b>пароль</b>. Для большинства провайдеров нужен «пароль приложения» (см. ниже).</li>
+<li>Нажмите <b>«Проверить подключение»</b> — сервис попробует войти и покажет список папок.</li>
+<li>Сохраните. Теперь ящик можно копировать.</li>
+</ol>
+<div class="warn"><b>⚠ Пароли приложений</b>
+Яндекс, Mail.ru, Gmail и другие часто не принимают обычный пароль для сторонних программ. Нужно включить
+доступ по IMAP в настройках почты и создать отдельный «пароль приложения». Gmail и Microsoft 365, как
+правило, требуют вход через <b>OAuth2</b> — выберите этот способ и заполните соответствующие поля.</p></div>
+
+<h3 id="providers">Настройки популярных провайдеров</h3>
+<table class="t">
+<tr><th>Провайдер</th><th>IMAP-сервер</th><th>Порт / шифрование</th><th>Примечание</th></tr>
+<tr><td>Яндекс.Почта</td><td>imap.yandex.ru</td><td>993 / SSL</td><td>Включить IMAP; пароль приложения</td></tr>
+<tr><td>Mail.ru</td><td>imap.mail.ru</td><td>993 / SSL</td><td>Пароль для внешних приложений</td></tr>
+<tr><td>Gmail</td><td>imap.gmail.com</td><td>993 / SSL</td><td>OAuth2 или пароль приложения (с 2FA)</td></tr>
+<tr><td>Microsoft 365 / Outlook</td><td>outlook.office365.com</td><td>993 / SSL</td><td>Обычно только OAuth2</td></tr>
+<tr><td>Свой сервер (Dovecot и т.п.)</td><td>адрес вашего сервера</td><td>993 / SSL или 143 / STARTTLS</td><td>—</td></tr>
+</table>
+
+<h2 id="backup">7. Резервное копирование</h2>
+<p>Запустить копирование можно тремя способами: кнопкой «Копировать» у ящика (на дашборде или в списке
+ящиков), автоматически по расписанию (раздел «Расписания»), либо оно запускается как часть задания.</p>
+<p>Копирование инкрементальное — при повторных запусках докачиваются только новые письма, поэтому оно
+быстрое. Прогресс виден в разделе «Очередь и задания».</p>
+<div class="tip"><b>💡 Рекомендация</b>
+Настройте расписание на ночное время (например, <code>0 3 * * *</code>). Так копирование не будет мешать
+работе и меньше нагрузит почтовый сервер.</p></div>
+
+<h2 id="export">8. Экспорт в PST (и EML/MBOX)</h2>
+<p>Из локальной копии можно получить файл для Outlook. Откройте ящик (меню «⋯») → <b>«Экспорт»</b>.</p>
+<img class="shot" src="img/10_export_modal.png" alt="Экспорт в PST">
+<div class="cap">Окно экспорта: выбор движка, формата PST и фильтров</div>
+
+<h3>Какой движок выбрать</h3>
+<table class="t">
+<tr><th>Движок</th><th>Формат</th><th>Надёжность</th><th>Когда использовать</th></tr>
+<tr><td>Aspose PST <span class="badge ok">надёжно</span></td><td>.pst</td><td>Высокая</td><td>Нужен гарантированный .pst. Требует библиотеки Aspose.Email и лицензии для продакшена.</td></tr>
+<tr><td>Встроенный PST <span class="badge exp">эксперим.</span></td><td>.pst</td><td>Средняя</td><td>Бесплатно, без зависимостей. Проверяйте результат в своём Outlook.</td></tr>
+<tr><td>EML <span class="badge ok">надёжно</span></td><td>каталог .eml (.zip)</td><td>Высокая</td><td>Без потерь. Письма можно перетаскивать в Outlook, хранить как архив.</td></tr>
+<tr><td>MBOX <span class="badge ok">надёжно</span></td><td>.mbox (.zip)</td><td>Высокая</td><td>Импорт в Thunderbird и конвертеры в Outlook.</td></tr>
+</table>
+
+<div class="note"><b>Почему .pst — особый случай</b>
+Формат PST — закрытый формат Microsoft. На Linux <b>надёжно</b> создавать корректный .pst умеет по сути только
+коммерческая библиотека Aspose.Email; полностью бесплатных генераторов .pst под Linux не существует
+(open-source умеет только читать .pst). Поэтому MailArchiver предлагает: надёжный путь через Aspose, встроенный
+бесплатный экспериментальный генератор, и всегда доступные EML/MBOX, которые Outlook импортирует без потерь.</p></div>
+
+<h3>Версии Outlook: ANSI или Unicode</h3>
+<p>Параметр «Формат PST» определяет совместимость:</p>
+<ul>
+<li><b>Unicode</b> — для Outlook 2003 и новее (2007/2010/2013/2016/2019/2021/365). Большой объём, поддержка любых языков. <b>Рекомендуется.</b></li>
+<li><b>ANSI</b> — для очень старого Outlook 97–2002. Ограничение размера 2 ГБ.</li>
+</ul>
+<p>Просто выберите вашу версию Outlook в поле «Целевая версия Outlook» — формат подберётся автоматически.</p>
+<p>Готовые файлы появляются в разделе <b>«Экспорт (PST)»</b>, откуда их можно скачать.</p>
+<img class="shot" src="img/06_exports.png" alt="Список экспортов">
+<div class="cap">Раздел «Экспорт»: готовые файлы для скачивания</div>
+
+<h3>Как открыть .pst в Outlook</h3>
+<ol><li>Скачайте файл .pst из раздела «Экспорт».</li>
+<li>В Outlook: <b>Файл → Открыть и экспортировать → Открыть файл данных Outlook</b> и выберите скачанный .pst.</li>
+<li>Папки появятся в левой панели Outlook.</li></ol>
+
+<h2 id="restore">9. Восстановление на сервер</h2>
+<p>Если письма пропали на почтовом сервере, их можно вернуть из локальной копии. Откройте ящик (меню «⋯»)
+→ <b>«Восстановить на сервер»</b>.</p>
+<div class="tip"><b>💡 Безопасный порядок</b>
+1) Сначала сделайте <b>пробный прогон</b> (галочка «Пробный прогон») — он посчитает письма, но ничего не зальёт.
+2) Заливайте в режиме <b>«В папки с префиксом»</b> (например, «Восстановлено») — так восстановленные письма не
+смешаются с текущей почтой. 3) Оставьте включённой галочку «Пропускать дубли» — можно безопасно
+перезапускать.</p></div>
+<p>Восстановление сохраняет флаги (прочитано/важное) и дату получения писем.</p>
+
+<h3>Импорт из существующего .pst</h3>
+<p>Меню ящика → <b>«Импорт из .pst»</b>: загрузите PST-файл, и его письма зальются на IMAP-сервер в папку с
+указанным префиксом. Для этого на сервере должен быть установлен <code>readpst</code> (пакет pst-utils) —
+скрипт установки ставит его автоматически, в Docker он уже включён.</p>
+
+<h2 id="retention">Хранение копий: 3 дня / 1 неделя</h2>
+<p>Можно ограничить, за какой период хранить локальные копии писем каждого ящика — например, только за
+последние <b>3 дня</b> или <b>1 неделю</b> от текущей даты. Копии старше выбранного срока удаляются
+автоматически (ежедневная очистка). На письма на самом почтовом сервере это не влияет.</p>
+<img class="shot" src="img/14_retention.png" alt="Хранение копий">
+<div class="cap">Пресеты хранения: последние 3 дня, последняя неделя, хранить всё или свой срок</div>
+<p>Открыть: меню ящика (⋯) → <b>«Хранение копий»</b>, либо задать в форме ящика поле «Хранение локальных
+копий». При выборе срока автоматически создаётся ежедневное расписание очистки. Значение «по глобальной
+настройке» берёт срок из общих настроек (раздел «Хранение и очистка»).</p>
+<div class="warn"><b>⚠ Обратите внимание</b>
+Ретеншн удаляет именно локальные копии старше срока. Если нужен полный «вечный» архив — оставьте
+«Хранить всё». Хранение за 3 дня/неделю удобно, когда важны только свежие письма и экономия места.</div>
+
+<h2 id="schedules">10. Расписания</h2>
+<p>Раздел <b>«Расписания»</b> позволяет запускать бэкап (или очистку/проверку) автоматически.</p>
+<img class="shot" src="img/07_schedules.png" alt="Расписания">
+<div class="cap">Расписания автоматического копирования</div>
+<p>Тип «по времени (cron)» задаётся выражением из пяти полей: <code>минуты часы день месяц день_недели</code>.</p>
+<table class="t">
+<tr><th>Выражение</th><th>Значение</th></tr>
+<tr><td><code>0 3 * * *</code></td><td>каждый день в 03:00</td></tr>
+<tr><td><code>0 */6 * * *</code></td><td>каждые 6 часов</td></tr>
+<tr><td><code>30 2 * * 1</code></td><td>каждый понедельник в 02:30</td></tr>
+<tr><td><code>0 22 * * 1-5</code></td><td>по будням в 22:00</td></tr>
+</table>
+<p>Часовой пояс расписаний задаётся в настройках (по умолчанию Europe/Moscow).</p>
+
+<h2 id="settings">11. Настройки — справочник всех параметров</h2>
+<p>Раздел <b>«Настройки»</b> сгруппирован по темам. У каждого параметра есть подсказка «?» с описанием,
+рекомендацией и примером. Ниже — полный справочник тех же параметров.</p>
+<img class="shot" src="img/09_settings_help.png" alt="Настройки с подсказкой">
+<div class="cap">Подсказка к параметру: описание, рекомендация (💡), пример и значение по умолчанию</div>
+
+%%PARAMS%%
+
+<h2 id="jobs">12. Очередь и логи</h2>
+<p>Раздел <b>«Очередь и задания»</b> показывает все задания, их статус и прогресс. Можно открыть детали
+(журнал событий задания), отменить выполняющееся или повторить упавшее.</p>
+<img class="shot" src="img/05_jobs.png" alt="Очередь заданий">
+<div class="cap">Очередь и задания с прогрессом и действиями</div>
+<p>Раздел <b>«Логи»</b> показывает системный журнал сервиса с фильтром по уровню важности.</p>
+<img class="shot" src="img/11_logs.png" alt="Логи">
+<div class="cap">Просмотр логов сервиса</div>
+
+<h2 id="security">13. Безопасность</h2>
+<ul>
+<li><b>Вход по паролю.</b> Пароли пользователей хранятся в виде необратимого хеша (PBKDF2-HMAC-SHA256). Есть защита от подбора: после нескольких неудач вход временно блокируется.</li>
+<li><b>Шифрование секретов ящиков.</b> Пароли и токены IMAP-ящиков хранятся в БД в зашифрованном виде (Fernet/AES). Ключ лежит в файле <code>secret.key</code> с правами только для владельца.</li>
+<li><b>Сессии.</b> Cookie сессии подписаны и ограничены по времени; есть авто-выход при бездействии.</li>
+</ul>
+<h3>Публикация через HTTPS (reverse proxy)</h3>
+<p>Чтобы открыть доступ извне безопасно, поставьте перед сервисом nginx или traefik с TLS. Пример nginx:</p>
+<pre class="cmd">server {
+  listen 443 ssl;
+  server_name mail-backup.example.ru;
+  ssl_certificate     /etc/letsencrypt/live/.../fullchain.pem;
+  ssl_certificate_key /etc/letsencrypt/live/.../privkey.pem;
+  location / {
+    proxy_pass http://127.0.0.1:8493;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;    <span class="c"># для WebSocket</span>
+    proxy_set_header Connection "upgrade";
+  }
+}</pre>
+<p>В настройках включите «За обратным прокси» и «Cookie только по HTTPS».</p>
+
+<h2 id="trouble">14. Устранение неполадок</h2>
+<table class="t">
+<tr><th>Симптом</th><th>Причина и решение</th></tr>
+<tr><td>«Аутентификация IMAP не удалась»</td><td>Неверный логин/пароль, либо провайдер требует «пароль приложения» или OAuth2. Включите IMAP в настройках почты, создайте пароль приложения.</td></tr>
+<tr><td>«Ошибка TLS/SSL»</td><td>Неверный порт или режим шифрования. Проверьте: SSL — порт 993, STARTTLS — порт 143. Для внутренних серверов с самоподписанным сертификатом отключите «Проверять TLS-сертификат IMAP».</td></tr>
+<tr><td>«Превышено время ожидания»</td><td>Медленная сеть/сервер. Увеличьте таймауты в настройках (backup.socket_timeout_s).</td></tr>
+<tr><td>Экспорт .pst не открывается в Outlook</td><td>Встроенный движок экспериментальный. Используйте движок Aspose (с лицензией) либо экспортируйте в EML/MBOX.</td></tr>
+<tr><td>Импорт .pst не работает</td><td>Не установлен <code>readpst</code>. Установите пакет pst-utils (Debian/Ubuntu) или libpst (RHEL).</td></tr>
+<tr><td>Служба не запускается</td><td>Смотрите логи: <code>journalctl -u mailarchiver -n 50</code>. Проверьте конфигурацию: <code>mailarchiver check-config</code>.</td></tr>
+<tr><td>Мало места на диске</td><td>Включите ретеншн (хранить N дней) или сжатие писем (gzip) в настройках, либо расширьте диск.</td></tr>
+<tr><td>Забыт пароль администратора</td><td><code>sudo -u mailarchiver /opt/mailarchiver/venv/bin/mailarchiver -c /etc/mailarchiver/config.yaml reset-password -u admin</code></td></tr>
+</table>
+
+<h2 id="faq">15. Частые вопросы</h2>
+<h3>Это удалит письма с почтового сервера?</h3>
+<p>Нет. Копирование только читает письма. По умолчанию локальная копия — это надёжный архив, из которого
+ничего не пропадает, даже если письмо удалят на сервере (если вы сами не включите соответствующую опцию ретеншна).</p>
+<h3>Сколько ящиков можно подключить?</h3>
+<p>Ограничений нет. Одновременность регулируется настройками (сколько заданий и подключений на ящик).</p>
+<h3>Нужен ли интернет для экспорта в PST?</h3>
+<p>Нет, экспорт локальный. Интернет нужен только движку Aspose при первичной установке библиотеки и для OAuth2.</p>
+<h3>Где лежат копии писем?</h3>
+<p>В каталоге данных (по умолчанию <code>/var/lib/mailarchiver/mailboxes</code>, в Docker — том <code>/data</code>).
+Это обычные файлы .eml в структуре папок Maildir.</p>
+<h3>Можно ли перенести копии на другой сервер?</h3>
+<p>Да. Скопируйте каталог данных целиком — в нём и письма, и база индексов.</p>
+<h3>Безопасно ли открывать доступ из интернета?</h3>
+<p>Только через HTTPS (reverse proxy) и с включённой аутентификацией. Прямой доступ по HTTP наружу не рекомендуется.</p>
+
+<h2 id="api">16. API</h2>
+<p>Весь интерфейс работает поверх REST API. Его можно использовать для автоматизации. Полное описание —
+по адресу <code>/api/docs</code> (интерактивная документация OpenAPI). Основные точки:</p>
+<table class="t">
+<tr><th>Метод</th><th>Путь</th><th>Назначение</th></tr>
+<tr><td>POST</td><td>/api/login</td><td>вход (устанавливает cookie сессии)</td></tr>
+<tr><td>GET</td><td>/api/state</td><td>сводка для дашборда</td></tr>
+<tr><td>GET/POST</td><td>/api/accounts</td><td>список / создание ящиков</td></tr>
+<tr><td>POST</td><td>/api/accounts/{id}/backup</td><td>запустить копирование</td></tr>
+<tr><td>POST</td><td>/api/accounts/{id}/export</td><td>запустить экспорт</td></tr>
+<tr><td>POST</td><td>/api/accounts/{id}/restore</td><td>запустить восстановление</td></tr>
+<tr><td>GET</td><td>/api/jobs</td><td>список заданий и их прогресс</td></tr>
+<tr><td>GET</td><td>/api/exports/{id}/download</td><td>скачать готовый файл экспорта</td></tr>
+<tr><td>GET/PUT</td><td>/api/settings</td><td>чтение / изменение настроек</td></tr>
+</table>
+
+<hr style="margin:40px 0;border:none;border-top:1px solid var(--bd)">
+<p class="cap">MailArchiver v%%VERSION%% · документация сгенерирована из исходного кода, поэтому справочник параметров
+всегда соответствует установленной версии.</p>
+
+</main>
+</div>
+</body>
+</html>"""
