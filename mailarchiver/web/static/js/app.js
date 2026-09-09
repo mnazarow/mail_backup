@@ -43,6 +43,8 @@ function toggleTheme(){
   const next = cur==='dark' ? 'light' : 'dark';
   document.documentElement.setAttribute('data-theme', next);
   try{ localStorage.setItem('ma-theme', next); }catch(e){}
+  // перерисовать графики под новую тему (canvas не наследует CSS-переменные)
+  if(State.redraw){ requestAnimationFrame(()=>{ try{ State.redraw(); }catch(e){} }); }
 }
 
 // ---------- Подсказка по параметру ----------
@@ -131,6 +133,8 @@ function renderSetup(){
 // ===================================================================
 const NAV = [
   {id:'dashboard', icon:'📊', title:'Дашборд', mb:true},
+  {id:'analytics', icon:'📈', title:'Аналитика', admin:true},
+  {id:'mailanalytics', icon:'🔎', title:'Аналитика писем', admin:true},
   {id:'mail', icon:'📧', title:'Почта', mb:true},
   {id:'accounts', icon:'📬', title:'Почтовые ящики'},
   {id:'jobs', icon:'⚙️', title:'Очередь и задания', mb:true},
@@ -178,6 +182,8 @@ async function startApp(){
   $('#themeBtn').onclick=toggleTheme;
   $('#logout').onclick=async(e)=>{ e.preventDefault(); try{await api('/logout',{method:'POST'});}catch(_){} location.reload(); };
   window.addEventListener('hashchange', route);
+  let rzT=null;
+  window.addEventListener('resize', ()=>{ if(!State.redraw) return; clearTimeout(rzT); rzT=setTimeout(()=>{ try{State.redraw();}catch(e){} }, 220); });
   startLive();
   route();
 }
@@ -193,9 +199,9 @@ function route(){
   // mailbox-пользователю доступны только его разделы
   const allowed = NAV.filter(n=>!n.sep && (!n.admin||State.user.role==='admin') && (!isMailbox()||n.mb)).map(n=>n.id);
   if(!allowed.includes(view)) view = isMailbox()?'mail':'dashboard';
-  State.view=view; setActiveNav(view);
+  State.view=view; setActiveNav(view); State.redraw=null;
   const c=$('#content'); c.innerHTML='<div class="empty"><div class="spinner"></div></div>';
-  const map={dashboard:viewDashboard,mail:viewMail,accounts:viewAccounts,jobs:viewJobs,exports:viewExports,schedules:viewSchedules,logs:viewLogs,settings:viewSettings,users:viewUsers,audit:viewAudit};
+  const map={dashboard:viewDashboard,analytics:viewAnalytics,mailanalytics:viewMailAnalytics,mail:viewMail,accounts:viewAccounts,jobs:viewJobs,exports:viewExports,schedules:viewSchedules,logs:viewLogs,settings:viewSettings,users:viewUsers,audit:viewAudit};
   (map[view]||viewDashboard)(c).catch(toastErr);
 }
 
@@ -876,6 +882,373 @@ async function loadMailMessage(accId, pk){
   const showHtml=()=>{ bodyBox.innerHTML=''; const f=document.createElement('iframe'); f.className='mail-body-frame'; f.setAttribute('sandbox',''); f.srcdoc=m.html; bodyBox.appendChild(f); };
   if(hasText) showText(); else if(hasHtml) showHtml(); else showText();
   el.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{ el.querySelectorAll('[data-tab]').forEach(x=>x.className='btn sm'); b.className='btn sm primary'; b.dataset.tab==='html'?showHtml():showText(); });
+}
+
+// ===================================================================
+//  Аналитика — набор графиков на canvas (без внешних библиотек)
+// ===================================================================
+const CHART_COLORS = ['#2f6fed','#1f9d55','#d98a00','#d64545','#2b8ca6','#7c5cff','#e0567f','#2bb0a6','#b0862e','#8e6bd8','#3aa0a0','#c76b3a'];
+const JOBLBL = {backup:'Резервное копирование',restore:'Восстановление',export:'Экспорт',import_pst:'Импорт PST',test:'Проверка подключения',retention:'Очистка (ретеншн)',verify:'Проверка целостности',analyze:'Глубокий анализ писем'};
+function cvar(n,f){ const v=getComputedStyle(document.documentElement).getPropertyValue(n).trim(); return v||f; }
+function fmtNum(n){ return Number(n||0).toLocaleString('ru-RU'); }
+function trunc(s,n){ s=String(s==null?'':s); return s.length>n? s.slice(0,n-1)+'…':s; }
+function hexA(hex,a){ hex=String(hex).replace('#',''); if(hex.length===3)hex=hex.split('').map(c=>c+c).join(''); const r=parseInt(hex.slice(0,2),16),g=parseInt(hex.slice(2,4),16),b=parseInt(hex.slice(4,6),16); return `rgba(${r||0},${g||0},${b||0},${a})`; }
+function niceMax(v){ v=Math.max(1,v); const p=Math.pow(10,Math.floor(Math.log10(v))); const n=v/p; let m; if(n<=1)m=1;else if(n<=2)m=2;else if(n<=2.5)m=2.5;else if(n<=5)m=5;else m=10; return m*p; }
+function rr(ctx,x,y,w,h,r){ if(h<0){y+=h;h=-h;} r=Math.max(0,Math.min(r,h/2,w/2)); ctx.beginPath(); ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r); ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath(); }
+function cEmpty(ctx,W,H){ ctx.fillStyle=cvar('--text-dim','#888'); ctx.textAlign='center'; ctx.font='13px sans-serif'; ctx.fillText('Нет данных',W/2,H/2); }
+function drawInto(container, height, fn){
+  container.innerHTML=''; const cv=document.createElement('canvas'); container.appendChild(cv);
+  const dpr=window.devicePixelRatio||1;
+  const cssW=Math.max(220, container.clientWidth||container.parentElement.clientWidth||600), cssH=height;
+  cv.style.width='100%'; cv.style.height=cssH+'px'; cv.width=Math.round(cssW*dpr); cv.height=Math.round(cssH*dpr);
+  const ctx=cv.getContext('2d'); ctx.scale(dpr,dpr);
+  fn(ctx, cssW, cssH);
+}
+function chartVBars(container, items, opts={}){
+  const H=opts.height||220, color=opts.color||cvar('--primary','#2f6fed');
+  drawInto(container,H,(ctx,W)=>{
+    const grid=cvar('--border','#ddd'), dim=cvar('--text-dim','#888');
+    const n=items.length; if(!n){ cEmpty(ctx,W,H); return; }
+    const padL=40,padR=10,padT=12,padB=opts.rotate?52:26, plotW=W-padL-padR, plotH=H-padT-padB;
+    const max=niceMax(Math.max(1,...items.map(d=>d.value)));
+    ctx.font='11px sans-serif'; ctx.lineWidth=1;
+    for(let i=0;i<=4;i++){ const y=padT+plotH*i/4; ctx.strokeStyle=grid; ctx.globalAlpha=.55; ctx.beginPath(); ctx.moveTo(padL,y); ctx.lineTo(W-padR,y); ctx.stroke(); ctx.globalAlpha=1; ctx.fillStyle=dim; ctx.textAlign='right'; ctx.fillText(fmtNum(Math.round(max*(4-i)/4)),padL-5,y+3); }
+    const bw=plotW/n;
+    items.forEach((d,i)=>{
+      const bh=plotH*(d.value/max), x=padL+i*bw+bw*0.15, w=Math.max(1,bw*0.7), y=padT+plotH-bh;
+      ctx.fillStyle=opts.colorByIndex?CHART_COLORS[i%CHART_COLORS.length]:color; rr(ctx,x,y,w,bh,3); ctx.fill();
+      ctx.fillStyle=dim; ctx.textAlign='center'; ctx.font='10px sans-serif';
+      if(opts.rotate){ ctx.save(); ctx.translate(x+w/2,H-padB+11); ctx.rotate(-Math.PI/4); ctx.textAlign='right'; ctx.fillText(trunc(d.label,10),0,0); ctx.restore(); }
+      else { const step=Math.max(1,Math.ceil(n/(W>560?24:8))); if(i%step===0||n<=12) ctx.fillText(d.label,x+w/2,H-padB+14); }
+    });
+  });
+}
+function chartHBars(container, items, opts={}){
+  const rowH=opts.rowH||27, H=opts.height||(items.length*rowH+14), color=opts.color||cvar('--primary','#2f6fed');
+  drawInto(container,H,(ctx,W)=>{
+    const dim=cvar('--text-dim','#888'), txt=cvar('--text','#222');
+    const n=items.length; if(!n){ cEmpty(ctx,W,H); return; }
+    const max=Math.max(1,...items.map(d=>d.value)); const chars=opts.labelChars||24;
+    ctx.font='12px sans-serif'; let labelW=0; items.forEach(d=>labelW=Math.max(labelW,ctx.measureText(trunc(d.label,chars)).width));
+    labelW=Math.min(labelW+6, opts.labelW||210); const valW=opts.valW||52, barX=labelW+8, barW=Math.max(20,W-barX-valW-4);
+    items.forEach((d,i)=>{
+      const y=7+i*rowH, bh=rowH*0.6, by=y+(rowH-bh)/2;
+      ctx.fillStyle=dim; ctx.textAlign='left'; ctx.font='12px sans-serif'; ctx.fillText(trunc(d.label,chars),0,by+bh*0.72);
+      ctx.fillStyle=opts.colorByIndex?CHART_COLORS[i%CHART_COLORS.length]:color; const w=Math.max(2,barW*(d.value/max)); rr(ctx,barX,by,w,bh,3); ctx.fill();
+      ctx.fillStyle=txt; ctx.font='11px sans-serif'; ctx.textAlign='left'; ctx.fillText(opts.fmt?opts.fmt(d):fmtNum(d.value), barX+w+5, by+bh*0.72);
+    });
+  });
+}
+function chartLine(container, items, opts={}){
+  const H=opts.height||230, color=opts.color||cvar('--primary','#2f6fed');
+  drawInto(container,H,(ctx,W)=>{
+    const grid=cvar('--border','#ddd'), dim=cvar('--text-dim','#888');
+    const n=items.length; if(!n){ cEmpty(ctx,W,H); return; }
+    const padL=44,padR=12,padT=12,padB=28, plotW=W-padL-padR, plotH=H-padT-padB;
+    const max=niceMax(Math.max(1,...items.map(d=>d.value)));
+    ctx.font='11px sans-serif'; ctx.lineWidth=1;
+    for(let i=0;i<=4;i++){ const y=padT+plotH*i/4; ctx.strokeStyle=grid; ctx.globalAlpha=.55; ctx.beginPath(); ctx.moveTo(padL,y); ctx.lineTo(W-padR,y); ctx.stroke(); ctx.globalAlpha=1; ctx.fillStyle=dim; ctx.textAlign='right'; ctx.fillText(opts.yfmt?opts.yfmt(max*(4-i)/4):fmtNum(Math.round(max*(4-i)/4)),padL-5,y+3); }
+    const xat=i=> n<=1?padL+plotW/2:padL+plotW*i/(n-1), yat=v=>padT+plotH*(1-v/max);
+    ctx.beginPath(); ctx.moveTo(xat(0),yat(items[0].value)); items.forEach((d,i)=>ctx.lineTo(xat(i),yat(d.value))); ctx.lineTo(xat(n-1),padT+plotH); ctx.lineTo(xat(0),padT+plotH); ctx.closePath(); ctx.fillStyle=color; ctx.globalAlpha=.13; ctx.fill(); ctx.globalAlpha=1;
+    ctx.beginPath(); items.forEach((d,i)=>{ const x=xat(i),y=yat(d.value); i?ctx.lineTo(x,y):ctx.moveTo(x,y); }); ctx.strokeStyle=color; ctx.lineWidth=2; ctx.stroke();
+    if(n<=40){ items.forEach((d,i)=>{ ctx.beginPath(); ctx.arc(xat(i),yat(d.value),2.4,0,7); ctx.fillStyle=color; ctx.fill(); }); }
+    ctx.fillStyle=dim; ctx.font='10px sans-serif'; const step=Math.max(1,Math.ceil(n/(W>620?12:6)));
+    items.forEach((d,i)=>{ if(i%step===0||i===n-1){ ctx.textAlign = i===0?'left':(i===n-1?'right':'center'); ctx.fillText(d.label,xat(i),H-padB+15); } });
+  });
+}
+function chartDonut(container, slices, opts={}){
+  const H=opts.height||200;
+  drawInto(container,H,(ctx,W)=>{
+    const total=slices.reduce((s,d)=>s+(d.value||0),0);
+    const cx=W/2, cy=H/2, r=Math.min(W,H)/2-10, ri=r*0.6;
+    if(!total){ cEmpty(ctx,W,H); return; }
+    let a=-Math.PI/2;
+    slices.forEach((d,i)=>{ const ang=2*Math.PI*(d.value||0)/total; if(ang>0){ ctx.beginPath(); ctx.moveTo(cx,cy); ctx.arc(cx,cy,r,a,a+ang); ctx.closePath(); ctx.fillStyle=d.color||CHART_COLORS[i%CHART_COLORS.length]; ctx.fill(); } a+=ang; });
+    ctx.beginPath(); ctx.arc(cx,cy,ri,0,7); ctx.fillStyle=cvar('--bg-elev','#fff'); ctx.fill();
+    ctx.fillStyle=cvar('--text','#222'); ctx.textAlign='center'; ctx.font='700 19px sans-serif'; ctx.fillText(fmtNum(total),cx,cy+1);
+    ctx.fillStyle=cvar('--text-dim','#888'); ctx.font='11px sans-serif'; ctx.fillText(opts.centerLabel||'всего',cx,cy+17);
+  });
+}
+function donutLegend(slices){ const tot=slices.reduce((s,d)=>s+(d.value||0),0)||1; return `<div class="an-legend">${slices.map((d,i)=>`<span class="lg"><span class="dot" style="background:${d.color||CHART_COLORS[i%CHART_COLORS.length]}"></span>${esc(d.label)} <b>${fmtNum(d.value)}</b> · ${Math.round(100*(d.value||0)/tot)}%</span>`).join('')}</div>`; }
+function chartHeat(container, matrix, rowLabels, opts={}){
+  const rows=matrix.length, cols=(matrix[0]||[]).length, H=opts.height||(rows*22+30);
+  drawInto(container,H,(ctx,W)=>{
+    const dim=cvar('--text-dim','#888'), base=cvar('--primary','#2f6fed');
+    if(!rows||!cols){ cEmpty(ctx,W,H); return; }
+    const padL=34,padT=6,padB=16, gw=(W-padL-6)/cols, gh=(H-padT-padB)/rows;
+    let max=opts.max||1; matrix.forEach(r=>r.forEach(v=>{ if(v>max)max=v; }));
+    for(let r=0;r<rows;r++){
+      for(let c=0;c<cols;c++){ const v=matrix[r][c]; ctx.fillStyle= v? hexA(base,0.14+0.86*(v/max)) : cvar('--bg-soft','#eee'); ctx.fillRect(padL+c*gw+1,padT+r*gh+1,gw-2,gh-2); }
+      ctx.fillStyle=dim; ctx.textAlign='right'; ctx.font='10px sans-serif'; ctx.fillText(rowLabels[r],padL-4,padT+r*gh+gh*0.66);
+    }
+    ctx.fillStyle=dim; ctx.textAlign='center'; ctx.font='9px sans-serif';
+    for(let c=0;c<cols;c+=3){ ctx.fillText(String(c).padStart(2,'0'),padL+c*gw+gw/2,H-4); }
+  });
+}
+function wordCloud(items, opts={}){
+  if(!items.length) return '<div class="an-empty-hint">Нет данных</div>';
+  const max=Math.max(...items.map(w=>w.value)), min=Math.min(...items.map(w=>w.value));
+  const lo=opts.min||13, hi=opts.max||30;
+  return `<div class="an-cloud">${items.map((w,i)=>{ const t=max===min?1:(w.value-min)/(max-min); const sz=(lo+(hi-lo)*t).toFixed(1); const col=CHART_COLORS[i%CHART_COLORS.length]; return `<span class="w" title="${fmtNum(w.value)}" style="font-size:${sz}px;color:${hexA(col,0.55+0.45*t)};font-weight:${400+Math.round(t*3)*100}">${esc(w.label)}</span>`; }).join('')}</div>`;
+}
+// реестр перерисовки при resize/смене темы
+function registerCharts(list){ State.redraw=()=>list.forEach(fn=>{ try{fn();}catch(e){} }); }
+
+// ===================================================================
+//  Раздел «Аналитика» (система)
+// ===================================================================
+async function viewAnalytics(c){
+  const accs = (State.accounts&&State.accounts.length)?State.accounts:await api('/accounts'); State.accounts=accs;
+  const scope=State.anScope||''; const days=State.anDays||90;
+  let d; try{ d=await api('/analytics/system'+(scope?('?account_id='+scope+'&days='+days):('?days='+days))); }catch(e){ toastErr(e); c.innerHTML='<div class="card"><div class="empty">Не удалось загрузить аналитику</div></div>'; return; }
+  c.innerHTML='';
+  // Панель управления
+  const bar=h(`<div class="an-toolbar">
+    <label class="muted small">Область:</label>
+    <select id="anScope"><option value="">Все ящики</option>${accs.map(a=>`<option value="${a.id}" ${String(a.id)===String(scope)?'selected':''}>${esc(a.name)}</option>`).join('')}</select>
+    <label class="muted small">Период активности:</label>
+    <select id="anDays">${[[30,'30 дней'],[90,'90 дней'],[180,'полгода'],[365,'год']].map(([v,t])=>`<option value="${v}" ${v===days?'selected':''}>${t}</option>`).join('')}</select>
+    <span class="spacer" style="flex:1"></span>
+    <button class="btn ghost sm" id="anRefresh">↻ Обновить</button></div>`);
+  c.appendChild(bar);
+  $('#anScope',bar).onchange=e=>{ State.anScope=e.target.value; viewAnalytics(c); };
+  $('#anDays',bar).onchange=e=>{ State.anDays=parseInt(e.target.value); viewAnalytics(c); };
+  $('#anRefresh',bar).onclick=()=>viewAnalytics(c);
+
+  const o=d.overview;
+  const kpi=(label,val,sub,accent)=>`<div class="kpi ${accent?'accent':''}"><div class="k-label">${label}</div><div class="k-value">${val}</div><div class="k-sub">${sub||''}</div></div>`;
+  c.appendChild(h(`<div class="an-kpis">
+    ${kpi('✉️ Писем в архиве',fmtNum(o.messages),o.bytes_h,true)}
+    ${kpi('💾 Объём копий',o.bytes_h,'ср. письмо '+o.avg_message_h)}
+    ${kpi('📬 Ящиков',o.accounts_total,'активных: '+o.accounts_enabled)}
+    ${kpi('🗂️ Папок',fmtNum(o.folders),'уникальных')}
+    ${kpi('⚙️ Заданий',fmtNum(o.jobs_total),o.jobs_success_rate!=null?('успех '+o.jobs_success_rate+'%'):'—')}
+    ${kpi('🔄 Прогонов',fmtNum(d.runs.total),'нов. писем '+fmtNum(d.runs.messages_new))}
+    ${kpi('📤 Экспортов',fmtNum(o.exports),d.exports.bytes_h)}
+    ${kpi('⏰ Расписаний',fmtNum(o.schedules),'вкл: '+o.schedules_enabled)}
+    ${kpi('💽 Свободно',o.disk_free_h,'на диске')}
+    ${kpi('🗄️ База',o.db_size_h,'файл БД')}
+    ${kpi('👥 Пользователей',fmtNum(o.users),'сессий: '+o.active_sessions)}
+    ${kpi('🚦 Планировщик',o.scheduler_running?'вкл':'выкл','воркеров: '+o.workers)}
+  </div>`));
+
+  const redraws=[];
+  const reg=(fn)=>{ fn(); redraws.push(fn); };
+
+  // Активность по дням (с переключателем метрики)
+  const actCard=h(`<div class="card an-card"><h3>📈 Активность по дням <span class="h-sub">— последние ${d.activity.length} дн.</span><span class="spacer" style="flex:1"></span>
+    <span class="btn-row" id="actMetric" style="gap:6px"></span></h3><div class="an-chart" id="actChart"></div></div>`);
+  c.appendChild(actCard);
+  const METRICS=[['messages','Письма',cvar('--primary','#2f6fed')],['bytes','Объём',cvar('--info','#2b8ca6')],['jobs','Задания',cvar('--success','#1f9d55')],['errors','Ошибки',cvar('--danger','#d64545')]];
+  let actMetric='messages';
+  const mbtns=$('#actMetric',actCard);
+  METRICS.forEach(([k,t])=>{ const b=h(`<button class="btn sm ${k==='messages'?'primary':''}" data-m="${k}">${t}</button>`); b.onclick=()=>{ actMetric=k; mbtns.querySelectorAll('button').forEach(x=>x.className='btn sm'); b.className='btn sm primary'; drawAct(); }; mbtns.appendChild(b); });
+  const drawAct=()=>{ const meta=METRICS.find(m=>m[0]===actMetric); const isB=actMetric==='bytes';
+    const items=d.activity.map(a=>({label:(a.day||'').slice(5), value:isB?(a.bytes/1048576):a[actMetric]}));
+    chartLine($('#actChart',actCard), items, {height:230, color:meta[2], yfmt:isB?(v=>v.toFixed(0)+'М'):null}); };
+  reg(drawAct);
+
+  // Задания: статусы (donut) + типы (hbars)
+  const jobsCard=h(`<div class="grid cols-2 an-card">
+    <div class="card"><h3>⚙️ Задания по статусам</h3><div class="an-chart" id="jobStatus"></div><div id="jobStatusLeg"></div></div>
+    <div class="card"><h3>🧩 Задания по типам</h3><div class="an-chart" id="jobType"></div></div></div>`);
+  c.appendChild(jobsCard);
+  const jStatus=d.jobs.by_status.map((s,i)=>({label:s.label,value:s.value,color:({success:cvar('--success','#1f9d55'),failed:cvar('--danger','#d64545'),running:cvar('--primary','#2f6fed'),queued:cvar('--text-dim','#888'),partial:cvar('--warn','#d98a00'),cancelled:cvar('--warn','#d98a00')})[s.key]||CHART_COLORS[i]}));
+  reg(()=>{ chartDonut($('#jobStatus',jobsCard), jStatus, {centerLabel:'заданий'}); $('#jobStatusLeg',jobsCard).innerHTML=donutLegend(jStatus); });
+  reg(()=>chartHBars($('#jobType',jobsCard), d.jobs.by_type, {colorByIndex:true, height:Math.max(90,d.jobs.by_type.length*30)}));
+
+  // Длительность + прогоны
+  if(d.jobs.durations.length){
+    const durRows=d.jobs.durations.map(x=>`<tr><td>${esc(x.type_label)}</td><td>${x.count}</td><td>${x.avg_s} с</td><td>${x.max_s} с</td></tr>`).join('');
+    c.appendChild(h(`<div class="card an-card"><h3>⏱️ Длительность заданий</h3><div class="table-wrap"><table class="tbl"><thead><tr><th>Тип</th><th>Кол-во</th><th>Средняя</th><th>Максимум</th></tr></thead><tbody>${durRows}</tbody></table></div></div>`));
+  }
+
+  // Экспорт: форматы (donut) + движки (hbars); восстановление
+  if(d.exports.total){
+    const exCard=h(`<div class="grid cols-2 an-card">
+      <div class="card"><h3>📤 Экспорт по форматам</h3><div class="an-chart" id="exFmt"></div><div id="exFmtLeg"></div></div>
+      <div class="card"><h3>🔧 Экспорт по движкам</h3><div class="an-chart" id="exEng"></div></div></div>`);
+    c.appendChild(exCard);
+    const exF=d.exports.by_format.map((x,i)=>({label:x.label,value:x.value}));
+    reg(()=>{ chartDonut($('#exFmt',exCard),exF,{centerLabel:'файлов'}); $('#exFmtLeg',exCard).innerHTML=donutLegend(exF); });
+    reg(()=>chartHBars($('#exEng',exCard),d.exports.by_engine,{colorByIndex:true,height:Math.max(80,d.exports.by_engine.length*30)}));
+  }
+
+  // Хранилище по ящикам
+  if(d.accounts.length){
+    const rows=d.accounts.map(a=>`<tr><td><strong>${esc(a.name)}</strong>${a.enabled?'':' <span class="tag">выкл</span>'}</td><td>${fmtNum(a.messages)}</td><td>${esc(a.bytes_h)}</td><td>${a.folders}</td><td>${a.last_run?`<span class="badge ${a.last_run.status}">${esc(a.last_run.status)}</span>`:'<span class="muted small">—</span>'}</td></tr>`).join('');
+    const stCard=h(`<div class="grid cols-2 an-card">
+      <div class="card"><h3>🗄️ Хранилище по ящикам</h3><div class="table-wrap"><table class="tbl"><thead><tr><th>Ящик</th><th>Писем</th><th>Объём</th><th>Папок</th><th>Последний</th></tr></thead><tbody>${rows}</tbody></table></div></div>
+      <div class="card"><h3>📊 Писем по ящикам</h3><div class="an-chart" id="accBars"></div></div></div>`);
+    c.appendChild(stCard);
+    reg(()=>chartHBars($('#accBars',stCard), d.accounts.map(a=>({label:a.name,value:a.messages})), {colorByIndex:true, height:Math.max(90,d.accounts.length*32), labelChars:20}));
+  }
+
+  // Расписания и аудит
+  const botGrid=h(`<div class="grid cols-2 an-card">
+    <div class="card"><h3>⏰ Ближайшие запуски</h3><div id="upNext"></div></div>
+    <div class="card"><h3>🛡️ Топ действий (аудит)</h3><div class="an-chart" id="auditBars"></div></div></div>`);
+  c.appendChild(botGrid);
+  const up=d.schedules.upcoming;
+  $('#upNext',botGrid).innerHTML = up.length? `<table class="an-mini-table">${up.map(u=>`<tr><td>${esc(accName(u.account_id)||('#'+u.account_id))}</td><td>${esc(JOBLBL[u.job_type]||u.job_type)}</td><td>${fmtDate(u.next_run)}</td></tr>`).join('')}</table>` : '<div class="an-empty-hint">Нет включённых расписаний</div>';
+  if(d.audit_top.length) reg(()=>chartHBars($('#auditBars',botGrid), d.audit_top, {colorByIndex:true, labelChars:22, height:Math.max(80,d.audit_top.length*24)}));
+  else $('#auditBars',botGrid).innerHTML='<div class="an-empty-hint">Нет записей аудита</div>';
+
+  registerCharts(redraws);
+}
+
+// ===================================================================
+//  Раздел «Аналитика писем» (содержание)
+// ===================================================================
+async function viewMailAnalytics(c){
+  const accs=(State.accounts&&State.accounts.length)?State.accounts:await api('/accounts'); State.accounts=accs;
+  const scope=State.maScope||'';
+  let d; try{ d=await api('/analytics/mail'+(scope?('?account_id='+scope):'')); }catch(e){ toastErr(e); c.innerHTML='<div class="card"><div class="empty">Не удалось загрузить аналитику писем</div></div>'; return; }
+  c.innerHTML='';
+  const bar=h(`<div class="an-toolbar">
+    <label class="muted small">Ящик:</label>
+    <select id="maScope"><option value="">Все ящики</option>${accs.map(a=>`<option value="${a.id}" ${String(a.id)===String(scope)?'selected':''}>${esc(a.name)}</option>`).join('')}</select>
+    <span class="spacer" style="flex:1"></span>
+    <button class="btn ghost sm" id="maRefresh">↻ Обновить</button></div>`);
+  c.appendChild(bar);
+  $('#maScope',bar).onchange=e=>{ State.maScope=e.target.value; viewMailAnalytics(c); };
+  $('#maRefresh',bar).onclick=()=>viewMailAnalytics(c);
+
+  const o=d.overview;
+  if(!o.messages){ c.appendChild(h('<div class="card"><div class="empty"><div class="big">🔎</div>Нет локальных копий для анализа.<br>Сделайте резервное копирование ящика.</div></div>')); return; }
+  const kpi=(l,v,s,ac)=>`<div class="kpi ${ac?'accent':''}"><div class="k-label">${l}</div><div class="k-value">${v}</div><div class="k-sub">${s||''}</div></div>`;
+  const span=o.date_from?`${(o.date_from||'').slice(0,10)} — ${(o.date_to||'').slice(0,10)}`:'—';
+  c.appendChild(h(`<div class="an-kpis">
+    ${kpi('✉️ Писем',fmtNum(o.messages),span,true)}
+    ${kpi('💾 Объём',o.bytes_h,'ср. '+o.avg_size_h+' · медиана '+o.median_size_h)}
+    ${kpi('👤 Отправителей',fmtNum(o.unique_senders),'доменов: '+o.unique_domains)}
+    ${kpi('📎 С вложениями',o.with_attach_pct+'%',fmtNum(o.with_attach)+' писем')}
+    ${kpi('📬 Непрочитанных',o.unseen_pct+'%',fmtNum(o.unseen)+' из '+fmtNum(o.messages))}
+    ${kpi('↩️ Ответы / Пересылки',fmtNum(o.reply)+' / '+fmtNum(o.forward),'⭐ важных: '+fmtNum(o.flagged))}
+    ${kpi('🗂️ Папок',fmtNum(o.folders),'без темы: '+fmtNum(o.empty_subject))}
+    ${kpi('📅 В среднем/день',fmtNum(o.avg_per_day),'за '+fmtNum(o.span_days)+' дн.')}
+  </div>`));
+
+  const redraws=[]; const reg=(fn)=>{ fn(); redraws.push(fn); };
+
+  // Динамика по месяцам
+  const mCard=h(`<div class="card an-card"><h3>📈 Динамика по месяцам</h3><div class="an-chart" id="maMonth"></div></div>`);
+  c.appendChild(mCard);
+  reg(()=>chartLine($('#maMonth',mCard), d.by_month, {height:230}));
+
+  // Год + день недели
+  const ywCard=h(`<div class="grid cols-2 an-card">
+    <div class="card"><h3>🗓️ По годам</h3><div class="an-chart" id="maYear"></div></div>
+    <div class="card"><h3>📆 По дням недели</h3><div class="an-chart" id="maWeek"></div></div></div>`);
+  c.appendChild(ywCard);
+  reg(()=>chartVBars($('#maYear',ywCard), d.by_year, {height:220}));
+  reg(()=>chartVBars($('#maWeek',ywCard), d.by_weekday, {height:220, color:cvar('--info','#2b8ca6')}));
+
+  // Часы
+  const hCard=h(`<div class="card an-card"><h3>🕐 Распределение по часам суток</h3><div class="an-chart" id="maHour"></div></div>`);
+  c.appendChild(hCard);
+  reg(()=>chartVBars($('#maHour',hCard), d.by_hour, {height:210, color:cvar('--success','#1f9d55')}));
+
+  // Тепловая карта день×час
+  const heatCard=h(`<div class="card an-card"><h3>🔥 Активность: день недели × час <span class="h-sub">— чем ярче, тем больше писем</span></h3><div class="an-chart" id="maHeat"></div></div>`);
+  c.appendChild(heatCard);
+  reg(()=>chartHeat($('#maHeat',heatCard), d.heatmap.matrix, d.heatmap.rows, {max:d.heatmap.max, height:7*24+30}));
+
+  // Размеры + состояния (donuts)
+  const szCard=h(`<div class="grid cols-2 an-card">
+    <div class="card"><h3>📐 Размеры писем</h3><div class="an-chart" id="maSize"></div></div>
+    <div class="card"><h3>👁️ Прочитанность и вложения</h3>
+      <div class="grid cols-2"><div><div class="an-chart" id="maRead"></div><div id="maReadLeg"></div></div>
+      <div><div class="an-chart" id="maAtt"></div><div id="maAttLeg"></div></div></div></div></div>`);
+  c.appendChild(szCard);
+  reg(()=>chartHBars($('#maSize',szCard), d.size_hist, {height:Math.max(120,d.size_hist.length*30), labelChars:14, color:cvar('--warn','#d98a00')}));
+  const readS=d.read_state.map((s,i)=>({...s,color:i===0?cvar('--success','#1f9d55'):cvar('--text-dim','#888')}));
+  const attS=d.attach_state.map((s,i)=>({...s,color:i===0?cvar('--primary','#2f6fed'):cvar('--text-dim','#888')}));
+  reg(()=>{ chartDonut($('#maRead',szCard),readS,{height:170,centerLabel:'писем'}); $('#maReadLeg',szCard).innerHTML=donutLegend(readS); });
+  reg(()=>{ chartDonut($('#maAtt',szCard),attS,{height:170,centerLabel:'писем'}); $('#maAttLeg',szCard).innerHTML=donutLegend(attS); });
+
+  // Отправители + домены
+  const sdCard=h(`<div class="grid cols-2 an-card">
+    <div class="card"><h3>👤 Топ отправителей</h3><div class="an-chart" id="maSenders"></div></div>
+    <div class="card"><h3>🌐 Топ доменов</h3><div class="an-chart" id="maDomains"></div></div></div>`);
+  c.appendChild(sdCard);
+  reg(()=>chartHBars($('#maSenders',sdCard), d.top_senders.slice(0,15), {colorByIndex:true, labelChars:30, labelW:250, height:Math.max(90,Math.min(15,d.top_senders.length)*28)}));
+  reg(()=>chartHBars($('#maDomains',sdCard), d.top_domains, {colorByIndex:true, labelChars:26, height:Math.max(90,d.top_domains.length*28)}));
+
+  // Папки + слова темы
+  const ffCard=h(`<div class="grid cols-2 an-card">
+    <div class="card"><h3>🗂️ Папки</h3><div class="an-chart" id="maFolders"></div></div>
+    <div class="card"><h3>🔤 Частые слова в темах</h3><div id="maWords"></div></div></div>`);
+  c.appendChild(ffCard);
+  reg(()=>chartHBars($('#maFolders',ffCard), d.folders, {colorByIndex:true, labelChars:20, height:Math.max(90,d.folders.length*28), fmt:x=>fmtNum(x.value)+' · '+x.bytes_h, valW:120}));
+  $('#maWords',ffCard).innerHTML=wordCloud(d.subject_words);
+
+  // Крупнейшие письма
+  if(d.largest.length){
+    const rows=d.largest.map(m=>`<tr><td>${esc(trunc(m.subject,48))}<div class="muted small">${esc(trunc(m.from,42))}</div></td><td>${esc(m.folder)}</td><td>${esc(m.size_h)}</td><td class="small muted">${fmtDateShort(m.date)}</td></tr>`).join('');
+    c.appendChild(h(`<div class="card an-card"><h3>🏋️ Крупнейшие письма</h3><div class="table-wrap"><table class="tbl"><thead><tr><th>Тема / отправитель</th><th>Папка</th><th>Размер</th><th>Дата</th></tr></thead><tbody>${rows}</tbody></table></div></div>`));
+  }
+
+  // ---- Глубокий анализ содержимого (чтение .eml) ----
+  const deepWrap=h(`<div id="deepWrap"></div>`); c.appendChild(deepWrap);
+  registerCharts(redraws);   // регистрируем то, что уже есть; глубокий догрузим отдельно
+  loadDeep(deepWrap, scope, redraws);
+}
+
+async function loadDeep(wrap, scope, redraws){
+  let dd; try{ dd=await api('/analytics/mail/deep'+(scope?('?account_id='+scope):'')); }catch(e){ return; }
+  const running = dd.running&&dd.running.length;
+  const when = dd.data? fmtDate(dd.data.generated_at):null;
+  wrap.innerHTML='';
+  const banner=h(`<div class="deep-banner">
+    <div><strong>🔬 Глубокий анализ содержимого</strong><div class="muted small">${dd.available?('обновлён: '+when+' · разобрано '+fmtNum(dd.data.scanned)+' писем'):'Разбирает сами письма (.eml): типы вложений, домены получателей, текст/HTML, язык, частые слова тела.'}</div></div>
+    <span class="spacer" style="flex:1"></span>
+    <button class="btn primary sm" id="deepRun" ${running?'disabled':''}>${running?'<span class="spinner"></span> Идёт анализ…':(dd.available?'↻ Пересчитать':'▶ Запустить анализ')}</button></div>`);
+  wrap.appendChild(banner);
+  $('#deepRun',banner).onclick=async()=>{
+    try{ const r=await api('/analytics/mail/scan'+(scope?('?account_id='+scope):''),{method:'POST'});
+      toast('Анализ запущен', r.already_running?'Уже выполняется':'Следите за прогрессом; результат появится здесь автоматически');
+      const b=$('#deepRun',banner); b.disabled=true; b.innerHTML='<span class="spinner"></span> Идёт анализ…';
+      pollDeep(wrap, scope, redraws, r.job_id);
+    }catch(e){ toastErr(e); }
+  };
+  if(running){ pollDeep(wrap, scope, redraws, dd.running[0].id); }
+  if(dd.available && dd.data) renderDeep(wrap, dd.data, redraws);
+}
+function pollDeep(wrap, scope, redraws, jobId){
+  let n=0;
+  const t=setInterval(async()=>{
+    n++; if(n>120){ clearInterval(t); return; }
+    if(State.view!=='mailanalytics'){ clearInterval(t); return; }
+    try{ const j=await api('/jobs/'+jobId); if(j.status && ['success','failed','cancelled','partial'].includes(j.status)){ clearInterval(t); if(State.view==='mailanalytics') loadDeep(wrap, scope, redraws); } }catch(e){ clearInterval(t); }
+  }, 2500);
+}
+function renderDeep(wrap, dp, redraws){
+  const at=dp.attachments, rc=dp.recipients, bd=dp.body;
+  const box=h(`<div>
+    <div class="an-kpis">
+      <div class="kpi accent"><div class="k-label">📎 Вложений</div><div class="k-value">${fmtNum(at.count)}</div><div class="k-sub">${at.bytes_h} · в ${fmtNum(at.messages_with_attach)} письмах</div></div>
+      <div class="kpi"><div class="k-label">🌐 Доменов получателей</div><div class="k-value">${fmtNum(rc.unique_domains)}</div><div class="k-sub">уникальных</div></div>
+      <div class="kpi"><div class="k-label">📝 Ср. длина текста</div><div class="k-value">${fmtNum(bd.avg_text_len)}</div><div class="k-sub">символов</div></div>
+      <div class="kpi"><div class="k-label">🔎 Разобрано</div><div class="k-value">${fmtNum(dp.scanned)}</div><div class="k-sub">ошибок: ${fmtNum(dp.errors)}</div></div>
+    </div>
+    <div class="grid cols-2 an-card">
+      <div class="card"><h3>📎 Типы вложений (расширение)</h3><div class="an-chart" id="dpExt"></div></div>
+      <div class="card"><h3>🧾 Типы вложений (MIME)</h3><div class="an-chart" id="dpType"></div></div></div>
+    <div class="grid cols-2 an-card">
+      <div class="card"><h3>📤 Домены получателей</h3><div class="an-chart" id="dpTo"></div></div>
+      <div class="card"><h3>🧬 Формат тела и язык</h3><div class="grid cols-2"><div><div class="an-chart" id="dpBody"></div><div id="dpBodyLeg"></div></div><div><div class="an-chart" id="dpLang"></div><div id="dpLangLeg"></div></div></div></div></div>
+    <div class="card an-card"><h3>🔤 Частые слова в тексте писем</h3><div id="dpWords"></div></div>
+  </div>`);
+  wrap.appendChild(box);
+  const add=(fn)=>{ fn(); redraws.push(fn); };
+  add(()=>chartHBars($('#dpExt',box), at.by_ext, {colorByIndex:true, labelChars:14, height:Math.max(80,at.by_ext.length*26)}));
+  add(()=>chartHBars($('#dpType',box), at.by_type, {colorByIndex:true, labelChars:34, labelW:260, height:Math.max(80,at.by_type.length*26)}));
+  add(()=>chartHBars($('#dpTo',box), rc.top_domains, {colorByIndex:true, labelChars:26, height:Math.max(80,rc.top_domains.length*26)}));
+  add(()=>{ chartDonut($('#dpBody',box), bd.kinds, {height:170,centerLabel:'писем'}); $('#dpBodyLeg',box).innerHTML=donutLegend(bd.kinds); });
+  add(()=>{ chartDonut($('#dpLang',box), bd.languages, {height:170,centerLabel:'писем'}); $('#dpLangLeg',box).innerHTML=donutLegend(bd.languages); });
+  $('#dpWords',box).innerHTML=wordCloud(bd.top_words, {min:13, max:34});
+  registerCharts(redraws);
 }
 
 // ---------- Старт ----------

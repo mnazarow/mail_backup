@@ -345,6 +345,29 @@ def handle_verify(ctx: JobContext) -> Dict:
     return {"final_status": status, "summary": summary, "ok": ok, "missing": missing, "corrupt": corrupt}
 
 
+# ---------------------------------------------------------------------------
+#  ANALYZE (глубокий анализ содержимого писем для раздела «Аналитика писем»)
+# ---------------------------------------------------------------------------
+def handle_analyze(ctx: JobContext) -> Dict:
+    from ..analytics import deep_scan, save_deep
+    svc = ctx.services
+    account_id = ctx.account_id  # None = по всем ящикам
+    scope = "все ящики"
+    if account_id is not None:
+        acc = svc.require_account(account_id)
+        scope = f"«{acc.name}»"
+    ctx.event("INFO", f"Старт глубокого анализа писем: {scope}.")
+    result = deep_scan(svc, account_id,
+                       progress_cb=ctx.progress, cancel_cb=ctx.is_cancelled, event_cb=ctx.event)
+    save_deep(svc, account_id, result)
+    ctx.progress(result["total"], result["total"], "Готово")
+    summary = (f"Проанализировано писем: {result['scanned']}/{result['total']}, "
+               f"вложений: {result['attachments']['count']}, ошибок: {result['errors']}.")
+    return {"final_status": JobStatus.SUCCESS, "summary": summary,
+            "scanned": result["scanned"], "attachments": result["attachments"]["count"],
+            "errors": result["errors"]}
+
+
 HANDLERS: Dict[str, Callable[[JobContext], Dict]] = {
     JobType.BACKUP: handle_backup,
     JobType.RESTORE: handle_restore,
@@ -353,4 +376,5 @@ HANDLERS: Dict[str, Callable[[JobContext], Dict]] = {
     JobType.TEST: handle_test,
     JobType.RETENTION: handle_retention,
     JobType.VERIFY: handle_verify,
+    JobType.ANALYZE: handle_analyze,
 }

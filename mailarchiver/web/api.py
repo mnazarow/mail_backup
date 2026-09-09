@@ -762,6 +762,61 @@ def get_audit(request: Request, limit: int = 200, user: dict = Depends(auth_mod.
 
 
 # =====================================================================
+#  Аналитика (только администратор)
+# =====================================================================
+@router.get("/analytics/system")
+def analytics_system(request: Request, account_id: Optional[int] = None, days: int = 90,
+                     user: dict = Depends(auth_mod.require_admin)):
+    """Аналитика по всем параметрам системы (хранилище, задания, прогоны и т.д.)."""
+    svc = svc_dep(request)
+    from ..analytics import system_analytics
+    if account_id is not None and svc.db.get_account(account_id) is None:
+        raise HTTPException(404, "Ящик не найден")
+    days = max(7, min(365, int(days)))
+    return system_analytics(svc, account_id=account_id, days=days)
+
+
+@router.get("/analytics/mail")
+def analytics_mail(request: Request, account_id: Optional[int] = None,
+                   user: dict = Depends(auth_mod.require_admin)):
+    """Аналитика по содержанию писем (метаданные индекса: тема, отправитель, дата…)."""
+    svc = svc_dep(request)
+    from ..analytics import mail_analytics
+    if account_id is not None and svc.db.get_account(account_id) is None:
+        raise HTTPException(404, "Ящик не найден")
+    return mail_analytics(svc, account_id=account_id)
+
+
+@router.get("/analytics/mail/deep")
+def analytics_mail_deep(request: Request, account_id: Optional[int] = None,
+                        user: dict = Depends(auth_mod.require_admin)):
+    """Кэш результата глубокого анализа писем (типы вложений, домены, язык, слова тела)."""
+    svc = svc_dep(request)
+    from ..analytics import load_deep
+    data = load_deep(svc, account_id)
+    running = [serialize_job(j) for j in svc.db.list_jobs(job_type=JobType.ANALYZE, limit=5)
+               if j["status"] in JobStatus.ACTIVE
+               and (account_id is None or j["account_id"] == account_id)]
+    return {"available": data is not None, "data": data, "running": running}
+
+
+@router.post("/analytics/mail/scan")
+def analytics_mail_scan(request: Request, account_id: Optional[int] = None,
+                        user: dict = Depends(auth_mod.require_admin)):
+    """Запустить (пересчитать) глубокий анализ писем как фоновое задание."""
+    svc = svc_dep(request)
+    if account_id is not None:
+        svc.require_account(account_id)
+    # не плодим дубли: если такой анализ уже в очереди/работе — вернём его
+    for j in svc.db.list_jobs(job_type=JobType.ANALYZE, limit=20):
+        if j["status"] in JobStatus.ACTIVE and j["account_id"] == account_id:
+            return {"ok": True, "job_id": j["id"], "already_running": True}
+    jid = svc.queue.enqueue(JobType.ANALYZE, account_id, {}, created_by=user["username"])
+    svc.db.add_audit(user["username"], "analytics_scan", f"account={account_id}")
+    return {"ok": True, "job_id": jid}
+
+
+# =====================================================================
 #  Пользователи (только администратор)
 # =====================================================================
 @router.get("/users")

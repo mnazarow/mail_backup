@@ -17,8 +17,9 @@ class JobType:
     TEST = "test"              # проверка подключения к ящику
     RETENTION = "retention"    # очистка по политике хранения
     VERIFY = "verify"          # проверка целостности локальной копии
+    ANALYZE = "analyze"        # глубокий анализ содержимого писем (аналитика)
 
-    ALL = [BACKUP, RESTORE, EXPORT, IMPORT_PST, TEST, RETENTION, VERIFY]
+    ALL = [BACKUP, RESTORE, EXPORT, IMPORT_PST, TEST, RETENTION, VERIFY, ANALYZE]
     LABELS = {
         BACKUP: "Резервное копирование",
         RESTORE: "Восстановление",
@@ -27,6 +28,7 @@ class JobType:
         TEST: "Проверка подключения",
         RETENTION: "Очистка (ретеншн)",
         VERIFY: "Проверка целостности",
+        ANALYZE: "Глубокий анализ писем",
     }
 
 

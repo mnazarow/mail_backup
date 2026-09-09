@@ -721,6 +721,76 @@ class Database:
     def list_audit(self, limit: int = 200) -> List[sqlite3.Row]:
         return self.query("SELECT * FROM audit ORDER BY id DESC LIMIT ?", (limit,))
 
+    # ======================================================================
+    #  Агрегаты для раздела «Аналитика»
+    # ======================================================================
+    def index_rows_for_analytics(self, account_id: Optional[int] = None) -> List[sqlite3.Row]:
+        """Лёгкая выборка полей индекса писем для расчёта аналитики (без тел)."""
+        cols = "account_id, folder, size, internaldate, flags, has_attach, subject, from_addr"
+        if account_id is None:
+            return self.query(f"SELECT {cols} FROM messages")
+        return self.query(f"SELECT {cols} FROM messages WHERE account_id=?", (account_id,))
+
+    def largest_messages(self, account_id: Optional[int] = None, limit: int = 10) -> List[sqlite3.Row]:
+        base = "SELECT account_id, folder, subject, from_addr, size, internaldate FROM messages"
+        if account_id is None:
+            return self.query(base + " ORDER BY size DESC LIMIT ?", (limit,))
+        return self.query(base + " WHERE account_id=? ORDER BY size DESC LIMIT ?", (account_id, limit))
+
+    def distinct_folder_count(self, account_id: Optional[int] = None) -> int:
+        if account_id is None:
+            return int(self.scalar(
+                "SELECT COUNT(*) FROM (SELECT DISTINCT account_id, folder FROM messages)") or 0)
+        return int(self.scalar(
+            "SELECT COUNT(DISTINCT folder) FROM messages WHERE account_id=?", (account_id,)) or 0)
+
+    def jobs_type_status_counts(self) -> List[sqlite3.Row]:
+        return self.query("SELECT type, status, COUNT(*) AS c FROM jobs GROUP BY type, status")
+
+    def jobs_duration_by_type(self) -> List[sqlite3.Row]:
+        """Средняя и максимальная длительность завершённых заданий по типам (сек)."""
+        return self.query(
+            "SELECT type, COUNT(*) AS c, "
+            "AVG((julianday(finished_at)-julianday(started_at))*86400.0) AS avg_s, "
+            "MAX((julianday(finished_at)-julianday(started_at))*86400.0) AS max_s "
+            "FROM jobs WHERE started_at IS NOT NULL AND finished_at IS NOT NULL "
+            "AND finished_at >= started_at GROUP BY type"
+        )
+
+    def runs_totals(self, account_id: Optional[int] = None) -> sqlite3.Row:
+        base = ("SELECT COUNT(*) AS runs, COALESCE(SUM(messages_new),0) AS msgs, "
+                "COALESCE(SUM(bytes_new),0) AS bytes, COALESCE(SUM(errors),0) AS errors FROM runs")
+        if account_id is None:
+            return self.query_one(base)
+        return self.query_one(base + " WHERE account_id=?", (account_id,))
+
+    def runs_type_status_counts(self) -> List[sqlite3.Row]:
+        return self.query("SELECT type, status, COUNT(*) AS c FROM runs GROUP BY type, status")
+
+    def exports_stats(self) -> List[sqlite3.Row]:
+        return self.query(
+            "SELECT format, engine, status, COUNT(*) AS c, COALESCE(SUM(size),0) AS bytes "
+            "FROM exports GROUP BY format, engine, status")
+
+    def restores_totals(self) -> sqlite3.Row:
+        return self.query_one(
+            "SELECT COUNT(*) AS c, COALESCE(SUM(restored),0) AS restored, "
+            "COALESCE(SUM(errors),0) AS errors FROM restores")
+
+    def audit_action_counts(self, limit: int = 15) -> List[sqlite3.Row]:
+        return self.query(
+            "SELECT action, COUNT(*) AS c FROM audit GROUP BY action ORDER BY c DESC LIMIT ?", (limit,))
+
+    def count_active_sessions(self) -> int:
+        return int(self.scalar("SELECT COUNT(*) FROM sessions WHERE expires_at > ?", (utcnow_iso(),)) or 0)
+
+    def count_login_failures_since(self, since_iso: str) -> int:
+        return int(self.scalar(
+            "SELECT COUNT(*) FROM login_attempts WHERE success=0 AND ts>=?", (since_iso,)) or 0)
+
+    def users_by_role(self) -> List[sqlite3.Row]:
+        return self.query("SELECT role, COUNT(*) AS c FROM users GROUP BY role")
+
 
 # ---------------------------------------------------------------------------
 #  DDL

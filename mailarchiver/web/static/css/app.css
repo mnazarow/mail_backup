@@ -226,6 +226,34 @@ table.tbl tr:last-child td { border-bottom: none; }
 canvas { max-width: 100%; }
 .pill-row { display:flex; gap:8px; flex-wrap: wrap; }
 
+/* ---------- Аналитика ---------- */
+.an-toolbar { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:16px; }
+.an-toolbar select { width:auto; padding:7px 12px; border:1px solid var(--border); border-radius:var(--radius-sm); background:var(--bg-elev); color:var(--text); font-size:.9rem; }
+.an-kpis { display:grid; grid-template-columns:repeat(auto-fill,minmax(158px,1fr)); gap:12px; margin-bottom:18px; }
+.kpi { background:var(--bg-elev); border:1px solid var(--border); border-radius:var(--radius); box-shadow:var(--shadow); padding:13px 15px; display:flex; flex-direction:column; gap:2px; }
+.kpi .k-label { color:var(--text-dim); font-size:.76rem; font-weight:600; display:flex; align-items:center; gap:5px; }
+.kpi .k-value { font-size:1.42rem; font-weight:700; letter-spacing:-.02em; line-height:1.15; }
+.kpi .k-sub { font-size:.72rem; color:var(--text-dim); }
+.kpi.accent { border-color:var(--primary); background:linear-gradient(180deg,var(--primary-soft),var(--bg-elev)); }
+.an-card { margin-bottom:16px; }
+.an-card h3 { display:flex; align-items:center; gap:8px; }
+.an-card .h-sub { font-weight:400; color:var(--text-dim); font-size:.8rem; }
+.an-chart { position:relative; width:100%; }
+.an-legend { display:flex; flex-wrap:wrap; gap:6px 14px; margin-top:12px; }
+.an-legend .lg { display:inline-flex; align-items:center; gap:6px; font-size:.82rem; color:var(--text-dim); }
+.an-legend .dot { width:11px; height:11px; border-radius:3px; flex:0 0 11px; }
+.an-legend .lg b { color:var(--text); font-weight:600; }
+.an-cloud { display:flex; flex-wrap:wrap; gap:5px 12px; align-items:baseline; line-height:1.7; }
+.an-cloud .w { color:var(--text); cursor:default; }
+.an-cloud .w:hover { color:var(--primary); }
+.an-empty-hint { text-align:center; padding:26px 16px; color:var(--text-dim); }
+.deep-banner { display:flex; align-items:center; gap:12px; flex-wrap:wrap; padding:14px 16px; border:1px dashed var(--border); border-radius:var(--radius); background:var(--bg-soft); margin-bottom:16px; }
+.deep-banner .spacer { flex:1; }
+.an-mini-table { width:100%; border-collapse:collapse; font-size:.86rem; }
+.an-mini-table td { padding:6px 8px; border-bottom:1px solid var(--border); }
+.an-mini-table td:last-child { text-align:right; color:var(--text-dim); white-space:nowrap; }
+.an-mini-table tr:last-child td { border-bottom:none; }
+
 /* ---------- Почтовый клиент (просмотр писем) ---------- */
 .mail-layout { display: grid; grid-template-columns: 210px 340px 1fr; gap: 0; border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; background: var(--bg-elev); min-height: 560px; }
 .mail-folders { border-right: 1px solid var(--border); padding: 10px; overflow-y: auto; max-height: 72vh; }
