@@ -33,8 +33,11 @@ class QueueManager:
         self._stop = threading.Event()
         self._poller: Optional[threading.Thread] = None
         self._executor: Optional[ThreadPoolExecutor] = None
+        self._pool_size = 0                   # фактический размер пула (настройка могла измениться)
         self._running: Dict[int, dict] = {}   # job_id -> {account_id, type, started, worker}
         self._to_requeue: set = set()         # задания, которые нужно поставить в очередь заново (повтор)
+        self._retry_delays: Dict[int, float] = {}   # job_id -> задержка перед повтором, с
+        self._retry_timers: set = set()       # таймеры отложенных повторов (для остановки)
         self._lock = threading.Lock()
         self._wake = threading.Event()
 
@@ -54,18 +57,45 @@ class QueueManager:
     # -- жизненный цикл ------------------------------------------------------
     def start(self) -> None:
         self._stop.clear()
-        self._executor = ThreadPoolExecutor(max_workers=self.max_workers(), thread_name_prefix="job")
+        workers = self.max_workers()
+        self._executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="job")
+        self._pool_size = workers
         self._poller = threading.Thread(target=self._poll_loop, name="queue-poller", daemon=True)
         self._poller.start()
-        log.info("Очередь запущена (воркеров: %s, на аккаунт: %s).", self.max_workers(), self.per_account_limit())
+        log.info("Очередь запущена (воркеров: %s, на аккаунт: %s).", workers, self.per_account_limit())
 
-    def stop(self) -> None:
+    def stop(self, timeout: float = 30.0) -> None:
         self._stop.set()
         self._wake.set()
+        # отменить отложенные повторы и сообщить выполняющимся заданиям, что
+        # пора останавливаться — иначе процесс висел бы до конца многочасового
+        # бэкапа (задания проверяют флаг отмены через ctx.is_cancelled()).
+        with self._lock:
+            timers = list(self._retry_timers)
+            self._retry_timers.clear()
+            running = list(self._running.keys())
+        for t in timers:
+            t.cancel()
+        for job_id in running:
+            try:
+                self.db.request_cancel(job_id)
+            except Exception:  # noqa: BLE001
+                log.debug("Не удалось запросить отмену задания #%s при остановке", job_id)
         if self._poller:
             self._poller.join(timeout=5)
         if self._executor:
             self._executor.shutdown(wait=False, cancel_futures=True)
+            # ждём завершения уже выполняющихся заданий, но не бесконечно
+            deadline = time.time() + max(0.0, timeout)
+            while time.time() < deadline:
+                with self._lock:
+                    if not self._running:
+                        break
+                time.sleep(0.2)
+            with self._lock:
+                stuck = list(self._running.keys())
+            if stuck:
+                log.warning("Задания не завершились за %s с и будут прерваны: %s", timeout, stuck)
         log.info("Очередь остановлена.")
 
     # -- публичный API -------------------------------------------------------
@@ -78,6 +108,18 @@ class QueueManager:
 
     def cancel(self, job_id: int) -> None:
         self.db.request_cancel(job_id)
+        row = self.db.get_job(job_id)
+        with self._lock:
+            active = job_id in self._running
+        if row is not None and row["status"] == JobStatus.QUEUED and not active:
+            # Задание ещё стоит в очереди: обработчика, который увидел бы флаг
+            # отмены, пока нет, а захват задания флаг не проверяет — без явного
+            # завершения «отменённое» задание всё равно выполнилось бы
+            # (для ретеншна это означало бы удаление писем после отмены).
+            self.db.finish_job(job_id, JobStatus.CANCELLED, error="Отменено пользователем")
+            self.db.add_job_event(job_id, "WARNING", "Задание отменено до начала выполнения.")
+            log.info("Задание #%s отменено (стояло в очереди).", job_id)
+            return
         log.info("Запрошена отмена задания #%s.", job_id)
 
     def running_ids(self) -> List[int]:
@@ -93,9 +135,15 @@ class QueueManager:
         while not self._stop.is_set():
             submitted = False
             try:
+                # настройку числа воркеров могли изменить на лету — применяем её,
+                # когда пул свободен (пересоздание пула с работающими заданиями опасно)
+                self._maybe_resize_pool()
                 while not self._stop.is_set():
                     with self._lock:
-                        free = self.max_workers() - len(self._running)
+                        # свободные слоты считаем по ФАКТИЧЕСКОМУ размеру пула:
+                        # иначе задания помечались бы running, а реально стояли
+                        # бы в очереди executor'а
+                        free = self._pool_size - len(self._running)
                         running_accounts: Dict[int, int] = {}
                         for info in self._running.values():
                             a = info.get("account_id")
@@ -117,6 +165,20 @@ class QueueManager:
                 self._wake.wait(timeout=1.0)
                 self._wake.clear()
 
+    def _maybe_resize_pool(self) -> None:
+        """Привести размер пула к текущей настройке (только когда он свободен)."""
+        desired = self.max_workers()
+        with self._lock:
+            if desired == self._pool_size or self._running:
+                return
+        old = self._executor
+        self._executor = ThreadPoolExecutor(max_workers=desired, thread_name_prefix="job")
+        with self._lock:
+            self._pool_size = desired
+        if old is not None:
+            old.shutdown(wait=False)
+        log.info("Размер пула воркеров изменён: %s.", desired)
+
     def _submit(self, job) -> None:
         job_id = job["id"]
         info = {"account_id": job["account_id"], "type": job["type"], "started": time.time()}
@@ -134,13 +196,37 @@ class QueueManager:
             self._running.pop(job_id, None)
             do_requeue = job_id in self._to_requeue
             self._to_requeue.discard(job_id)
+            delay = self._retry_delays.pop(job_id, 0.0) if do_requeue else 0.0
         if do_requeue:
-            self.db.requeue_job(job_id)
-            log.warning("Задание #%s возвращено в очередь для повтора.", job_id)
+            self._schedule_requeue(job_id, delay)
         exc = future.exception()
         if exc:
             log.error("Задание #%s завершилось необработанной ошибкой: %s", job_id, exc)
         self._wake.set()
+
+    def _schedule_requeue(self, job_id: int, delay: float) -> None:
+        """Вернуть задание в очередь через delay секунд, НЕ занимая слот воркера."""
+        def _do(timer=None) -> None:
+            if timer is not None:
+                with self._lock:
+                    self._retry_timers.discard(timer)
+            if self._stop.is_set():
+                return
+            try:
+                self.db.requeue_job(job_id)
+                log.warning("Задание #%s возвращено в очередь для повтора.", job_id)
+                self._wake.set()
+            except Exception:  # noqa: BLE001
+                log.exception("Не удалось вернуть задание #%s в очередь", job_id)
+
+        if delay <= 0 or self._stop.is_set():
+            _do()
+            return
+        timer = threading.Timer(delay, lambda: _do(timer))
+        timer.daemon = True
+        with self._lock:
+            self._retry_timers.add(timer)
+        timer.start()
 
     # -- выполнение задания --------------------------------------------------
     def _run_job(self, job: dict) -> None:
@@ -184,10 +270,14 @@ class QueueManager:
                 delay = 2 * attempts
             self.db.add_job_event(job_id, "WARNING",
                                   f"Повторная попытка через {delay} с (попытка {attempts + 1}/{max_attempts}).")
-            time.sleep(delay)
-            # НЕ ставим в очередь здесь — это сделает _on_done после снятия с учёта
+            # НЕ спим в воркере: сон держал бы слот пула, и пара падающих
+            # заданий парализовала бы очередь. Задержку отработает отдельный
+            # таймер (см. _schedule_requeue), а в очередь задание вернёт
+            # _on_done — только после снятия с учёта, иначе поллер мог бы
+            # захватить его вторым воркером.
             with self._lock:
                 self._to_requeue.add(job_id)
+                self._retry_delays[job_id] = float(delay)
         else:
             self.db.finish_job(job_id, JobStatus.FAILED, error=message)
             log.error("Задание #%s провалено: %s", job_id, message)

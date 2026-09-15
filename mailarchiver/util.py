@@ -78,8 +78,33 @@ def ensure_dir(path: str, mode: int = 0o700) -> str:
     return path
 
 
-def atomic_write_bytes(path: str, data: bytes, mode: int = 0o600) -> None:
-    """Атомарная запись файла: сначала во временный, затем rename."""
+def fsync_dir(path: str) -> None:
+    """Сбросить на диск сам каталог (чтобы переименование пережило потерю питания).
+
+    На части файловых систем и на Windows это не поддерживается — такой сбой
+    не должен ронять уже выполненную запись, поэтому ошибки игнорируются.
+    """
+    try:
+        fd = os.open(path, os.O_DIRECTORY)
+    except (OSError, AttributeError):
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def atomic_write_bytes(path: str, data: bytes, mode: int = 0o600, fsync: bool = True) -> None:
+    """Атомарная запись файла: сначала во временный, затем rename.
+
+    При ``fsync=True`` на диск сбрасывается и содержимое файла, и запись
+    каталога — иначе при потере питания переименование может не сохраниться.
+    """
     directory = os.path.dirname(path) or "."
     ensure_dir(directory, 0o700)
     fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp_")
@@ -87,9 +112,12 @@ def atomic_write_bytes(path: str, data: bytes, mode: int = 0o600) -> None:
         with os.fdopen(fd, "wb") as fh:
             fh.write(data)
             fh.flush()
-            os.fsync(fh.fileno())
+            if fsync:
+                os.fsync(fh.fileno())
         os.chmod(tmp, mode)
         os.replace(tmp, path)
+        if fsync:
+            fsync_dir(directory)
     except BaseException:
         try:
             os.unlink(tmp)
@@ -98,8 +126,8 @@ def atomic_write_bytes(path: str, data: bytes, mode: int = 0o600) -> None:
         raise
 
 
-def atomic_write_text(path: str, text: str, mode: int = 0o600) -> None:
-    atomic_write_bytes(path, text.encode("utf-8"), mode)
+def atomic_write_text(path: str, text: str, mode: int = 0o600, fsync: bool = True) -> None:
+    atomic_write_bytes(path, text.encode("utf-8"), mode, fsync=fsync)
 
 
 _slug_re = re.compile(r"[^\w.\- ]+", re.UNICODE)
@@ -123,7 +151,13 @@ def sanitize_folder_component(name: str) -> str:
     for ch in ("\\", ":", "*", "?", '"', "<", ">", "|"):
         name = name.replace(ch, "_")
     name = name.strip()
-    return name or "INBOX"
+    # Срезаем ведущие/хвостовые точки и пробелы: имена «.», «..» (и вида «..  »)
+    # с сервера увели бы запись за пределы каталога ящика (path traversal).
+    # Внутренние точки сохраняем — «Sent.2024» остаётся как есть.
+    stripped = name.strip(". ")
+    if not stripped or set(stripped) <= {"."}:
+        return "_" if name else "INBOX"
+    return stripped
 
 
 def sha256_hex(data: bytes) -> str:
@@ -163,6 +197,10 @@ def retry(
     :param exceptions: какие исключения считать временными;
     :param on_retry:   колбэк (номер_попытки, ошибка, следующая_задержка).
     """
+
+    # attempts=0 (или отрицательное) дало бы «ноль попыток» и падение на assert —
+    # выполняем функцию хотя бы один раз.
+    attempts = max(1, int(attempts))
 
     def decorator(func: Callable[..., T]) -> Callable[..., T]:
         @wraps(func)

@@ -5,8 +5,11 @@
   1. Подключиться к ящику, получить список папок, отфильтровать по правилам.
   2. Фаза планирования: для каждой папки определить, какие письма новые.
      Признак новизны — пара (UIDVALIDITY, UID). Если UIDVALIDITY у папки
-     изменился, весь прежний индекс для неё считается недействительным и папка
-     перекачивается заново (так устроен протокол IMAP).
+     изменился, прежние UID недействительны (так устроен протокол IMAP), и папка
+     перекачивается заново — но УЖЕ СКАЧАННОЕ НЕ УДАЛЯЕТСЯ: письма просто
+     сохраняются заново под новым UIDVALIDITY (он входит в уникальный ключ
+     индекса), а старые записи остаются как исторические. Так обрыв связи или
+     «похудевший» после восстановления ящик не уничтожает локальную копию.
   3. Фаза загрузки: скачать новые письма батчами, сохранить в Maildir, занести
      в индекс БД, обновлять прогресс.
   4. Обновить состояние папок и статистику.
@@ -38,6 +41,7 @@ class BackupResult:
     messages_new: int = 0
     bytes_new: int = 0
     messages_total: int = 0
+    messages_skipped: int = 0  # не скачаны: больше лимита размера
     folders_processed: int = 0
     folders_total: int = 0
     errors: int = 0
@@ -125,17 +129,30 @@ class BackupEngine:
                     continue
                 uidvalidity = info["uidvalidity"]
                 state = self.db.get_folder_state(account.id, f.name)
-                reindex = state is not None and state["uidvalidity"] != uidvalidity
-                if reindex:
-                    emit("WARNING", f"UIDVALIDITY папки «{f.name}» изменился — полная перезагрузка папки.")
-                    # Удаляем устаревшие записи и файлы этой папки, чтобы не копить дубли.
-                    for relpath in self.db.folder_stored_paths(account.id, f.name):
-                        try:
-                            self.store.delete_message(account.id, relpath)
-                        except Exception:  # noqa: BLE001
-                            pass
-                    self.db.purge_folder_index(account.id, f.name)
-                existing = set() if (state is None or reindex) else self.db.existing_uids(account.id, f.name, uidvalidity)
+                old_uidvalidity = int(state["uidvalidity"]) if state else 0
+                if not uidvalidity:
+                    # Сервер не сообщил UIDVALIDITY. Считать это сменой нельзя —
+                    # иначе папка перекачивалась бы на каждом прогоне.
+                    emit("WARNING", f"Папка «{f.name}»: сервер не сообщил UIDVALIDITY — "
+                                    f"проверка смены пропущена, работаем по прежнему значению "
+                                    f"({old_uidvalidity}).")
+                    uidvalidity = old_uidvalidity
+                elif state is not None and old_uidvalidity != uidvalidity:
+                    # Настоящая смена UIDVALIDITY. Ничего не удаляем: ни файлы, ни
+                    # индекс. Письма будут скачаны заново под новым uidvalidity
+                    # (он входит в UNIQUE(account_id, folder, uidvalidity, uid)),
+                    # а прежние записи останутся как исторические.
+                    if old_uidvalidity:
+                        emit("WARNING", f"UIDVALIDITY папки «{f.name}» изменился "
+                                        f"({old_uidvalidity} → {uidvalidity}): письма будут перекачаны заново под "
+                                        f"новым UIDVALIDITY. Ранее скачанные файлы и записи индекса сохранены "
+                                        f"как исторические — ничего не удаляется.")
+                    else:
+                        emit("WARNING", f"Папка «{f.name}»: сервер впервые сообщил UIDVALIDITY ({uidvalidity}) — "
+                                        f"письма будут переписаны под ним; ранее скачанное сохранено.")
+                # existing_uids запрашиваем с НОВЫМ uidvalidity: при смене набор
+                # окажется пустым и папка скачается целиком — это и требуется.
+                existing = self.db.existing_uids(account.id, f.name, uidvalidity)
                 all_uids = conn.search_all_uids()
                 new_uids = [u for u in all_uids if u not in existing]
                 new_uids.sort()
@@ -154,18 +171,50 @@ class BackupEngine:
             # --- Фаза загрузки ---
             done = 0
             bytes_done = 0
+
+            def on_skipped(uid: int, size: int) -> None:
+                """
+                Письмо отсеяно по размеру ещё ДО скачивания (см.
+                ImapConnection.fetch_messages). Учитываем его в done, иначе
+                прогресс никогда не дойдёт до 100 %.
+                """
+                nonlocal done
+                result.messages_skipped += 1
+                done += 1
+                emit("WARNING", f"Письмо UID {uid} пропущено (больше лимита размера: {size} Б).")
+
+            planned_done = 0  # сколько писем «прошло» по плану (для прогресса)
             for p in plan:
                 check_cancel()
                 f = p["folder"]
+                planned_done += len(p["uids"])
                 emit("INFO", f"Папка «{f.name}»: загрузка {len(p['uids'])} писем…")
                 try:
-                    conn.select(f.name, readonly=True)
+                    sel = conn.select(f.name, readonly=True)
+                    cur_uidvalidity = sel["uidvalidity"]
+                    if cur_uidvalidity and cur_uidvalidity != p["uidvalidity"]:
+                        # UIDVALIDITY сменился между планированием и загрузкой:
+                        # запланированные UID теперь указывают на ЧУЖИЕ письма.
+                        msg = (f"Папка «{f.name}»: UIDVALIDITY изменился между планированием и загрузкой "
+                               f"({p['uidvalidity']} → {cur_uidvalidity}) — папка пропущена, "
+                               f"будет скачана при следующем запуске.")
+                        result.errors += 1
+                        result.error_details.append(msg)
+                        emit("ERROR", msg)
+                        continue
                     max_uid = 0
-                    for msg in conn.fetch_messages(p["uids"]):
+                    # Лимит размера передаём в клиент: слишком крупные письма
+                    # отсеиваются по ответу (RFC822.SIZE) и вообще не качаются.
+                    for msg in conn.fetch_messages(p["uids"], skip_larger_than=self.skip_larger_than,
+                                                   on_skipped=on_skipped):
                         check_cancel()
                         uid = msg["uid"]
                         raw = msg["raw"]
                         if self.skip_larger_than and len(raw) > self.skip_larger_than:
+                            # Подстраховка: сервер мог не сообщить RFC822.SIZE
+                            # или сообщить заниженный размер.
+                            result.messages_skipped += 1
+                            done += 1
                             emit("WARNING", f"Письмо UID {uid} пропущено (больше лимита размера).")
                             continue
                         flags = msg["flags"] if self.download_flags else []
@@ -178,6 +227,9 @@ class BackupEngine:
                             result.errors += 1
                             result.error_details.append(f"UID {uid} в «{f.name}»: {exc.message}")
                             emit("ERROR", f"Ошибка сохранения UID {uid}: {exc.message}")
+                            # письмо обработано (пусть и с ошибкой) — иначе
+                            # прогресс-бар не дойдёт до 100 %
+                            done += 1
                             continue
                         subject, from_addr, has_attach = self._extract_meta(raw)
                         self.db.add_message_index(
@@ -207,12 +259,18 @@ class BackupEngine:
                     result.errors += 1
                     result.error_details.append(f"Папка «{f.name}»: {exc.message}")
                     emit("ERROR", f"Ошибка в папке «{f.name}»: {exc.message}")
+                finally:
+                    # Папка пройдена — целиком, с ошибкой или пропущена: её
+                    # запланированные письма больше не «в работе». Без этого
+                    # прогресс-бар застревал бы ниже 100 %.
+                    done = max(done, planned_done)
 
             if progress_cb:
                 elapsed = max(0.001, time.time() - started)
                 progress_cb(done, total_new, "Готово", bytes_done, bytes_done / elapsed)
 
-        emit("INFO", f"Бэкап завершён: новых писем {result.messages_new}, ошибок {result.errors}.")
+        emit("INFO", f"Бэкап завершён: новых писем {result.messages_new}, "
+                     f"пропущено по размеру {result.messages_skipped}, ошибок {result.errors}.")
         return result
 
     @staticmethod
@@ -239,8 +297,10 @@ class BackupEngine:
             hdrs = BytesHeaderParser(policy=policy.default).parsebytes(raw)
             subject = str(hdrs.get("Subject", "") or "")
             from_raw = str(hdrs.get("From", "") or "")
-            name, addr = parseaddr(from_raw)
-            from_addr = from_raw or addr
+            _name, addr = parseaddr(from_raw)
+            # в БД нужен нормализованный адрес; сырой заголовок — только если
+            # адрес выделить не удалось
+            from_addr = addr or from_raw
             ctype = (str(hdrs.get("Content-Type", "")) or "").lower()
             low = raw[:40000].lower()
             if "multipart/mixed" in ctype or b"content-disposition: attachment" in low or b"filename=" in low:

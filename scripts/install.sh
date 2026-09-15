@@ -121,10 +121,21 @@ check_python(){
     err "Требуется Python >= 3.10, найден $ver. Установите более новую версию."
     exit 1
   fi
+  # Сервис проверен на 3.10–3.14. На более новых версиях установка, скорее всего,
+  # тоже пройдёт, но части зависимостей может не хватать готовых пакетов (колёс).
+  if [ "$major" -eq 3 ] && [ "$minor" -gt 14 ]; then
+    warn "Python $ver новее проверенных версий (3.10–3.14)."
+    warn "Если установка зависимостей не удастся — используйте Python 3.12–3.14."
+  fi
   ok "Python $ver подходит."
 }
 
 create_user(){
+  # Группа: useradd --system создаёт одноимённую группу не на всех дистрибутивах,
+  # а на неё дальше опирается chown. Создаём явно, если её ещё нет.
+  if ! getent group "$APP_GROUP" >/dev/null 2>&1; then
+    groupadd --system "$APP_GROUP" 2>/dev/null || warn "Не удалось создать группу $APP_GROUP"
+  fi
   if id "$APP_USER" >/dev/null 2>&1; then
     info "Пользователь $APP_USER уже существует."
   else
@@ -153,8 +164,29 @@ setup_venv(){
   info "Создание виртуального окружения и установка зависимостей…"
   python3 -m venv "$VENV_DIR" || { err "Не удалось создать venv (установлен ли python3-venv?)"; exit 1; }
   "$VENV_DIR/bin/pip" install --upgrade pip setuptools wheel -q || warn "Обновление pip завершилось с предупреждениями"
-  if ! "$VENV_DIR/bin/pip" install -q "$APP_DIR"; then
-    err "Не удалось установить зависимости Python. Проверьте доступ в интернет / прокси."
+
+  # ВАЖНО: зависимости ставим ИЗ requirements.txt, а сам пакет — с --no-deps.
+  # Раньше здесь было `pip install "$APP_DIR"`, из-за чего версии библиотек
+  # подтягивались по нестрогим границам pyproject.toml и «уплывали» при каждой
+  # установке — на новых версиях Starlette это роняло веб-интерфейс.
+  if [ -f "$APP_DIR/requirements.txt" ]; then
+    if ! "$VENV_DIR/bin/pip" install -q -r "$APP_DIR/requirements.txt"; then
+      err "Не удалось установить зависимости Python из requirements.txt."
+      err "Проверьте доступ в интернет / прокси и версию Python (нужен 3.10+)."
+      exit 1
+    fi
+  else
+    warn "requirements.txt не найден — ставлю зависимости по pyproject.toml."
+  fi
+  if ! "$VENV_DIR/bin/pip" install -q --no-deps "$APP_DIR"; then
+    err "Не удалось установить пакет mailarchiver."
+    exit 1
+  fi
+
+  # Контроль: пакет должен импортироваться и видеть все зависимости.
+  if ! "$VENV_DIR/bin/python" -c "import mailarchiver, fastapi, uvicorn, jinja2, yaml, apscheduler, imapclient, cryptography" 2>/dev/null; then
+    err "Зависимости установлены не полностью — приложение не импортируется."
+    "$VENV_DIR/bin/python" -c "import mailarchiver" || true
     exit 1
   fi
   ok "Зависимости установлены."

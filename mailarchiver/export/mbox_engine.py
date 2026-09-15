@@ -17,8 +17,10 @@ import re
 import time
 from typing import Dict, Iterable, Optional, TextIO
 
+from ..errors import ExportError
 from ..util import ensure_dir
-from .base import CancelCB, ExportEngine, ExportResult, MailItem, ProgressCB, folder_to_fs
+from .base import (CancelCB, ExportEngine, ExportResult, MailItem, ProgressCB, folder_to_fs,
+                   safe_export_path)
 
 _FROM_RE = re.compile(rb"^(>*From )", re.MULTILINE)
 
@@ -39,11 +41,17 @@ class MboxExportEngine(ExportEngine):
                 if cancel_cb and cancel_cb():
                     break
                 rel = folder_to_fs(item.folder) + ".mbox"
-                path = os.path.join(out_path, rel)
                 fh = open_files.get(rel)
                 if fh is None:
-                    ensure_dir(os.path.dirname(path) or out_path, 0o700)
-                    fh = open(path, "ab")
+                    try:
+                        # защита «в глубину»: путь обязан остаться внутри каталога экспорта
+                        path = safe_export_path(out_path, rel)
+                        ensure_dir(os.path.dirname(path) or out_path, 0o700)
+                        fh = open(path, "ab")
+                    except (ExportError, OSError) as exc:
+                        result.errors += 1
+                        result.error_details.append(f"{rel}: {exc}")
+                        continue
                     open_files[rel] = fh
                 try:
                     fh.write(self._mbox_record(item))
@@ -55,11 +63,22 @@ class MboxExportEngine(ExportEngine):
                 if progress_cb and result.count % 25 == 0:
                     progress_cb(result.count, total_hint, f"mbox: {result.count}")
         finally:
-            for fh in open_files.values():
+            # Ошибки close() глотать нельзя: именно на flush/close вылезает
+            # «кончилось место», и обрезанный mbox иначе уехал бы как успешный.
+            for rel, fh in open_files.items():
+                problem = ""
+                try:
+                    fh.flush()
+                except (OSError, ValueError) as exc:
+                    problem = f"не удалось записать данные на диск: {exc}"
                 try:
                     fh.close()
-                except OSError:
-                    pass
+                except (OSError, ValueError) as exc:
+                    if not problem:
+                        problem = f"ошибка закрытия файла: {exc}"
+                if problem:
+                    result.errors += 1
+                    result.error_details.append(f"{rel}: {problem}")
         if progress_cb:
             progress_cb(result.count, total_hint or result.count, "mbox: готово")
         return result

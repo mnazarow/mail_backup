@@ -73,3 +73,32 @@ def folder_to_fs(folder: str) -> str:
     from ..util import sanitize_folder_component
     parts = [sanitize_folder_component(p) for p in folder.replace("\\", "/").split("/") if p]
     return os.path.join(*parts) if parts else "INBOX"
+
+
+def safe_export_path(base_dir: str, *parts: str) -> str:
+    """
+    Собрать путь внутри каталога экспорта и проверить (защита «в глубину»), что
+    он действительно остался внутри него.
+
+    Имя папки приходит с почтового сервера, поэтому одной очистки компонентов
+    (sanitize_folder_component) мало: путь может увести наружу через символическую
+    ссылку или неожиданную комбинацию разделителей. Сверяем реальные пути
+    (realpath) — при выходе за пределы каталога бросаем ExportError, вызывающий
+    движок обязан пропустить письмо и учесть ошибку.
+    """
+    from ..errors import ExportError
+
+    target = os.path.normpath(os.path.join(base_dir, *parts))
+    base_real = os.path.realpath(base_dir)
+    # realpath самого файла: если он ещё не существует, разыменуются каталоги-родители
+    target_real = os.path.realpath(target)
+    try:
+        inside = os.path.commonpath([base_real, target_real]) == base_real
+    except ValueError:  # разные диски/несопоставимые пути
+        inside = False
+    if not inside:
+        raise ExportError(
+            f"Путь экспорта выходит за пределы каталога назначения: {target}",
+            hint="Проверьте имена папок в ящике и отсутствие символических ссылок в каталоге экспорта.",
+        )
+    return target

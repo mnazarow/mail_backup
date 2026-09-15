@@ -5,8 +5,9 @@
   * определяется целевая папка (та же, что была; либо с префиксом; либо одна
     общая папка — по выбору пользователя);
   * при необходимости папка создаётся на сервере;
-  * по желанию проверяется дубликат (поиск по Message-ID), чтобы не заливать
-    письмо повторно;
+  * по желанию проверяется дубликат по Message-ID, чтобы не заливать письмо
+    повторно (набор уже лежащих в папке Message-ID берётся ОДНИМ запросом на
+    папку и дальше сверяется в памяти);
   * письмо добавляется командой APPEND с сохранением флагов и даты получения.
 
 Поддерживается «сухой прогон» (dry-run) — подсчёт без реальной заливки.
@@ -16,7 +17,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional, Set
 
 from ..errors import JobCancelled, MailArchiverError
 from ..logging_setup import get_logger
@@ -29,7 +30,9 @@ log = get_logger("restore")
 # Системные флаги, которые сервер назначает сам и НЕ принимает в APPEND.
 _NON_SETTABLE_FLAGS = {"\\Recent", "\\*"}
 # Разрешённые к установке системные флаги IMAP.
-_SETTABLE_SYSTEM_FLAGS = {"\\Seen", "\\Answered", "\\Flagged", "\\Draft", "\\Deleted"}
+# \Deleted намеренно НЕ входит: иначе восстановленные письма сразу помечаются
+# удалёнными и исчезают при ближайшем EXPUNGE.
+_SETTABLE_SYSTEM_FLAGS = {"\\Seen", "\\Answered", "\\Flagged", "\\Draft"}
 
 
 def sanitize_flags_for_append(flags) -> List[str]:
@@ -56,12 +59,92 @@ CancelCB = Callable[[], bool]
 EventCB = Callable[[str, str], None]
 
 
+def _normalize_message_id(value: str) -> str:
+    """Привести Message-ID к сравнимому виду: без пробелов и угловых скобок."""
+    mid = (value or "").strip()
+    if mid.startswith("<") and mid.endswith(">"):
+        mid = mid[1:-1].strip()
+    return mid
+
+
+class _DuplicateIndex:
+    """
+    Проверка дублей при заливке — с одним запросом на папку.
+
+    Message-ID писем, уже лежащих в папке, запрашиваются ОДИН раз
+    (``FETCH 1:* BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]``) и дальше сверяются в
+    памяти. Прежний вариант делал SELECT + SEARCH на каждое письмо: на
+    100 000 писем это 200 000 обращений к серверу.
+
+    Сбой получения набора НЕ считается ответом «дублей нет»: папка переводится
+    на прежнюю поштучную проверку, а если не работает и она — проверка для
+    папки честно помечается недоступной (об этом сообщается в лог/событие).
+    """
+
+    def __init__(self, conn: ImapConnection, emit: EventCB) -> None:
+        self._conn = conn
+        self._emit = emit
+        self._known: Dict[str, Set[str]] = {}      # папка -> Message-ID на сервере
+        self._appended: Dict[str, Set[str]] = {}   # папка -> залитое в этом прогоне
+        self._single_mode: Set[str] = set()        # папки на поштучной проверке
+        self._off: Set[str] = set()                # папки, где проверка не работает
+
+    def remember(self, folder: str, message_id: str) -> None:
+        """Запомнить письмо, только что залитое в папку."""
+        mid = _normalize_message_id(message_id)
+        if mid:
+            self._appended.setdefault(folder, set()).add(mid)
+
+    def is_duplicate(self, folder: str, message_id: str) -> Optional[bool]:
+        """True — дубль; False — точно не дубль; None — проверить не удалось."""
+        mid = _normalize_message_id(message_id)
+        if not mid:
+            return False
+        if mid in self._appended.get(folder, ()):
+            return True
+        if folder in self._off:
+            return None
+        known = self._folder_ids(folder)
+        if known is not None:
+            return mid in known
+        # Запасной путь: поштучный поиск по серверу — медленно, но лучше, чем
+        # заливать вслепую.
+        try:
+            self._conn.select(folder, readonly=True)
+            return bool(self._conn.search_header_messageid(message_id))
+        except MailArchiverError as exc:
+            self._off.add(folder)
+            self._emit("WARNING", f"Папка «{folder}»: проверка дублей недоступна ({exc.message}). "
+                                  f"Письма будут залиты без проверки — возможны повторы.")
+            return None
+
+    def _folder_ids(self, folder: str) -> Optional[Set[str]]:
+        cached = self._known.get(folder)
+        if cached is not None:
+            return cached
+        if folder in self._single_mode:
+            return None
+        try:
+            raw_ids = self._conn.fetch_existing_message_ids(folder)
+        except MailArchiverError as exc:
+            self._single_mode.add(folder)
+            self._emit("WARNING", f"Папка «{folder}»: не удалось получить список Message-ID одним запросом "
+                                  f"({exc.message}). Дубли будут проверяться по одному письму — это медленнее.")
+            return None
+        ids = {_normalize_message_id(v) for v in raw_ids}
+        ids.discard("")
+        self._known[folder] = ids
+        self._emit("INFO", f"Папка «{folder}»: для проверки дублей получено Message-ID: {len(ids)}.")
+        return ids
+
+
 @dataclass
 class RestoreResult:
     restored: int = 0
     skipped: int = 0
     errors: int = 0
     total: int = 0
+    dup_check_unavailable: int = 0  # залито без работающей проверки дублей
     error_details: List[str] = field(default_factory=list)
     cancelled: bool = False
     dry_run: bool = False
@@ -116,7 +199,7 @@ class RestoreEngine:
             folder_list = conn.list_folders()
             delimiter = conn.delimiter
             ensured: set = set()
-            created_dup_index: dict = {}
+            dup_index = _DuplicateIndex(conn, emit)
 
             done = 0
             bytes_done = 0
@@ -131,6 +214,9 @@ class RestoreEngine:
                     result.errors += 1
                     result.error_details.append(f"{row['stored_path']}: {exc.message}")
                     emit("ERROR", f"Файл копии недоступен: {exc.message}")
+                    # письмо обработано (пусть и с ошибкой) — иначе прогресс-бар
+                    # не дойдёт до 100 %
+                    done += 1
                     continue
 
                 if dry_run:
@@ -147,14 +233,21 @@ class RestoreEngine:
                         result.errors += 1
                         result.error_details.append(f"Папка «{target}»: {exc.message}")
                         emit("ERROR", f"Не удалось создать папку «{target}»: {exc.message}")
+                        done += 1
                         continue
                     ensured.add(target)
 
                 if check_duplicates and row["message_id"]:
-                    if self._is_duplicate(conn, target, row["message_id"], created_dup_index):
+                    is_dup = dup_index.is_duplicate(target, row["message_id"])
+                    if is_dup:
                         result.skipped += 1
                         done += 1
                         continue
+                    if is_dup is None:
+                        # Проверить не удалось. Это НЕ «дублей нет»: письмо
+                        # заливаем (чтобы восстановление не встало), но факт
+                        # учитываем и сообщаем в итоге.
+                        result.dup_check_unavailable += 1
 
                 flags = sanitize_flags_for_append((row["flags"] or "").split(","))
                 msg_time = self._iso_to_dt(row["internaldate"])
@@ -162,7 +255,7 @@ class RestoreEngine:
                     conn.append(target, raw, flags=flags, msg_time=msg_time)
                     result.restored += 1
                     bytes_done += row["size"] or len(raw)
-                    created_dup_index.setdefault(target, set()).add(row["message_id"])
+                    dup_index.remember(target, row["message_id"])
                 except MailArchiverError as exc:
                     result.errors += 1
                     result.error_details.append(f"UID {row['uid']} -> «{target}»: {exc.message}")
@@ -174,6 +267,9 @@ class RestoreEngine:
                                 bytes_done, bytes_done / elapsed)
 
         emit("INFO", f"Восстановление завершено: залито {result.restored}, пропущено {result.skipped}, ошибок {result.errors}.")
+        if result.dup_check_unavailable:
+            emit("WARNING", f"Для {result.dup_check_unavailable} писем проверка дублей была недоступна — "
+                            f"эти письма залиты без проверки, возможны повторы.")
         if progress_cb:
             progress_cb(result.total, result.total, "Готово", bytes_done, 0.0)
         return result
@@ -182,7 +278,16 @@ class RestoreEngine:
     def _collect_messages(self, account_id: int, folders: Optional[List[str]], limit: int) -> List:
         rows = []
         if folders:
+            # Список папок обязательно дедуплицируем: одна и та же папка,
+            # переданная дважды, дала бы двойной список писем (и при
+            # выключенной проверке дублей — двойную заливку на сервер).
+            # Пустые имена тоже отбрасываем: list_messages(folder="") вернул бы
+            # письма ВСЕГО ящика.
+            seen: Set[str] = set()
             for fld in folders:
+                if not fld or fld in seen:
+                    continue
+                seen.add(fld)
                 rows.extend(self.db.list_messages(account_id, folder=fld, limit=1_000_000))
         else:
             rows = self.db.list_messages(account_id, limit=1_000_000)
@@ -197,16 +302,6 @@ class RestoreEngine:
         if mode == "prefixed" and prefix:
             return f"{prefix}{delimiter}{src_folder}"
         return src_folder
-
-    def _is_duplicate(self, conn: ImapConnection, folder: str, message_id: str, cache: dict) -> bool:
-        if message_id in cache.get(folder, set()):
-            return True
-        try:
-            conn.select(folder, readonly=True)
-            found = conn.search_header_messageid(message_id)
-            return bool(found)
-        except MailArchiverError:
-            return False
 
     @staticmethod
     def _iso_to_dt(iso: str) -> Optional[datetime]:

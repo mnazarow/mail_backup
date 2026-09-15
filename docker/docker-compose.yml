@@ -8,7 +8,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    image: mailarchiver:1.0.0
+    image: mailarchiver:1.1.0
     container_name: mailarchiver
     restart: unless-stopped
     ports:

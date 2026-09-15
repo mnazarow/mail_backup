@@ -45,15 +45,11 @@ def parse_message(raw: bytes) -> Dict:
         filename = part.get_filename()
         is_attachment = (disp == "attachment") or (filename and not ctype.startswith("text/"))
         if is_attachment:
-            try:
-                payload = part.get_payload(decode=True) or b""
-            except Exception:  # noqa: BLE001
-                payload = b""
             attachments.append({
                 "index": idx,
                 "filename": filename or f"attachment_{idx}",
                 "content_type": ctype,
-                "size": len(payload),
+                "size": _estimated_size(part),
             })
             idx += 1
         elif ctype == "text/plain" and not text:
@@ -62,6 +58,27 @@ def parse_message(raw: bytes) -> Dict:
             html = _get_text(part)
     # если только HTML — оставим text пустым; клиент покажет HTML в песочнице
     return {"headers": headers, "text": text, "html": html, "attachments": attachments}
+
+
+def _estimated_size(part) -> int:
+    """
+    Оценить размер вложения, НЕ декодируя его в память: письмо с вложением на
+    сотни мегабайт иначе уложило бы сервис (decode=True создаёт полную копию).
+    Точный размер отдаётся только при реальном скачивании — см. get_attachment().
+    """
+    try:
+        payload = part.get_payload(decode=False)
+    except Exception:  # noqa: BLE001
+        return 0
+    if not isinstance(payload, (str, bytes, bytearray)):
+        return 0
+    encoded_len = len(payload)
+    enc = str(part.get("Content-Transfer-Encoding", "") or "").strip().lower()
+    if enc == "base64":
+        # 4 символа base64 = 3 байта данных (переводы строк дают небольшой запас)
+        return max(0, encoded_len * 3 // 4)
+    # для 7bit/8bit/binary размер совпадает, для quoted-printable это оценка сверху
+    return encoded_len
 
 
 def _get_text(part) -> str:
@@ -78,10 +95,14 @@ def _get_text(part) -> str:
     charset = part.get_content_charset()
     if charset:
         try:
-            return payload.decode(charset, "strict")
-        except (LookupError, UnicodeDecodeError):
-            pass
-    # charset не указан или неверен — пробуем распространённые кодировки
+            # Кодировка ОБЪЯВЛЕНА — декодируем именно ею, битые байты заменяем.
+            # Перебор здесь недопустим: koi8-r (и latin-1) успешно «декодируют»
+            # любые 256 байт, и одно испорченное UTF-8 письмо превратилось бы в
+            # сплошную абракадабру вместо пары символов-заменителей.
+            return payload.decode(charset, "replace")
+        except LookupError:
+            pass  # кодировка неизвестна Python — переходим к перебору
+    # charset не указан или неизвестен — пробуем распространённые кодировки
     for enc in ("utf-8", "cp1251", "koi8-r", "latin-1"):
         try:
             return payload.decode(enc, "strict")

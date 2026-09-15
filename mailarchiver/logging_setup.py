@@ -58,8 +58,14 @@ _CONFIGURED = False
 def setup_logging(log_dir: str, level: str = "INFO", to_stdout: bool = True) -> None:
     """Однократно настроить корневой логгер приложения."""
     global _CONFIGURED
+    numeric_level = getattr(logging, str(level).upper(), logging.INFO)
+    if not isinstance(numeric_level, int):
+        numeric_level = logging.INFO
+
     root = logging.getLogger()
-    root.setLevel(logging.DEBUG)
+    # Уровень настроен пользователем — применяем его, иначе в буфер и в файл
+    # попадало бы всё подряд, включая DEBUG.
+    root.setLevel(numeric_level)
 
     # Удаляем существующие хендлеры (важно при перезапуске в тестах/reload)
     for h in list(root.handlers):
@@ -69,8 +75,6 @@ def setup_logging(log_dir: str, level: str = "INFO", to_stdout: bool = True) -> 
         "%(asctime)s [%(levelname)-7s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-
-    numeric_level = getattr(logging, str(level).upper(), logging.INFO)
 
     # Файл с ротацией
     try:
@@ -93,7 +97,7 @@ def setup_logging(log_dir: str, level: str = "INFO", to_stdout: bool = True) -> 
         stream.setFormatter(fmt)
         root.addHandler(stream)
 
-    memory_handler.setLevel(logging.DEBUG)
+    memory_handler.setLevel(numeric_level)
     memory_handler.setFormatter(fmt)
     root.addHandler(memory_handler)
 

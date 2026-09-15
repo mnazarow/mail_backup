@@ -45,6 +45,10 @@ class SchedulerService:
         if not bool(self.services.rt("scheduler", "enabled")):
             log.info("Планировщик отключён в настройках.")
             return
+        if self._sched is not None:
+            # уже запущен — просто пересинхронизируем расписания
+            self.reload()
+            return
         self._sched = BackgroundScheduler(timezone=self._timezone())
         self._sched.start()
         self.reload()
@@ -67,7 +71,16 @@ class SchedulerService:
 
     # -- синхронизация расписаний -------------------------------------------
     def reload(self) -> None:
+        enabled = bool(self.services.rt("scheduler", "enabled"))
         if not self._sched:
+            # Настройку могли включить уже после старта процесса: без этого
+            # галочка «Планировщик включён» требовала бы перезапуска сервиса.
+            if enabled:
+                self.start()
+            return
+        if not enabled:
+            # настройку выключили — останавливаем работающий планировщик
+            self.stop()
             return
         # удалить существующие задания расписаний
         for job in self._sched.get_jobs():
@@ -103,8 +116,29 @@ class SchedulerService:
             secs = int(row["interval_seconds"] or 0)
             if secs < 60:
                 raise ValidationError("Интервал не может быть меньше 60 секунд.")
+            # Отсчёт ведём от последнего ФАКТИЧЕСКОГО запуска: reload() вызывается
+            # при каждом сохранении настроек, и пересоздание триггера «с нуля»
+            # обнуляло бы таймер — шестичасовой бэкап мог не запуститься никогда.
+            # APScheduler сам выберет ближайшую будущую точку сетки last_run + N*интервал.
+            start = self._interval_start(row, tz)
+            if start is not None:
+                return IntervalTrigger(seconds=secs, timezone=tz, start_date=start)
             return IntervalTrigger(seconds=secs, timezone=tz)
         raise ValidationError(f"Неизвестный тип расписания: {kind}")
+
+    def _interval_start(self, row, tz) -> Optional[datetime]:
+        """Точка отсчёта interval-расписания — время последнего запуска (или None)."""
+        try:
+            last = row["last_run"]
+        except (KeyError, IndexError, TypeError):
+            return None
+        if not last:
+            return None
+        try:
+            dt = datetime.fromisoformat(str(last))
+        except (ValueError, TypeError):
+            return None
+        return dt.replace(tzinfo=tz) if dt.tzinfo is None else dt.astimezone(tz)
 
     # -- срабатывание --------------------------------------------------------
     def _fire(self, schedule_id: int) -> None:
@@ -143,6 +177,12 @@ class SchedulerService:
             self.services.db.purge_expired_sessions()
             keep_jobs = int(self.services.rt("retention", "keep_last_runs") or 30) * 10
             self.services.db.purge_old_jobs(max(keep_jobs, 200))
+            # Журнал неудачных входов нужен только для временной блокировки —
+            # без очистки он рос бы бесконечно (перебор паролей раздувает БД).
+            from datetime import datetime, timedelta, timezone
+            lockout_min = int(self.services.rt("security", "lockout_minutes") or 15)
+            cutoff = (datetime.now(timezone.utc) - timedelta(minutes=max(lockout_min, 15) * 4)).isoformat()
+            self.services.db.purge_old_login_attempts(cutoff)
             log.debug("Служебное обслуживание выполнено.")
         except Exception:  # noqa: BLE001
             log.exception("Ошибка служебного обслуживания")

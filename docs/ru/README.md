@@ -13,6 +13,7 @@
 | [03-installation.md](03-installation.md) | Установка (systemd и Docker), обновление, удаление |
 | [04-configuration.md](04-configuration.md) | Конфигурация, подключение ящиков, OAuth2, reverse proxy |
 | [05-parameters-reference.md](05-parameters-reference.md) | **Справочник всех параметров** (генерируется из кода) |
+| [06-analytics.md](06-analytics.md) | Разделы «Аналитика» и «Аналитика писем» |
 | [11-troubleshooting.md](11-troubleshooting.md) | Устранение неполадок |
 | [12-faq.md](12-faq.md) | Частые вопросы |
 | [screenshots/](screenshots/) | Скриншоты интерфейса |

@@ -16,13 +16,25 @@ from pydantic import BaseModel
 from ..errors import ValidationError
 from ..imap.client import probe_account
 from ..models import Account, AuthType, JobStatus, JobType, ScheduleKind, Security
-from ..util import human_size
+from ..util import human_size, safe_filename
 from ..version import __version__
 from . import auth as auth_mod
 from .i18n import all_help
 from ..export import list_engines
 
 router = APIRouter(prefix="/api")
+
+# Максимальный размер загружаемого .pst. Отдельной настройки для него нет,
+# поэтому держим лимит константой: без него один запрос мог бы забить диск.
+MAX_PST_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024   # 2 ГБ
+
+# Минимальный интервал расписания (совпадает с проверкой в планировщике):
+# более частое расписание планировщик не примет и оно молча не сработает.
+MIN_SCHEDULE_INTERVAL_S = 60
+
+# Параметры-секреты: не отдаются через GET /settings и не затираются пустым
+# значением при сохранении (пустое поле = «оставить как есть»).
+SECRET_SETTINGS = {"notifications.smtp_password"}
 
 
 def svc_dep(request: Request):
@@ -33,6 +45,20 @@ def _ensure_account_access(user: dict, account_id: int) -> None:
     """Пользователь-ящик (role=mailbox) имеет доступ только к своему ящику."""
     if user.get("role") == "mailbox" and user.get("account_id") != account_id:
         raise HTTPException(403, "Доступ разрешён только к своему почтовому ящику")
+
+
+def _ensure_job_access(user: dict, row) -> None:
+    """Доступ к заданию для пользователя-ящика.
+
+    Общесистемные задания (``account_id IS NULL`` — например глобальный анализ
+    писем по всем ящикам) содержат данные по всем ящикам и к тому же тяжело
+    нагружают сервер, поэтому доступны только администратору.
+    """
+    if user.get("role") != "mailbox":
+        return
+    if row["account_id"] is None:
+        raise HTTPException(403, "Общесистемные задания доступны только администратору")
+    _ensure_account_access(user, row["account_id"])
 
 
 def _require_not_mailbox(user: dict) -> None:
@@ -383,15 +409,33 @@ def import_pst(request: Request, account_id: int, file: UploadFile = File(...),
     svc = svc_dep(request)
     _ensure_account_access(user, account_id)
     svc.require_account(account_id)
-    if not (file.filename or "").lower().endswith(".pst"):
+    # имя файла приходит от клиента: берём только базовое имя и чистим его,
+    # иначе «../../» в имени увело бы запись за пределы каталога временных файлов
+    origin_name = os.path.basename(file.filename or "")
+    if not origin_name.lower().endswith(".pst"):
         raise ValidationError("Ожидается файл .pst", hint="Выберите файл с расширением .pst")
-    dest = os.path.join(svc.cfg.tmp_dir, f"import_{account_id}_{os.getpid()}_{file.filename}")
-    with open(dest, "wb") as fh:
-        while True:
-            chunk = file.file.read(1024 * 1024)
-            if not chunk:
-                break
-            fh.write(chunk)
+    fname = safe_filename(origin_name, default="import.pst")
+    dest = os.path.join(svc.cfg.tmp_dir, f"import_{account_id}_{os.getpid()}_{fname}")
+    written = 0
+    try:
+        with open(dest, "wb") as fh:
+            while True:
+                chunk = file.file.read(1024 * 1024)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > MAX_PST_UPLOAD_BYTES:
+                    raise ValidationError(
+                        f"Файл слишком большой: допустимо не более {human_size(MAX_PST_UPLOAD_BYTES)}.",
+                        hint="Разделите архив .pst на части и импортируйте их по очереди.")
+                fh.write(chunk)
+    except BaseException:
+        # частично записанный файл не должен оставаться на диске
+        try:
+            os.unlink(dest)
+        except OSError:
+            pass
+        raise
     jid = svc.queue.enqueue(JobType.IMPORT_PST, account_id,
                             {"pst_path": dest, "target": "imap", "target_prefix": target_prefix},
                             created_by=user["username"])
@@ -527,8 +571,7 @@ def get_job(request: Request, job_id: int, user: dict = Depends(auth_mod.require
     row = svc.db.get_job(job_id)
     if row is None:
         raise HTTPException(404, "Задание не найдено")
-    if row["account_id"] is not None:
-        _ensure_account_access(user, row["account_id"])
+    _ensure_job_access(user, row)
     data = serialize_job(row)
     try:
         data["result"] = json.loads(row["result"] or "{}")
@@ -541,10 +584,10 @@ def get_job(request: Request, job_id: int, user: dict = Depends(auth_mod.require
 @router.get("/jobs/{job_id}/events")
 def job_events(request: Request, job_id: int, user: dict = Depends(auth_mod.require_user)):
     svc = svc_dep(request)
-    if user.get("role") == "mailbox":
-        j = svc.db.get_job(job_id)
-        if j and j["account_id"] is not None:
-            _ensure_account_access(user, j["account_id"])
+    row = svc.db.get_job(job_id)
+    if row is None:
+        raise HTTPException(404, "Задание не найдено")
+    _ensure_job_access(user, row)
     rows = svc.db.list_job_events(job_id, limit=500)
     return [{"ts": r["ts"], "level": r["level"], "message": r["message"]} for r in rows][::-1]
 
@@ -555,8 +598,7 @@ def cancel_job(request: Request, job_id: int, user: dict = Depends(auth_mod.requ
     row = svc.db.get_job(job_id)
     if row is None:
         raise HTTPException(404, "Задание не найдено")
-    if row["account_id"] is not None:
-        _ensure_account_access(user, row["account_id"])
+    _ensure_job_access(user, row)
     svc.queue.cancel(job_id)
     return {"ok": True}
 
@@ -567,10 +609,11 @@ def retry_job(request: Request, job_id: int, user: dict = Depends(auth_mod.requi
     row = svc.db.get_job(job_id)
     if row is None:
         raise HTTPException(404, "Задание не найдено")
-    if row["account_id"] is not None:
-        _ensure_account_access(user, row["account_id"])
+    _ensure_job_access(user, row)
     if row["status"] not in JobStatus.TERMINAL:
         raise ValidationError("Повторить можно только завершённое задание.")
+    # Снимаем флаг отмены: иначе повтор ранее отменённого задания сразу упал бы.
+    svc.db.execute("UPDATE jobs SET cancel_requested=0 WHERE id=?", (job_id,))
     svc.db.requeue_job(job_id)
     svc.queue._wake.set()
     return {"ok": True}
@@ -599,9 +642,13 @@ def list_exports(request: Request, account_id: Optional[int] = None, user: dict 
 def download_export(request: Request, export_id: int, user: dict = Depends(auth_mod.require_user)):
     svc = svc_dep(request)
     r = svc.db.get_export(export_id)
-    if r is None or not r["path"] or not os.path.exists(r["path"]):
+    # Проверка доступа — сразу после получения записи: если сначала проверять
+    # наличие файла, перебором id можно отличить чужой существующий экспорт.
+    if r is None:
         raise HTTPException(404, "Файл экспорта не найден")
     _ensure_account_access(user, r["account_id"])
+    if not r["path"] or not os.path.exists(r["path"]):
+        raise HTTPException(404, "Файл экспорта не найден")
     return FileResponse(r["path"], filename=os.path.basename(r["path"]), media_type="application/octet-stream")
 
 
@@ -643,12 +690,41 @@ def list_schedules(request: Request, user: dict = Depends(auth_mod.require_user)
     return out
 
 
+def _validate_schedule(body: ScheduleBody) -> None:
+    """Проверить расписание ДО записи в БД.
+
+    Иначе некорректное расписание (кривой cron, слишком маленький интервал)
+    принимается, а планировщик молча не может построить триггер — задание
+    никогда не срабатывает.
+    """
+    if body.job_type not in JobType.ALL:
+        raise ValidationError(f"Неизвестный тип задания: {body.job_type}")
+    if body.kind == ScheduleKind.CRON:
+        expr = (body.cron_expr or "").strip()
+        hint = "Пример: «0 3 * * *» — каждый день в 03:00."
+        if len(expr.split()) != 5:
+            raise ValidationError(f"Некорректное cron-выражение: «{expr}» (нужно 5 полей).", hint=hint)
+        try:
+            from apscheduler.triggers.cron import CronTrigger
+            CronTrigger.from_crontab(expr)
+        except Exception as exc:  # noqa: BLE001
+            raise ValidationError(f"Некорректное cron-выражение: «{expr}» ({exc}).", hint=hint) from exc
+    elif body.kind == ScheduleKind.INTERVAL:
+        if int(body.interval_seconds or 0) < MIN_SCHEDULE_INTERVAL_S:
+            raise ValidationError(f"Интервал не может быть меньше {MIN_SCHEDULE_INTERVAL_S} секунд.",
+                                  hint="Укажите интервал от 1 минуты.")
+    else:
+        raise ValidationError(f"Неизвестный тип расписания: {body.kind}",
+                              hint="Допустимые значения: «cron» или «interval».")
+
+
 @router.post("/schedules")
 def create_schedule(request: Request, body: ScheduleBody, user: dict = Depends(auth_mod.require_user)):
     svc = svc_dep(request)
     if user.get("role") == "mailbox":
         _ensure_account_access(user, body.account_id)
     svc.require_account(body.account_id)
+    _validate_schedule(body)
     sid = svc.db.create_schedule(body.account_id, body.kind, body.job_type, body.cron_expr,
                                  body.interval_seconds, body.enabled, body.options)
     svc.scheduler.reload()
@@ -664,6 +740,7 @@ def update_schedule(request: Request, schedule_id: int, body: ScheduleBody, user
     if user.get("role") == "mailbox":
         _ensure_account_access(user, existing["account_id"])
         _ensure_account_access(user, body.account_id)
+    _validate_schedule(body)
     svc.db.update_schedule(schedule_id, kind=body.kind, job_type=body.job_type, cron_expr=body.cron_expr,
                            interval_seconds=body.interval_seconds, enabled=body.enabled, options=body.options)
     svc.scheduler.reload()
@@ -698,8 +775,15 @@ def get_settings(request: Request, user: dict = Depends(auth_mod.require_admin))
         section = sec["section"]
         result[section] = {}
         for key in sec["keys"]:
-            result[section][key] = svc.rt(section, key)
-    return {"values": result, "sections": SETTINGS_SECTIONS, "help": all_help()}
+            value = svc.rt(section, key)
+            # Секреты наружу не отдаём даже администратору: в поле показывается
+            # пустое значение с подсказкой «без изменений», а сохранённый пароль
+            # остаётся в БД (см. update_settings — пустая строка его не затирает).
+            if f"{section}.{key}" in SECRET_SETTINGS and value:
+                value = ""
+            result[section][key] = value
+    return {"values": result, "sections": SETTINGS_SECTIONS, "help": all_help(),
+            "secrets_set": {k: bool(svc.rt(*k.split(".", 1))) for k in SECRET_SETTINGS}}
 
 
 @router.put("/settings")
@@ -711,6 +795,16 @@ def update_settings(request: Request, body: SettingsBody, user: dict = Depends(a
         if "." not in full_key:
             continue
         section, key = full_key.split(".", 1)
+        # Принимаем только известные параметры. Без белого списка сюда можно было
+        # записать служебный ключ (например кэш глубокого анализа) и подменить
+        # данные, которые отдаёт раздел «Аналитика писем».
+        if key not in DEFAULTS.get(section, {}):
+            raise ValidationError(f"Неизвестный параметр «{full_key}».",
+                                  hint="Допустимы только параметры из раздела «Настройки».")
+        # Пустое значение секрета означает «оставить как есть» — иначе простое
+        # сохранение формы затирало бы сохранённый пароль.
+        if full_key in SECRET_SETTINGS and (value is None or value == ""):
+            continue
         # Валидация типа по значению по умолчанию (защита от «битых» настроек,
         # которые могли бы, например, остановить очередь).
         default = DEFAULTS.get(section, {}).get(key)
@@ -738,7 +832,9 @@ def update_settings(request: Request, body: SettingsBody, user: dict = Depends(a
 #  Логи, статистика, аудит
 # =====================================================================
 @router.get("/logs")
-def get_logs(limit: int = 300, level: Optional[str] = None, user: dict = Depends(auth_mod.require_user)):
+def get_logs(limit: int = 300, level: Optional[str] = None, user: dict = Depends(auth_mod.require_admin)):
+    """Общий лог сервиса: содержит имена и хосты всех ящиков и ошибки чужих
+    заданий, поэтому доступен только администратору."""
     from ..logging_setup import memory_handler
     return memory_handler.tail(limit=limit, level=level)
 
@@ -746,11 +842,23 @@ def get_logs(limit: int = 300, level: Optional[str] = None, user: dict = Depends
 @router.get("/stats")
 def get_stats(request: Request, days: int = 30, user: dict = Depends(auth_mod.require_user)):
     svc = svc_dep(request)
-    series = svc.db.daily_series(days=days)
+    days = max(1, min(365, int(days)))
+    if user.get("role") == "mailbox":
+        # пользователь-ящик видит статистику только по своему ящику
+        aid = user.get("account_id")
+        series = svc.db.query(
+            """SELECT day, messages, bytes, jobs, errors FROM stats_daily
+               WHERE account_id=? ORDER BY day DESC LIMIT ?""",
+            (aid, days),
+        )
+        totals = {"messages": svc.db.count_messages(aid), "bytes": svc.db.sum_message_bytes(aid)}
+    else:
+        series = svc.db.daily_series(days=days)
+        totals = {"messages": svc.db.count_messages(), "bytes": svc.db.sum_message_bytes()}
     return {
         "series": [{"day": r["day"], "messages": r["messages"], "bytes": r["bytes"],
                     "jobs": r["jobs"], "errors": r["errors"]} for r in series][::-1],
-        "totals": {"messages": svc.db.count_messages(), "bytes": svc.db.sum_message_bytes()},
+        "totals": totals,
     }
 
 
@@ -830,12 +938,18 @@ def list_users(request: Request, user: dict = Depends(auth_mod.require_admin)):
 def create_user(request: Request, body: UserBody, user: dict = Depends(auth_mod.require_admin)):
     svc = svc_dep(request)
     from ..security import check_password_policy, hash_password
+    role = (body.role or "admin").strip().lower()
+    if role != "admin":
+        # вход по ящику (role=mailbox) выполняется по email и паролю ящика,
+        # отдельная запись пользователя для этого не создаётся и не работает
+        raise ValidationError("Здесь можно создать только пользователя с ролью «admin».",
+                              hint="Для доступа к своему ящику пользователь входит по email и паролю ящика.")
     if svc.db.get_user_by_name(body.username):
         raise ValidationError("Пользователь с таким именем уже существует.")
     policy = check_password_policy(body.password, int(svc.rt("security", "min_password_length") or 8))
     if policy:
         raise ValidationError(policy)
-    uid = svc.db.create_user(body.username.strip(), hash_password(body.password), body.role)
+    uid = svc.db.create_user(body.username.strip(), hash_password(body.password), role)
     svc.db.add_audit(user["username"], "user_create", body.username)
     return {"ok": True, "id": uid}
 

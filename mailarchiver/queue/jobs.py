@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -24,6 +25,53 @@ from ..models import JobStatus, JobType
 from ..util import human_size, safe_filename, utcnow_iso
 
 log = get_logger("jobs")
+
+# Размер страницы при обходе индекса писем. Один большой limit брать нельзя:
+# list_messages сортирует по дате (ORDER BY internaldate DESC), поэтому в
+# выборку попадали бы только самые новые письма, а самые старые — те, что и
+# должен удалить ретеншн, — вообще не рассматривались.
+MESSAGE_PAGE_SIZE = 2000
+
+
+def _iter_all_messages(db, account_id: int, page_size: int = MESSAGE_PAGE_SIZE):
+    """Постранично обойти ВСЕ письма ящика (без ограничения сверху)."""
+    offset = 0
+    while True:
+        rows = db.list_messages(account_id, limit=page_size, offset=offset)
+        if not rows:
+            return
+        for row in rows:
+            yield row
+        if len(rows) < page_size:
+            return
+        offset += page_size
+
+
+def _rel_to_imap_folder(rel_folder: str, delimiter: str) -> str:
+    """
+    Перевести относительный путь каталога (как его отдал readpst) в имя
+    IMAP-папки: разделители ОС («/» и «\\») заменяются на разделитель иерархии
+    сервера, пустые сегменты и «.» отбрасываются.
+    """
+    parts = [p for p in re.split(r"[\\/]+", rel_folder or "") if p and p != "."]
+    return (delimiter or "/").join(parts)
+
+
+def _count_older_than(db, account_id: int, cutoff_iso: str) -> int:
+    return int(db.scalar(
+        "SELECT COUNT(*) FROM messages WHERE account_id=? AND internaldate IS NOT NULL "
+        "AND internaldate<>'' AND internaldate<?",
+        (account_id, cutoff_iso),
+    ) or 0)
+
+
+def _page_older_than(db, account_id: int, cutoff_iso: str, limit: int) -> list:
+    """Порция САМЫХ СТАРЫХ писем ящика старше cutoff (для ретеншна)."""
+    return db.query(
+        "SELECT id, stored_path, size FROM messages WHERE account_id=? AND internaldate IS NOT NULL "
+        "AND internaldate<>'' AND internaldate<? ORDER BY internaldate ASC LIMIT ?",
+        (account_id, cutoff_iso, limit),
+    )
 
 
 class JobContext:
@@ -80,6 +128,9 @@ def handle_backup(ctx: JobContext) -> Dict:
 
     summary = (f"Ящик «{acc.name}»: новых писем {res.messages_new} ({human_size(res.bytes_new)}), "
                f"папок {res.folders_processed}/{res.folders_total}, ошибок {res.errors}.")
+    if res.messages_skipped:
+        # письма, не скачанные из-за лимита размера, иначе «потерялись» бы без объяснений
+        summary += f" Пропущено по лимиту размера: {res.messages_skipped}."
     svc.notifier.notify_job(JobType.BACKUP, res.status_label,
                             f"[MailArchiver] Бэкап «{acc.name}»: {res.status_label}", summary)
     # авто-ретеншн истории прогонов
@@ -120,6 +171,8 @@ def handle_restore(ctx: JobContext) -> Dict:
     ctx.db.update_restore(restore_id, status=res.status_label, restored=res.restored, errors=res.errors,
                           error="; ".join(res.error_details[:5]))
     summary = f"Восстановлено {res.restored}, пропущено {res.skipped}, ошибок {res.errors}."
+    if res.dup_check_unavailable:
+        summary += f" Без проверки дублей залито писем: {res.dup_check_unavailable} (возможны повторы)."
     svc.notifier.notify_job(JobType.RESTORE, res.status_label,
                             f"[MailArchiver] Восстановление «{acc.name}»: {res.status_label}", summary)
     return {"final_status": res.status_label, "summary": summary,
@@ -174,6 +227,14 @@ def handle_export(ctx: JobContext) -> Dict:
         res = engine.export(items, final_path, options=options, progress_cb=ctx.progress,
                             cancel_cb=ctx.is_cancelled, total_hint=total)
         if ctx.is_cancelled():
+            # Файл отменённого экспорта в БД не попадает, поэтому в интерфейсе он
+            # не виден и удалить его оттуда нельзя — убираем сами, как это уже
+            # делается с рабочим каталогом в ветке eml/mbox.
+            if os.path.exists(final_path):
+                try:
+                    os.unlink(final_path)
+                except OSError as exc:
+                    log.warning("Не удалось удалить файл отменённого экспорта %s: %s", final_path, exc)
             ctx.db.update_export(export_id, status=JobStatus.CANCELLED)
             raise JobCancelled("Экспорт отменён пользователем.")
         size = os.path.getsize(final_path) if os.path.exists(final_path) else 0
@@ -229,14 +290,32 @@ def handle_import_pst(ctx: JobContext) -> Dict:
             acc = svc.require_account(ctx.account_id)
             prefix = p.get("target_prefix", "Импорт PST")
             with ImapConnection(acc, svc.connect_options()) as conn:
-                delimiter = (conn.list_folders() or [None]) and conn.delimiter
+                # list_folders() заодно сообщает разделитель иерархии сервера;
+                # подстраховываемся на случай, если сервер его не прислал —
+                # иначе None попал бы в имя папки строкой "None".
+                conn.list_folders()
+                delimiter = conn.delimiter or "/"
                 ensured = set()
+                failed_folders = set()
                 for i, (rel_folder, fp) in enumerate(eml_files, 1):
                     if ctx.is_cancelled():
                         raise JobCancelled("Импорт отменён пользователем.")
-                    folder = f"{prefix}{delimiter}{rel_folder}" if rel_folder not in (".", "") else prefix
+                    # разделитель каталогов ОС переводим в разделитель IMAP
+                    rel = _rel_to_imap_folder(rel_folder, delimiter)
+                    folder = f"{prefix}{delimiter}{rel}" if rel else prefix
+                    if folder in failed_folders:
+                        errors += 1
+                        continue
                     if folder not in ensured:
-                        conn.ensure_folder(folder)
+                        try:
+                            conn.ensure_folder(folder)
+                        except MailArchiverError as exc:
+                            # папку создать не удалось — письма этой папки
+                            # пропускаем, но весь импорт не роняем
+                            failed_folders.add(folder)
+                            errors += 1
+                            ctx.event("ERROR", f"Папка «{folder}» недоступна: {exc.message}")
+                            continue
                         ensured.add(folder)
                     try:
                         with open(fp, "rb") as fh:
@@ -245,6 +324,9 @@ def handle_import_pst(ctx: JobContext) -> Dict:
                     except MailArchiverError as exc:
                         errors += 1
                         ctx.event("ERROR", f"Ошибка заливки: {exc.message}")
+                    except OSError as exc:
+                        errors += 1
+                        ctx.event("ERROR", f"Не удалось прочитать файл «{os.path.basename(fp)}»: {exc}")
                     if i % 20 == 0:
                         ctx.progress(i, total, f"Импорт {i}/{total}")
         else:
@@ -257,6 +339,12 @@ def handle_import_pst(ctx: JobContext) -> Dict:
         return {"final_status": status, "summary": summary, "imported": imported, "errors": errors}
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+        # загруженный .pst больше не нужен: без удаления он навсегда оставался
+        # бы в каталоге временных файлов
+        try:
+            os.unlink(pst_path)
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +373,9 @@ def handle_retention(ctx: JobContext) -> Dict:
     removed = 0
     freed = 0
     accounts = [svc.require_account(ctx.account_id)] if ctx.account_id else svc.db.list_accounts()
+    # Сначала план: по каким ящикам и сколько писем подлежит удалению —
+    # это даёт корректный прогресс и не требует держать выборку в памяти.
+    plan = []
     for acc in accounts:
         # приоритет у настройки ящика: -1 = наследовать глобальную; 0 = хранить всё; N = N дней
         eff_days = acc.retention_days if acc.retention_days is not None and acc.retention_days >= 0 else global_days
@@ -292,8 +383,22 @@ def handle_retention(ctx: JobContext) -> Dict:
             continue
         cutoff = datetime.now(timezone.utc).timestamp() - eff_days * 86400
         cutoff_iso = datetime.fromtimestamp(cutoff, tz=timezone.utc).isoformat()
-        for row in svc.db.list_messages(acc.id, limit=1_000_000):
-            if row["internaldate"] and row["internaldate"] < cutoff_iso:
+        plan.append((acc, eff_days, cutoff_iso, _count_older_than(svc.db, acc.id, cutoff_iso)))
+    total = sum(p[3] for p in plan)
+    ctx.progress(0, total, f"К удалению писем: {total}")
+    for acc, eff_days, cutoff_iso, planned in plan:
+        ctx.event("INFO", f"Ящик «{acc.name}»: хранение {eff_days} дн., к удалению писем {planned}.")
+        # Выбираем ровно то, что подлежит удалению, порциями от самых старых.
+        # Каждая порция удаляется целиком, поэтому следующий запрос снова
+        # возвращает самые старые из оставшихся (смещение не нужно).
+        while True:
+            rows = _page_older_than(svc.db, acc.id, cutoff_iso, MESSAGE_PAGE_SIZE)
+            if not rows:
+                break
+            for row in rows:
+                if ctx.is_cancelled():
+                    ctx.event("WARNING", f"Очистка прервана: удалено {removed} ({human_size(freed)}).")
+                    raise JobCancelled("Очистка отменена пользователем.")
                 try:
                     svc.store.delete_message(acc.id, row["stored_path"])
                 except Exception:  # noqa: BLE001
@@ -301,7 +406,11 @@ def handle_retention(ctx: JobContext) -> Dict:
                 svc.db.delete_message_index(row["id"])
                 removed += 1
                 freed += row["size"] or 0
-        ctx.event("INFO", f"Ящик «{acc.name}»: хранение {eff_days} дн.")
+                if removed % 50 == 0:
+                    ctx.progress(removed, total, f"Удалено {removed}/{total} ({human_size(freed)})")
+            if len(rows) < MESSAGE_PAGE_SIZE:
+                break
+    ctx.progress(total, total, "Готово")
     ctx.event("INFO", f"Ретеншн: удалено писем {removed} ({human_size(freed)}).")
     return {"final_status": JobStatus.SUCCESS, "summary": f"Удалено {removed} писем, освобождено {human_size(freed)}.",
             "removed": removed, "freed": freed}
@@ -314,12 +423,14 @@ def handle_verify(ctx: JobContext) -> Dict:
     svc = ctx.services
     from ..util import sha256_hex
     acc = svc.require_account(ctx.account_id)
-    rows = svc.db.list_messages(acc.id, limit=1_000_000)
-    total = len(rows)
+    # обходим ВСЕ письма ящика постранично (см. _iter_all_messages)
+    total = svc.db.count_messages(acc.id)
     missing = 0
     corrupt = 0
     ok = 0
-    for i, row in enumerate(rows, 1):
+    i = 0
+    for row in _iter_all_messages(svc.db, acc.id):
+        i += 1
         if ctx.is_cancelled():
             raise JobCancelled("Проверка отменена пользователем.")
         path = os.path.join(svc.store.account_dir(acc.id), row["stored_path"])

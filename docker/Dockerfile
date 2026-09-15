@@ -13,14 +13,18 @@ RUN python -m venv /venv \
  && /venv/bin/pip install -r requirements.txt
 
 COPY . /app
-RUN /venv/bin/pip install .
+# Пакет ставим БЕЗ зависимостей: они уже установлены строго по requirements.txt
+# выше. Иначе pip заново разрешил бы их по границам pyproject.toml и в образ
+# попали бы непроверенные версии библиотек.
+RUN /venv/bin/pip install --no-deps . \
+ && /venv/bin/python -c "import mailarchiver, fastapi, uvicorn, jinja2, yaml, apscheduler, imapclient, cryptography"
 
 # ---------------------------------------------------------------------------
 FROM python:3.12-slim
 
 LABEL org.opencontainers.image.title="MailArchiver" \
       org.opencontainers.image.description="Резервное копирование почтовых ящиков по IMAP с веб-интерфейсом" \
-      org.opencontainers.image.version="1.0.0"
+      org.opencontainers.image.version="1.1.0"
 
 # readpst нужен только для импорта .pst; ca-certificates — для TLS/OAuth2
 RUN apt-get update \

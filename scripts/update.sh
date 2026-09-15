@@ -90,7 +90,18 @@ main(){
 
   info "Обновление зависимостей…"
   "$VENV_DIR/bin/pip" install --upgrade pip -q || true
-  "$VENV_DIR/bin/pip" install -q --upgrade "$APP_DIR"
+  # Как и в install.sh: версии библиотек берём из requirements.txt, а пакет
+  # ставим с --no-deps. Прежний `pip install --upgrade "$APP_DIR"` обновлял
+  # зависимости по нестрогим границам pyproject.toml, из-за чего при обычном
+  # обновлении в систему приезжали непроверенные версии библиотек.
+  if [ -f "$APP_DIR/requirements.txt" ]; then
+    "$VENV_DIR/bin/pip" install -q -r "$APP_DIR/requirements.txt"
+  fi
+  "$VENV_DIR/bin/pip" install -q --no-deps --upgrade "$APP_DIR"
+
+  info "Проверка импорта приложения…"
+  "$VENV_DIR/bin/python" -c "import mailarchiver, fastapi, uvicorn, jinja2, yaml, apscheduler, imapclient, cryptography" \
+    || { err "После обновления приложение не импортируется."; exit 1; }
 
   info "Проверка конфигурации…"
   "$VENV_DIR/bin/mailarchiver" -c "$CONFIG_FILE" check-config

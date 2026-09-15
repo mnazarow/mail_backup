@@ -27,6 +27,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
+import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from email.utils import getaddresses, parseaddr
@@ -67,6 +69,13 @@ _SIZE_EDGES = [
     (10 * 1024 * 1024, float("inf"), "> 10 МБ"),
 ]
 
+# Размер страницы при постраничном обходе индекса в глубоком анализе.
+_SCAN_PAGE_SIZE = 2000
+# Верхняя граница словаря частот: на большом архиве Counter со ВСЕМИ уникальными
+# словами всех писем вырастает до сотен МБ, хотя наружу отдаётся только топ-60.
+_WORDS_SOFT_LIMIT = 50_000
+_WORDS_KEEP = 5_000
+
 _WORD_RE = re.compile(r"[0-9A-Za-zА-Яа-яЁё]{3,}")
 _SUBJ_PREFIX_RE = re.compile(r"^\s*(re|fwd?|отв|переслать|пересл)\s*(\[\d+\])?\s*:", re.IGNORECASE)
 
@@ -74,16 +83,22 @@ _SUBJ_PREFIX_RE = re.compile(r"^\s*(re|fwd?|отв|переслать|перес
 # ---------------------------------------------------------------------------
 #  Вспомогательные
 # ---------------------------------------------------------------------------
-def _parse_dt(s: Optional[str]) -> Optional[datetime]:
-    """Разобрать ISO-дату из индекса (с учётом смещения) → aware datetime UTC."""
+def _parse_dt(s) -> Optional[datetime]:
+    """Разобрать ISO-дату из индекса (с учётом смещения) → aware datetime UTC.
+
+    Значение приходит из БД и может оказаться не строкой (например числом) —
+    тогда ``s.replace`` падал с AttributeError, поэтому приводим к строке.
+    """
     if not s:
         return None
+    if not isinstance(s, str):
+        s = str(s)
     try:
         dt = datetime.fromisoformat(s)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, AttributeError):
         try:
             dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, AttributeError):
             return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
@@ -120,14 +135,77 @@ def _dir_size(path: str) -> int:
     return total
 
 
+# --- Размер архива на диске --------------------------------------------------
+# Обход всего архива (отдельный файл на каждое письмо) на больших архивах
+# занимает минуты, поэтому в обработчике запроса его делать нельзя. Показываем
+# последнее сохранённое значение (кэш в settings), а сам обход выполняем в
+# фоновом потоке не чаще раза в сутки.
+_ARCHIVE_DISK_KEY = "analytics.archive_disk"
+_ARCHIVE_DISK_TTL_S = 24 * 3600
+_archive_scan_lock = threading.Lock()
+_archive_scanning = False
+
+
+def archive_disk_size(svc) -> int:
+    """Размер архива на диске: из кэша; пересчёт — в фоне, не чаще раза в сутки."""
+    cached = svc.db.get_setting(_ARCHIVE_DISK_KEY, None)
+    value, stamp = 0, 0.0
+    if isinstance(cached, dict):
+        try:
+            value = int(cached.get("bytes") or 0)
+            stamp = float(cached.get("ts") or 0)
+        except (ValueError, TypeError):
+            value, stamp = 0, 0.0
+    if time.time() - stamp > _ARCHIVE_DISK_TTL_S:
+        _start_archive_scan(svc)
+    if not value:
+        # кэша ещё нет — показываем логический объём из индекса (без обхода ФС)
+        value = int(svc.db.sum_message_bytes() or 0)
+    return value
+
+
+def _start_archive_scan(svc) -> None:
+    """Запустить фоновый пересчёт размера архива (не более одного за раз)."""
+    global _archive_scanning
+    with _archive_scan_lock:
+        if _archive_scanning:
+            return
+        _archive_scanning = True
+
+    def _run() -> None:
+        global _archive_scanning
+        try:
+            size = _dir_size(svc.cfg.mail_root)
+            svc.db.set_setting(_ARCHIVE_DISK_KEY, {"bytes": size, "ts": time.time()})
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            with _archive_scan_lock:
+                _archive_scanning = False
+
+    threading.Thread(target=_run, name="archive-disk-scan", daemon=True).start()
+
+
 # ===========================================================================
 #  СИСТЕМНАЯ АНАЛИТИКА
 # ===========================================================================
 def system_analytics(svc, account_id: Optional[int] = None, *, days: int = 90) -> Dict:
+    """Системная аналитика; при заданном account_id — строго по одному ящику.
+
+    Раньше при фильтре скоупились только письма/объём/папки/прогоны, а задания,
+    экспорты, восстановления, расписания, активность, безопасность и аудит
+    считались по ВСЕЙ системе — на карточке «Аналитика ящика N» чужие задания и
+    экспорты выглядели как свои. Теперь по ящику фильтруется всё, у чего есть
+    привязка к ящику. Блоки, у которых её нет по смыслу (пользователи
+    веб-интерфейса), при фильтрации не считаются: ключи остаются на месте, но
+    значения пустые — см. ниже «Пользователи и безопасность».
+    """
     db = svc.db
     accounts = db.list_accounts()
     if account_id is not None:
         accounts = [a for a in accounts if a.id == account_id]
+    # ящик, по которому идёт разрез (None — разрез по всей системе)
+    scoped = accounts[0] if (account_id is not None and accounts) else None
 
     # --- Хранилище и ящики ---
     total_messages = db.count_messages(account_id)
@@ -154,7 +232,7 @@ def system_analytics(svc, account_id: Optional[int] = None, *, days: int = 90) -
     jobs_by_status: Counter = Counter()
     jobs_by_type: Counter = Counter()
     jobs_type_status: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
-    for r in db.jobs_type_status_counts():
+    for r in db.jobs_type_status_counts(account_id):
         jobs_by_status[r["status"]] += r["c"]
         jobs_by_type[r["type"]] += r["c"]
         jobs_type_status[r["type"]][r["status"]] += r["c"]
@@ -164,13 +242,13 @@ def system_analytics(svc, account_id: Optional[int] = None, *, days: int = 90) -
     success_rate = round(100.0 * succeeded / terminal, 1) if terminal else None
     durations = [{"type": r["type"], "type_label": JobType.LABELS.get(r["type"], r["type"]),
                   "count": r["c"], "avg_s": round(r["avg_s"] or 0, 1), "max_s": round(r["max_s"] or 0, 1)}
-                 for r in db.jobs_duration_by_type()]
+                 for r in db.jobs_duration_by_type(account_id)]
     durations.sort(key=lambda x: x["count"], reverse=True)
 
     # --- Прогоны (backup/restore/…): суммарно и по типам ---
     rt = db.runs_totals(account_id)
     runs_type_status: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
-    for r in db.runs_type_status_counts():
+    for r in db.runs_type_status_counts(account_id):
         runs_type_status[r["type"]][r["status"]] += r["c"]
 
     # --- Экспорты / восстановления ---
@@ -179,16 +257,16 @@ def system_analytics(svc, account_id: Optional[int] = None, *, days: int = 90) -
     exp_by_status: Counter = Counter()
     exp_bytes = 0
     exp_total = 0
-    for r in db.exports_stats():
+    for r in db.exports_stats(account_id):
         exp_by_format[r["format"]] += r["c"]
         exp_by_engine[r["engine"]] += r["c"]
         exp_by_status[r["status"]] += r["c"]
         exp_bytes += r["bytes"] or 0
         exp_total += r["c"]
-    restores = db.restores_totals()
+    restores = db.restores_totals(account_id)
 
     # --- Расписания ---
-    schedules = db.list_schedules()
+    schedules = db.list_schedules(account_id)
     sched_by_type: Counter = Counter()
     sched_enabled = 0
     upcoming = []
@@ -206,18 +284,28 @@ def system_analytics(svc, account_id: Optional[int] = None, *, days: int = 90) -
     upcoming.sort(key=lambda x: x["next_run"] or "")
 
     # --- Активность по дням ---
-    series = db.daily_series(days=days)
+    series = db.daily_series(days=days, account_id=account_id)
     activity = [{"day": r["day"], "messages": r["messages"] or 0, "bytes": r["bytes"] or 0,
                  "jobs": r["jobs"] or 0, "errors": r["errors"] or 0} for r in series][::-1]
 
     # --- Пользователи и безопасность ---
-    users_roles = {r["role"]: r["c"] for r in db.users_by_role()}
+    # Сессии и неудачные входы у ящика свои: сессии с его account_id и попытки
+    # входа под его логином. А пользователи веб-интерфейса к ящику отношения не
+    # имеют — в разрезе по ящику список остаётся пустым (ключи не убираем, чтобы
+    # не ломать структуру ответа).
     since = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
-    login_failures_24h = db.count_login_failures_since(since)
-    active_sessions = db.count_active_sessions()
+    if account_id is None:
+        users_roles = {r["role"]: r["c"] for r in db.users_by_role()}
+        login_failures_24h = db.count_login_failures_since(since)
+    else:
+        users_roles = {}
+        login_failures_24h = db.count_login_failures_since(since, username=scoped.username) if scoped else 0
+    active_sessions = db.count_active_sessions(account_id)
 
     # --- Аудит: топ действий ---
-    audit_actions = [{"label": r["action"], "value": r["c"]} for r in db.audit_action_counts(15)]
+    audit_actions = [{"label": r["action"], "value": r["c"]}
+                     for r in db.audit_action_counts(15, account_id=account_id,
+                                                     account_name=(scoped.name if scoped else None))]
 
     # --- Диск / размеры на диске ---
     disk_free = 0
@@ -233,11 +321,12 @@ def system_analytics(svc, account_id: Optional[int] = None, *, days: int = 90) -
     except OSError:
         db_size = 0
     if account_id is None:
-        archive_disk = _dir_size(svc.cfg.mail_root)
+        # без обхода ФС в обработчике запроса: кэш или логический объём индекса
+        archive_disk = archive_disk_size(svc)
 
     return {
         "scope": {"account_id": account_id,
-                  "account_name": (accounts[0].name if account_id is not None and accounts else None)},
+                  "account_name": (scoped.name if scoped else None)},
         "overview": {
             "accounts_total": len(accounts), "accounts_enabled": enabled,
             "messages": total_messages, "bytes": total_bytes, "bytes_h": human_size(total_bytes),
@@ -492,13 +581,25 @@ def deep_scan(svc, account_id: Optional[int] = None,
     from .mailview import parse_message
 
     db = svc.db
-    if account_id is not None:
-        rows = list(db.list_messages(account_id, limit=1_000_000))
-    else:
-        rows = []
-        for a in db.list_accounts():
-            rows.extend(db.list_messages(a.id, limit=1_000_000))
-    total = len(rows)
+    # Обходим индекс ПОСТРАНИЧНО. Единым запросом с limit=1_000_000 брать нельзя:
+    # list_messages сортирует по дате (ORDER BY internaldate DESC), поэтому на
+    # больших ящиках в выборку попадали бы только самые новые письма, а самые
+    # старые молча выпадали бы из анализа. Заодно не держим весь индекс в памяти.
+    account_ids = [account_id] if account_id is not None else [a.id for a in db.list_accounts()]
+    total = sum(db.count_messages(aid) for aid in account_ids)
+
+    def _iter_rows():
+        for aid in account_ids:
+            offset = 0
+            while True:
+                page = db.list_messages(aid, limit=_SCAN_PAGE_SIZE, offset=offset)
+                if not page:
+                    break
+                for row in page:
+                    yield row
+                if len(page) < _SCAN_PAGE_SIZE:
+                    break
+                offset += _SCAN_PAGE_SIZE
 
     ext_counter: Counter = Counter()
     ctype_counter: Counter = Counter()
@@ -514,7 +615,7 @@ def deep_scan(svc, account_id: Optional[int] = None,
     scanned = 0
     errors = 0
 
-    for i, row in enumerate(rows, 1):
+    for i, row in enumerate(_iter_rows(), 1):
         if cancel_cb and cancel_cb():
             from .errors import JobCancelled
             raise JobCancelled("Глубокий анализ отменён пользователем.")
@@ -561,6 +662,9 @@ def deep_scan(svc, account_id: Optional[int] = None,
                 if w in STOPWORDS or w.isdigit():
                     continue
                 body_words[w] += 1
+            # периодически усекаем словарь частот, чтобы он не рос бесконечно
+            if len(body_words) > _WORDS_SOFT_LIMIT:
+                body_words = Counter(dict(body_words.most_common(_WORDS_KEEP)))
         if progress_cb and (i % 25 == 0 or i == total):
             progress_cb(i, total, f"Анализ письма {i}/{total}")
 

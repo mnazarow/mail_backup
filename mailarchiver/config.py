@@ -122,6 +122,10 @@ def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any
     for key, value in (override or {}).items():
         if key in result and isinstance(result[key], dict) and isinstance(value, dict):
             result[key] = _deep_merge(result[key], value)
+        elif value is None and isinstance(result.get(key), dict):
+            # Пустая секция в YAML («storage:» без тела) даёт None — не затираем
+            # ею словарь значений по умолчанию, иначе запуск падает с AttributeError.
+            continue
         else:
             result[key] = value
     return result

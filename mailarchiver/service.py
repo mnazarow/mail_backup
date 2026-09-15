@@ -86,7 +86,7 @@ class Services:
         return ConnectOptions(
             connect_timeout_s=int(self.rt("backup", "connect_timeout_s")),
             socket_timeout_s=int(self.rt("backup", "socket_timeout_s")),
-            verify_ssl=bool(self.db.get_setting("security.imap_ssl_verify", True)),
+            verify_ssl=bool(self.rt("security", "imap_ssl_verify")),
             fetch_batch_size=int(self.rt("backup", "fetch_batch_size")),
         )
 
@@ -103,9 +103,12 @@ class Services:
         count = 0
         for row in rows:
             idate = row["internaldate"] or ""
-            if date_from and idate and idate < date_from:
+            # Сравниваем только календарные даты: internaldate хранится полной
+            # меткой времени («2026-09-15T12:00:00+00:00»), а границы задаются
+            # днём («2026-09-15») — иначе терялся бы весь последний день.
+            if date_from and idate and idate[:10] < date_from[:10]:
                 continue
-            if date_to and idate and idate > date_to:
+            if date_to and idate and idate[:10] > date_to[:10]:
                 continue
             try:
                 raw = self.store.read_message(account_id, row["stored_path"])
@@ -130,7 +133,8 @@ class Services:
             return self.db.count_messages(account_id)
         total = 0
         for fld in folders:
-            total += len(self.db.list_messages(account_id, folder=fld, limit=1_000_000))
+            # COUNT(*) в БД вместо выборки всех строк ради len()
+            total += self.db.count_folder_messages(account_id, fld)
         return total
 
     # -- удобные фабрики -----------------------------------------------------

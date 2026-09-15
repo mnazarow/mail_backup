@@ -11,7 +11,8 @@ from __future__ import annotations
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
+from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -21,6 +22,7 @@ from ..errors import MailArchiverError
 from ..logging_setup import get_logger, setup_logging
 from ..service import Services
 from ..version import __version__, APP_TITLE
+from . import auth as auth_mod
 from .api import router as api_router
 from .ws import router as ws_router
 
@@ -83,14 +85,27 @@ async def lifespan(app: FastAPI):
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title=APP_TITLE, version=__version__, lifespan=lifespan, docs_url="/api/docs",
-                  openapi_url="/api/openapi.json")
+    # Встроенные маршруты документации отключены: /api/docs, /api/openapi.json и
+    # /redoc отдавали полную схему API кому угодно без входа. Ниже они заведены
+    # заново — под правами администратора.
+    app = FastAPI(title=APP_TITLE, version=__version__, lifespan=lifespan,
+                  docs_url=None, redoc_url=None, openapi_url=None)
 
     if os.path.isdir(STATIC_DIR):
         app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
     app.include_router(api_router)
     app.include_router(ws_router)
+
+    # --- документация API (только администратор) ---
+    @app.get("/api/openapi.json", include_in_schema=False)
+    async def openapi_schema(user: dict = Depends(auth_mod.require_admin)):
+        return JSONResponse(app.openapi())
+
+    @app.get("/api/docs", include_in_schema=False)
+    async def api_docs(user: dict = Depends(auth_mod.require_admin)):
+        return get_swagger_ui_html(openapi_url="/api/openapi.json",
+                                   title=f"{APP_TITLE} — API")
 
     # --- обработчики ошибок ---
     @app.exception_handler(MailArchiverError)

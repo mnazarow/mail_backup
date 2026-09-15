@@ -22,10 +22,15 @@ from __future__ import annotations
 
 import email
 import email.utils
+import os
+import re
+import shutil
 import struct
+import tempfile
 import time
 from email.header import decode_header, make_header
-from typing import Dict, Iterable, List, Optional, Tuple
+from html import unescape
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 from ..errors import PstEngineError
 from ..logging_setup import get_logger
@@ -83,11 +88,29 @@ _FILETIME_EPOCH_DIFF = 11644473600
 # заголовки автоматически обрезаются под этот бюджет (см. _message_props).
 MAX_PC_BLOCK = 8000
 
+# Верхние границы, с которых начинается подбор длин (см. _message_props).
+# Смысл только в том, чтобы не гонять бинарный поиск по мегабайтному телу:
+# в блок всё равно влезает несколько тысяч символов.
+BODY_SCAN_LIMIT = 20000
+HEADERS_SCAN_LIMIT = 10000
+# Сколько символов заголовков стараемся сохранить, когда ради тела письма
+# заголовки приходится ужимать.
+HEADERS_FLOOR = 400
+CUT_MARK = "\n\n[…текст письма обрезан для native-PST; полная копия — в экспорте eml…]"
+
 
 def _sig(ib: int, bid: int) -> int:
     """Блочная/страничная сигнатура wSig (MS-PST 5.5)."""
     x = (ib ^ bid) & 0xFFFFFFFF
     return ((x >> 16) ^ x) & 0xFFFF
+
+
+def _unlink_quiet(path: str) -> None:
+    """Удалить файл, если он есть; отсутствие файла и ошибки ФС игнорируем."""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
 
 def _to_filetime(epoch: Optional[float]) -> int:
@@ -103,6 +126,38 @@ def _decode_hdr(value: str) -> str:
         return str(make_header(decode_header(value)))
     except Exception:  # noqa: BLE001
         return value
+
+
+def _part_text(part) -> str:
+    """Текст MIME-части с устойчивым декодированием (кодировка может врать)."""
+    payload = part.get_payload(decode=True) or b""
+    charset = part.get_content_charset() or "utf-8"
+    try:
+        return payload.decode(charset, "replace")
+    except (LookupError, UnicodeDecodeError):
+        return payload.decode("utf-8", "replace")
+
+
+_RE_SCRIPT = re.compile(r"(?is)<(script|style)[^>]*>.*?</\1\s*>")
+_RE_BREAK = re.compile(r"(?i)<br\s*/?>|</p\s*>|</div\s*>|</tr\s*>|<li[^>]*>")
+_RE_TAG = re.compile(r"(?s)<[^>]*>")
+
+
+def html_to_text(html_src: str) -> str:
+    """
+    Грубо снять HTML-теги. Точность не нужна: задача — чтобы у письма без
+    text/plain тело в .pst не оказалось пустым (native — упрощённый экспорт,
+    полная копия доступна в eml/mbox).
+    """
+    if not html_src:
+        return ""
+    text = _RE_SCRIPT.sub(" ", html_src)
+    text = _RE_BREAK.sub("\n", text)
+    text = _RE_TAG.sub("", text)
+    text = unescape(text)
+    text = re.sub(r"[ \t\x0b\f\r]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 class _Heap:
@@ -182,6 +237,39 @@ def build_pc_block(props: List[Tuple[int, int, object]]) -> bytes:
         raise PstEngineError("native PST: свойства письма не помещаются в один блок.",
                              code="pst_engine_error")
     return data
+
+
+def _build_or_none(props: List[Tuple[int, int, object]]) -> Optional[bytes]:
+    """build_pc_block, но «не влезло в блок» -> None (а не исключение)."""
+    try:
+        return build_pc_block(props)
+    except PstEngineError:
+        return None
+
+
+def _fit_longest(make_props: Callable[[int], List[Tuple[int, int, object]]], hi: int) -> Tuple[Optional[bytes], int]:
+    """
+    Подобрать бинарным поиском НАИБОЛЬШУЮ длину n ∈ [0, hi], при которой блок PC
+    ещё укладывается в бюджет MAX_PC_BLOCK. ``make_props(n)`` собирает свойства
+    для длины n; размер блока растёт вместе с n, поэтому поиск корректен.
+
+    Деление пополам («не влезло — режем вдвое») недопустимо: оно перелетает мимо
+    и оставляет половину бюджета блока пустой.
+
+    Возвращает (готовый блок, n) либо (None, -1), если не влезает даже n = 0.
+    """
+    lo = 0
+    best_data: Optional[bytes] = None
+    best_n = -1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        data = _build_or_none(make_props(mid))
+        if data is None:
+            hi = mid - 1
+        else:
+            best_data, best_n = data, mid
+            lo = mid + 1
+    return best_data, best_n
 
 
 class _Node:
@@ -288,7 +376,8 @@ class PstWriter:
             level += 1
         return pages[0][1], pages[0][2]
 
-    def write(self) -> bytes:
+    def build(self) -> bytearray:
+        """Собрать файл целиком в буфер. Возвращается САМ буфер, без копии."""
         self._buf = bytearray(512)  # заголовок (заполним в конце)
         ib = 512
         bbt_leaves: List[tuple] = []  # (bid, entry_bytes)
@@ -312,7 +401,20 @@ class PstWriter:
         file_eof = len(self._buf)
         header = self._build_header(nbt_bid, nbt_ib, bbt_bid, bbt_ib, file_eof)
         self._buf[0:len(header)] = header
-        return bytes(self._buf)
+        return self._buf
+
+    def write_to(self, path: str) -> int:
+        """
+        Записать собранный PST в файл. Возвращает размер файла.
+
+        bytearray пишется в файл напрямую: bytes(self._buf) сделал бы ещё одну
+        полную копию уже собранного файла в памяти (на крупном ящике — лишние
+        сотни мегабайт на ровном месте).
+        """
+        buf = self.build()
+        with open(path, "wb") as fh:
+            fh.write(buf)
+        return len(buf)
 
     def _build_header(self, nbt_bid: int, nbt_ib: int, bbt_bid: int, bbt_ib: int, file_eof: int) -> bytes:
         h = bytearray(512)
@@ -350,6 +452,29 @@ class PstWriter:
 # ---------------------------------------------------------------------------
 #  Высокоуровневый движок экспорта
 # ---------------------------------------------------------------------------
+class _Spooled:
+    """
+    Лёгкая запись об одном письме: тело сброшено во временный файл (spool), в
+    памяти остаются только метаданные и путь к нему.
+
+    Держать сырые байты всех писем в списке нельзя: на ящике в десятки
+    гигабайт столько же уйдёт в оперативную память. Тело читается обратно
+    ровно в тот момент, когда нужно собрать узел письма, и тут же забывается.
+    """
+
+    __slots__ = ("folder", "key", "path", "size", "flags", "internaldate", "message_id")
+
+    def __init__(self, folder: str, key: str, path: str, size: int,
+                 flags: List[str], internaldate: Optional[float], message_id: str) -> None:
+        self.folder = folder
+        self.key = key                 # путь папки внутри PST («Work/2024»)
+        self.path = path               # файл со сырым телом письма
+        self.size = size
+        self.flags = flags
+        self.internaldate = internaldate
+        self.message_id = message_id
+
+
 class NativePstExportEngine(ExportEngine):
     name = "native"
     fmt = "pst"
@@ -359,17 +484,18 @@ class NativePstExportEngine(ExportEngine):
     def available(cls):
         return True, ""
 
-    def _folder_props(self, name: str, count: int) -> bytes:
+    def _folder_props(self, name: str, count: int, has_subfolders: bool) -> bytes:
         return build_pc_block([
             (TAG_DISPLAY_NAME, PT_STRING, name),
             (TAG_CONTENT_COUNT, PT_INT32, count),
             (TAG_CONTENT_UNREAD, PT_INT32, 0),
-            (TAG_SUBFOLDERS, PT_BOOL, 0),
+            (TAG_SUBFOLDERS, PT_BOOL, 1 if has_subfolders else 0),
         ])
 
-    def _message_props(self, item: MailItem) -> bytes:
+    def _message_props(self, raw: bytes, internaldate: Optional[float]) -> Tuple[bytes, bool]:
+        """Блок свойств письма. Возвращает (блок PC, обрезано ли тело)."""
         try:
-            msg = email.message_from_bytes(item.raw)
+            msg = email.message_from_bytes(raw)
         except Exception:  # noqa: BLE001
             msg = None
         subject = _decode_hdr(msg.get("Subject", "")) if msg else ""
@@ -378,7 +504,7 @@ class NativePstExportEngine(ExportEngine):
         cc_hdr = _decode_hdr(msg.get("Cc", "")) if msg else ""
         sender_name, sender_email = email.utils.parseaddr(from_hdr)
         body = self._extract_body(msg) if msg else ""
-        headers_blob = item.raw.split(b"\r\n\r\n", 1)[0].split(b"\n\n", 1)[0]
+        headers_blob = raw.split(b"\r\n\r\n", 1)[0].split(b"\n\n", 1)[0]
         try:
             headers_text = headers_blob.decode("utf-8", "replace")
         except Exception:  # noqa: BLE001
@@ -395,52 +521,72 @@ class NativePstExportEngine(ExportEngine):
                 (TAG_DISPLAY_TO, PT_STRING, to_hdr[:500]),
                 (TAG_DISPLAY_CC, PT_STRING, cc_hdr[:500]),
                 (TAG_TRANSPORT_HEADERS, PT_STRING, headers_txt),
-                (TAG_DELIVERY_TIME, PT_TIME, item.internaldate),
-                (TAG_SUBMIT_TIME, PT_TIME, item.internaldate),
+                (TAG_DELIVERY_TIME, PT_TIME, internaldate),
+                (TAG_SUBMIT_TIME, PT_TIME, internaldate),
                 (TAG_MESSAGE_FLAGS, PT_INT32, 1),  # MSGFLAG_READ
             ]
 
         # Тело и заголовки в UTF-16LE занимают вдвое больше байт, а весь узел
-        # должен поместиться в один блок. Подбираем длины так, чтобы блок влез в
-        # бюджет: сперва укорачиваем тело, затем заголовки (native — упрощённый
-        # экспорт; для полной точности используйте Aspose или экспорт eml).
-        body = body[:20000]
-        headers_text = headers_text[:10000]
-        cut = ""
-        for _ in range(40):
-            try:
-                return build_pc_block(make(body + cut, headers_text))
-            except PstEngineError:
-                if len(body) > 300:
-                    body = body[: max(300, len(body) // 2)]
-                    cut = "\n\n[…текст письма обрезан для native-PST; полная копия — в экспорте eml…]"
-                elif len(headers_text) > 200:
-                    headers_text = headers_text[: len(headers_text) // 2]
-                else:
-                    # крайний случай — минимальный набор свойств
-                    return build_pc_block([
-                        (TAG_MESSAGE_CLASS, PT_STRING, "IPM.Note"),
-                        (TAG_SUBJECT, PT_STRING, (subject or "(без темы)")[:200]),
-                        (TAG_BODY, PT_STRING, (body[:200] + " […обрезано…]")),
-                        (TAG_DELIVERY_TIME, PT_TIME, item.internaldate),
-                        (TAG_MESSAGE_FLAGS, PT_INT32, 1),
-                    ])
-        # теоретически недостижимо
-        return build_pc_block(make(body[:300], ""))
+        # должен поместиться в один блок. Порядок жертв: сначала служебные
+        # заголовки, тело письма режем в последнюю очередь и ровно настолько,
+        # чтобы выбрать бюджет блока целиком (native — упрощённый экспорт; для
+        # полной точности используйте Aspose или экспорт eml).
+        body = body[:BODY_SCAN_LIMIT]
+        headers_text = headers_text[:HEADERS_SCAN_LIMIT]
+
+        # 1) всё целиком
+        block = _build_or_none(make(body, headers_text))
+        if block is not None:
+            return block, False
+
+        # 2) ужимаем заголовки: ищем их наибольшую длину, при которой ПОЛНОЕ
+        #    тело письма ещё помещается в блок
+        block, _n = _fit_longest(lambda n: make(body, headers_text[:n]), len(headers_text))
+        if block is not None:
+            return block, False
+
+        # 3) тело не влезает даже без заголовков — оставляем заголовкам минимум
+        #    и подбираем длину тела под весь оставшийся бюджет
+        headers_text = headers_text[:HEADERS_FLOOR]
+        block, _n = _fit_longest(lambda n: make(body[:n] + CUT_MARK, headers_text),
+                                 max(0, len(body) - 1))
+        if block is not None:
+            return block, True
+
+        # 4) крайний случай (гигантские тема/адресаты) — минимальный набор свойств
+        block, _n = _fit_longest(lambda n: [
+            (TAG_MESSAGE_CLASS, PT_STRING, "IPM.Note"),
+            (TAG_SUBJECT, PT_STRING, (subject or "(без темы)")[:200]),
+            (TAG_BODY, PT_STRING, body[:n] + CUT_MARK),
+            (TAG_DELIVERY_TIME, PT_TIME, internaldate),
+            (TAG_MESSAGE_FLAGS, PT_INT32, 1),
+        ], min(len(body), 200))
+        if block is None:
+            raise PstEngineError("native PST: свойства письма не помещаются в один блок.",
+                                 code="pst_engine_error")
+        return block, True
 
     @staticmethod
     def _extract_body(msg) -> str:
         try:
             if msg.is_multipart():
+                html_body = ""
                 for part in msg.walk():
-                    if part.get_content_type() == "text/plain" and "attachment" not in str(part.get("Content-Disposition", "")):
-                        payload = part.get_payload(decode=True) or b""
-                        charset = part.get_content_charset() or "utf-8"
-                        return payload.decode(charset, "replace")
-                return ""
-            payload = msg.get_payload(decode=True) or b""
-            charset = msg.get_content_charset() or "utf-8"
-            return payload.decode(charset, "replace")
+                    if part.is_multipart():
+                        continue
+                    if "attachment" in str(part.get("Content-Disposition", "")):
+                        continue
+                    ctype = part.get_content_type()
+                    if ctype == "text/plain":
+                        return _part_text(part)
+                    if ctype == "text/html" and not html_body:
+                        html_body = _part_text(part)
+                # text/plain нет (обычное письмо «HTML + картинки внутри») —
+                # берём HTML и грубо снимаем теги, иначе письмо ушло бы в .pst
+                # с пустым телом и без единой ошибки.
+                return html_to_text(html_body) if html_body else ""
+            text = _part_text(msg)
+            return html_to_text(text) if msg.get_content_type() == "text/html" else text
         except Exception:  # noqa: BLE001
             return ""
 
@@ -452,56 +598,145 @@ class NativePstExportEngine(ExportEngine):
                                       "Обязательно проверьте открытие в вашей версии Outlook. "
                                       "Для гарантированного результата используйте движок Aspose или экспорт eml/mbox.")
         writer = PstWriter()
-        # Узел «хранилище сообщений»
-        writer.add_node(NID_MESSAGE_STORE, 0, self._store_props())
-        # Корневая папка
-        writer.add_node(NID_ROOT_FOLDER, NID_MESSAGE_STORE, self._folder_props("Верхний уровень PST", 0))
-
-        folder_nids: Dict[str, int] = {"": NID_ROOT_FOLDER}
-        materialized: List[MailItem] = list(items)
-        # создать узлы папок
-        for folder in sorted({folder_to_fs(i.folder).replace("\\", "/") for i in materialized}):
-            parts = folder.split("/")
-            accum = ""
-            parent = NID_ROOT_FOLDER
-            for part in parts:
-                accum = f"{accum}/{part}" if accum else part
-                if accum not in folder_nids:
-                    nid = writer.new_folder_nid()
-                    writer.add_node(nid, parent, self._folder_props(part, 0))
-                    folder_nids[accum] = nid
-                parent = folder_nids[accum]
-
-        # создать узлы писем
-        for item in materialized:
-            if cancel_cb and cancel_cb():
-                result.cancelled = True
-                break
-            key = folder_to_fs(item.folder).replace("\\", "/")
-            parent = folder_nids.get(key, NID_ROOT_FOLDER)
-            nid = writer.new_message_nid()
-            try:
-                writer.add_node(nid, parent, self._message_props(item))
-                result.count += 1
-                result.bytes_written += len(item.raw)
-            except PstEngineError as exc:
-                result.errors += 1
-                result.error_details.append(str(exc))
-            if progress_cb and result.count % 20 == 0:
-                progress_cb(result.count, total_hint, f"PST(native): {result.count}")
-
+        spool_dir = self._make_spool_dir(options)
+        truncated = 0
+        cancelled = False
         try:
-            data = writer.write()
-        except PstEngineError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            raise PstEngineError(f"Ошибка сборки PST (native): {exc}", cause=exc) from exc
+            # --- проход 1: тела писем на диск, в памяти — только лёгкие записи
+            spooled: List[_Spooled] = []
+            counts: Dict[str, int] = {}
+            for item in items:
+                if cancel_cb and cancel_cb():
+                    cancelled = True
+                    break
+                key = folder_to_fs(item.folder).replace("\\", "/")
+                path = os.path.join(spool_dir, f"{len(spooled):08d}.eml")
+                try:
+                    with open(path, "wb") as fh:
+                        fh.write(item.raw)
+                except OSError as exc:
+                    result.errors += 1
+                    result.error_details.append(
+                        f"{item.folder}: не удалось сохранить тело во временный файл: {exc}")
+                    continue
+                spooled.append(_Spooled(item.folder, key, path, item.size or len(item.raw),
+                                        list(item.flags or []), item.internaldate, item.message_id))
+                counts[key] = counts.get(key, 0) + 1
 
-        with open(out_path, "wb") as fh:
-            fh.write(data)
-        result.bytes_written = len(data)
+            if cancelled:
+                return self._cancelled_result(result, out_path, progress_cb, total_hint)
+
+            # --- узлы папок: строятся по лёгким записям, тела для этого не нужны
+            # Полный список папок (вместе с промежуточными уровнями).
+            paths: set = set()
+            for key in counts:
+                accum = ""
+                for part in key.split("/"):
+                    accum = f"{accum}/{part}" if accum else part
+                    paths.add(accum)
+            # У какой папки есть подпапки (признак PidTagSubfolders).
+            has_sub = {p: False for p in paths}
+            root_has_sub = False
+            for p in paths:
+                parent_path = p.rsplit("/", 1)[0] if "/" in p else ""
+                if parent_path:
+                    has_sub[parent_path] = True
+                else:
+                    root_has_sub = True
+
+            # Узел «хранилище сообщений»
+            writer.add_node(NID_MESSAGE_STORE, 0, self._store_props())
+            # Корневая папка
+            writer.add_node(NID_ROOT_FOLDER, NID_MESSAGE_STORE,
+                            self._folder_props("Верхний уровень PST", counts.get("", 0), root_has_sub))
+
+            folder_nids: Dict[str, int] = {"": NID_ROOT_FOLDER}
+            # sorted(): родитель — префикс потомка, поэтому всегда идёт раньше него
+            for accum in sorted(paths):
+                parent_path = accum.rsplit("/", 1)[0] if "/" in accum else ""
+                name = accum.rsplit("/", 1)[-1]
+                nid = writer.new_folder_nid()
+                writer.add_node(nid, folder_nids.get(parent_path, NID_ROOT_FOLDER),
+                                self._folder_props(name, counts.get(accum, 0), has_sub.get(accum, False)))
+                folder_nids[accum] = nid
+
+            # --- проход 2: узлы писем (тело читается обратно по одному)
+            for rec in spooled:
+                if cancel_cb and cancel_cb():
+                    cancelled = True
+                    break
+                parent = folder_nids.get(rec.key, NID_ROOT_FOLDER)
+                nid = writer.new_message_nid()
+                try:
+                    props, was_cut = self._props_from_spool(rec)
+                    writer.add_node(nid, parent, props)
+                    result.count += 1
+                    result.bytes_written += rec.size
+                    if was_cut:
+                        truncated += 1
+                except PstEngineError as exc:
+                    result.errors += 1
+                    result.error_details.append(str(exc))
+                except OSError as exc:
+                    result.errors += 1
+                    result.error_details.append(f"{rec.folder}: временный файл недоступен: {exc}")
+                if progress_cb and result.count % 20 == 0:
+                    progress_cb(result.count, total_hint, f"PST(native): {result.count}")
+
+            if cancelled:
+                return self._cancelled_result(result, out_path, progress_cb, total_hint)
+
+            if truncated:
+                # одной сводной строкой, а не по строке на письмо
+                result.error_details.append(
+                    f"Тело обрезано под лимит блока native-PST у писем: {truncated}. "
+                    f"Полная копия писем доступна в экспорте eml/mbox.")
+
+            try:
+                result.bytes_written = writer.write_to(out_path)
+            except PstEngineError:
+                _unlink_quiet(out_path)          # недописанный файл не оставляем
+                raise
+            except Exception as exc:  # noqa: BLE001
+                _unlink_quiet(out_path)
+                raise PstEngineError(f"Ошибка сборки PST (native): {exc}", cause=exc) from exc
+        finally:
+            # временные файлы удаляем всегда: и при ошибке, и при отмене
+            shutil.rmtree(spool_dir, ignore_errors=True)
+
         if progress_cb:
             progress_cb(result.count, total_hint or result.count, "PST(native): готово")
+        return result
+
+    def _props_from_spool(self, rec: "_Spooled") -> Tuple[bytes, bool]:
+        """
+        Прочитать тело письма из временного файла и собрать блок свойств.
+
+        Тело живёт только внутри этого вызова: на выходе остаётся готовый блок
+        (не больше MAX_PC_BLOCK), а сырые байты письма сразу освобождаются.
+        """
+        with open(rec.path, "rb") as fh:
+            raw = fh.read()
+        return self._message_props(raw, rec.internaldate)
+
+    @staticmethod
+    def _make_spool_dir(options: Optional[dict]) -> str:
+        """Каталог для временных тел писем (рядом с прочими временными файлами)."""
+        tmp_dir = (options or {}).get("tmp_dir") or tempfile.gettempdir()
+        try:
+            os.makedirs(tmp_dir, exist_ok=True)
+        except OSError:
+            tmp_dir = tempfile.gettempdir()
+        return tempfile.mkdtemp(prefix="pstspool_", dir=tmp_dir)
+
+    @staticmethod
+    def _cancelled_result(result: ExportResult, out_path: str,
+                          progress_cb: Optional[ProgressCB], total_hint: int) -> ExportResult:
+        """Отмена: недоделанный .pst не должен остаться мусором в каталоге экспортов."""
+        _unlink_quiet(out_path)
+        result.bytes_written = 0
+        if progress_cb:
+            progress_cb(result.count, total_hint or result.count, "PST(native): отменено")
         return result
 
     def _store_props(self) -> bytes:

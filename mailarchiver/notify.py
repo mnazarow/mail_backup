@@ -64,6 +64,20 @@ class Notifier:
         msg["Subject"] = subject
         msg.set_content(body)
 
+        security = str(security or "").strip().lower()
+        if user and security not in ("ssl", "starttls"):
+            # Иначе пароль ушёл бы на сервер открытым текстом (например при
+            # опечатке в настройке: «tls», «none» и т.п.).
+            log.warning(
+                "Уведомление не отправлено: SMTP-аутентификация по незашифрованному каналу "
+                "запрещена (notifications.smtp_security=%r).", security
+            )
+            raise RuntimeError(
+                "SMTP-аутентификация по незашифрованному каналу запрещена. "
+                "Укажите notifications.smtp_security = 'ssl' или 'starttls' "
+                "(либо уберите имя пользователя, если сервер не требует входа)."
+            )
+
         ctx = ssl.create_default_context()
         if security == "ssl":
             with smtplib.SMTP_SSL(host, port, context=ctx, timeout=30) as s:

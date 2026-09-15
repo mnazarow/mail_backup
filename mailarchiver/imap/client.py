@@ -9,7 +9,7 @@ import imaplib
 import socket
 import ssl
 from dataclasses import dataclass, field
-from typing import Dict, Iterator, List, Optional
+from typing import Callable, Dict, Iterator, List, Optional, Set
 
 from imapclient import IMAPClient
 from imapclient.exceptions import LoginError
@@ -25,6 +25,22 @@ from ..models import Account, AuthType, Security
 from .oauth import refresh_access_token
 
 log = get_logger("imap")
+
+# Целевой СУММАРНЫЙ объём одной порции FETCH (байты). Порция набирается по
+# размеру писем, а не по их количеству: батч из 200 писем с вложениями по
+# 20-30 МБ забирал бы в память несколько гигабайт за один запрос (OOM).
+FETCH_CHUNK_TARGET_BYTES = 64 * 1024 * 1024
+# Сколько UID спрашивать за один запрос размеров: ответ на (RFC822.SIZE)
+# крошечный, поэтому порция здесь заметно крупнее порции загрузки.
+SIZE_PROBE_BATCH_SIZE = 2000
+# Во что оценивать письмо, размер которого сервер не сообщил. Нужно только
+# для набора порции: без оценки такие письма считались бы «нулевыми» и порция
+# опять набиралась бы одним лишь количеством.
+UNKNOWN_SIZE_ASSUMPTION = 256 * 1024
+
+# Признаки ответа «папка уже существует». Подстрока «exist» для этого не
+# годится: ответ вида `NO [TRYCREATE] Mailbox doesn't exist` — это ОТКАЗ.
+_ALREADY_EXISTS_MARKERS = ("alreadyexists", "already exist", "duplicate folder", "duplicate mailbox")
 
 
 @dataclass
@@ -67,6 +83,55 @@ def _map_exception(exc: BaseException) -> Exception:
     return ImapProtocolError(f"Неожиданная ошибка IMAP: {exc}", cause=exc)
 
 
+def _is_already_exists_error(exc: BaseException) -> bool:
+    """
+    Отличить ответ «папка уже существует» от любого другого отказа CREATE.
+
+    Опираемся на код ответа ALREADYEXISTS (RFC 5530) и явные формулировки
+    серверов. Ответы вроде `NO [TRYCREATE] Mailbox doesn't exist` под это
+    условие НЕ подпадают — глушить их нельзя, иначе все последующие APPEND в
+    эту папку падают без внятной причины.
+    """
+    text = str(exc).lower()
+    return any(marker in text for marker in _ALREADY_EXISTS_MARKERS)
+
+
+def _header_message_id(raw_header) -> str:
+    """Достать значение Message-ID из куска заголовков, отданного сервером."""
+    if not raw_header:
+        return ""
+    if isinstance(raw_header, bytes):
+        text = raw_header.decode("latin-1", "ignore")
+    else:
+        text = str(raw_header)
+    for line in text.splitlines():
+        if line.lower().startswith("message-id:"):
+            return line.split(":", 1)[1].strip()
+    return ""
+
+
+def _plan_size_chunks(uids: List[int], sizes: Dict[int, int], max_count: int,
+                      target_bytes: int) -> Iterator[List[int]]:
+    """
+    Разбить UID на порции по СУММАРНОМУ размеру писем.
+
+    Порция закрывается, когда добавление следующего письма перевалило бы за
+    ``target_bytes``, либо когда в ней уже ``max_count`` писем. Письмо, которое
+    само больше целевого объёма, из-за этого попадает в порцию в одиночку.
+    """
+    chunk: List[int] = []
+    chunk_bytes = 0
+    for uid in uids:
+        size = int(sizes.get(uid) or UNKNOWN_SIZE_ASSUMPTION)
+        if chunk and (len(chunk) >= max_count or chunk_bytes + size > target_bytes):
+            yield chunk
+            chunk, chunk_bytes = [], 0
+        chunk.append(uid)
+        chunk_bytes += size
+    if chunk:
+        yield chunk
+
+
 class ImapConnection:
     """Одно соединение с IMAP-ящиком. Используйте как контекстный менеджер."""
 
@@ -82,7 +147,9 @@ class ImapConnection:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        self.close()
+        # Если выходим из-за ошибки, соединение может быть уже мёртвым —
+        # не тратим время на logout по такому сокету.
+        self.close(force=exc_type is not None)
 
     # -- подключение ---------------------------------------------------------
     def _ssl_context(self) -> ssl.SSLContext:
@@ -92,29 +159,41 @@ class ImapConnection:
             ctx.verify_mode = ssl.CERT_NONE
         return ctx
 
+    def _timeout(self):
+        """
+        Таймауты для самого IMAPClient. Глобальный socket.setdefaulttimeout()
+        использовать нельзя: он меняет таймаут для всего процесса (SMTP, OAuth,
+        HTTP), а подключаемся мы из рабочих потоков.
+        """
+        try:
+            from imapclient import SocketTimeout  # есть не во всех версиях
+            return SocketTimeout(self.opt.connect_timeout_s, self.opt.socket_timeout_s)
+        except ImportError:  # старая/другая версия imapclient — один общий таймаут
+            return self.opt.socket_timeout_s
+
     def connect(self) -> None:
         acc = self.account
-        socket.setdefaulttimeout(self.opt.connect_timeout_s)
+        timeout = self._timeout()
         try:
             if acc.security == Security.SSL:
                 client = IMAPClient(acc.host, port=acc.port or 993, ssl=True,
-                                    ssl_context=self._ssl_context(), timeout=self.opt.socket_timeout_s)
+                                    ssl_context=self._ssl_context(), timeout=timeout)
             else:
-                client = IMAPClient(acc.host, port=acc.port or 143, ssl=False,
-                                    timeout=self.opt.socket_timeout_s)
-                if acc.security == Security.STARTTLS:
-                    client.starttls(self._ssl_context())
+                client = IMAPClient(acc.host, port=acc.port or 143, ssl=False, timeout=timeout)
+            # Запоминаем клиента СРАЗУ после конструктора: если STARTTLS (или
+            # логин) упадёт, close() всё равно закроет уже открытый сокет.
             self.client = client
+            if acc.security == Security.STARTTLS:
+                client.starttls(self._ssl_context())
             self._login()
             log.info("Подключение к ящику «%s» (%s:%s) установлено", acc.name, acc.host, acc.port)
         except (LoginError, ImapAuthError):
             self.close()
             raise
         except Exception as exc:  # noqa: BLE001
-            self.close()
+            # ошибка уровня сети/TLS — сокет наверняка непригоден, рвём сразу
+            self.close(force=True)
             raise _map_exception(exc) from exc
-        finally:
-            socket.setdefaulttimeout(None)
 
     def _login(self) -> None:
         acc = self.account
@@ -135,16 +214,42 @@ class ImapConnection:
                 cause=exc,
             ) from exc
 
-    def close(self) -> None:
-        if self.client is not None:
+    _CLOSE_TIMEOUT_S = 5
+
+    def close(self, *, force: bool = False) -> None:
+        """
+        Закрыть соединение.
+
+        При force=True (или при любой ошибке logout) сокет рвётся сразу через
+        shutdown(), без ожидания ответа сервера. Иначе на разорванном соединении
+        logout() висел бы до socket_timeout_s (до 120 с) при каждом обрыве —
+        поэтому перед logout мы ещё и укорачиваем таймаут сокета.
+        """
+        client = self.client
+        self.client = None
+        if client is None:
+            return
+        if not force:
+            self._shorten_socket_timeout(client)
             try:
-                self.client.logout()
+                client.logout()
+                return
             except Exception:  # noqa: BLE001
-                try:
-                    self.client.shutdown()
-                except Exception:  # noqa: BLE001
-                    pass
-            self.client = None
+                pass  # сервер не ответил или сокет мёртв — закрываем принудительно
+        try:
+            client.shutdown()
+        except Exception:  # noqa: BLE001
+            pass
+
+    @classmethod
+    def _shorten_socket_timeout(cls, client) -> None:
+        """Ограничить ожидание ответа на LOGOUT (best-effort, зависит от версии)."""
+        try:
+            sock = client._imap.sock  # noqa: SLF001
+            if sock is not None:
+                sock.settimeout(cls._CLOSE_TIMEOUT_S)
+        except Exception:  # noqa: BLE001
+            pass
 
     # -- операции ------------------------------------------------------------
     def capabilities(self) -> List[str]:
@@ -194,44 +299,152 @@ class ImapConnection:
         except Exception as exc:  # noqa: BLE001
             raise _map_exception(exc) from exc
 
-    def fetch_messages(self, uids: List[int]) -> Iterator[dict]:
-        """Скачать письма по списку UID (по батчам). Не помечает как прочитанные."""
+    def fetch_sizes(self, uids: List[int]) -> Dict[int, int]:
+        """
+        Спросить у сервера ТОЛЬКО размеры писем: `UID FETCH <uids> (RFC822.SIZE)`.
+
+        Запрос дешёвый (тела не передаются), поэтому его можно сделать до
+        загрузки и заранее отсеять слишком крупные письма. Возвращает
+        {uid: размер}; UID, по которым сервер размер не сообщил, в результат
+        не попадают.
+        """
+        sizes: Dict[int, int] = {}
         if not uids:
-            return
-        batch = max(1, int(self.opt.fetch_batch_size))
+            return sizes
+        batch = max(1, int(SIZE_PROBE_BATCH_SIZE))
         for start in range(0, len(uids), batch):
             chunk = uids[start:start + batch]
             try:
-                data = self.client.fetch(chunk, [b"BODY.PEEK[]", b"FLAGS", b"INTERNALDATE", b"RFC822.SIZE"])
+                data = self.client.fetch(chunk, [b"RFC822.SIZE"])
             except Exception as exc:  # noqa: BLE001
                 raise _map_exception(exc) from exc
-            for uid in chunk:
-                item = data.get(uid)
-                if not item:
+            for uid, item in (data or {}).items():
+                raw_size = (item or {}).get(b"RFC822.SIZE")
+                if raw_size is None:
                     continue
-                raw = item.get(b"BODY[]") or item.get(b"RFC822") or b""
-                if not raw:
+                try:
+                    sizes[int(uid)] = int(raw_size)
+                except (TypeError, ValueError):
                     continue
-                internaldate = item.get(b"INTERNALDATE")
-                epoch = internaldate.timestamp() if internaldate else None
-                flags = [f.decode() if isinstance(f, bytes) else str(f) for f in (item.get(b"FLAGS") or ())]
-                yield {
-                    "uid": uid,
-                    "raw": raw,
-                    "flags": flags,
-                    "internaldate": epoch,
-                    "size": int(item.get(b"RFC822.SIZE", len(raw)) or len(raw)),
-                }
+        return sizes
+
+    def fetch_messages(self, uids: List[int], *, skip_larger_than: int = 0,
+                       on_skipped: Optional[Callable[[int, int], None]] = None) -> Iterator[dict]:
+        """
+        Скачать письма по списку UID. Не помечает их как прочитанные.
+
+        Порядок работы (окнами по ``SIZE_PROBE_BATCH_SIZE`` писем, чтобы не
+        держать в памяти размеры всей папки и не молчать до первого письма):
+          1. дёшево спросить у сервера только размеры (RFC822.SIZE);
+          2. письма больше ``skip_larger_than`` отсеять СРАЗУ, не скачивая —
+             о каждом сообщается вызовом ``on_skipped(uid, size)``;
+          3. остальные качать порциями, которые набираются по СУММАРНОМУ
+             размеру (≈``FETCH_CHUNK_TARGET_BYTES``) и не длиннее
+             ``fetch_batch_size`` писем.
+
+        Контракт наружу прежний: генератор словарей
+        {uid, raw, flags, internaldate, size}.
+        """
+        if not uids:
+            return
+        limit = max(0, int(skip_larger_than or 0))
+        batch = max(1, int(self.opt.fetch_batch_size))
+        target_bytes = max(1, int(FETCH_CHUNK_TARGET_BYTES))
+        window = max(batch, int(SIZE_PROBE_BATCH_SIZE))
+        for wstart in range(0, len(uids), window):
+            window_uids = uids[wstart:wstart + window]
+            sizes = self.fetch_sizes(window_uids)
+            wanted: List[int] = []
+            for uid in window_uids:
+                size = sizes.get(uid)
+                if limit and size is not None and size > limit:
+                    # Ни трафика, ни памяти на заведомо слишком большое письмо.
+                    log.info("Письмо UID %s (%d Б) не скачивается: больше лимита %d Б.", uid, size, limit)
+                    if on_skipped:
+                        on_skipped(uid, size)
+                    continue
+                wanted.append(uid)
+            for chunk in _plan_size_chunks(wanted, sizes, batch, target_bytes):
+                yield from self._fetch_chunk(chunk)
+
+    def _fetch_chunk(self, chunk: List[int]) -> Iterator[dict]:
+        """Скачать одну готовую порцию UID и отдать письма по одному."""
+        if not chunk:
+            return
+        try:
+            data = self.client.fetch(chunk, [b"BODY.PEEK[]", b"FLAGS", b"INTERNALDATE", b"RFC822.SIZE"])
+        except Exception as exc:  # noqa: BLE001
+            raise _map_exception(exc) from exc
+        missing: List[int] = []
+        for uid in chunk:
+            # pop, а не get: отданное письмо сразу перестаёт удерживаться
+            # словарём ответа и освобождает память, не дожидаясь конца порции.
+            item = data.pop(uid, None)
+            if not item:
+                missing.append(uid)
+                continue
+            raw = item.get(b"BODY[]") or item.get(b"RFC822") or b""
+            if not raw:
+                missing.append(uid)
+                continue
+            internaldate = item.get(b"INTERNALDATE")
+            epoch = internaldate.timestamp() if internaldate else None
+            flags = [f.decode() if isinstance(f, bytes) else str(f) for f in (item.get(b"FLAGS") or ())]
+            yield {
+                "uid": uid,
+                "raw": raw,
+                "flags": flags,
+                "internaldate": epoch,
+                "size": int(item.get(b"RFC822.SIZE", len(raw)) or len(raw)),
+            }
+        if missing:
+            # Молча терять письма нельзя: сервер мог их удалить между SEARCH и
+            # FETCH, но так же выглядит и сбой выдачи — пишем в лог.
+            shown = ", ".join(str(u) for u in missing[:20])
+            tail = f" и ещё {len(missing) - 20}" if len(missing) > 20 else ""
+            log.warning("FETCH не вернул %d из %d писем (пропущены): UID %s%s",
+                        len(missing), len(chunk), shown, tail)
 
     # -- запись (для восстановления) ----------------------------------------
     def ensure_folder(self, folder: str) -> None:
+        """
+        Создать папку, если её ещё нет.
+
+        Ответ «папка уже существует» — не ошибка (см. :func:`_is_already_exists_error`),
+        всё остальное ошибка настоящая. После CREATE наличие папки
+        перепроверяется: сервер мог ответить отказом с непривычной
+        формулировкой (хотя папка есть), а мог ответить OK и папку не создать
+        (нет прав, недопустимое имя) — тогда все последующие APPEND падали бы
+        без внятной причины.
+        """
         try:
-            if not self.client.folder_exists(folder):
-                self.client.create_folder(folder)
+            if self.client.folder_exists(folder):
+                return
         except Exception as exc:  # noqa: BLE001
-            # некоторые серверы бросают ошибку, если папка уже есть — игнорируем
-            if "exist" not in str(exc).lower():
-                raise _map_exception(exc) from exc
+            raise _map_exception(exc) from exc
+
+        create_error: Optional[BaseException] = None
+        try:
+            self.client.create_folder(folder)
+        except Exception as exc:  # noqa: BLE001
+            if not _is_already_exists_error(exc):
+                create_error = exc  # вердикт вынесем после перепроверки
+
+        exists: Optional[bool] = None
+        try:
+            exists = bool(self.client.folder_exists(folder))
+        except Exception:  # noqa: BLE001
+            exists = None  # перепроверить не удалось — не мешаем работе
+
+        if exists:
+            return
+        if create_error is not None:
+            raise _map_exception(create_error) from create_error
+        if exists is False:
+            raise ImapProtocolError(
+                f"Папка «{folder}» не создана: сервер принял команду CREATE, но папки на сервере нет.",
+                hint="Проверьте права на создание папок, допустимость имени и разделитель иерархии.",
+            )
 
     def append(self, folder: str, raw: bytes, flags=(), msg_time=None) -> None:
         try:
@@ -239,13 +452,46 @@ class ImapConnection:
         except Exception as exc:  # noqa: BLE001
             raise _map_exception(exc) from exc
 
+    def fetch_existing_message_ids(self, folder: str) -> Set[str]:
+        """
+        Множество Message-ID писем, уже лежащих в папке — ОДНИМ запросом
+        `FETCH 1:* BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]`.
+
+        Нужно проверке дублей при восстановлении: иначе на каждое письмо
+        приходится SELECT + SEARCH (на 100 000 писем — сотни тысяч обращений
+        к серверу). Ошибку НЕ глушим: «не удалось проверить» и «дублей нет» —
+        разные вещи, и решать, что с этим делать, должен вызывающий код.
+        """
+        info = self.select(folder, readonly=True)
+        if not info.get("exists"):
+            return set()  # пустая папка: `FETCH 1:*` часть серверов считает ошибкой
+        try:
+            data = self.client.fetch(["1:*"], [b"BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]"])
+        except Exception as exc:  # noqa: BLE001
+            raise _map_exception(exc) from exc
+        found: Set[str] = set()
+        for item in (data or {}).values():
+            for key, value in (item or {}).items():
+                if not isinstance(key, bytes) or b"HEADER.FIELDS" not in key:
+                    continue
+                mid = _header_message_id(value)
+                if mid:
+                    found.add(mid)
+        return found
+
     def search_header_messageid(self, message_id: str) -> List[int]:
+        """
+        Поиск письма по Message-ID (поштучный, медленный — запасной путь).
+
+        Ошибку поиска НЕ подменяем пустым списком: пустой ответ означает
+        «дублей нет», и на сбое SEARCH письмо заливалось бы повторно.
+        """
         if not message_id:
             return []
         try:
             return list(self.client.search(["HEADER", "Message-ID", message_id]))
-        except Exception:  # noqa: BLE001
-            return []
+        except Exception as exc:  # noqa: BLE001
+            raise _map_exception(exc) from exc
 
 
 def probe_account(account: Account, options: Optional[ConnectOptions] = None) -> dict:

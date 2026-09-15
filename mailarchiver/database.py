@@ -20,10 +20,18 @@ import threading
 from typing import Any, Dict, List, Optional
 
 from . import models
+from .logging_setup import get_logger
 from .security import SecretBox
-from .util import utcnow_iso
+from .util import chunked, utcnow_iso
 
 SCHEMA_VERSION = 1
+
+log = get_logger("db")
+
+#: Настройки, значения которых хранятся в БД в зашифрованном виде
+#: (шифруются в :meth:`Database.set_setting`, расшифровываются в
+#: :meth:`Database.get_setting`).
+_ENCRYPTED_SETTINGS = {"notifications.smtp_password"}
 
 
 class Database:
@@ -59,15 +67,33 @@ class Database:
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         conn = self.connect()
         with self._write_lock:
-            cur = conn.execute(sql, params)
-            conn.commit()
-            return cur
+            try:
+                cur = conn.execute(sql, params)
+                conn.commit()
+                return cur
+            except BaseException:
+                # Без отката транзакция осталась бы открытой и держала writer-lock —
+                # вся БД встала бы с «database is locked».
+                self._safe_rollback(conn)
+                raise
 
     def executemany(self, sql: str, seq_params) -> None:
         conn = self.connect()
         with self._write_lock:
-            conn.executemany(sql, seq_params)
-            conn.commit()
+            try:
+                conn.executemany(sql, seq_params)
+                conn.commit()
+            except BaseException:
+                self._safe_rollback(conn)
+                raise
+
+    @staticmethod
+    def _safe_rollback(conn: sqlite3.Connection) -> None:
+        """Откатить транзакцию, не маскируя исходную ошибку."""
+        try:
+            conn.rollback()
+        except sqlite3.Error as exc:  # pragma: no cover - крайне редкий случай
+            log.warning("Не удалось откатить транзакцию: %s", exc)
 
     def query(self, sql: str, params: tuple = ()) -> List[sqlite3.Row]:
         return self.connect().execute(sql, params).fetchall()
@@ -83,15 +109,19 @@ class Database:
     def init_schema(self) -> None:
         conn = self.connect()
         with self._write_lock:
-            conn.executescript(_SCHEMA_SQL)
-            cur = conn.execute("SELECT value FROM meta WHERE key='schema_version'")
-            row = cur.fetchone()
-            if row is None:
-                conn.execute(
-                    "INSERT INTO meta(key, value) VALUES('schema_version', ?)",
-                    (str(SCHEMA_VERSION),),
-                )
-            conn.commit()
+            try:
+                conn.executescript(_SCHEMA_SQL)
+                cur = conn.execute("SELECT value FROM meta WHERE key='schema_version'")
+                row = cur.fetchone()
+                if row is None:
+                    conn.execute(
+                        "INSERT INTO meta(key, value) VALUES('schema_version', ?)",
+                        (str(SCHEMA_VERSION),),
+                    )
+                conn.commit()
+            except BaseException:
+                self._safe_rollback(conn)
+                raise
             self._migrate(conn)
 
     def _migrate(self, conn: sqlite3.Connection) -> None:
@@ -112,10 +142,17 @@ class Database:
                 if col not in cols(table):
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
                     changed = True
-            except sqlite3.OperationalError:
-                pass
+            except sqlite3.OperationalError as exc:
+                # Не падаем на одной миграции, но и не молчим: иначе код позже
+                # упадёт на отсутствующей колонке без всяких объяснений.
+                self._safe_rollback(conn)
+                log.error("Миграция не выполнена: %s.%s (%s) — %s", table, col, decl, exc)
         if changed:
-            conn.commit()
+            try:
+                conn.commit()
+            except BaseException:
+                self._safe_rollback(conn)
+                raise
 
     # ======================================================================
     #  Пользователи и вход
@@ -128,6 +165,25 @@ class Database:
             "INSERT INTO users(username, password_hash, role, created_at) VALUES(?,?,?,?)",
             (username, password_hash, role, utcnow_iso()),
         )
+        return int(cur.lastrowid)
+
+    def create_first_user(self, username: str, password_hash: str, role: str = "admin") -> Optional[int]:
+        """Создать ПЕРВОГО пользователя атомарно; None — если кто-то уже опередил.
+
+        Проверка «пользователей ещё нет» и вставка выполняются одним оператором
+        SQL (``INSERT ... SELECT ... WHERE NOT EXISTS``), поэтому два
+        одновременных ``POST /api/setup`` на свежей установке не создадут двух
+        администраторов: второй запрос не вставит ничего и получит None.
+        Дополнительно защищает UNIQUE(username) — при совпадении имени вызов
+        поднимет sqlite3.IntegrityError.
+        """
+        cur = self.execute(
+            "INSERT INTO users(username, password_hash, role, created_at) "
+            "SELECT ?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM users)",
+            (username, password_hash, role, utcnow_iso()),
+        )
+        if not cur.rowcount:
+            return None
         return int(cur.lastrowid)
 
     def get_user_by_name(self, username: str) -> Optional[sqlite3.Row]:
@@ -157,17 +213,62 @@ class Database:
             (username, utcnow_iso(), 1 if success else 0, ip),
         )
 
-    def count_recent_failures(self, username: str, since_iso: str) -> int:
+    def count_recent_failures(self, username: str, since_iso: str, ip: Optional[str] = None) -> int:
+        """Неудачные попытки входа за период.
+
+        ``ip`` задан → считаются только попытки с этого источника, то есть по
+        ПАРЕ «имя пользователя + IP». Без него — по учётной записи целиком
+        (прежнее поведение, используется для общесистемной защиты).
+        """
+        if ip is None:
+            return int(
+                self.scalar(
+                    "SELECT COUNT(*) FROM login_attempts WHERE username=? COLLATE NOCASE AND success=0 AND ts>=?",
+                    (username, since_iso),
+                )
+                or 0
+            )
         return int(
             self.scalar(
-                "SELECT COUNT(*) FROM login_attempts WHERE username=? COLLATE NOCASE AND success=0 AND ts>=?",
-                (username, since_iso),
+                "SELECT COUNT(*) FROM login_attempts "
+                "WHERE username=? COLLATE NOCASE AND ip=? AND success=0 AND ts>=?",
+                (username, ip, since_iso),
             )
             or 0
         )
 
-    def clear_login_failures(self, username: str) -> None:
-        self.execute("DELETE FROM login_attempts WHERE username=? COLLATE NOCASE", (username,))
+    def count_recent_failures_by_ip(self, ip: str, since_iso: str) -> int:
+        """Неудачные попытки входа с одного источника по ВСЕМ именам пользователей.
+
+        Нужно против перебора имён с одного адреса: блокируется сам источник,
+        а не чужие учётные записи.
+        """
+        if not ip:
+            return 0
+        return int(
+            self.scalar(
+                "SELECT COUNT(*) FROM login_attempts WHERE ip=? AND success=0 AND ts>=?",
+                (ip, since_iso),
+            )
+            or 0
+        )
+
+    def clear_login_failures(self, username: str, ip: Optional[str] = None) -> None:
+        """Сбросить журнал неудач: по паре «имя пользователя + IP» либо (без ip)
+        по учётной записи целиком — прежнее поведение."""
+        if ip is None:
+            self.execute("DELETE FROM login_attempts WHERE username=? COLLATE NOCASE", (username,))
+            return
+        self.execute("DELETE FROM login_attempts WHERE username=? COLLATE NOCASE AND ip=?", (username, ip))
+
+    def purge_old_login_attempts(self, older_than_iso: str) -> int:
+        """Удалить попытки входа старше указанной отметки времени (ISO-8601).
+
+        Таблица иначе растёт бесконечно: её пишет каждый вход, а чистит только
+        успешный вход конкретного пользователя.
+        """
+        cur = self.execute("DELETE FROM login_attempts WHERE ts < ?", (older_than_iso,))
+        return int(cur.rowcount or 0)
 
     # ======================================================================
     #  Сессии
@@ -418,42 +519,50 @@ class Database:
         """Атомарно взять следующее задание из очереди (по приоритету и времени)."""
         with self._write_lock:
             conn = self.connect()
-            row = conn.execute(
-                """SELECT * FROM jobs WHERE status=? ORDER BY priority ASC, id ASC LIMIT 1""",
-                (models.JobStatus.QUEUED,),
-            ).fetchone()
-            if row is None:
-                return None
-            conn.execute(
-                "UPDATE jobs SET status=?, started_at=?, worker_id=?, attempts=attempts+1 WHERE id=?",
-                (models.JobStatus.RUNNING, utcnow_iso(), worker_id, row["id"]),
-            )
-            conn.commit()
-            return conn.execute("SELECT * FROM jobs WHERE id=?", (row["id"],)).fetchone()
+            try:
+                row = conn.execute(
+                    """SELECT * FROM jobs WHERE status=? ORDER BY priority ASC, id ASC LIMIT 1""",
+                    (models.JobStatus.QUEUED,),
+                ).fetchone()
+                if row is None:
+                    return None
+                conn.execute(
+                    "UPDATE jobs SET status=?, started_at=?, worker_id=?, attempts=attempts+1 WHERE id=?",
+                    (models.JobStatus.RUNNING, utcnow_iso(), worker_id, row["id"]),
+                )
+                conn.commit()
+                return conn.execute("SELECT * FROM jobs WHERE id=?", (row["id"],)).fetchone()
+            except BaseException:
+                self._safe_rollback(conn)
+                raise
 
     def claim_next_job_filtered(self, worker_id: str, skip_accounts) -> Optional[sqlite3.Row]:
         """Захватить следующее задание, пропуская аккаунты из skip_accounts."""
         skip_accounts = list(skip_accounts or [])
         with self._write_lock:
             conn = self.connect()
-            if skip_accounts:
-                ph = ",".join("?" * len(skip_accounts))
-                sql = (f"SELECT * FROM jobs WHERE status=? AND (account_id IS NULL OR account_id NOT IN ({ph})) "
-                       f"ORDER BY priority ASC, id ASC LIMIT 1")
-                row = conn.execute(sql, (models.JobStatus.QUEUED, *skip_accounts)).fetchone()
-            else:
-                row = conn.execute(
-                    "SELECT * FROM jobs WHERE status=? ORDER BY priority ASC, id ASC LIMIT 1",
-                    (models.JobStatus.QUEUED,),
-                ).fetchone()
-            if row is None:
-                return None
-            conn.execute(
-                "UPDATE jobs SET status=?, started_at=?, worker_id=?, attempts=attempts+1 WHERE id=?",
-                (models.JobStatus.RUNNING, utcnow_iso(), worker_id, row["id"]),
-            )
-            conn.commit()
-            return conn.execute("SELECT * FROM jobs WHERE id=?", (row["id"],)).fetchone()
+            try:
+                if skip_accounts:
+                    ph = ",".join("?" * len(skip_accounts))
+                    sql = (f"SELECT * FROM jobs WHERE status=? AND (account_id IS NULL OR account_id NOT IN ({ph})) "
+                           f"ORDER BY priority ASC, id ASC LIMIT 1")
+                    row = conn.execute(sql, (models.JobStatus.QUEUED, *skip_accounts)).fetchone()
+                else:
+                    row = conn.execute(
+                        "SELECT * FROM jobs WHERE status=? ORDER BY priority ASC, id ASC LIMIT 1",
+                        (models.JobStatus.QUEUED,),
+                    ).fetchone()
+                if row is None:
+                    return None
+                conn.execute(
+                    "UPDATE jobs SET status=?, started_at=?, worker_id=?, attempts=attempts+1 WHERE id=?",
+                    (models.JobStatus.RUNNING, utcnow_iso(), worker_id, row["id"]),
+                )
+                conn.commit()
+                return conn.execute("SELECT * FROM jobs WHERE id=?", (row["id"],)).fetchone()
+            except BaseException:
+                self._safe_rollback(conn)
+                raise
 
     def get_job(self, job_id: int) -> Optional[sqlite3.Row]:
         return self.query_one("SELECT * FROM jobs WHERE id=?", (job_id,))
@@ -533,15 +642,22 @@ class Database:
 
     def purge_old_jobs(self, keep: int) -> int:
         """Оставить последние keep завершённых заданий, остальные удалить."""
-        ids = self.query(
+        rows = self.query(
             "SELECT id FROM jobs WHERE status NOT IN (?,?) ORDER BY id DESC LIMIT -1 OFFSET ?",
             (models.JobStatus.QUEUED, models.JobStatus.RUNNING, keep),
         )
+        ids = [r["id"] for r in rows]
+        if not ids:
+            return 0
         removed = 0
-        for r in ids:
-            self.execute("DELETE FROM job_events WHERE job_id=?", (r["id"],))
-            self.execute("DELETE FROM jobs WHERE id=?", (r["id"],))
-            removed += 1
+        # Два массовых DELETE вместо пары запросов на каждое задание: быстрее и
+        # не оставляет «висячих» событий. Режем на части, чтобы не упереться в
+        # ограничение SQLite на число параметров запроса.
+        for batch in chunked(ids, 500):
+            ph = ",".join("?" * len(batch))
+            self.execute(f"DELETE FROM job_events WHERE job_id IN ({ph})", tuple(batch))
+            cur = self.execute(f"DELETE FROM jobs WHERE id IN ({ph})", tuple(batch))
+            removed += int(cur.rowcount) if cur.rowcount and cur.rowcount > 0 else len(batch)
         return removed
 
     # ======================================================================
@@ -673,14 +789,26 @@ class Database:
         if row is None:
             return default
         try:
-            return json.loads(row["value"])
+            value = json.loads(row["value"])
         except (json.JSONDecodeError, TypeError):
-            return row["value"]
+            value = row["value"]
+        if key in _ENCRYPTED_SETTINGS and isinstance(value, str) and value:
+            try:
+                return self.secret.decrypt(value)
+            except Exception:  # noqa: BLE001
+                # Обратная совместимость: значение сохранено прошлой версией
+                # открытым текстом (или ключ шифрования сменился) — отдаём как есть.
+                return value
+        return value
 
     def set_setting(self, key: str, value: Any) -> None:
+        stored: Any = value
+        if key in _ENCRYPTED_SETTINGS and isinstance(value, str) and value:
+            # Секрет не должен лежать в БД открытым текстом (см. _ENCRYPTED_SETTINGS).
+            stored = self.secret.encrypt(value)
         self.execute(
             "INSERT INTO settings(key, value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (key, json.dumps(value, ensure_ascii=False)),
+            (key, json.dumps(stored, ensure_ascii=False)),
         )
 
     def all_settings(self) -> Dict[str, Any]:
@@ -705,11 +833,14 @@ class Database:
             (day, account_id, messages, bytes_, jobs, errors),
         )
 
-    def daily_series(self, days: int = 30) -> List[sqlite3.Row]:
+    def daily_series(self, days: int = 30, account_id: Optional[int] = None) -> List[sqlite3.Row]:
+        """Активность по дням; при заданном ящике — только его строки."""
+        where = " WHERE account_id=?" if account_id is not None else ""
+        params: tuple = (account_id, days) if account_id is not None else (days,)
         return self.query(
-            """SELECT day, SUM(messages) AS messages, SUM(bytes) AS bytes, SUM(jobs) AS jobs, SUM(errors) AS errors
-               FROM stats_daily GROUP BY day ORDER BY day DESC LIMIT ?""",
-            (days,),
+            "SELECT day, SUM(messages) AS messages, SUM(bytes) AS bytes, SUM(jobs) AS jobs, "
+            f"SUM(errors) AS errors FROM stats_daily{where} GROUP BY day ORDER BY day DESC LIMIT ?",
+            params,
         )
 
     def add_audit(self, user: str, action: str, detail: str = "") -> None:
@@ -744,17 +875,29 @@ class Database:
         return int(self.scalar(
             "SELECT COUNT(DISTINCT folder) FROM messages WHERE account_id=?", (account_id,)) or 0)
 
-    def jobs_type_status_counts(self) -> List[sqlite3.Row]:
-        return self.query("SELECT type, status, COUNT(*) AS c FROM jobs GROUP BY type, status")
+    def jobs_type_status_counts(self, account_id: Optional[int] = None) -> List[sqlite3.Row]:
+        """Счётчики заданий по типу и статусу; при заданном ящике — только его задания."""
+        if account_id is None:
+            return self.query("SELECT type, status, COUNT(*) AS c FROM jobs GROUP BY type, status")
+        return self.query(
+            "SELECT type, status, COUNT(*) AS c FROM jobs WHERE account_id=? GROUP BY type, status",
+            (account_id,),
+        )
 
-    def jobs_duration_by_type(self) -> List[sqlite3.Row]:
+    def jobs_duration_by_type(self, account_id: Optional[int] = None) -> List[sqlite3.Row]:
         """Средняя и максимальная длительность завершённых заданий по типам (сек)."""
+        where = ("WHERE started_at IS NOT NULL AND finished_at IS NOT NULL "
+                 "AND finished_at >= started_at")
+        params: tuple = ()
+        if account_id is not None:
+            where += " AND account_id=?"
+            params = (account_id,)
         return self.query(
             "SELECT type, COUNT(*) AS c, "
             "AVG((julianday(finished_at)-julianday(started_at))*86400.0) AS avg_s, "
             "MAX((julianday(finished_at)-julianday(started_at))*86400.0) AS max_s "
-            "FROM jobs WHERE started_at IS NOT NULL AND finished_at IS NOT NULL "
-            "AND finished_at >= started_at GROUP BY type"
+            f"FROM jobs {where} GROUP BY type",
+            params,
         )
 
     def runs_totals(self, account_id: Optional[int] = None) -> sqlite3.Row:
@@ -764,29 +907,71 @@ class Database:
             return self.query_one(base)
         return self.query_one(base + " WHERE account_id=?", (account_id,))
 
-    def runs_type_status_counts(self) -> List[sqlite3.Row]:
-        return self.query("SELECT type, status, COUNT(*) AS c FROM runs GROUP BY type, status")
-
-    def exports_stats(self) -> List[sqlite3.Row]:
+    def runs_type_status_counts(self, account_id: Optional[int] = None) -> List[sqlite3.Row]:
+        if account_id is None:
+            return self.query("SELECT type, status, COUNT(*) AS c FROM runs GROUP BY type, status")
         return self.query(
-            "SELECT format, engine, status, COUNT(*) AS c, COALESCE(SUM(size),0) AS bytes "
-            "FROM exports GROUP BY format, engine, status")
+            "SELECT type, status, COUNT(*) AS c FROM runs WHERE account_id=? GROUP BY type, status",
+            (account_id,),
+        )
 
-    def restores_totals(self) -> sqlite3.Row:
-        return self.query_one(
-            "SELECT COUNT(*) AS c, COALESCE(SUM(restored),0) AS restored, "
-            "COALESCE(SUM(errors),0) AS errors FROM restores")
+    def exports_stats(self, account_id: Optional[int] = None) -> List[sqlite3.Row]:
+        base = ("SELECT format, engine, status, COUNT(*) AS c, COALESCE(SUM(size),0) AS bytes "
+                "FROM exports")
+        if account_id is None:
+            return self.query(base + " GROUP BY format, engine, status")
+        return self.query(base + " WHERE account_id=? GROUP BY format, engine, status", (account_id,))
 
-    def audit_action_counts(self, limit: int = 15) -> List[sqlite3.Row]:
+    def restores_totals(self, account_id: Optional[int] = None) -> sqlite3.Row:
+        base = ("SELECT COUNT(*) AS c, COALESCE(SUM(restored),0) AS restored, "
+                "COALESCE(SUM(errors),0) AS errors FROM restores")
+        if account_id is None:
+            return self.query_one(base)
+        return self.query_one(base + " WHERE account_id=?", (account_id,))
+
+    def audit_action_counts(self, limit: int = 15, account_id: Optional[int] = None,
+                            account_name: Optional[str] = None) -> List[sqlite3.Row]:
+        """Топ действий аудита; при заданном ящике — только записи о нём.
+
+        Колонки account_id в таблице audit нет: принадлежность записи к ящику
+        видна лишь по тексту detail — это либо маркер ``account=<id>``
+        (retention, аналитика, вход по ящику), либо ровно имя ящика
+        (создание/изменение/удаление). По ним и отбираем.
+        """
+        if account_id is None:
+            return self.query(
+                "SELECT action, COUNT(*) AS c FROM audit GROUP BY action ORDER BY c DESC LIMIT ?", (limit,))
+        marker = f"account={int(account_id)}"
+        conds = ["detail=?", "detail LIKE ?", "detail LIKE ?", "detail LIKE ?"]
+        params: List[Any] = [marker, f"{marker} %", f"% {marker}", f"% {marker} %"]
+        if account_name:
+            # точное сравнение (а не LIKE): имя ящика может содержать % и _
+            conds.append("detail=?")
+            params.append(account_name)
+        params.append(limit)
         return self.query(
-            "SELECT action, COUNT(*) AS c FROM audit GROUP BY action ORDER BY c DESC LIMIT ?", (limit,))
+            f"SELECT action, COUNT(*) AS c FROM audit WHERE {' OR '.join(conds)} "
+            f"GROUP BY action ORDER BY c DESC LIMIT ?",
+            tuple(params),
+        )
 
-    def count_active_sessions(self) -> int:
-        return int(self.scalar("SELECT COUNT(*) FROM sessions WHERE expires_at > ?", (utcnow_iso(),)) or 0)
-
-    def count_login_failures_since(self, since_iso: str) -> int:
+    def count_active_sessions(self, account_id: Optional[int] = None) -> int:
+        """Действующие сессии; при заданном ящике — только входы в этот ящик."""
+        if account_id is None:
+            return int(self.scalar("SELECT COUNT(*) FROM sessions WHERE expires_at > ?", (utcnow_iso(),)) or 0)
         return int(self.scalar(
-            "SELECT COUNT(*) FROM login_attempts WHERE success=0 AND ts>=?", (since_iso,)) or 0)
+            "SELECT COUNT(*) FROM sessions WHERE expires_at > ? AND account_id=?",
+            (utcnow_iso(), account_id)) or 0)
+
+    def count_login_failures_since(self, since_iso: str, username: Optional[str] = None) -> int:
+        """Неудачные входы с момента; при заданном username — только по нему
+        (для ящика это его собственный логин)."""
+        if username is None:
+            return int(self.scalar(
+                "SELECT COUNT(*) FROM login_attempts WHERE success=0 AND ts>=?", (since_iso,)) or 0)
+        return int(self.scalar(
+            "SELECT COUNT(*) FROM login_attempts WHERE success=0 AND ts>=? AND username=? COLLATE NOCASE",
+            (since_iso, username)) or 0)
 
     def users_by_role(self) -> List[sqlite3.Row]:
         return self.query("SELECT role, COUNT(*) AS c FROM users GROUP BY role")
@@ -819,6 +1004,12 @@ CREATE TABLE IF NOT EXISTS login_attempts (
     ip       TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_login_attempts ON login_attempts(username, ts);
+-- запросы по логину идут с COLLATE NOCASE — им нужен индекс с той же сортировкой,
+-- иначе SQLite делает полный скан таблицы
+CREATE INDEX IF NOT EXISTS idx_login_attempts_nc ON login_attempts(username COLLATE NOCASE, ts);
+-- блокировка перебора считается по паре «логин + источник», плюс отдельно по
+-- самому источнику (перебор имён с одного IP) — для этого нужен индекс по ip
+CREATE INDEX IF NOT EXISTS idx_login_attempts_ip ON login_attempts(ip, ts);
 
 CREATE TABLE IF NOT EXISTS sessions (
     token      TEXT PRIMARY KEY,
@@ -887,6 +1078,8 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS idx_messages_acc ON messages(account_id, folder);
 CREATE INDEX IF NOT EXISTS idx_messages_hash ON messages(account_id, sha256);
+-- под горячий ORDER BY internaldate DESC в списках писем
+CREATE INDEX IF NOT EXISTS idx_messages_date ON messages(account_id, folder, internaldate);
 
 CREATE TABLE IF NOT EXISTS jobs (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
