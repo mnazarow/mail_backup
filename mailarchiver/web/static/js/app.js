@@ -70,9 +70,9 @@ function modal(title, bodyHtml, {wide=false, footer=''}={}){
   document.body.appendChild(back);
   return { el:back, close, body:back.querySelector('.modal-body'), foot:back.querySelector('.modal-foot') };
 }
-function confirmDlg(title, message){
+function confirmDlg(title, message, {okText='Подтвердить', okClass='danger'}={}){
   return new Promise(res=>{
-    const m=modal(title, `<p>${esc(message)}</p>`, {footer:`<button class="btn ghost" data-c>Отмена</button><button class="btn danger" data-ok>Подтвердить</button>`});
+    const m=modal(title, `<p>${esc(message)}</p>`, {footer:`<button class="btn ghost" data-c>Отмена</button><button class="btn ${okClass}" data-ok>${esc(okText)}</button>`});
     m.foot.querySelector('[data-c]').onclick=()=>{m.close();res(false);};
     m.foot.querySelector('[data-ok]').onclick=()=>{m.close();res(true);};
   });
@@ -312,11 +312,55 @@ function getVar(n){ return getComputedStyle(document.documentElement).getPropert
 // ===================================================================
 //  Ящики
 // ===================================================================
+// ---------- Резервное копирование по кнопке ----------
+function plural(n, one, few, many){
+  const m10=n%10, m100=n%100;
+  if(m10===1 && m100!==11) return one;
+  if(m10>=2 && m10<=4 && (m100<12 || m100>14)) return few;
+  return many;
+}
+
+/** Поставить в очередь копирование одного ящика. */
+async function backupNow(id, name){
+  try{
+    await api(`/accounts/${id}/backup`,{method:'POST'});
+    toast('Резервное копирование запущено', name?`Ящик «${name}» добавлен в очередь`:'Задание добавлено в очередь');
+    location.hash='#/jobs';
+  }catch(e){ toastErr(e); }
+}
+
+/** Поставить в очередь копирование сразу всех включённых ящиков. */
+async function backupAllNow(){
+  const accs=State.accounts||[];
+  const enabled=accs.filter(a=>a.enabled).length;
+  const off=accs.length-enabled;
+  if(!enabled) return toast('Нет включённых ящиков','Включите хотя бы один ящик, чтобы запустить копирование','warn');
+  const ok=await confirmDlg('Сделать резервную копию всех ящиков?',
+    `В очередь будет поставлено копирование для ${enabled} ${plural(enabled,'ящика','ящиков','ящиков')}.`
+    + (off?` Выключенные ящики (${off}) пропускаются.`:'')
+    + ' Ящики, по которым копирование уже идёт, повторно запущены не будут.',
+    {okText:'Запустить', okClass:'primary'});
+  if(!ok) return;
+  try{
+    const r=await api('/accounts/backup-all',{method:'POST'});
+    const st=(r.started||[]).length, sk=(r.skipped||[]).length;
+    if(st) toast('Резервное копирование запущено',
+                 `Ящиков в очереди: ${st}` + (sk?`, пропущено (уже копируются): ${sk}`:''));
+    else toast('Новых заданий нет','Все включённые ящики уже копируются','warn');
+    location.hash='#/jobs';
+  }catch(e){ toastErr(e); }
+}
+
 async function viewAccounts(c){
   const accs=await api('/accounts'); State.accounts=accs;
   c.innerHTML='';
-  const head=h(`<div class="section-title"><h2 style="margin:0">Почтовые ящики</h2><div class="spacer"></div><button class="btn primary" id="add">+ Добавить ящик</button></div>`);
-  c.appendChild(head); $('#add',c).onclick=()=>accountModal();
+  const enabledCnt=accs.filter(a=>a.enabled).length;
+  const head=h(`<div class="section-title"><h2 style="margin:0">Почтовые ящики</h2><div class="spacer"></div>
+    <button class="btn" id="bkAll" ${enabledCnt?'':'disabled'} title="Поставить в очередь резервное копирование всех включённых ящиков">💾 Копия всех ящиков сейчас</button>
+    <button class="btn primary" id="add">+ Добавить ящик</button></div>`);
+  c.appendChild(head);
+  $('#add',c).onclick=()=>accountModal();
+  $('#bkAll',c).onclick=()=>backupAllNow();
   if(!accs.length){ c.appendChild(h('<div class="card"><div class="empty"><div class="big">📭</div>Пока нет ни одного ящика.<br>Нажмите «Добавить ящик», чтобы начать.</div></div>')); return; }
   const wrap=h('<div class="card table-wrap"><table class="tbl"><thead><tr><th>Название</th><th>Сервер</th><th>Логин</th><th>Статус</th><th></th></tr></thead><tbody></tbody></table></div>');
   const tb=wrap.querySelector('tbody');
@@ -328,11 +372,11 @@ async function viewAccounts(c){
       <td><span class="tag">${a.auth_type==='oauth2'?'OAuth2':'пароль'}</span></td>
       <td style="text-align:right;white-space:nowrap">
         <button class="btn sm" data-test>Проверить</button>
-        <button class="btn sm primary" data-bk>Копировать</button>
+        <button class="btn sm primary" data-bk ${a.enabled?'':'disabled'} title="${a.enabled?'Сделать резервную копию этого ящика сейчас':'Ящик выключен — включите его, чтобы делать копии'}">💾 Копия сейчас</button>
         <button class="btn sm" data-menu>⋯</button>
       </td></tr>`);
     tr.querySelector('[data-test]').onclick=()=>testAccount(a.id);
-    tr.querySelector('[data-bk]').onclick=async()=>{ try{await api(`/accounts/${a.id}/backup`,{method:'POST'}); toast('Запущено','Копирование в очереди'); location.hash='#/jobs';}catch(e){toastErr(e);} };
+    tr.querySelector('[data-bk]').onclick=()=>backupNow(a.id, a.name);
     tr.querySelector('[data-menu]').onclick=()=>accountMenu(a);
     tb.appendChild(tr);
   });
@@ -341,7 +385,8 @@ async function viewAccounts(c){
 
 function accountMenu(a){
   const m=modal(`Ящик: ${a.name}`, `<div class="btn-row" style="flex-direction:column;align-items:stretch;gap:10px">
-    <button class="btn primary" data-a="mail">📧 Просмотр писем</button>
+    <button class="btn primary" data-a="backup" ${a.enabled?'':'disabled title="Ящик выключен — включите его, чтобы делать копии"'}>💾 Сделать резервную копию сейчас</button>
+    <button class="btn" data-a="mail">📧 Просмотр писем</button>
     <button class="btn" data-a="edit">✏️ Редактировать</button>
     <button class="btn" data-a="export">📤 Экспорт в PST / EML / MBOX</button>
     <button class="btn" data-a="restore">♻️ Восстановить на сервер</button>
@@ -352,7 +397,8 @@ function accountMenu(a){
   </div>`);
   m.body.querySelectorAll('[data-a]').forEach(b=>b.onclick=async()=>{
     const act=b.dataset.a; m.close();
-    if(act==='mail'){ State.mailAccount=a.id; location.hash='#/mail'; }
+    if(act==='backup') backupNow(a.id, a.name);
+    else if(act==='mail'){ State.mailAccount=a.id; location.hash='#/mail'; }
     else if(act==='edit') accountModal(a.id);
     else if(act==='export') exportModal(a);
     else if(act==='restore') restoreModal(a);

@@ -89,3 +89,25 @@ def test_mail_viewer_endpoints(client):
     # .eml
     eml = client.get(f"/api/accounts/{aid}/messages/{pk}/raw")
     assert eml.status_code == 200 and b"Subject: Hi" in eml.content
+
+
+def test_backup_all_accounts(client):
+    """Кнопка «копия всех ящиков»: ставит задание на каждый включённый ящик."""
+    _login(client)
+    svc = client.app.state.services
+    a1 = svc.db.create_account(models.Account(name="A1", host="h", port=993, username="u1", password="p"))
+    a2 = svc.db.create_account(models.Account(name="A2", host="h", port=993, username="u2", password="p"))
+    off = svc.db.create_account(models.Account(name="Off", host="h", port=993, username="u3",
+                                               password="p", enabled=False))
+    r = client.post("/api/accounts/backup-all")
+    assert r.status_code == 200
+    data = r.json()
+    started = {s["account_id"] for s in data["started"]}
+    # включённые попали в очередь, выключенный — нет
+    assert a1 in started and a2 in started
+    assert off not in started
+    assert data["total_enabled"] == len(started)
+    # повторное нажатие не удваивает работу: ящики уже в очереди
+    again = client.post("/api/accounts/backup-all").json()
+    assert len(again["started"]) == 0
+    assert {s["account_id"] for s in again["skipped"]} == started

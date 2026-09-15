@@ -354,6 +354,31 @@ def start_backup(request: Request, account_id: int, user: dict = Depends(auth_mo
     return {"ok": True, "job_id": jid}
 
 
+@router.post("/accounts/backup-all")
+def start_backup_all(request: Request, user: dict = Depends(auth_mod.require_admin)):
+    """Поставить в очередь резервное копирование СРАЗУ ВСЕХ включённых ящиков.
+
+    Выключенные ящики пропускаются (они намеренно исключены из копирования).
+    Ящики, по которым копирование уже идёт или стоит в очереди, тоже
+    пропускаются — чтобы повторное нажатие кнопки не удваивало работу.
+    """
+    svc = svc_dep(request)
+    max_attempts = int(svc.rt("backup", "retry_attempts") or 1)
+    busy = {j["account_id"] for j in svc.db.active_jobs() if j["type"] == JobType.BACKUP}
+    started, skipped = [], []
+    for acc in svc.db.list_accounts(only_enabled=True):
+        if acc.id in busy:
+            skipped.append({"account_id": acc.id, "name": acc.name})
+            continue
+        jid = svc.queue.enqueue(JobType.BACKUP, acc.id, {}, max_attempts=max_attempts,
+                                created_by=user["username"])
+        started.append({"account_id": acc.id, "name": acc.name, "job_id": jid})
+    svc.db.add_audit(user["username"], "backup_all",
+                     f"запущено: {len(started)}, пропущено: {len(skipped)}")
+    return {"ok": True, "started": started, "skipped": skipped,
+            "total_enabled": len(started) + len(skipped)}
+
+
 @router.post("/accounts/{account_id}/export")
 def start_export(request: Request, account_id: int, body: ExportBody, user: dict = Depends(auth_mod.require_user)):
     svc = svc_dep(request)
