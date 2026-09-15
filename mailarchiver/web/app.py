@@ -33,6 +33,39 @@ TEMPLATES_DIR = os.path.join(_HERE, "templates")
 templates = Jinja2Templates(directory=TEMPLATES_DIR)
 
 
+def _starlette_request_first() -> bool:
+    """Определяет, требует ли установленный Starlette request первым аргументом.
+
+    Начиная со Starlette 0.29 у Jinja2Templates.TemplateResponse изменилась
+    сигнатура: request передаётся первым (TemplateResponse(request, name, context)).
+    В более старых версиях первым идёт имя шаблона, а request кладут в контекст.
+    """
+    try:
+        import starlette
+        major, minor = (int(p) for p in starlette.__version__.split(".")[:2])
+        return (major, minor) >= (0, 29)
+    except Exception:  # noqa: BLE001
+        return True
+
+
+_REQUEST_FIRST = _starlette_request_first()
+
+
+def render_template(request: Request, name: str, context: dict):
+    """Отрисовать HTML-шаблон, поддерживая обе сигнатуры Starlette.
+
+    Без этого на новых версиях Starlette вызов вида
+    ``TemplateResponse(name, {"request": ...})`` трактуется как
+    ``TemplateResponse(request=name, name={...})`` — именем шаблона становится
+    словарь контекста, и Jinja2 падает с «unhashable type: dict».
+    """
+    if _REQUEST_FIRST:
+        return templates.TemplateResponse(request, name, context)
+    ctx = dict(context)
+    ctx.setdefault("request", request)
+    return templates.TemplateResponse(name, ctx)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     cfg = load_config(os.environ.get("MAILARCHIVER_CONFIG"))
@@ -75,8 +108,8 @@ def create_app() -> FastAPI:
     # --- корневые маршруты ---
     @app.get("/", response_class=HTMLResponse)
     async def index(request: Request):
-        return templates.TemplateResponse("index.html", {"request": request, "version": __version__,
-                                                          "title": APP_TITLE})
+        return render_template(request, "index.html",
+                               {"version": __version__, "title": APP_TITLE})
 
     @app.get("/health")
     async def health(request: Request):

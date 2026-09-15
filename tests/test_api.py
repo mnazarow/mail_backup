@@ -6,6 +6,15 @@ def test_health(client):
     assert r.status_code == 200 and r.json()["status"] == "ok"
 
 
+def test_index_page_renders(client):
+    """Корневая страница должна отдавать HTML (регрессия на сигнатуру Starlette
+    TemplateResponse: на новых версиях требуется request первым аргументом)."""
+    r = client.get("/")
+    assert r.status_code == 200
+    assert "text/html" in r.headers.get("content-type", "")
+    assert "root" in r.text  # <div id="root"> из шаблона index.html
+
+
 def test_needs_setup_flow(client):
     assert client.get("/api/needs-setup").json()["needs_setup"] is True
     # доступ к защищённому endpoint без входа
