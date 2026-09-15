@@ -200,7 +200,10 @@ function route(){
   const allowed = NAV.filter(n=>!n.sep && (!n.admin||State.user.role==='admin') && (!isMailbox()||n.mb)).map(n=>n.id);
   if(!allowed.includes(view)) view = isMailbox()?'mail':'dashboard';
   State.view=view; setActiveNav(view); State.redraw=null;
-  const c=$('#content'); c.innerHTML='<div class="empty"><div class="spinner"></div></div>';
+  const c=$('#content');
+  // почтовому клиенту нужна вся ширина экрана — три колонки в 1240px тесно
+  c.classList.toggle('wide', view==='mail');
+  c.innerHTML='<div class="empty"><div class="spinner"></div></div>';
   const map={dashboard:viewDashboard,analytics:viewAnalytics,mailanalytics:viewMailAnalytics,mail:viewMail,accounts:viewAccounts,jobs:viewJobs,exports:viewExports,schedules:viewSchedules,logs:viewLogs,settings:viewSettings,users:viewUsers,audit:viewAudit};
   (map[view]||viewDashboard)(c).catch(toastErr);
 }
@@ -231,7 +234,7 @@ async function viewDashboard(c){
   const s=await api('/state'); State.engines=s.engines; State.accounts=s.accounts;
   c.innerHTML='';
   const stats=h(`<div class="grid cols-4" style="margin-bottom:16px">
-    <div class="card stat-card"><div class="label">📬 Ящиков</div><div class="value">${s.totals.accounts}</div><div class="sub">под резервным копированием</div></div>
+    <div class="card stat-card"><div class="label">📬 Ящиков всего</div><div class="value">${s.totals.accounts}</div><div class="sub">${(()=>{const en=(s.accounts||[]).filter(a=>a.enabled).length; const off=s.totals.accounts-en; return `под копированием: ${en}${off?` · выключено: ${off}`:''}`;})()}</div></div>
     <div class="card stat-card"><div class="label">✉️ Писем в архиве</div><div class="value">${s.totals.messages.toLocaleString('ru-RU')}</div><div class="sub">${esc(s.totals.bytes_h)}</div></div>
     <div class="card stat-card"><div class="label">⚙️ В очереди / работе</div><div class="value" id="dq">${(s.job_counts.queued||0)+(s.job_counts.running||0)}</div><div class="sub">воркеров: ${s.workers}</div></div>
     <div class="card stat-card"><div class="label">💽 Свободно на диске</div><div class="value">${esc(s.disk.free_h)}</div><div class="sub">каталог копий</div></div>
@@ -243,14 +246,22 @@ async function viewDashboard(c){
   updateDashboardLive({active_jobs:s.active_jobs, job_counts:s.job_counts});
 
   const grid=h(`<div class="grid cols-2">
-    <div class="card"><div class="section-title"><h3>📈 Активность (30 дней)</h3></div><div class="chart-box"><canvas id="chart" height="220"></canvas></div></div>
-    <div class="card"><div class="section-title"><h3>📬 Ящики</h3><div class="spacer"></div><button class="btn sm primary" id="addAcc">+ Добавить</button></div><div id="accList"></div></div>
+    <div class="card"><div class="section-title"><h3>📈 Активность</h3><span class="muted small">новые письма за 30 дней</span></div><div class="an-chart" id="chartBox"></div></div>
+    <div class="card"><div class="section-title"><h3>📬 Ящики</h3><span class="tag">${s.totals.accounts}</span><div class="spacer"></div><button class="btn sm primary" id="addAcc">+ Добавить</button></div><div id="accList"></div></div>
   </div>`);
   c.appendChild(grid);
   $('#addAcc').onclick=()=>accountModal();
   renderAccountMini(s.accounts, $('#accList'));
 
-  try{ const st=await api('/stats?days=30'); drawChart($('#chart'), st.series); }catch(e){}
+  // График активности рисуем тем же движком, что и в разделе «Аналитика»:
+  // он сам подгоняет холст под контейнер и учитывает плотность экрана.
+  try{
+    const st=await api('/stats?days=30');
+    const items=(st.series||[]).map(d=>({label:(d.day||'').slice(5), value:d.messages||0}));
+    const draw=()=>chartLine($('#chartBox'), items, {height:220});
+    draw();
+    State.redraw=draw;   // перерисовать при смене темы и размера окна
+  }catch(e){}
 }
 
 function updateDashboardLive(d){
@@ -282,32 +293,14 @@ function renderAccountMini(accounts, box){
   if(!accounts.length){ box.innerHTML='<div class="empty">Нет ящиков. Добавьте первый.</div>'; return; }
   box.innerHTML='';
   accounts.forEach(a=>{
-    const st=a.last_run?`<span class="badge ${a.last_run.status}">${esc(a.last_run.status)}</span>`:'<span class="tag">нет копий</span>';
-    const row=h(`<div class="kv" style="align-items:center"><div style="flex:1"><strong>${esc(a.name)}</strong><div class="muted small">${esc(a.username)} · ${a.messages} писем · ${esc(a.bytes_h)}</div></div>${st}
-      <button class="btn sm primary" data-bk="${a.id}">Копировать</button></div>`);
-    row.querySelector('[data-bk]').onclick=async()=>{ try{ await api(`/accounts/${a.id}/backup`,{method:'POST'}); toast('Запущено','Резервное копирование добавлено в очередь'); location.hash='#/jobs'; }catch(e){toastErr(e);} };
+    const st=a.last_run?`<span class="badge ${a.last_run.status}">${esc(STATUS_LBL[a.last_run.status]||a.last_run.status)}</span>`:'<span class="tag">нет копий</span>';
+    const row=h(`<div class="kv" style="align-items:center"><div style="flex:1"><strong>${esc(a.name)}</strong>${a.enabled?'':' <span class="tag">выключен</span>'}<div class="muted small">${esc(a.username)} · ${a.messages} писем · ${esc(a.bytes_h)}</div></div>${st}
+      <button class="btn sm primary" data-bk="${a.id}" ${a.enabled?'':'disabled'} title="${a.enabled?'Сделать резервную копию этого ящика сейчас':'Ящик выключен — включите его, чтобы делать копии'}">💾 Копия сейчас</button></div>`);
+    row.querySelector('[data-bk]').onclick=()=>backupNow(a.id, a.name);
     box.appendChild(row);
   });
 }
 
-// ---------- Простой график на canvas (без библиотек) ----------
-function drawChart(canvas, series){
-  if(!canvas) return; const ctx=canvas.getContext('2d');
-  const W=canvas.width=canvas.clientWidth*2, H=canvas.height=440; ctx.scale(1,1);
-  ctx.clearRect(0,0,W,H);
-  const data=series||[]; if(!data.length){ ctx.fillStyle=getVar('--text-dim'); ctx.font='24px sans-serif'; ctx.fillText('Пока нет данных',20,40); return; }
-  const vals=data.map(d=>d.messages);
-  const max=Math.max(1,...vals); const pad=40, bw=(W-pad*2)/data.length;
-  ctx.strokeStyle=getVar('--border'); ctx.lineWidth=1;
-  for(let i=0;i<=4;i++){ const y=pad+(H-pad*2)*i/4; ctx.beginPath(); ctx.moveTo(pad,y); ctx.lineTo(W-pad,y); ctx.stroke(); ctx.fillStyle=getVar('--text-dim'); ctx.font='18px sans-serif'; ctx.fillText(Math.round(max*(4-i)/4),4,y+6); }
-  data.forEach((d,i)=>{
-    const barH=(H-pad*2)*(d.messages/max); const x=pad+i*bw+bw*0.15; const w=bw*0.7; const y=H-pad-barH;
-    ctx.fillStyle=getVar('--primary'); roundRect(ctx,x,y,w,barH,4); ctx.fill();
-    if(i%Math.ceil(data.length/8||1)===0){ ctx.fillStyle=getVar('--text-dim'); ctx.font='16px sans-serif'; ctx.save(); ctx.translate(x+w/2,H-pad+18); ctx.fillText((d.day||'').slice(5),-14,0); ctx.restore(); }
-  });
-}
-function roundRect(ctx,x,y,w,hh,r){ if(hh<1)hh=1; ctx.beginPath(); ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+hh,r); ctx.arcTo(x+w,y+hh,x,y+hh,r); ctx.arcTo(x,y+hh,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath(); }
-function getVar(n){ return getComputedStyle(document.documentElement).getPropertyValue(n).trim()||'#888'; }
 
 // ===================================================================
 //  Ящики
@@ -355,7 +348,9 @@ async function viewAccounts(c){
   const accs=await api('/accounts'); State.accounts=accs;
   c.innerHTML='';
   const enabledCnt=accs.filter(a=>a.enabled).length;
-  const head=h(`<div class="section-title"><h2 style="margin:0">Почтовые ящики</h2><div class="spacer"></div>
+  const head=h(`<div class="section-title"><h2 style="margin:0">Почтовые ящики</h2>
+    <span class="tag" title="Всего ящиков в системе">всего: ${accs.length}${accs.length!==enabledCnt?` · включено: ${enabledCnt}`:''}</span>
+    <div class="spacer"></div>
     <button class="btn" id="bkAll" ${enabledCnt?'':'disabled'} title="Поставить в очередь резервное копирование всех включённых ящиков">💾 Копия всех ящиков сейчас</button>
     <button class="btn primary" id="add">+ Добавить ящик</button></div>`);
   c.appendChild(head);
@@ -934,6 +929,7 @@ async function loadMailMessage(accId, pk){
 //  Аналитика — набор графиков на canvas (без внешних библиотек)
 // ===================================================================
 const CHART_COLORS = ['#2f6fed','#1f9d55','#d98a00','#d64545','#2b8ca6','#7c5cff','#e0567f','#2bb0a6','#b0862e','#8e6bd8','#3aa0a0','#c76b3a'];
+const STATUS_LBL = {queued:'в очереди',running:'выполняется',success:'успешно',failed:'ошибка',cancelled:'отменено',partial:'частично'};
 const JOBLBL = {backup:'Резервное копирование',restore:'Восстановление',export:'Экспорт',import_pst:'Импорт PST',test:'Проверка подключения',retention:'Очистка (ретеншн)',verify:'Проверка целостности',analyze:'Глубокий анализ писем'};
 function cvar(n,f){ const v=getComputedStyle(document.documentElement).getPropertyValue(n).trim(); return v||f; }
 function fmtNum(n){ return Number(n||0).toLocaleString('ru-RU'); }
