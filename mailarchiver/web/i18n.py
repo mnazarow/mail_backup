@@ -172,6 +172,12 @@ PARAM_HELP: Dict[str, dict] = {
         "recommend": "Включено.",
         "example": "true", "default": "true",
     },
+    "backup.unreadable_folder_grace_runs": {
+        "title": "Терпеть нечитаемую папку, прогонов",
+        "help": "Сколько прогонов подряд папка, которую почтовый сервер отказывается открыть, считается ОШИБКОЙ и делает копию неполной. После этого числа она переходит в разряд «известных нечитаемых»: сервис продолжает пробовать её каждый раз, сообщает о ней в итоге задания, но задание больше не помечается неудачным. Как только сервер отдаст папку, счётчик сбрасывается и письма копируются. 0 — считать ошибкой всегда.",
+        "recommend": "3. Бесконечное «КОПИЯ НЕПОЛНАЯ» из-за папки, которую на сервере уже не починить, приучает не читать предупреждения — и настоящая пропажа писем остаётся незамеченной.",
+        "example": "3", "default": "3",
+    },
     "backup.skip_larger_than_mb": {
         "title": "Пропускать письма крупнее, МБ",
         "help": "Не сохранять письма больше указанного размера (0 — сохранять все). Полезно, если не нужны гигантские вложения.",
@@ -505,7 +511,8 @@ SETTINGS_SECTIONS: List[dict] = [
     {"section": "backup", "title": "Резервное копирование", "icon": "📥",
      "keys": ["max_concurrent_jobs", "per_account_concurrency", "fetch_batch_size", "connect_timeout_s",
               "socket_timeout_s", "retry_attempts", "retry_initial_delay_s", "retry_backoff",
-              "download_flags", "skip_larger_than_mb", "folder_include", "folder_exclude"]},
+              "download_flags", "skip_larger_than_mb", "unreadable_folder_grace_runs",
+              "folder_include", "folder_exclude"]},
     {"section": "retention", "title": "Хранение и очистка", "icon": "🧹",
      "keys": ["enabled", "keep_days", "keep_last_runs", "delete_removed_from_server"]},
     {"section": "export", "title": "Экспорт (PST и др.)", "icon": "📤",

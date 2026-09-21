@@ -202,3 +202,18 @@ def test_exclude_folders_validates_input(client):
     acc_id = _make_account(client)
     assert client.post(f"/api/accounts/{acc_id}/exclude-folders", json={"folders": []}).status_code >= 400
     assert client.post("/api/accounts/9999/exclude-folders", json={"folders": ["X"]}).status_code == 404
+
+
+def test_folder_problem_history_is_stored(client):
+    """История «папка не открывается» живёт в БД и сбрасывается при успехе."""
+    _login(client)
+    acc_id = _make_account(client, "История папок")
+    from mailarchiver.web.app import create_app  # noqa: F401  (приложение уже поднято фикстурой)
+    svc = client.app.state.services
+    assert svc.db.record_folder_problem(acc_id, "Отправленные/s2022", "failed EXAMINE") == 1
+    assert svc.db.record_folder_problem(acc_id, "Отправленные/s2022", "failed EXAMINE") == 2
+    row = svc.db.get_folder_problem(acc_id, "Отправленные/s2022")
+    assert row["fails"] == 2 and row["first_failed"] and "EXAMINE" in row["last_error"]
+    assert [r["folder"] for r in svc.db.list_folder_problems(acc_id)] == ["Отправленные/s2022"]
+    svc.db.clear_folder_problem(acc_id, "Отправленные/s2022")
+    assert svc.db.list_folder_problems(acc_id) == []

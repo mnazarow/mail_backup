@@ -65,6 +65,10 @@ class BackupResult:
     # Своих писем такие папки не хранят (сервер просто забыл пометить их
     # флагом \Noselect), поэтому потерей это не является.
     container_folders: List[str] = field(default_factory=list)
+    # Папки, которые не открываются уже несколько прогонов подряд. Ошибкой их
+    # больше не считаем (см. BackupEngine.unreadable_grace_runs), но в итоге
+    # задания перечисляем — чтобы они не исчезли из виду.
+    known_unreadable_folders: List[str] = field(default_factory=list)
     cancelled: bool = False
 
     @property
@@ -116,7 +120,8 @@ def _folder_matches(name: str, patterns: List[str], delimiter: str) -> bool:
 class BackupEngine:
     def __init__(self, db, store: MaildirStore, options: ConnectOptions,
                  *, skip_larger_than_mb: int = 0, download_flags: bool = True,
-                 global_exclude: Optional[List[str]] = None, global_include: Optional[List[str]] = None) -> None:
+                 global_exclude: Optional[List[str]] = None, global_include: Optional[List[str]] = None,
+                 unreadable_grace_runs: int = 3) -> None:
         self.db = db
         self.store = store
         self.options = options
@@ -124,6 +129,36 @@ class BackupEngine:
         self.download_flags = download_flags
         self.global_exclude = global_exclude or []
         self.global_include = global_include or []
+        # Сколько прогонов подряд нечитаемая папка считается ОШИБКОЙ. Дальше она
+        # переходит в «известные нечитаемые»: пробовать продолжаем, сообщать
+        # продолжаем, но задание перестаёт быть неуспешным.
+        self.unreadable_grace_runs = max(0, int(unreadable_grace_runs))
+
+    def _note_unreadable(self, account: Account, folder: str, error: str) -> int:
+        """Запомнить очередную неудачу и вернуть, сколько их подряд."""
+        try:
+            return int(self.db.record_folder_problem(account.id, folder, error))
+        except Exception as exc:  # noqa: BLE001
+            # История неудач — вспомогательная вещь: если БД её не приняла,
+            # копирование всё равно должно продолжаться.
+            log.debug("Не удалось записать историю папки «%s»: %s", folder, exc)
+            return 1
+
+    def _forget_unreadable(self, account: Account, folder: str) -> None:
+        """Папка открылась — забыть её историю неудач."""
+        try:
+            self.db.clear_folder_problem(account.id, folder)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("Не удалось очистить историю папки «%s»: %s", folder, exc)
+
+    def _unreadable_since(self, account: Account, folder: str) -> str:
+        """« с 21.09.2026» — когда папка перестала открываться (для журнала)."""
+        try:
+            row = self.db.get_folder_problem(account.id, folder)
+        except Exception:  # noqa: BLE001
+            return ""
+        first = (row["first_failed"] if row else "") or ""
+        return f", с {first[:10]}" if first else ""
 
     def _select_folders(self, conn: ImapConnection, account: Account,
                         emit: Optional[EventCB] = None) -> List:
@@ -222,6 +257,7 @@ class BackupEngine:
                         # они копируются сами по себе. Ошибкой это не считаем —
                         # иначе каждый ящик с деревом папок вечно числился бы
                         # скопированным частично.
+                        self._forget_unreadable(account, f.name)
                         result.container_folders.append(f.name)
                         emit("INFO",
                              f"Папка «{f.name}» не открывается, но у неё есть вложенные папки "
@@ -229,21 +265,39 @@ class BackupEngine:
                              f"вложенные папки копируются отдельно.")
                         continue
                     if status is not None and status.get("messages") == 0:
+                        self._forget_unreadable(account, f.name)
                         result.empty_unreadable_folders.append(f.name)
                         emit("WARNING",
                              f"Папка «{f.name}» не открывается, но по данным сервера она ПУСТАЯ "
                              f"(0 писем) — копировать нечего, потерь нет.{twin}")
                         continue
-                    # Письма этой папки в копию НЕ попадут. Кроме счётчика ошибок
-                    # запоминаем ИМЯ папки (для итога и для результата задания) и
-                    # показываем подсказку, что смотреть на сервере.
+                    # Письма этой папки в копию НЕ попадут.
+                    detail = exc.message + (f" {exc.hint}" if exc.hint else "")
+                    fails = self._note_unreadable(account, f.name, exc.message)
+                    if self.unreadable_grace_runs and fails > self.unreadable_grace_runs:
+                        # Папка не открывается уже давно — это состояние сервера,
+                        # а не новость. Продолжаем пробовать и сообщать, но не
+                        # помечаем задание неуспешным: иначе «копия неполная»
+                        # висит вечно и перестаёт что-либо значить.
+                        result.known_unreadable_folders.append(f.name)
+                        since = self._unreadable_since(account, f.name)
+                        emit("WARNING",
+                             f"Папка «{f.name}» не открывается на сервере "
+                             f"{fails}-й прогон подряд{since} — ошибкой больше не считаем, "
+                             f"но и копировать её нечем. Чинить на почтовом сервере или "
+                             f"добавить в «Пропускать папки».{twin}")
+                        continue
                     result.errors += 1
                     result.skipped_folders.append(f.name)
-                    detail = exc.message + (f" {exc.hint}" if exc.hint else "")
                     result.error_details.append(f"Папка «{f.name}»: {detail}")
-                    emit("WARNING", f"Пропуск папки «{f.name}»: {detail}{twin}")
+                    left = (self.unreadable_grace_runs - fails + 1) if self.unreadable_grace_runs else 0
+                    tail = (f" Не открывается {fails}-й прогон подряд; ещё {left} — и папка перейдёт "
+                            f"в «известные нечитаемые» (задание перестанет помечаться неполным)."
+                            if left > 0 else "")
+                    emit("WARNING", f"Пропуск папки «{f.name}»: {detail}{twin}{tail}")
                     continue
                 result.folders_read += 1
+                self._forget_unreadable(account, f.name)
                 uidvalidity = info["uidvalidity"]
                 state = self.db.get_folder_state(account.id, f.name)
                 old_uidvalidity = int(state["uidvalidity"]) if state else 0
@@ -388,6 +442,12 @@ class BackupEngine:
 
         summary = (f"Бэкап завершён: новых писем {result.messages_new}, "
                    f"пропущено по размеру {result.messages_skipped}, ошибок {result.errors}.")
+        if result.known_unreadable_folders:
+            shown = ", ".join(result.known_unreadable_folders[:MAX_SKIPPED_FOLDERS_IN_SUMMARY])
+            rest = len(result.known_unreadable_folders) - MAX_SKIPPED_FOLDERS_IN_SUMMARY
+            tail = f" и ещё {rest}" if rest > 0 else ""
+            summary += (f" Известные нечитаемые папки ({len(result.known_unreadable_folders)}): "
+                        f"{shown}{tail} — сервер не открывает их давно, ошибкой не считаем.")
         if result.container_folders:
             shown = ", ".join(result.container_folders[:MAX_SKIPPED_FOLDERS_IN_SUMMARY])
             rest = len(result.container_folders) - MAX_SKIPPED_FOLDERS_IN_SUMMARY

@@ -696,7 +696,7 @@ async function folderDiagnoseModal(a){
       <td class="mono small" style="word-break:break-all">${esc(f.name)}</td>
       <td><span class="tag ${cls}">${esc(label)}</span></td>
       <td class="small">${f.messages==null?'—':fmtNum(f.messages)}</td>
-      <td class="small muted">${esc(f.detail||'')}</td></tr>`;
+      <td class="small muted">${esc(f.detail||'')}${f.fails?` <span class="tag warn">отказов подряд: ${f.fails}</span>`:''}</td></tr>`;
   }).join('');
   m.body.innerHTML=`
     <div class="an-kpis" style="margin-bottom:12px">

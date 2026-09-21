@@ -114,6 +114,7 @@ def handle_backup(ctx: JobContext) -> Dict:
         download_flags=bool(svc.rt("backup", "download_flags")),
         global_exclude=svc.rt("backup", "folder_exclude") or [],
         global_include=svc.rt("backup", "folder_include") or [],
+        unreadable_grace_runs=int(svc.rt("backup", "unreadable_folder_grace_runs") or 0),
     )
     try:
         res = engine.run(acc, progress_cb=ctx.progress, cancel_cb=ctx.is_cancelled, event_cb=ctx.event)
@@ -131,6 +132,11 @@ def handle_backup(ctx: JobContext) -> Dict:
     if res.messages_skipped:
         # письма, не скачанные из-за лимита размера, иначе «потерялись» бы без объяснений
         summary += f" Пропущено по лимиту размера: {res.messages_skipped}."
+    if res.known_unreadable_folders:
+        shown = ", ".join(res.known_unreadable_folders[:10])
+        more = len(res.known_unreadable_folders) - 10
+        summary += (f" Известные нечитаемые папки ({len(res.known_unreadable_folders)}): {shown}"
+                    f"{f' и ещё {more}' if more > 0 else ''} — сервер не открывает их давно.")
     if res.container_folders:
         summary += (f" Папок-контейнеров, которые сервер не открывает "
                     f"({len(res.container_folders)}): своих писем они не хранят.")
@@ -159,7 +165,8 @@ def handle_backup(ctx: JobContext) -> Dict:
             "messages_new": res.messages_new, "bytes_new": res.bytes_new, "errors": res.errors,
             "skipped_folders": res.skipped_folders,
             "empty_unreadable_folders": res.empty_unreadable_folders,
-            "container_folders": res.container_folders}
+            "container_folders": res.container_folders,
+            "known_unreadable_folders": res.known_unreadable_folders}
 
 
 # ---------------------------------------------------------------------------

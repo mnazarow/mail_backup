@@ -424,6 +424,21 @@ def diagnose_account_folders(request: Request, account_id: int,
     if acc is None:
         raise HTTPException(404, "Ящик не найден")
     result = diagnose_folders(acc, svc.connect_options())
+    # Дополняем историей отказов: одно дело — папка сломалась сегодня, другое —
+    # она не открывается третью неделю подряд.
+    grace = int(svc.rt("backup", "unreadable_folder_grace_runs") or 0)
+    problems = {row["folder"]: row for row in svc.db.list_folder_problems(account_id)}
+    for row in result.get("folders") or []:
+        problem = problems.get(row["name"])
+        if problem is None:
+            continue
+        row["fails"] = int(problem["fails"])
+        row["since"] = (problem["first_failed"] or "")[:10]
+        if row.get("verdict") == "broken" and grace and row["fails"] > grace:
+            row["detail"] += (f"; не открывается {row['fails']} прогонов подряд"
+                              f"{' с ' + row['since'] if row['since'] else ''} — "
+                              f"заданием больше не считается ошибкой")
+    result["grace_runs"] = grace
     svc.db.add_audit(user["username"], "account_folders_diagnose",
                      f"{acc.name}: проблемных папок {len(result.get('broken_folders') or [])}")
     return result

@@ -72,6 +72,7 @@ DEFAULTS: Dict[str, Any] = {
         "retry_backoff": 2.0,          # множитель роста задержки
         "idle_reconnect_min": 30,      # переподключаться к IMAP не реже, чем раз в N минут
         "download_flags": True,        # сохранять флаги писем (\Seen, \Flagged и т.п.)
+        "unreadable_folder_grace_runs": 3,  # после скольких прогонов подряд нечитаемая папка перестаёт считаться ошибкой
         "skip_larger_than_mb": 0,      # пропускать письма крупнее (0 — не пропускать)
         "folder_include": [],          # белый список папок (пусто — все)
         "folder_exclude": [],          # чёрный список папок (напр. ["[Gmail]/Spam", "Корзина"])

@@ -558,6 +558,44 @@ class Database:
     def list_folder_states(self, account_id: int) -> List[sqlite3.Row]:
         return self.query("SELECT * FROM folders WHERE account_id=? ORDER BY folder", (account_id,))
 
+    # ---- папки, которые сервер не даёт открыть -------------------------
+    def record_folder_problem(self, account_id: int, folder: str, error: str = "") -> int:
+        """Отметить, что папка снова не открылась, и вернуть число неудач ПОДРЯД.
+
+        Счётчик нужен, чтобы отличать свежую поломку (о ней надо кричать) от
+        папки, которая не открывается на сервере неделями: бесконечное «копия
+        неполная» приучает не читать предупреждения, и настоящая пропажа писем
+        теряется среди них.
+        """
+        now = utcnow_iso()
+        self.execute(
+            """INSERT INTO folder_problems(account_id, folder, fails, first_failed, last_failed, last_error)
+               VALUES(?,?,1,?,?,?)
+               ON CONFLICT(account_id, folder) DO UPDATE SET
+                   fails=folder_problems.fails+1,
+                   last_failed=excluded.last_failed,
+                   last_error=excluded.last_error""",
+            (account_id, folder, now, now, (error or "")[:1000]),
+        )
+        row = self.query_one("SELECT fails FROM folder_problems WHERE account_id=? AND folder=?",
+                             (account_id, folder))
+        return int(row["fails"]) if row else 1
+
+    def clear_folder_problem(self, account_id: int, folder: str) -> None:
+        """Папка снова открылась (или исчезла) — забыть её историю неудач."""
+        self.execute("DELETE FROM folder_problems WHERE account_id=? AND folder=?",
+                     (account_id, folder))
+
+    def get_folder_problem(self, account_id: int, folder: str) -> Optional[sqlite3.Row]:
+        return self.query_one("SELECT * FROM folder_problems WHERE account_id=? AND folder=?",
+                              (account_id, folder))
+
+    def list_folder_problems(self, account_id: Optional[int] = None) -> List[sqlite3.Row]:
+        if account_id is None:
+            return self.query("SELECT * FROM folder_problems ORDER BY account_id, folder")
+        return self.query("SELECT * FROM folder_problems WHERE account_id=? ORDER BY folder",
+                          (account_id,))
+
     def add_message_index(
         self, account_id: int, folder: str, uidvalidity: int, uid: int,
         message_id: str, size: int, internaldate: str, flags: str, stored_path: str, sha256: str,
@@ -1224,6 +1262,18 @@ CREATE TABLE IF NOT EXISTS folders (
     last_uid    INTEGER DEFAULT 0,
     msg_count   INTEGER DEFAULT 0,
     updated_at  TEXT,
+    UNIQUE(account_id, folder),
+    FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS folder_problems (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id    INTEGER NOT NULL,
+    folder        TEXT NOT NULL,
+    fails         INTEGER DEFAULT 0,   -- сколько прогонов подряд папка не открывается
+    first_failed  TEXT,                -- когда перестала открываться впервые
+    last_failed   TEXT,                -- когда пробовали в последний раз
+    last_error    TEXT,                -- ответ сервера (для интерфейса и поддержки)
     UNIQUE(account_id, folder),
     FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
 );

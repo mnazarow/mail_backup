@@ -98,11 +98,27 @@ class FakeIMAP:
 
 
 class FakeDB:
-    """Минимальная БД в памяти: состояние папок и индекс писем."""
+    """Минимальная БД в памяти: состояние папок, индекс писем и история отказов."""
 
     def __init__(self):
         self.folder_state = {}
         self.indexed = []
+        self.problems = {}
+
+    # -- история папок, которые не открываются ------------------------------
+    def record_folder_problem(self, account_id, folder, error=""):
+        row = self.problems.setdefault((account_id, folder),
+                                       {"fails": 0, "first_failed": "2026-09-01T00:00:00+00:00",
+                                        "last_error": ""})
+        row["fails"] += 1
+        row["last_error"] = error
+        return row["fails"]
+
+    def clear_folder_problem(self, account_id, folder):
+        self.problems.pop((account_id, folder), None)
+
+    def get_folder_problem(self, account_id, folder):
+        return self.problems.get((account_id, folder))
 
     def get_folder_state(self, account_id, folder):
         return self.folder_state.get((account_id, folder))
@@ -556,3 +572,83 @@ def test_diagnose_folders_reports_connection_error(monkeypatch):
     acc = models.Account(id=1, name="Ящик", host="h", username="u", password="p")
     d = client_mod.diagnose_folders(acc)
     assert d["ok"] is False and "нет связи" in d["error"] and d["hint"]
+
+
+# ---------------------------------------------------------------------------
+#  (е) папка, нечитаемая много прогонов подряд, перестаёт быть «ошибкой»
+# ---------------------------------------------------------------------------
+def _engine_and_account(monkeypatch, fake, **kw):
+    _patch_connection(monkeypatch, fake)
+    db, store = FakeDB(), FakeStore()
+    engine = backup_mod.BackupEngine(db, store, client_mod.ConnectOptions(), **kw)
+    acc = models.Account(id=1, name="Ящик", host="h", username="u", password="p")
+    return engine, acc, db, store
+
+
+def test_chronically_unreadable_folder_stops_being_an_error(monkeypatch):
+    """Три прогона папка — ошибка, дальше «известная нечитаемая».
+
+    Иначе «КОПИЯ НЕПОЛНАЯ» висит вечно из-за папки, которую на сервере уже не
+    починить, и на этом фоне настоящая пропажа писем остаётся незамеченной.
+    """
+    bad = "Отправленные/s2022"
+    fake = FakeIMAP(
+        folders=[((b"\\HasNoChildren",), b"/", "INBOX"),
+                 ((b"\\HasNoChildren",), b"/", bad)],
+        messages=_messages("INBOX"),
+        select_errors={bad: [_axigen_refusal()] * 60},
+    )
+    engine, acc, db, _store = _engine_and_account(monkeypatch, fake, unreadable_grace_runs=3)
+
+    runs = []
+    for _ in range(4):
+        events = []
+        runs.append((engine.run(acc, event_cb=lambda lvl, m: events.append((lvl, m))), events))
+
+    assert [r.errors for r, _ in runs] == [1, 1, 1, 0]
+    assert [r.status_label for r, _ in runs] == ["partial", "partial", "partial", "success"]
+    assert runs[3][0].known_unreadable_folders == [bad]
+    assert runs[3][0].skipped_folders == []
+
+    # предупреждение никуда не делось — просто перестало быть ошибкой
+    note = [m for lvl, m in runs[3][1] if bad in m and lvl == "WARNING"][0]
+    assert "4-й прогон подряд" in note and "ошибкой больше не считаем" in note
+    final = [m for _lvl, m in runs[3][1] if m.startswith("Бэкап завершён")][-1]
+    assert "Известные нечитаемые папки (1)" in final and "КОПИЯ НЕПОЛНАЯ" not in final
+    # а в первых прогонах видно, сколько осталось до этого
+    warn1 = [m for lvl, m in runs[0][1] if m.startswith("Пропуск папки")][0]
+    assert "ещё 3" in warn1
+
+
+def test_recovered_folder_resets_the_counter(monkeypatch):
+    """Папка снова открылась — история отказов забыта, письма скопированы."""
+    bad = "Отправленные/s2022"
+    fake = FakeIMAP(
+        folders=[((b"\\HasNoChildren",), b"/", bad)],
+        messages=_messages(bad),
+        select_errors={bad: [_axigen_refusal()] * 6},   # 2 EXAMINE + SELECT на каждый из 2 прогонов
+    )
+    engine, acc, db, _store = _engine_and_account(monkeypatch, fake, unreadable_grace_runs=3)
+
+    first = engine.run(acc)
+    second = engine.run(acc)
+    assert first.errors == 1 and second.errors == 1
+    assert db.problems[(1, bad)]["fails"] == 2
+
+    third = engine.run(acc)                  # отказы кончились — папка открылась
+    assert third.errors == 0 and third.messages_new == 2
+    assert (1, bad) not in db.problems       # счётчик сброшен
+
+
+def test_grace_can_be_switched_off(monkeypatch):
+    """С нулём папка остаётся ошибкой всегда — для тех, кому нужен строгий режим."""
+    bad = "Архив/битая"
+    fake = FakeIMAP(
+        folders=[((b"\\HasNoChildren",), b"/", bad)],
+        select_errors={bad: [_axigen_refusal()] * 60},
+    )
+    engine, acc, _db, _store = _engine_and_account(monkeypatch, fake, unreadable_grace_runs=0)
+    for _ in range(5):
+        res = engine.run(acc)
+    assert res.errors == 1 and res.skipped_folders == [bad]
+    assert res.known_unreadable_folders == []
