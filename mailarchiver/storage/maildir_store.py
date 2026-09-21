@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import gzip
 import os
+import shutil
 import socket
 import time
 from typing import Iterator, List, Optional, Tuple
@@ -213,6 +214,21 @@ class MaildirStore:
                     count += 1
                 except OSError:
                     pass
+        return count, total
+
+    def delete_account_files(self, account_id: int) -> Tuple[int, int]:
+        """Удалить ВСЕ файлы писем ящика (копия «с нуля»).
+
+        Возвращает ``(удалено файлов, освобождено байт)``. Каталог самого ящика
+        создаётся заново пустым, чтобы последующая копия писала в привычное
+        место. Вызывается только по явной команде администратора: письма,
+        которых уже нет на сервере, после этого не восстановить.
+        """
+        acc_dir = self.account_dir(account_id)
+        count, total = self.account_disk_usage(account_id)
+        if os.path.isdir(acc_dir):
+            shutil.rmtree(acc_dir, ignore_errors=True)
+        ensure_dir(acc_dir, 0o700)
         return count, total
 
     @staticmethod

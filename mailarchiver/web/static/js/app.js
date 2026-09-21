@@ -669,6 +669,47 @@ async function viewAccounts(c){
   c.appendChild(wrap);
 }
 
+/** Копирование заново: докачать потерянное или стереть копию и скачать всё. */
+function rebuildModal(a){
+  const m=modal(`Скопировать заново: ${a.name}`, `
+    <p class="muted">Обычная копия скачивает только те письма, которых ещё нет в архиве.
+      Здесь можно перепроверить архив целиком.</p>
+    <label class="form-row check" style="align-items:flex-start;gap:10px">
+      <input type="radio" name="rb" value="missing" checked style="margin-top:4px">
+      <span><b>Докачать потерянные письма</b><br>
+        <span class="muted small">Сверяет индекс с файлами на диске: если файл письма пропал
+        (сбой диска, оборванный прогон, чужая уборка), письмо скачивается заново.
+        <b>Ничего не удаляется</b> — это безопасный режим.</span></span></label>
+    <label class="form-row check" style="align-items:flex-start;gap:10px;margin-top:10px">
+      <input type="radio" name="rb" value="full" style="margin-top:4px">
+      <span><b>Полностью с нуля</b><br>
+        <span class="muted small">Стирает локальную копию ящика — и файлы писем, и записи индекса —
+        и скачивает всё с сервера заново.</span></span></label>
+    <div class="hint" style="margin-top:12px;border-left:3px solid var(--danger)">
+      <b>Режим «с нуля» необратим.</b> Письма, которых уже нет на почтовом сервере, есть только
+      в этой копии — после стирания их не вернуть. Выбирайте его, только если архив испорчен
+      и нужен именно чистый лист.</div>`,
+    {wide:true, footer:'<button class="btn ghost" data-c>Отмена</button><button class="btn primary" data-go>Запустить</button>'});
+  m.foot.querySelector('[data-c]').onclick=()=>m.close();
+  m.foot.querySelector('[data-go]').onclick=async()=>{
+    const mode=(m.body.querySelector('input[name=rb]:checked')||{}).value||'missing';
+    if(mode==='full'){
+      const ok=await confirmDlg('Стереть локальную копию и скачать заново?',
+        `Все скачанные письма ящика «${a.name}» будут удалены с диска, а затем заново скачаны с сервера. `+
+        `Письма, которых на сервере уже нет, будут потеряны безвозвратно. Продолжить?`,
+        {okText:'Да, стереть и скачать заново', okClass:'danger'});
+      if(!ok) return;
+    }
+    try{
+      await api(`/accounts/${a.id}/backup`,{method:'POST',body:{rebuild:mode}});
+      m.close();
+      toast(mode==='full'?'Копия пересоздаётся с нуля':'Докачка потерянных писем запущена',
+            'Следите за ходом в разделе «Очередь и задания»');
+      location.hash='#/jobs';
+    }catch(e){ toastErr(e); }
+  };
+}
+
 /** Проверка папок на сервере: что открывается, что нет и теряются ли письма. */
 async function folderDiagnoseModal(a){
   const m=modal(`Папки на сервере: ${a.name}`,
@@ -736,6 +777,7 @@ function accountMenu(a){
     <button class="btn" data-a="retention">🗓️ Хранение копий (3 дня / неделя)</button>
     <button class="btn" data-a="verify">🔍 Проверить целостность копии</button>
     <button class="btn" data-a="folders">🗂️ Проверить папки на сервере</button>
+    <button class="btn" data-a="rebuild" ${a.enabled?'':'disabled title="Ящик выключен"'}>🔄 Скопировать заново</button>
     <button class="btn danger" data-a="del">🗑️ Удалить ящик</button>
   </div>`);
   m.body.querySelectorAll('[data-a]').forEach(b=>b.onclick=async()=>{
@@ -748,6 +790,7 @@ function accountMenu(a){
     else if(act==='import') importModal(a);
     else if(act==='retention') retentionModal(a);
     else if(act==='folders') folderDiagnoseModal(a);
+    else if(act==='rebuild') rebuildModal(a);
     else if(act==='verify'){ try{await api(`/accounts/${a.id}/verify`,{method:'POST'}); toast('Запущено','Проверка целостности в очереди'); location.hash='#/jobs';}catch(e){toastErr(e);} }
     else if(act==='del'){ if(await confirmDlg('Удалить ящик?', `Ящик «${a.name}» и его настройки будут удалены. Локальные копии писем на диске останутся. Продолжить?`)){ try{await api(`/accounts/${a.id}`,{method:'DELETE'}); toast('Удалено'); route();}catch(e){toastErr(e);} } }
   });

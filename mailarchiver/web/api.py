@@ -92,6 +92,17 @@ class SetupBody(BaseModel):
     password: str
 
 
+class BackupBody(BaseModel):
+    """Параметры запуска копирования.
+
+    ``rebuild``: пусто — обычная (инкрементная) копия; ``missing`` — сверить
+    индекс с файлами на диске и докачать потерянные письма; ``full`` — стереть
+    локальную копию ящика и скачать всё заново.
+    """
+
+    rebuild: str = ""
+
+
 class ExcludeFoldersBody(BaseModel):
     """Папки, которые больше не нужно пытаться копировать."""
 
@@ -445,13 +456,37 @@ def diagnose_account_folders(request: Request, account_id: int,
 
 
 @router.post("/accounts/{account_id}/backup")
-def start_backup(request: Request, account_id: int, user: dict = Depends(auth_mod.require_user)):
+def start_backup(request: Request, account_id: int, body: Optional[BackupBody] = None,
+                 user: dict = Depends(auth_mod.require_user)):
+    """Поставить копирование в очередь.
+
+    По умолчанию копия инкрементная. ``rebuild=missing`` возвращает письма,
+    файлы которых потерялись на диске; ``rebuild=full`` стирает локальную копию
+    ящика и качает всё заново — это необратимо, поэтому доступно только
+    администратору и записывается в аудит.
+    """
     svc = svc_dep(request)
     _ensure_account_access(user, account_id)
-    svc.require_account(account_id)
+    acc = svc.require_account(account_id)
+    rebuild = (body.rebuild if body else "").strip().lower()
+    if rebuild not in ("", "missing", "full"):
+        raise ValidationError(f"Неизвестный режим пересоздания копии: «{rebuild}».",
+                              hint="Допустимо: пусто (обычная копия), missing, full.")
+    if rebuild == "full":
+        # Стирание локальной копии — не то действие, которое можно доверить
+        # владельцу ящика: письма, удалённые на сервере, после него не вернуть.
+        if (user.get("role") or "") != "admin":
+            raise HTTPException(403, "Полное пересоздание копии доступно только администратору")
+        svc.db.add_audit(user["username"], "backup_rebuild_full_request", acc.name)
+    params = {"rebuild": rebuild} if rebuild else {}
     max_attempts = int(svc.rt("backup", "retry_attempts") or 1)
-    jid = svc.queue.enqueue(JobType.BACKUP, account_id, {}, max_attempts=max_attempts, created_by=user["username"])
-    return {"ok": True, "job_id": jid}
+    # Пересоздание не повторяем автоматически: повтор «полной» копии стёр бы
+    # уже скачанное во второй раз.
+    if rebuild:
+        max_attempts = 1
+    jid = svc.queue.enqueue(JobType.BACKUP, account_id, params,
+                            max_attempts=max_attempts, created_by=user["username"])
+    return {"ok": True, "job_id": jid, "rebuild": rebuild}
 
 
 @router.post("/accounts/backup-all")

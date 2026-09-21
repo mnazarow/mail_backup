@@ -1,4 +1,6 @@
 """Тесты новых функций: просмотр писем, ретеншн на ящик, разбор письма."""
+import os
+
 from mailarchiver import models
 from mailarchiver.mailview import parse_message, get_attachment
 
@@ -111,3 +113,65 @@ def test_backup_all_accounts(client):
     again = client.post("/api/accounts/backup-all").json()
     assert len(again["started"]) == 0
     assert {s["account_id"] for s in again["skipped"]} == started
+
+
+# ---------------------------------------------------------------------------
+#  Пересоздание копии: докачка потерянных файлов и полная очистка
+# ---------------------------------------------------------------------------
+def test_rebuild_missing_drops_index_rows_without_files(services, tmp_path):
+    """Файла на диске нет — запись индекса убираем, чтобы письмо скачалось заново."""
+    from mailarchiver.models import Account
+    from mailarchiver.queue.jobs import _rebuild_missing
+
+    acc_id = services.db.create_account(Account(name="Я", host="h", username="u", password="p"))
+    acc = services.db.get_account(acc_id)
+    acc_dir = services.store.account_dir(acc_id)
+    os.makedirs(os.path.join(acc_dir, "INBOX", "cur"), exist_ok=True)
+    alive = os.path.join("INBOX", "cur", "alive.eml")
+    with open(os.path.join(acc_dir, alive), "wb") as fh:
+        fh.write("From: a@b\r\n\r\nтело".encode("utf-8"))
+    empty = os.path.join("INBOX", "cur", "empty.eml")
+    open(os.path.join(acc_dir, empty), "wb").close()      # файл есть, но пустой
+
+    for uid, rel in ((1, alive), (2, empty), (3, os.path.join("INBOX", "cur", "gone.eml"))):
+        services.db.add_message_index(acc_id, "INBOX", 1000, uid, f"<{uid}@x>", 10,
+                                      "2026-09-01T00:00:00+00:00", "", rel, "sha")
+    assert services.db.count_messages(acc_id) == 3
+
+    events = []
+
+    class _Ctx:
+        def __init__(self):
+            self.db = services.db
+            self.services = services
+
+        def event(self, level, message):
+            events.append((level, message))
+
+        def progress(self, *_a, **_k):
+            pass
+
+    lost = _rebuild_missing(_Ctx(), acc)
+    assert lost == 2                                   # пустой и пропавший
+    assert services.db.count_messages(acc_id) == 1     # целое письмо осталось
+    assert any("потерянных файлов: 2" in m for _lvl, m in events)
+
+
+def test_rebuild_full_wipes_index_and_files(services):
+    """«С нуля» удаляет и записи индекса, и файлы писем ящика."""
+    from mailarchiver.models import Account
+
+    acc_id = services.db.create_account(Account(name="Я2", host="h", username="u", password="p"))
+    rel, _sha, _size = services.store.store_message(
+        acc_id, "INBOX", "/", 1, "From: a@b\r\n\r\nтело".encode("utf-8"))
+    services.db.add_message_index(acc_id, "INBOX", 1000, 1, "<1@x>", 10,
+                                  "2026-09-01T00:00:00+00:00", "", rel, "sha")
+    assert os.path.isfile(os.path.join(services.store.account_dir(acc_id), rel))
+
+    removed = services.db.purge_account_index(acc_id)
+    files, freed = services.store.delete_account_files(acc_id)
+    assert removed == 1 and files == 1 and freed > 0
+    assert services.db.count_messages(acc_id) == 0
+    assert not os.path.isfile(os.path.join(services.store.account_dir(acc_id), rel))
+    # каталог ящика воссоздан пустым — следующая копия пишет туда же
+    assert os.path.isdir(services.store.account_dir(acc_id))

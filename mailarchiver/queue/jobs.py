@@ -23,6 +23,7 @@ from ..export.base import MailItem, zip_directory
 from ..logging_setup import get_logger
 from ..models import JobStatus, JobType
 from ..util import human_size, safe_filename, utcnow_iso
+from ..version import __version__
 
 log = get_logger("jobs")
 
@@ -102,11 +103,69 @@ class JobContext:
 # ---------------------------------------------------------------------------
 #  BACKUP
 # ---------------------------------------------------------------------------
+def _rebuild_missing(ctx: JobContext, acc) -> int:
+    """Убрать из индекса письма, файлов которых на диске больше нет.
+
+    После этого обычная копия скачает их заново. Нужно, когда файлы потеряны
+    (сбой диска, чужая уборка, оборванный прогон): пока запись в индексе есть,
+    письмо считается скачанным и сервер о нём больше не спрашивают.
+    """
+    store = ctx.services.store
+    acc_dir = store.account_dir(acc.id)
+    lost, checked = [], 0
+    for msg_id, _folder, rel in ctx.db.iter_message_paths(acc.id):
+        checked += 1
+        if not rel:
+            lost.append(msg_id)
+            continue
+        path = os.path.join(acc_dir, rel)
+        try:
+            if not os.path.isfile(path) or os.path.getsize(path) == 0:
+                lost.append(msg_id)
+        except OSError:
+            lost.append(msg_id)
+        if checked % 20000 == 0:
+            ctx.progress(0, 1, f"Проверено записей: {checked}")
+    if lost:
+        ctx.db.delete_message_indexes(lost)
+    ctx.event("INFO", f"Проверено записей индекса: {checked}; потерянных файлов: {len(lost)}."
+                      + (" Эти письма будут скачаны заново." if lost else " Всё на месте."))
+    return len(lost)
+
+
+def _rebuild_full(ctx: JobContext, acc) -> Dict[str, int]:
+    """Стереть локальную копию ящика целиком и начать её заново.
+
+    Удаляются и записи индекса, и файлы писем. Делается ТОЛЬКО по явной
+    команде администратора: письма, которых уже нет на почтовом сервере,
+    после этого не восстановить.
+    """
+    removed_index = ctx.db.purge_account_index(acc.id)
+    files, freed = ctx.services.store.delete_account_files(acc.id)
+    ctx.event("WARNING", f"Локальная копия ящика стёрта: записей индекса {removed_index}, "
+                         f"файлов {files} ({human_size(freed)}). Скачиваем всё заново.")
+    ctx.db.add_audit("system", "backup_rebuild_full",
+                     f"{acc.name}: индекс {removed_index}, файлов {files}")
+    return {"index": removed_index, "files": files, "bytes": freed}
+
+
 def handle_backup(ctx: JobContext) -> Dict:
     svc = ctx.services
     acc = svc.require_account(ctx.account_id)
-    ctx.event("INFO", f"Старт резервного копирования ящика «{acc.name}».")
+    # rebuild: "" — обычная копия; "missing" — вернуть потерянные файлы;
+    # "full" — стереть локальную копию и скачать всё заново.
+    rebuild = str(ctx.params.get("rebuild") or "").strip().lower()
+    label = {"missing": " (докачка потерянных писем)", "full": " (полностью заново)"}.get(rebuild, "")
+    ctx.event("INFO", f"Старт резервного копирования ящика «{acc.name}»{label}. "
+                      f"MailArchiver {__version__}.")
     run_id = ctx.db.start_run(acc.id, JobType.BACKUP, ctx.job_id)
+
+    rebuild_info: Dict[str, int] = {}
+    if rebuild == "missing":
+        ctx.event("INFO", "Сверяем индекс с файлами на диске…")
+        rebuild_info["restored"] = _rebuild_missing(ctx, acc)
+    elif rebuild == "full":
+        rebuild_info = _rebuild_full(ctx, acc)
 
     engine = BackupEngine(
         ctx.db, svc.store, svc.connect_options(),
@@ -129,6 +188,11 @@ def handle_backup(ctx: JobContext) -> Dict:
 
     summary = (f"Ящик «{acc.name}»: новых писем {res.messages_new} ({human_size(res.bytes_new)}), "
                f"папок {res.folders_processed}/{res.folders_total}, ошибок {res.errors}.")
+    if rebuild == "missing":
+        summary += f" Докачка потерянных: возвращено в очередь {rebuild_info.get('restored', 0)} писем."
+    elif rebuild == "full":
+        summary += (f" Копия пересоздана с нуля (стёрто записей {rebuild_info.get('index', 0)}, "
+                    f"файлов {rebuild_info.get('files', 0)}).")
     if res.messages_skipped:
         # письма, не скачанные из-за лимита размера, иначе «потерялись» бы без объяснений
         summary += f" Пропущено по лимиту размера: {res.messages_skipped}."
@@ -166,7 +230,8 @@ def handle_backup(ctx: JobContext) -> Dict:
             "skipped_folders": res.skipped_folders,
             "empty_unreadable_folders": res.empty_unreadable_folders,
             "container_folders": res.container_folders,
-            "known_unreadable_folders": res.known_unreadable_folders}
+            "known_unreadable_folders": res.known_unreadable_folders,
+            "rebuild": rebuild or "", **({"rebuild_info": rebuild_info} if rebuild_info else {})}
 
 
 # ---------------------------------------------------------------------------

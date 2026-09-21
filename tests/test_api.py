@@ -208,7 +208,6 @@ def test_folder_problem_history_is_stored(client):
     """История «папка не открывается» живёт в БД и сбрасывается при успехе."""
     _login(client)
     acc_id = _make_account(client, "История папок")
-    from mailarchiver.web.app import create_app  # noqa: F401  (приложение уже поднято фикстурой)
     svc = client.app.state.services
     assert svc.db.record_folder_problem(acc_id, "Отправленные/s2022", "failed EXAMINE") == 1
     assert svc.db.record_folder_problem(acc_id, "Отправленные/s2022", "failed EXAMINE") == 2
@@ -216,4 +215,46 @@ def test_folder_problem_history_is_stored(client):
     assert row["fails"] == 2 and row["first_failed"] and "EXAMINE" in row["last_error"]
     assert [r["folder"] for r in svc.db.list_folder_problems(acc_id)] == ["Отправленные/s2022"]
     svc.db.clear_folder_problem(acc_id, "Отправленные/s2022")
+    assert svc.db.list_folder_problems(acc_id) == []
+
+
+# ---------------------------------------------------------------------------
+#  Копирование заново («докачать потерянные» и «с нуля»)
+# ---------------------------------------------------------------------------
+def test_backup_rebuild_modes_are_validated(client):
+    _login(client)
+    acc_id = _make_account(client, "Пересоздание")
+    assert client.post(f"/api/accounts/{acc_id}/backup", json={}).status_code == 200
+    assert client.post(f"/api/accounts/{acc_id}/backup", json={"rebuild": "missing"}).status_code == 200
+    bad = client.post(f"/api/accounts/{acc_id}/backup", json={"rebuild": "wipe"})
+    assert bad.status_code >= 400 and "режим" in bad.json().get("message", "").lower()
+
+
+def test_backup_rebuild_passes_mode_to_the_job(client):
+    _login(client)
+    acc_id = _make_account(client, "Пересоздание 2")
+    r = client.post(f"/api/accounts/{acc_id}/backup", json={"rebuild": "full"})
+    assert r.status_code == 200 and r.json()["rebuild"] == "full"
+    job = client.get(f"/api/jobs/{r.json()['job_id']}").json()
+    assert job["params"]["rebuild"] == "full"
+    # необратимое действие должно попадать в аудит
+    actions = [a["action"] for a in client.get("/api/audit?limit=20").json()]
+    assert "backup_rebuild_full_request" in actions
+
+
+def test_purge_account_index_clears_everything(client):
+    """«С нуля» стирает и индекс писем, и состояние папок, и историю отказов."""
+    _login(client)
+    acc_id = _make_account(client, "Очистка")
+    svc = client.app.state.services
+    svc.db.add_message_index(acc_id, "INBOX", 1000, 1, "<a@b>", 10, "2026-09-01T00:00:00+00:00",
+                             "", "cur/1.eml", "sha", subject="тест")
+    svc.db.upsert_folder_state(acc_id, "INBOX", 1000, 1, 1)
+    svc.db.record_folder_problem(acc_id, "Архив/битая", "failed EXAMINE")
+    assert svc.db.count_messages(acc_id) == 1
+
+    removed = svc.db.purge_account_index(acc_id)
+    assert removed == 1
+    assert svc.db.count_messages(acc_id) == 0
+    assert svc.db.get_folder_state(acc_id, "INBOX") is None
     assert svc.db.list_folder_problems(acc_id) == []

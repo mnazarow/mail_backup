@@ -125,7 +125,10 @@ main(){
   fi
 
   ROLLED_BACK=1  # успех — откат не нужен
-  ok "Обновление завершено успешно."
+  # Печатаем версию: без неё после обновления невозможно убедиться, что
+  # запустилась именно новая сборка (а не осталась прежняя).
+  NEW_VERSION="$("$VENV_DIR/bin/python" -c 'from mailarchiver.version import __version__; print(__version__)' 2>/dev/null || echo '?')"
+  ok "Обновление завершено успешно. Установленная версия: $NEW_VERSION"
   # чистим старые бэкапы (оставляем 5 последних)
   ls -1dt "$BACKUP_DIR"/app_* 2>/dev/null | tail -n +6 | xargs -r rm -rf || true
   info "Резервная копия прежней версии: $BACKUP_PATH"

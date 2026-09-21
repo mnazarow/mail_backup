@@ -17,7 +17,7 @@ import json
 import os
 import sqlite3
 import threading
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from . import models
 from .logging_setup import get_logger
@@ -677,6 +677,53 @@ class Database:
     def purge_folder_index(self, account_id: int, folder: str) -> None:
         """Удалить из индекса все записи папки (при смене UIDVALIDITY)."""
         self.execute("DELETE FROM messages WHERE account_id=? AND folder=?", (account_id, folder))
+
+    # ---- пересоздание копии ящика «с нуля» ------------------------------
+    def iter_message_paths(self, account_id: int, batch: int = 5000):
+        """Пройти индекс ящика порциями: ``(id, папка, путь к файлу)``.
+
+        Порциями — потому что у большого ящика сотни тысяч записей, и читать их
+        одним списком в память при проверке файлов на диске не стоит.
+        """
+        offset = 0
+        while True:
+            rows = self.query(
+                "SELECT id, folder, stored_path FROM messages WHERE account_id=? "
+                "ORDER BY id LIMIT ? OFFSET ?",
+                (account_id, batch, offset),
+            )
+            if not rows:
+                return
+            for row in rows:
+                yield int(row["id"]), row["folder"], (row["stored_path"] or "")
+            offset += len(rows)
+
+    def delete_message_indexes(self, ids: Sequence[int]) -> int:
+        """Удалить записи индекса по списку id. Возвращает число удалённых."""
+        removed = 0
+        ids = list(ids)
+        for start in range(0, len(ids), 500):       # SQLite не любит огромные IN
+            chunk = ids[start:start + 500]
+            marks = ",".join("?" * len(chunk))
+            self.execute(f"DELETE FROM messages WHERE id IN ({marks})", tuple(chunk))
+            removed += len(chunk)
+        return removed
+
+    def purge_account_index(self, account_id: int) -> int:
+        """Стереть весь индекс писем ящика и состояние его папок.
+
+        Нужно для копии «с нуля»: пока запись о письме есть в индексе, сервис
+        считает письмо уже скачанным и заново его не запрашивает.
+        """
+        count = self.count_messages(account_id)
+        self.execute("DELETE FROM messages WHERE account_id=?", (account_id,))
+        self.execute("DELETE FROM folders WHERE account_id=?", (account_id,))
+        self.execute("DELETE FROM folder_problems WHERE account_id=?", (account_id,))
+        return int(count)
+
+    def reset_folder_states(self, account_id: int) -> None:
+        """Забыть состояние папок ящика (UIDVALIDITY и последний UID)."""
+        self.execute("DELETE FROM folders WHERE account_id=?", (account_id,))
 
     def folders_summary(self, account_id: int) -> List[sqlite3.Row]:
         return self.query(
