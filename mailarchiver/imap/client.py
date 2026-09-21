@@ -359,10 +359,15 @@ class ImapConnection:
 
         Делаем до ``SELECT_ATTEMPTS`` попыток с паузой: часть отказов временная
         (ящик занят другой сессией, блокировка, кратковременная перегрузка).
-        Если открыть так и не удалось — в сообщение кладём ФАКТИЧЕСКИЙ ответ
-        сервера и его untagged-уведомления: без них в журнале остаётся лишь
-        общий текст библиотеки («select failed: …»), по которому причину на
-        стороне сервера определить невозможно.
+        Если EXAMINE так и не прошёл, пробуем ОДИН раз обычный SELECT: часть
+        серверов (замечено на Axigen) отдаёт «failed EXAMINE» на папку, которую
+        при этом нормально открывает на запись. Читать это безопасно — письма
+        всё равно скачиваются через ``BODY.PEEK``, флаг ``\Seen`` не ставится.
+        Если открыть не удалось ничем — в сообщение кладём ФАКТИЧЕСКИЙ ответ
+        сервера, его untagged-уведомления и данные STATUS (сколько писем сервер
+        видит в этой папке): без них в журнале остаётся лишь общий текст
+        библиотеки («select failed: …»), по которому нельзя понять ни причину,
+        ни того, потеряно ли вообще что-нибудь.
         """
         attempts = max(1, int(SELECT_ATTEMPTS))
         attempt = 0
@@ -372,6 +377,10 @@ class ImapConnection:
                 info = self.client.select_folder(folder, readonly=readonly)
             except Exception as exc:  # noqa: BLE001
                 if attempt >= attempts:
+                    if readonly:
+                        fallback = self._select_readwrite_fallback(folder)
+                        if fallback is not None:
+                            return fallback
                     raise self._select_error(folder, exc, attempt) from exc
                 log.warning("Папка «%s» не открылась (%s). Повтор попытки %d из %d через %.1f с…",
                             folder, _server_reply(exc) or exc, attempt + 1, attempts, SELECT_RETRY_DELAY_S)
@@ -383,6 +392,48 @@ class ImapConnection:
                 "exists": int(info.get(b"EXISTS", 0) or 0),
             }
 
+    def _select_readwrite_fallback(self, folder: str) -> Optional[Dict[str, int]]:
+        """Последняя попытка открыть папку обычным SELECT вместо EXAMINE."""
+        try:
+            info = self.client.select_folder(folder, readonly=False)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("Папка «%s» не открылась и обычным SELECT: %s", folder, exc)
+            return None
+        log.warning("Папка «%s» не открылась по EXAMINE, но открылась обычным SELECT — "
+                    "читаем её так (письма скачиваются через BODY.PEEK, флаги не меняются).", folder)
+        return {
+            "uidvalidity": int(info.get(b"UIDVALIDITY", 0) or 0),
+            "uidnext": int(info.get(b"UIDNEXT", 0) or 0),
+            "exists": int(info.get(b"EXISTS", 0) or 0),
+        }
+
+    def folder_status(self, folder: str) -> Optional[Dict[str, int]]:
+        """Спросить о папке командой STATUS, не открывая её.
+
+        STATUS часто отвечает по папке, которую сервер отказывается открыть, —
+        и тогда сразу видно главное: есть ли в ней письма. Папка с нулём писем,
+        которая не открывается, копию неполной не делает.
+
+        :returns: словарь с ключами ``messages``, ``uidnext``, ``uidvalidity``
+            либо ``None``, если сервер не ответил и на STATUS. Диагностика не
+            должна ронять копирование, поэтому исключения не пробрасываются.
+        """
+        try:
+            raw = self.client.folder_status(folder, [b"MESSAGES", b"UIDNEXT", b"UIDVALIDITY"])
+        except Exception as exc:  # noqa: BLE001
+            log.debug("STATUS по папке «%s» не прошёл: %s", folder, exc)
+            return None
+        data = {_as_text(k).upper(): v for k, v in (raw or {}).items()}
+
+        def _int(key: str) -> int:
+            try:
+                return int(data.get(key) or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        return {"messages": _int("MESSAGES"), "uidnext": _int("UIDNEXT"),
+                "uidvalidity": _int("UIDVALIDITY")}
+
     def _select_error(self, folder: str, exc: BaseException, attempts: int) -> Exception:
         """
         Собрать ошибку открытия папки так, чтобы администратор увидел ПРИЧИНУ:
@@ -392,7 +443,10 @@ class ImapConnection:
         mapped = _map_exception(exc)
         reply = _server_reply(exc)
         notices = _server_notices(self.client)
+        status = self.folder_status(folder)
         parts = [f"Не удалось открыть папку «{folder}» (попыток: {attempts}): {mapped.message}"]
+        if status is not None:
+            parts.append(f"По команде STATUS сервер сообщает: писем {status['messages']}")
         if reply:
             # Дублирование с текстом библиотеки допускаем осознанно: так в логе
             # всегда есть строка «ответ сервера», которую можно показать
@@ -404,7 +458,9 @@ class ImapConnection:
         hint = getattr(mapped, "hint", None) or (
             "Что проверить на сервере: существует ли папка и открывается ли она (не контейнер ли "
             "это); права (ACL) этой учётной записи на папку; не заблокирован ли ящик другим "
-            "процессом; имя папки и его кодировка (IMAP UTF-7)."
+            "процессом; имя папки и его кодировка (IMAP UTF-7). Если папку не восстановить, "
+            "добавьте её в «Пропускать папки» в карточке ящика — тогда копия перестанет "
+            "считаться неполной из-за неё."
         )
         return type(mapped)(message, hint=hint, cause=exc)
 

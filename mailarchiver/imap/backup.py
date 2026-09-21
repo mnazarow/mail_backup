@@ -19,6 +19,7 @@
 """
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Set
@@ -55,6 +56,11 @@ class BackupResult:
     # Их письма в копию НЕ попали — список нужен, чтобы неполнота копии была
     # видна и в итоге задания, и в его результате, а не только в счётчике ошибок.
     skipped_folders: List[str] = field(default_factory=list)
+    # Папки, которые сервер не даёт открыть, но по данным STATUS они ПУСТЫЕ.
+    # Терять в них нечего, поэтому ошибкой это не считается и копия остаётся
+    # полной — иначе каждый прогон навсегда помечался бы «частично выполнен»
+    # из-за битых пустых папок, которые на сервере уже не восстановить.
+    empty_unreadable_folders: List[str] = field(default_factory=list)
     cancelled: bool = False
 
     @property
@@ -71,6 +77,25 @@ class BackupResult:
         if self.errors:
             return "failed"
         return "success"
+
+
+def _duplicate_hint(name: str, all_names: List[str]) -> str:
+    """Подсказать, что папка похожа на дубликат, созданный самим сервером.
+
+    Axigen при конфликте имён (например «s2022» и «S2022» — в файловой системе
+    это одно и то же) заводит вторую папку с суффиксом ``_000``. Такие папки
+    обычно и не открываются. Без этой подсказки администратор ищет причину в
+    правах доступа, хотя чинить нужно сами папки на сервере.
+    """
+    def _key(value: str) -> str:
+        return re.sub(r"_\d{3}$", "", value).lower()
+
+    twins = [other for other in all_names if other != name and _key(other) == _key(name)]
+    if not twins:
+        return ""
+    return (f" Похоже на дубликат папки «{twins[0]}», созданный самим почтовым сервером "
+            f"при конфликте имён (различие только в регистре или суффикс вида «_000»); "
+            f"такие папки обычно и не открываются — их удаляют на сервере.")
 
 
 def _folder_matches(name: str, patterns: List[str], delimiter: str) -> bool:
@@ -181,15 +206,26 @@ class BackupEngine:
                 try:
                     info = conn.select(f.name, readonly=True)
                 except MailArchiverError as exc:
-                    # Папка не открылась: её письма в копию НЕ попадут. Кроме
-                    # счётчика ошибок запоминаем ИМЯ папки (для итога и для
-                    # результата задания) и показываем подсказку, что смотреть
-                    # на сервере.
+                    # Папка не открылась. Прежде чем объявлять копию неполной,
+                    # спрашиваем сервер командой STATUS: сколько писем он вообще
+                    # видит в этой папке. Пустая папка, которую не открыть, —
+                    # это мусор на сервере, а не потеря писем.
+                    status = conn.folder_status(f.name)
+                    twin = _duplicate_hint(f.name, [x.name for x in folders])
+                    if status is not None and status.get("messages") == 0:
+                        result.empty_unreadable_folders.append(f.name)
+                        emit("WARNING",
+                             f"Папка «{f.name}» не открывается, но по данным сервера она ПУСТАЯ "
+                             f"(0 писем) — копировать нечего, потерь нет.{twin}")
+                        continue
+                    # Письма этой папки в копию НЕ попадут. Кроме счётчика ошибок
+                    # запоминаем ИМЯ папки (для итога и для результата задания) и
+                    # показываем подсказку, что смотреть на сервере.
                     result.errors += 1
                     result.skipped_folders.append(f.name)
                     detail = exc.message + (f" {exc.hint}" if exc.hint else "")
                     result.error_details.append(f"Папка «{f.name}»: {detail}")
-                    emit("WARNING", f"Пропуск папки «{f.name}»: {detail}")
+                    emit("WARNING", f"Пропуск папки «{f.name}»: {detail}{twin}")
                     continue
                 result.folders_read += 1
                 uidvalidity = info["uidvalidity"]
@@ -336,6 +372,14 @@ class BackupEngine:
 
         summary = (f"Бэкап завершён: новых писем {result.messages_new}, "
                    f"пропущено по размеру {result.messages_skipped}, ошибок {result.errors}.")
+        if result.empty_unreadable_folders:
+            # Про такие папки сообщаем, но копию неполной не объявляем: писем в
+            # них нет, и администратору важно лишь знать, что на сервере мусор.
+            shown = ", ".join(result.empty_unreadable_folders[:MAX_SKIPPED_FOLDERS_IN_SUMMARY])
+            rest = len(result.empty_unreadable_folders) - MAX_SKIPPED_FOLDERS_IN_SUMMARY
+            tail = f" и ещё {rest}" if rest > 0 else ""
+            summary += (f" Пустых папок, которые сервер не даёт открыть "
+                        f"({len(result.empty_unreadable_folders)}): {shown}{tail} — писем в них нет.")
         if result.skipped_folders:
             # Неполная копия должна быть ВИДНА: из «ошибок 2» не понять, что
             # именно не скопировано, поэтому перечисляем сами папки.

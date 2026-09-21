@@ -27,14 +27,19 @@ RAW = (b"From: a@example.com\r\nSubject: test\r\nMessage-ID: <1@example.com>\r\n
 class FakeIMAP:
     """Заглушка imapclient: отвечает заранее заданными данными и считает вызовы."""
 
-    def __init__(self, folders, messages=None, select_errors=None, uidvalidity=1000):
+    def __init__(self, folders, messages=None, select_errors=None, uidvalidity=1000,
+                 status_messages=None):
         self.folders = folders                    # [(флаги, разделитель, имя)]
         self.messages = messages or {}            # {папка: {uid: письмо}}
         # {папка: [исключение | None, …]} — по одному элементу на попытку SELECT;
         # когда список кончился, папка открывается нормально.
         self.select_errors = {k: list(v) for k, v in (select_errors or {}).items()}
+        # {папка: сколько писем показывает STATUS}. Папки, которой тут нет,
+        # сервер по STATUS не отвечает — как настоящий сервер на битой папке.
+        self.status_messages = dict(status_messages or {})
         self.uidvalidity = uidvalidity
         self.select_calls = []
+        self.status_calls = []
         self.current = None
         self._imap = types.SimpleNamespace(untagged_responses={})
 
@@ -55,6 +60,13 @@ class FakeIMAP:
         self.current = folder
         msgs = self.messages.get(folder, {})
         return {b"UIDVALIDITY": self.uidvalidity, b"UIDNEXT": 9999, b"EXISTS": len(msgs)}
+
+    def folder_status(self, folder, what):
+        self.status_calls.append(folder)
+        if folder not in self.status_messages:
+            raise IMAPClientError("STATUS failed")
+        return {b"MESSAGES": int(self.status_messages[folder]),
+                b"UIDNEXT": 9999, b"UIDVALIDITY": self.uidvalidity}
 
     def search(self, criteria):
         return sorted(self.messages.get(self.current, {}))
@@ -248,15 +260,17 @@ def test_select_failure_is_retried_and_reported(monkeypatch):
             ((b"\\HasNoChildren",), b"/", "Отправленные/s2018"),
         ],
         messages=_messages("INBOX"),
-        select_errors={"Отправленные/s2018": [_axigen_refusal(), _axigen_refusal()]},
+        # три отказа: два EXAMINE и запасная попытка обычным SELECT
+        select_errors={"Отправленные/s2018": [_axigen_refusal()] * 3},
+        status_messages={"Отправленные/s2018": 7},   # письма в папке есть — это потеря
     )
     # сервер объяснил причину в untagged-строке — её тоже нельзя терять
     fake._imap.untagged_responses = {"NO": [b"[ALERT] mailbox is locked by another session"]}
 
     res, db, store, events = _run_backup(monkeypatch, fake)
 
-    # ровно одна ПОВТОРНАЯ попытка (две всего), папка в план не попала
-    assert fake.select_calls.count("Отправленные/s2018") == 2
+    # две попытки EXAMINE и одна запасная SELECT; папка в план не попала
+    assert fake.select_calls.count("Отправленные/s2018") == 3
     assert res.skipped_folders == ["Отправленные/s2018"]
     assert res.errors == 1 and res.folders_read == 1
 
@@ -264,6 +278,7 @@ def test_select_failure_is_retried_and_reported(monkeypatch):
     assert "Отправленные/s2018" in detail
     assert "попыток: 2" in detail
     assert "Ответ сервера: «failed EXAMINE»" in detail          # слова сервера как есть
+    assert "STATUS сервер сообщает: писем 7" in detail           # сколько писем потеряно
     assert "mailbox is locked by another session" in detail      # и его untagged-строка
     assert "Что проверить на сервере:" in detail                 # подсказка администратору
 
@@ -292,7 +307,7 @@ def test_select_retry_recovers_after_temporary_refusal(monkeypatch):
 
 def test_select_error_message_keeps_server_words(monkeypatch):
     """Прямая проверка select(): ошибка несёт ответ сервера и подсказку."""
-    fake = FakeIMAP(folders=[], select_errors={"X": [_axigen_refusal(), _axigen_refusal()]})
+    fake = FakeIMAP(folders=[], select_errors={"X": [_axigen_refusal()] * 3})
     conn_cls = _patch_connection(monkeypatch, fake)
     acc = models.Account(id=1, name="Ящик", host="h", username="u", password="p")
     from mailarchiver.errors import ImapProtocolError
@@ -305,7 +320,7 @@ def test_select_error_message_keeps_server_words(monkeypatch):
             assert exc.hint and "ACL" in exc.hint
         else:  # pragma: no cover - ошибка обязана подняться
             raise AssertionError("select() должен был бросить ошибку")
-    assert fake.select_calls == ["X", "X"]
+    assert fake.select_calls == ["X", "X", "X"]   # 2 × EXAMINE + запасной SELECT
 
 
 # ---------------------------------------------------------------------------
@@ -329,3 +344,90 @@ def test_probe_account_marks_duplicate_folders(monkeypatch):
     archive = [f for f in res["folders"] if f["name"] == "Архив"][0]
     # по флагам видно, ПОЧЕМУ папка не копируется — SELECT для этого не нужен
     assert archive["selectable"] is False and "\\Noselect" in archive["flags"]
+
+
+# ---------------------------------------------------------------------------
+#  (г) папка не открывается по EXAMINE: запасной SELECT, STATUS и пустые папки
+# ---------------------------------------------------------------------------
+def test_examine_refused_but_plain_select_works(monkeypatch):
+    """Axigen отвечает «failed EXAMINE», но обычный SELECT папку открывает.
+
+    Раньше такая папка объявлялась непрочитанной и копия — неполной, хотя
+    письма были доступны. Читать через SELECT безопасно: письма скачиваются
+    командой BODY.PEEK, флаг \\Seen на сервере не ставится.
+    """
+    fake = FakeIMAP(
+        folders=[((b"\\HasNoChildren",), b"/", "Отправленные/s2022")],
+        messages=_messages("Отправленные/s2022"),
+        select_errors={"Отправленные/s2022": [_axigen_refusal(), _axigen_refusal()]},
+    )
+    res, db, store, events = _run_backup(monkeypatch, fake)
+
+    assert res.skipped_folders == [] and res.errors == 0
+    assert res.messages_new == 2 and res.status_label == "success"
+    assert fake.select_calls.count("Отправленные/s2022") == 4   # 2 EXAMINE + SELECT + загрузка
+
+
+def test_unreadable_but_empty_folder_is_not_a_loss(monkeypatch):
+    """Папка не открывается, но по STATUS в ней 0 писем — терять нечего.
+
+    Так выглядят битые папки, оставшиеся на сервере: объявлять из-за них копию
+    неполной на каждом прогоне неправильно, администратор перестанет замечать
+    настоящие пропажи.
+    """
+    fake = FakeIMAP(
+        folders=[
+            ((b"\\HasNoChildren",), b"/", "INBOX"),
+            ((b"\\HasNoChildren",), b"/", "Отправленные/s2022_000"),
+        ],
+        messages=_messages("INBOX"),
+        select_errors={"Отправленные/s2022_000": [_axigen_refusal()] * 3},
+        status_messages={"Отправленные/s2022_000": 0},
+    )
+    res, db, store, events = _run_backup(monkeypatch, fake)
+
+    assert res.errors == 0 and res.skipped_folders == []
+    assert res.empty_unreadable_folders == ["Отправленные/s2022_000"]
+    assert res.status_label == "success"
+    assert res.messages_new == 2                       # остальной ящик скопирован
+    warned = [m for lvl, m in events if lvl == "WARNING" and "s2022_000" in m]
+    assert warned and "ПУСТАЯ" in warned[0]
+    final = [m for _lvl, m in events if m.startswith("Бэкап завершён")][-1]
+    assert "писем в них нет" in final
+    assert "КОПИЯ НЕПОЛНАЯ" not in final
+
+
+def test_unreadable_folder_hints_at_server_made_duplicate(monkeypatch):
+    """Имя вида «s2022_000» рядом с «s2022» — дубликат, созданный сервером."""
+    fake = FakeIMAP(
+        folders=[
+            ((b"\\HasNoChildren",), b"/", "Отправленные/s2022"),
+            ((b"\\HasNoChildren",), b"/", "Отправленные/s2022_000"),
+        ],
+        messages=_messages("Отправленные/s2022"),
+        select_errors={"Отправленные/s2022_000": [_axigen_refusal()] * 3},
+        status_messages={"Отправленные/s2022_000": 4},
+    )
+    res, db, store, events = _run_backup(monkeypatch, fake)
+
+    assert res.skipped_folders == ["Отправленные/s2022_000"] and res.errors == 1
+    skip = [m for lvl, m in events if lvl == "WARNING" and m.startswith("Пропуск папки")][0]
+    assert "Похоже на дубликат папки «Отправленные/s2022»" in skip
+    assert "STATUS сервер сообщает: писем 4" in skip
+    # подсказка объясняет и как перестать получать «неполную копию»
+    assert "Пропускать папки" in skip
+
+
+def test_status_unavailable_keeps_folder_as_loss(monkeypatch):
+    """Сервер молчит и на STATUS — считаем, что письма потеряны, и говорим об этом."""
+    fake = FakeIMAP(
+        folders=[((b"\\HasNoChildren",), b"/", "Архив/битая")],
+        select_errors={"Архив/битая": [_axigen_refusal()] * 3},
+    )
+    res, db, store, events = _run_backup(monkeypatch, fake)
+
+    assert res.skipped_folders == ["Архив/битая"] and res.errors == 1
+    assert res.empty_unreadable_folders == []
+    assert res.status_label == "failed"                # прочитать не удалось ничего
+    final = [m for _lvl, m in events if m.startswith("Бэкап завершён")][-1]
+    assert "КОПИЯ НЕПОЛНАЯ" in final

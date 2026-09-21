@@ -131,6 +131,14 @@ def handle_backup(ctx: JobContext) -> Dict:
     if res.messages_skipped:
         # письма, не скачанные из-за лимита размера, иначе «потерялись» бы без объяснений
         summary += f" Пропущено по лимиту размера: {res.messages_skipped}."
+    if res.empty_unreadable_folders:
+        # Пустые папки, которые сервер не даёт открыть, копию неполной не делают:
+        # писем в них нет. Но администратор должен знать, что на сервере мусор.
+        shown = ", ".join(res.empty_unreadable_folders[:10])
+        more = len(res.empty_unreadable_folders) - 10
+        summary += (f" Пустых папок, которые сервер не даёт открыть "
+                    f"({len(res.empty_unreadable_folders)}): {shown}"
+                    f"{f' и ещё {more}' if more > 0 else ''} — писем в них нет.")
     if res.skipped_folders:
         # Непрочитанные папки означают НЕПОЛНУЮ копию ящика — это должно быть
         # видно в карточке задания и в письме-уведомлении, а не только в логе.
@@ -146,7 +154,8 @@ def handle_backup(ctx: JobContext) -> Dict:
         ctx.db.purge_old_runs(acc.id, keep_runs)
     return {"final_status": res.status_label, "summary": summary,
             "messages_new": res.messages_new, "bytes_new": res.bytes_new, "errors": res.errors,
-            "skipped_folders": res.skipped_folders}
+            "skipped_folders": res.skipped_folders,
+            "empty_unreadable_folders": res.empty_unreadable_folders}
 
 
 # ---------------------------------------------------------------------------
