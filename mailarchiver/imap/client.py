@@ -354,7 +354,7 @@ class ImapConnection:
         return self._delimiter
 
     def select(self, folder: str, readonly: bool = True) -> Dict[str, int]:
-        """
+        r"""
         Открыть папку: EXAMINE при readonly, иначе SELECT.
 
         Делаем до ``SELECT_ATTEMPTS`` попыток с паузой: часть отказов временная
@@ -377,11 +377,12 @@ class ImapConnection:
                 info = self.client.select_folder(folder, readonly=readonly)
             except Exception as exc:  # noqa: BLE001
                 if attempt >= attempts:
+                    fallback_error = None
                     if readonly:
-                        fallback = self._select_readwrite_fallback(folder)
+                        fallback, fallback_error = self._select_readwrite_fallback(folder)
                         if fallback is not None:
                             return fallback
-                    raise self._select_error(folder, exc, attempt) from exc
+                    raise self._select_error(folder, exc, attempt, fallback_error) from exc
                 log.warning("Папка «%s» не открылась (%s). Повтор попытки %d из %d через %.1f с…",
                             folder, _server_reply(exc) or exc, attempt + 1, attempts, SELECT_RETRY_DELAY_S)
                 time.sleep(max(0.0, float(SELECT_RETRY_DELAY_S)))
@@ -392,20 +393,26 @@ class ImapConnection:
                 "exists": int(info.get(b"EXISTS", 0) or 0),
             }
 
-    def _select_readwrite_fallback(self, folder: str) -> Optional[Dict[str, int]]:
-        """Последняя попытка открыть папку обычным SELECT вместо EXAMINE."""
+    def _select_readwrite_fallback(self, folder: str):
+        """Последняя попытка открыть папку обычным SELECT вместо EXAMINE.
+
+        :returns: ``(данные папки, None)`` при успехе либо ``(None, текст
+            отказа)`` — отказ нужен отчёту об ошибке: администратор должен
+            видеть, что пробовали и этот путь тоже.
+        """
         try:
             info = self.client.select_folder(folder, readonly=False)
         except Exception as exc:  # noqa: BLE001
-            log.debug("Папка «%s» не открылась и обычным SELECT: %s", folder, exc)
-            return None
+            reply = _server_reply(exc) or str(exc)
+            log.debug("Папка «%s» не открылась и обычным SELECT: %s", folder, reply)
+            return None, reply
         log.warning("Папка «%s» не открылась по EXAMINE, но открылась обычным SELECT — "
                     "читаем её так (письма скачиваются через BODY.PEEK, флаги не меняются).", folder)
         return {
             "uidvalidity": int(info.get(b"UIDVALIDITY", 0) or 0),
             "uidnext": int(info.get(b"UIDNEXT", 0) or 0),
             "exists": int(info.get(b"EXISTS", 0) or 0),
-        }
+        }, None
 
     def folder_status(self, folder: str) -> Optional[Dict[str, int]]:
         """Спросить о папке командой STATUS, не открывая её.
@@ -434,19 +441,101 @@ class ImapConnection:
         return {"messages": _int("MESSAGES"), "uidnext": _int("UIDNEXT"),
                 "uidvalidity": _int("UIDVALIDITY")}
 
-    def _select_error(self, folder: str, exc: BaseException, attempts: int) -> Exception:
+    # Символы, которые в имени папки почти всегда означают беду: их не видно
+    # глазом, но сервер считает такое имя ДРУГИМ именем. Ради них и печатается
+    # имя папки посимвольно, когда открыть её не удаётся ничем.
+    _INVISIBLE_CHARS = {
+        " ": "NBSP (неразрывный пробел)",
+        " ": "figure space",
+        "​": "zero-width space",
+        "‌": "zero-width non-joiner",
+        "‍": "zero-width joiner",
+        " ": "line separator",
+        " ": "paragraph separator",
+        "﻿": "BOM",
+    }
+
+    def _name_warnings(self, folder: str) -> List[str]:
+        """Что не так с самим ИМЕНЕМ папки (невидимые символы, пробелы по краям)."""
+        problems: List[str] = []
+        for char, title in self._INVISIBLE_CHARS.items():
+            if char in folder:
+                problems.append(f"невидимый символ {title} (U+{ord(char):04X})")
+        if any(ord(c) < 0x20 for c in folder):
+            problems.append("управляющий символ")
+        if folder != folder.strip():
+            problems.append("пробел в начале или в конце имени")
+        return problems
+
+    def _folder_is_listed(self, folder: str) -> Optional[bool]:
+        """Показывает ли сервер эту папку, если спросить её ИМЕНЕМ ЦЕЛИКОМ.
+
+        Решающая проверка: если LIST по точному имени папку не находит, значит
+        сервер считает, что такого имени у него нет, — мы шлём не то имя
+        (кодировка, невидимый символ, регистр). Если находит, а открыть не даёт
+        — папка битая на самой почтовой системе, и чинить надо там.
+
+        :returns: True/False, либо None — проверку выполнить не удалось.
+        """
+        if "*" in folder or "%" in folder:   # спецсимволы LIST: точной проверки не выйдет
+            return None
+        try:
+            raw = self.client.list_folders(directory="", pattern=folder)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("LIST по точному имени «%s» не прошёл: %s", folder, exc)
+            return None
+        for _flags, _deli, name in raw or ():
+            if _as_text(name) == folder:
+                return True
+        return False
+
+    def _folder_diagnosis(self, folder: str) -> str:
+        """Собрать человеческий отчёт о том, что ещё известно про папку.
+
+        Сюда попадает всё, что можно спросить у сервера, НЕ открывая папку:
+        STATUS (сколько писем), LIST по точному имени (знает ли сервер такое
+        имя) и разбор самого имени. Без этого отчёта администратор видит лишь
+        «failed EXAMINE» и не может понять, кто виноват и потеряно ли что-то.
+        """
+        parts: List[str] = []
+        status = self.folder_status(folder)
+        if status is not None:
+            parts.append(f"по команде STATUS сервер сообщает: писем {status['messages']}")
+        else:
+            parts.append("на команду STATUS сервер тоже не ответил")
+
+        listed = self._folder_is_listed(folder)
+        if listed is True:
+            parts.append("в списке папок сервера это имя есть (LIST по точному имени находит его) — "
+                         "значит имя верное, а сама папка на сервере нерабочая")
+        elif listed is False:
+            parts.append("LIST по точному имени эту папку НЕ находит — сервер считает, что такого "
+                         "имени у него нет: проверьте кодировку и точное написание имени")
+
+        warnings = self._name_warnings(folder)
+        if warnings:
+            parts.append("в имени папки: " + ", ".join(warnings))
+        return "; ".join(parts)
+
+    def _select_error(self, folder: str, exc: BaseException, attempts: int,
+                      fallback_error: Optional[str] = None) -> Exception:
         """
         Собрать ошибку открытия папки так, чтобы администратор увидел ПРИЧИНУ:
-        какую папку не удалось открыть, сколько раз пробовали, что именно
-        ответил сервер и что он прислал в untagged-строках.
+        какую папку не удалось открыть, что именно пробовали (EXAMINE, обычный
+        SELECT, STATUS, LIST по точному имени), что ответил сервер и что он
+        прислал в untagged-строках.
         """
         mapped = _map_exception(exc)
         reply = _server_reply(exc)
         notices = _server_notices(self.client)
-        status = self.folder_status(folder)
-        parts = [f"Не удалось открыть папку «{folder}» (попыток: {attempts}): {mapped.message}"]
-        if status is not None:
-            parts.append(f"По команде STATUS сервер сообщает: писем {status['messages']}")
+        tried = [f"EXAMINE — отказ (попыток: {attempts})"]
+        if fallback_error is not None:
+            tried.append(f"обычный SELECT — отказ ({fallback_error})")
+        parts = [f"Не удалось открыть папку «{folder}»: {mapped.message}",
+                 "Что пробовали: " + "; ".join(tried)]
+        diagnosis = self._folder_diagnosis(folder)
+        if diagnosis:
+            parts.append("Дополнительно: " + diagnosis)
         if reply:
             # Дублирование с текстом библиотеки допускаем осознанно: так в логе
             # всегда есть строка «ответ сервера», которую можно показать

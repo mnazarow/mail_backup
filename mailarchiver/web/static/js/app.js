@@ -916,15 +916,43 @@ async function updateJobsLive(){ try{ const jobs=await api('/jobs?limit=80'); re
 
 async function jobDetails(id){
   const j=await api(`/jobs/${id}`); const ev=await api(`/jobs/${id}/events`);
-  const res=j.result?Object.entries(j.result).map(([k,v])=>`<div class="kv"><div class="k">${esc(k)}</div><div>${esc(typeof v==='object'?JSON.stringify(v):v)}</div></div>`).join(''):'';
+  // Непрочитанные папки показываем отдельным блоком с кнопкой: так их можно
+  // сразу перестать копировать, а не искать ящик и править список руками.
+  const skipped=(j.result&&j.result.skipped_folders)||[];
+  const resEntries=j.result?Object.entries(j.result).filter(([k])=>k!=='skipped_folders'):[];
+  const res=resEntries.map(([k,v])=>`<div class="kv"><div class="k">${esc(k)}</div><div>${esc(typeof v==='object'?JSON.stringify(v):v)}</div></div>`).join('');
   const evs=ev.map(e=>`<div class="l-${e.level}">${fmtDate(e.ts)} [${e.level}] ${esc(e.message)}</div>`).join('')||'<span class="muted">нет событий</span>';
-  modal(`Задание #${j.id} — ${j.type_label}`, `
+  const skipBlock = skipped.length ? `
+    <div class="card" style="margin:14px 0;border-color:var(--warn)">
+      <b>⚠️ Копия неполная: не удалось прочитать папки (${skipped.length})</b>
+      <div class="mono small" style="margin:8px 0;word-break:break-all">${skipped.map(esc).join('<br>')}</div>
+      <div class="muted small">Причина у каждой папки — в журнале событий ниже. Если папку на почтовом
+        сервере не восстановить, добавьте её в «Пропускать папки» — тогда копия перестанет считаться
+        неполной из-за неё.</div>
+      ${j.account_id?'<button class="btn small" id="jobExclude" style="margin-top:10px">🚫 Больше не копировать эти папки</button>':''}
+    </div>` : '';
+  const m=modal(`Задание #${j.id} — ${j.type_label}`, `
     <div class="kv"><div class="k">Статус</div><div><span class="badge ${j.status}">${esc(j.status_label)}</span></div></div>
     <div class="kv"><div class="k">Создано / завершено</div><div>${fmtDate(j.created_at)} → ${fmtDate(j.finished_at)}</div></div>
     <div class="kv"><div class="k">Попыток</div><div>${j.attempts}/${j.max_attempts}</div></div>
     ${j.error?`<div class="kv"><div class="k">Ошибка</div><div style="color:var(--danger)">${esc(j.error)}</div></div>`:''}
     ${res}
+    ${skipBlock}
     <h3 style="margin-top:16px">Журнал событий</h3><div class="log-view">${evs}</div>`, {wide:true});
+  const ex=$('#jobExclude', m.el);
+  if(ex) ex.onclick=async()=>{
+    const ok=await confirmDlg('Больше не копировать эти папки?',
+      `Папки (${skipped.length}) будут добавлены в «Пропускать папки» ящика. `+
+      `Их письма копироваться не будут, зато копия перестанет помечаться неполной. `+
+      `Убрать исключение можно в карточке ящика.`, {okText:'Добавить в исключения', okClass:'primary'});
+    if(!ok) return;
+    try{
+      const r=await api(`/accounts/${j.account_id}/exclude-folders`,
+                        {method:'POST', body:{folders:skipped}});
+      toast('Папки исключены', r.added.length?`Добавлено: ${r.added.length}`:'Они уже были в списке');
+      ex.disabled=true;
+    }catch(e){ toastErr(e); }
+  };
 }
 
 // ===================================================================

@@ -47,7 +47,10 @@ class FakeIMAP:
     def capabilities(self):
         return [b"IMAP4REV1"]
 
-    def list_folders(self):
+    def list_folders(self, directory="", pattern="*"):
+        if pattern and pattern != "*":
+            # Точная проверка имени: сервер отвечает только на своё имя.
+            return [f for f in self.folders if f[2] == pattern]
         return list(self.folders)
 
     def select_folder(self, folder, readonly=False):
@@ -431,3 +434,46 @@ def test_status_unavailable_keeps_folder_as_loss(monkeypatch):
     assert res.status_label == "failed"                # прочитать не удалось ничего
     final = [m for _lvl, m in events if m.startswith("Бэкап завершён")][-1]
     assert "КОПИЯ НЕПОЛНАЯ" in final
+
+
+def test_select_error_names_every_attempt(monkeypatch):
+    """Отчёт об отказе перечисляет всё, что пробовали: этим он и полезен.
+
+    Администратору почтового сервера нужно показать, что клиент не «не умеет»
+    открывать папку, а перебрал все способы: EXAMINE, обычный SELECT, STATUS и
+    LIST по точному имени.
+    """
+    fake = FakeIMAP(
+        folders=[((b"\\HasNoChildren",), b"/", "Отправленные/s2022")],
+        select_errors={"Отправленные/s2022": [_axigen_refusal()] * 3},
+    )
+    res, db, store, events = _run_backup(monkeypatch, fake)
+
+    detail = res.error_details[0]
+    assert "EXAMINE — отказ (попыток: 2)" in detail
+    assert "обычный SELECT — отказ" in detail
+    assert "на команду STATUS сервер тоже не ответил" in detail
+    # сервер имя знает — значит битая сама папка, а не имя
+    assert "имя верное, а сама папка на сервере нерабочая" in detail
+
+
+def test_select_error_detects_name_mismatch(monkeypatch):
+    """LIST по точному имени не находит папку — значит шлём не то имя.
+
+    Так выглядит беда с кодировкой или невидимым символом: сервер показал имя
+    в общем списке, но своим его не признаёт.
+    """
+    hidden = "Отправленные/s2022 "          # NBSP на конце имени
+    fake = FakeIMAP(
+        folders=[((b"\\HasNoChildren",), b"/", hidden)],
+        select_errors={hidden: [_axigen_refusal()] * 3},
+    )
+    # сервер знает папку под именем БЕЗ невидимого символа
+    fake.folders_exact = []
+    monkeypatch.setattr(fake, "list_folders",
+                        lambda directory="", pattern="*": ([] if pattern != "*" else list(fake.folders)))
+    res, db, store, events = _run_backup(monkeypatch, fake)
+
+    detail = res.error_details[0]
+    assert "LIST по точному имени эту папку НЕ находит" in detail
+    assert "невидимый символ NBSP" in detail

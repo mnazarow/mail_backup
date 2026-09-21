@@ -155,3 +155,50 @@ def test_employee_account_schedule_cron_is_validated(client):
     assert bad.status_code >= 400
     ok = client.put("/api/settings", json={"values": {"employees.account_schedule_cron": "30 3 * * *"}})
     assert ok.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+#  Исключение папок, которые почтовый сервер не даёт прочитать
+# ---------------------------------------------------------------------------
+def _make_account(client, name="Ящик"):
+    r = client.post("/api/accounts", json={
+        "name": name, "host": "mx.example.ru", "port": 993, "username": "u@example.ru",
+        "password": "pw", "security": "ssl", "enabled": True,
+    })
+    assert r.status_code == 200
+    return r.json()["id"]
+
+
+def test_exclude_folders_adds_to_account(client):
+    _login(client)
+    acc_id = _make_account(client)
+    r = client.post(f"/api/accounts/{acc_id}/exclude-folders",
+                    json={"folders": ["Отправленные/s2022", "Отправленные/s2022_000"]})
+    assert r.status_code == 200
+    assert r.json()["added"] == ["Отправленные/s2022", "Отправленные/s2022_000"]
+
+    acc = [a for a in client.get("/api/accounts").json() if a["id"] == acc_id][0]
+    assert acc["folder_exclude"] == ["Отправленные/s2022", "Отправленные/s2022_000"]
+
+    # повторный вызов ничего не дублирует
+    again = client.post(f"/api/accounts/{acc_id}/exclude-folders",
+                        json={"folders": ["Отправленные/s2022"]})
+    assert again.json()["added"] == []
+    acc = [a for a in client.get("/api/accounts").json() if a["id"] == acc_id][0]
+    assert acc["folder_exclude"] == ["Отправленные/s2022", "Отправленные/s2022_000"]
+
+
+def test_exclude_folders_keeps_password(client):
+    """Исключение папок не должно затирать пароль ящика."""
+    _login(client)
+    acc_id = _make_account(client)
+    client.post(f"/api/accounts/{acc_id}/exclude-folders", json={"folders": ["Спам"]})
+    acc = [a for a in client.get("/api/accounts").json() if a["id"] == acc_id][0]
+    assert acc["has_password"] is True
+
+
+def test_exclude_folders_validates_input(client):
+    _login(client)
+    acc_id = _make_account(client)
+    assert client.post(f"/api/accounts/{acc_id}/exclude-folders", json={"folders": []}).status_code >= 400
+    assert client.post("/api/accounts/9999/exclude-folders", json={"folders": ["X"]}).status_code == 404

@@ -92,6 +92,12 @@ class SetupBody(BaseModel):
     password: str
 
 
+class ExcludeFoldersBody(BaseModel):
+    """Папки, которые больше не нужно пытаться копировать."""
+
+    folders: List[str] = []
+
+
 class AccountBody(BaseModel):
     name: str
     host: str
@@ -348,6 +354,35 @@ def update_account(request: Request, account_id: int, body: AccountBody, user: d
     )
     svc.db.add_audit(user["username"], "account_update", acc.name)
     return {"ok": True}
+
+
+@router.post("/accounts/{account_id}/exclude-folders")
+def exclude_account_folders(request: Request, account_id: int, body: ExcludeFoldersBody,
+                            user: dict = Depends(auth_mod.require_user)):
+    """Добавить папки в «Пропускать папки» этого ящика.
+
+    Нужен для папок, которые почтовый сервер не даёт открыть и починить нельзя:
+    без исключения каждый прогон бесконечно помечался бы «копия неполная», и на
+    этом фоне настоящая пропажа писем осталась бы незамеченной. Правим только
+    список исключений — остальные поля ящика (и его пароль) не трогаем.
+    """
+    svc = svc_dep(request)
+    _require_not_mailbox(user)
+    acc = svc.db.get_account(account_id)
+    if acc is None:
+        raise HTTPException(404, "Ящик не найден")
+    wanted = [str(f).strip() for f in (body.folders or []) if str(f).strip()]
+    if not wanted:
+        raise ValidationError("Не указано ни одной папки.",
+                              hint="Передайте список имён папок в поле «folders».")
+    existing = list(acc.folder_exclude or [])
+    added = [f for f in wanted if f not in existing]
+    acc.folder_exclude = existing + added
+    svc.db.update_account(acc, update_password=False, update_oauth_secret=False,
+                          update_oauth_token=False)
+    svc.db.add_audit(user["username"], "account_exclude_folders",
+                     f"{acc.name}: {', '.join(added) or 'без изменений'}"[:500])
+    return {"ok": True, "added": added, "folder_exclude": acc.folder_exclude}
 
 
 @router.delete("/accounts/{account_id}")
