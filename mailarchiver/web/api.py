@@ -19,7 +19,7 @@ from ..employees import (
     preview_account_template, sync_employees,
 )
 from ..errors import ValidationError
-from ..imap.client import probe_account
+from ..imap.client import diagnose_folders, probe_account
 from ..models import Account, AuthType, JobStatus, JobType, ScheduleKind, Security
 from ..util import human_size, safe_filename
 from ..version import __version__
@@ -405,6 +405,27 @@ def test_account(request: Request, account_id: int, user: dict = Depends(auth_mo
     if acc is None:
         raise HTTPException(404, "Ящик не найден")
     result = probe_account(acc, svc.connect_options())
+    return result
+
+
+@router.post("/accounts/{account_id}/folders/diagnose")
+def diagnose_account_folders(request: Request, account_id: int,
+                             user: dict = Depends(auth_mod.require_user)):
+    """Проверить каждую папку ящика: открывается ли она и что в ней.
+
+    Отдельная кнопка, а не часть «Проверить подключение»: здесь на каждую
+    папку идёт запрос к серверу, и на ящике с сотней папок это заметно дольше.
+    Зато сразу видно, из-за каких именно папок копия считается неполной и
+    теряются ли при этом письма.
+    """
+    svc = svc_dep(request)
+    _ensure_account_access(user, account_id)
+    acc = svc.db.get_account(account_id)
+    if acc is None:
+        raise HTTPException(404, "Ящик не найден")
+    result = diagnose_folders(acc, svc.connect_options())
+    svc.db.add_audit(user["username"], "account_folders_diagnose",
+                     f"{acc.name}: проблемных папок {len(result.get('broken_folders') or [])}")
     return result
 
 

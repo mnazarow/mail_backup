@@ -12,6 +12,7 @@ r"""
 Сеть не нужна: подменяется только самый нижний слой (клиент imapclient),
 весь остальной код — настоящий.
 """
+import re
 import types
 
 from imapclient.exceptions import IMAPClientError
@@ -49,8 +50,9 @@ class FakeIMAP:
 
     def list_folders(self, directory="", pattern="*"):
         if pattern and pattern != "*":
-            # Точная проверка имени: сервер отвечает только на своё имя.
-            return [f for f in self.folders if f[2] == pattern]
+            # Как настоящий сервер: «*» — любые символы, «%» — кроме разделителя.
+            rx = re.escape(pattern).replace(r"\*", ".*").replace(r"\%", "[^/]*")
+            return [f for f in self.folders if re.fullmatch(rx, f[2])]
         return list(self.folders)
 
     def select_folder(self, folder, readonly=False):
@@ -477,3 +479,80 @@ def test_select_error_detects_name_mismatch(monkeypatch):
     detail = res.error_details[0]
     assert "LIST по точному имени эту папку НЕ находит" in detail
     assert "невидимый символ NBSP" in detail
+
+
+def test_unopenable_folder_with_children_is_a_container(monkeypatch):
+    """Папка не открывается, но у неё есть вложенные — это контейнер.
+
+    Некоторые серверы забывают пометить такую папку флагом \\Noselect. Своих
+    писем она не хранит, вложенные копируются отдельно — значит копия полная.
+    """
+    fake = FakeIMAP(
+        folders=[
+            ((b"\\HasChildren",), b"/", "Отправленные"),
+            ((b"\\HasNoChildren",), b"/", "Отправленные/2022"),
+        ],
+        messages=_messages("Отправленные/2022"),
+        select_errors={"Отправленные": [_axigen_refusal()] * 3},
+    )
+    res, db, store, events = _run_backup(monkeypatch, fake)
+
+    assert res.errors == 0 and res.skipped_folders == []
+    assert res.container_folders == ["Отправленные"]
+    assert res.status_label == "success" and res.messages_new == 2
+    note = [m for lvl, m in events if "контейнер" in m][0]
+    assert "вложенные папки" in note
+    final = [m for _lvl, m in events if m.startswith("Бэкап завершён")][-1]
+    assert "КОПИЯ НЕПОЛНАЯ" not in final
+
+
+# ---------------------------------------------------------------------------
+#  (д) проверка всех папок по кнопке
+# ---------------------------------------------------------------------------
+def test_diagnose_folders_sorts_folders_by_verdict(monkeypatch):
+    fake = FakeIMAP(
+        folders=[
+            ((b"\\HasNoChildren",), b"/", "INBOX"),
+            ((b"\\Noselect", b"\\HasChildren"), b"/", "Архив"),
+            ((b"\\HasChildren",), b"/", "Отправленные"),
+            ((b"\\HasNoChildren",), b"/", "Отправленные/s2022"),
+            ((b"\\HasNoChildren",), b"/", "Отправленные/s2022_000"),
+            ((b"\\HasNoChildren",), b"/", "Спам"),
+        ],
+        messages=_messages("INBOX", "Отправленные/s2022"),
+        select_errors={
+            "Отправленные": [_axigen_refusal()],        # контейнер без \Noselect
+            "Отправленные/s2022_000": [_axigen_refusal()],
+        },
+        status_messages={"Отправленные/s2022_000": 12},
+    )
+    _patch_connection(monkeypatch, fake)
+    acc = models.Account(id=1, name="Ящик", host="h", username="u", password="p",
+                         folder_exclude=["Спам"])
+    d = client_mod.diagnose_folders(acc)
+
+    assert d["ok"] is True
+    by_name = {f["name"]: f for f in d["folders"]}
+    assert by_name["INBOX"]["verdict"] == "ok" and by_name["INBOX"]["messages"] == 2
+    assert by_name["Архив"]["verdict"] == "noselect"
+    assert by_name["Отправленные"]["verdict"] == "container"
+    assert by_name["Отправленные/s2022"]["verdict"] == "ok"
+    assert by_name["Отправленные/s2022_000"]["verdict"] == "broken"
+    assert by_name["Спам"]["verdict"] == "excluded"
+    # итог: потеряно ровно то, что не читается
+    assert d["broken_folders"] == ["Отправленные/s2022_000"]
+    assert d["messages_lost"] == 12
+    assert d["counts"]["ok"] == 2 and d["counts"]["container"] == 1
+
+
+def test_diagnose_folders_reports_connection_error(monkeypatch):
+    """Ошибку подключения диагностика возвращает в результате, а не исключением."""
+    class _Broken(client_mod.ImapConnection):
+        def connect(self):
+            from mailarchiver.errors import ImapConnectionError
+            raise ImapConnectionError("нет связи", hint="проверьте адрес")
+
+    monkeypatch.setattr(client_mod, "ImapConnection", _Broken)
+    acc = models.Account(id=1, name="Ящик", host="h", username="u", password="p")
+    d = client_mod.diagnose_folders(acc)
+    assert d["ok"] is False and "нет связи" in d["error"] and d["hint"]

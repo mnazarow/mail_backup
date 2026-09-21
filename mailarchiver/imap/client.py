@@ -489,6 +489,45 @@ class ImapConnection:
                 return True
         return False
 
+    def folder_children(self, folder: str, delimiter: str = "") -> List[str]:
+        r"""Вложенные папки этой папки (по данным LIST).
+
+        Папка, у которой есть вложенные, но которая сама не открывается, —
+        это КОНТЕЙНЕР: своих писем она не хранит, а её содержимое лежит во
+        вложенных папках, и они копируются отдельно. Некоторые серверы
+        забывают пометить такую папку флагом ``\Noselect``, и без этой
+        проверки она выглядела бы как потеря писем.
+        """
+        if "*" in folder or "%" in folder:
+            return []
+        delim = delimiter or self.delimiter or "/"
+        try:
+            raw = self.client.list_folders(directory="", pattern=f"{folder}{delim}*")
+        except Exception as exc:  # noqa: BLE001
+            log.debug("LIST вложенных папок «%s» не прошёл: %s", folder, exc)
+            return []
+        names = []
+        for _flags, _deli, name in raw or ():
+            text = _as_text(name)
+            if text != folder:
+                names.append(text)
+        return names
+
+    def probe_select(self, folder: str):
+        """Одна попытка открыть папку — для диагностики, без повторов и пауз.
+
+        :returns: ``(данные папки, None)`` либо ``(None, текст отказа)``.
+        """
+        try:
+            info = self.client.select_folder(folder, readonly=True)
+        except Exception as exc:  # noqa: BLE001
+            return None, (_server_reply(exc) or str(exc))
+        return {
+            "uidvalidity": int(info.get(b"UIDVALIDITY", 0) or 0),
+            "uidnext": int(info.get(b"UIDNEXT", 0) or 0),
+            "exists": int(info.get(b"EXISTS", 0) or 0),
+        }, None
+
     def _folder_diagnosis(self, folder: str) -> str:
         """Собрать человеческий отчёт о том, что ещё известно про папку.
 
@@ -511,6 +550,13 @@ class ImapConnection:
         elif listed is False:
             parts.append("LIST по точному имени эту папку НЕ находит — сервер считает, что такого "
                          "имени у него нет: проверьте кодировку и точное написание имени")
+
+        children = self.folder_children(folder)
+        if children:
+            shown = ", ".join(children[:5]) + (" и др." if len(children) > 5 else "")
+            parts.append(f"у папки есть вложенные папки ({len(children)}): {shown} — "
+                         f"похоже, это папка-контейнер, своих писем она не хранит, "
+                         f"а вложенные копируются отдельно")
 
         warnings = self._name_warnings(folder)
         if warnings:
@@ -800,6 +846,92 @@ def probe_account(account: Account, options: Optional[ConnectOptions] = None) ->
             if result["duplicate_folders"]:
                 log.warning("Сервер вернул повторяющиеся папки в LIST: %s",
                             ", ".join(result["duplicate_folders"]))
+            result["ok"] = True
+    except Exception as exc:  # noqa: BLE001
+        from ..errors import MailArchiverError
+        if isinstance(exc, MailArchiverError):
+            result["error"] = exc.message
+            result["hint"] = exc.hint
+        else:
+            result["error"] = str(exc)
+    return result
+
+
+def diagnose_folders(account: Account, options: Optional[ConnectOptions] = None,
+                     max_folders: int = 500) -> dict:
+    """Проверить КАЖДУЮ папку ящика и сказать по каждой, что с ней.
+
+    Отвечает на вопрос «почему копия неполная», не заставляя администратора
+    читать журнал задания: по каждой папке видно, открывается ли она, сколько
+    в ней писем и что делать. В отличие от :func:`probe_account` здесь на
+    каждую папку идёт запрос к серверу (EXAMINE, при отказе — STATUS), поэтому
+    вызывается только по кнопке, а не при обычной проверке подключения.
+
+    Вердикты (поле ``verdict``):
+      * ``ok`` — папка открылась, письма доступны;
+      * ``container`` — не открывается, но есть вложенные папки: своих писем
+        не хранит, содержимое копируется через вложенные;
+      * ``noselect`` — сервер сам пометил папку как неоткрываемую;
+      * ``empty_broken`` — не открывается, по STATUS писем 0: терять нечего;
+      * ``broken`` — не открывается, письма недоступны: ЭТО потеря;
+      * ``excluded`` — папка исключена настройками ящика и не копируется.
+
+    Исключения наружу не пробрасываются — всё упаковано в результат.
+    """
+    result: dict = {"ok": False, "error": None, "hint": None, "folders": [],
+                    "counts": {"ok": 0, "container": 0, "noselect": 0, "empty_broken": 0,
+                               "broken": 0, "excluded": 0},
+                    "broken_folders": [], "messages_lost": 0, "checked": 0, "truncated": False}
+    exclude = [str(x).strip().lower() for x in (account.folder_exclude or []) if str(x).strip()]
+    include = [str(x).strip().lower() for x in (account.folder_include or []) if str(x).strip()]
+    try:
+        with ImapConnection(account, options) as conn:
+            infos = conn.list_folders()
+            all_names = [fi.name for fi in infos]
+            result["truncated"] = len(infos) > max_folders
+            for fi in infos[:max_folders]:
+                row = {"name": fi.name, "flags": list(fi.flags), "children": 0,
+                       "messages": None, "verdict": "", "detail": ""}
+                low = fi.name.lower()
+                if include and low not in include:
+                    row["verdict"] = "excluded"
+                    row["detail"] = "не входит в список «Копировать только папки»"
+                elif low in exclude:
+                    row["verdict"] = "excluded"
+                    row["detail"] = "папка в списке «Пропускать папки»"
+                elif not fi.selectable:
+                    row["verdict"] = "noselect"
+                    row["detail"] = "сервер пометил папку как неоткрываемую (контейнер)"
+                else:
+                    info, error = conn.probe_select(fi.name)
+                    result["checked"] += 1
+                    if info is not None:
+                        row["verdict"] = "ok"
+                        row["messages"] = info["exists"]
+                        row["detail"] = "открывается, письма доступны"
+                    else:
+                        children = [n for n in all_names
+                                    if n != fi.name and n.startswith(fi.name + (fi.delimiter or "/"))]
+                        row["children"] = len(children)
+                        status = conn.folder_status(fi.name)
+                        row["messages"] = status["messages"] if status else None
+                        if children:
+                            row["verdict"] = "container"
+                            row["detail"] = (f"не открывается, но содержит вложенные папки "
+                                             f"({len(children)}): своих писем не хранит")
+                        elif status is not None and status["messages"] == 0:
+                            row["verdict"] = "empty_broken"
+                            row["detail"] = f"не открывается ({error}), но писем в ней 0 — терять нечего"
+                        else:
+                            row["verdict"] = "broken"
+                            row["detail"] = (f"не открывается ({error}); "
+                                             + (f"по STATUS писем {status['messages']}"
+                                                if status else "STATUS тоже не отвечает"))
+                            result["broken_folders"].append(fi.name)
+                            if status:
+                                result["messages_lost"] += int(status["messages"])
+                result["counts"][row["verdict"]] = result["counts"].get(row["verdict"], 0) + 1
+                result["folders"].append(row)
             result["ok"] = True
     except Exception as exc:  # noqa: BLE001
         from ..errors import MailArchiverError

@@ -669,6 +669,62 @@ async function viewAccounts(c){
   c.appendChild(wrap);
 }
 
+/** Проверка папок на сервере: что открывается, что нет и теряются ли письма. */
+async function folderDiagnoseModal(a){
+  const m=modal(`Папки на сервере: ${a.name}`,
+    '<div class="empty">⏳ Опрашиваем сервер по каждой папке…</div>', {wide:true});
+  let d;
+  try{ d=await api(`/accounts/${a.id}/folders/diagnose`,{method:'POST'}); }
+  catch(e){ m.close(); return toastErr(e); }
+  if(!d.ok){
+    m.body.innerHTML=`<div class="empty">Не удалось подключиться: ${esc(d.error||'')}</div>`+
+      (d.hint?`<div class="hint">${esc(d.hint)}</div>`:'');
+    return;
+  }
+  const V={
+    ok:['ok','копируется'],
+    container:['', 'контейнер'],
+    noselect:['', 'контейнер (\\Noselect)'],
+    empty_broken:['warn','пустая, не открывается'],
+    broken:['bad','НЕ ЧИТАЕТСЯ'],
+    excluded:['', 'исключена'],
+  };
+  const c=d.counts||{};
+  const rows=(d.folders||[]).map(f=>{
+    const [cls,label]=V[f.verdict]||['',f.verdict];
+    return `<tr>
+      <td class="mono small" style="word-break:break-all">${esc(f.name)}</td>
+      <td><span class="tag ${cls}">${esc(label)}</span></td>
+      <td class="small">${f.messages==null?'—':fmtNum(f.messages)}</td>
+      <td class="small muted">${esc(f.detail||'')}</td></tr>`;
+  }).join('');
+  m.body.innerHTML=`
+    <div class="an-kpis" style="margin-bottom:12px">
+      <div class="kpi accent"><div class="k-label">✅ Копируется</div><div class="k-value">${fmtNum(c.ok||0)}</div><div class="k-sub">папок открывается</div></div>
+      <div class="kpi"><div class="k-label">🗂️ Контейнеры</div><div class="k-value">${fmtNum((c.container||0)+(c.noselect||0))}</div><div class="k-sub">своих писем не хранят</div></div>
+      <div class="kpi"><div class="k-label">⚠️ Не читается</div><div class="k-value">${fmtNum(c.broken||0)}</div><div class="k-sub">${d.messages_lost?`писем недоступно: ${fmtNum(d.messages_lost)}`:'писем в них не видно'}</div></div>
+    </div>
+    ${(c.empty_broken||c.excluded)?`<div class="muted small" style="margin-bottom:10px">Пустых нечитаемых папок: ${fmtNum(c.empty_broken||0)} · исключено настройками: ${fmtNum(c.excluded||0)}</div>`:''}
+    <div class="table-wrap" style="max-height:420px;overflow:auto">
+      <table class="tbl"><thead><tr><th>Папка</th><th>Состояние</th><th>Писем</th><th>Пояснение</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>
+    ${(d.broken_folders&&d.broken_folders.length)?`
+      <div class="card" style="margin-top:12px;border-color:var(--warn)">
+        <b>⚠️ Папки, которые сервер не даёт прочитать (${d.broken_folders.length})</b>
+        <div class="muted small" style="margin:6px 0">Чинить их нужно на почтовом сервере. Если это
+          невозможно — исключите их, чтобы задание перестало помечаться неполным.</div>
+        <button class="btn small" id="diagExclude">🚫 Больше не копировать эти папки</button>
+      </div>`:''}`;
+  const ex=$('#diagExclude', m.el);
+  if(ex) ex.onclick=async()=>{
+    try{
+      const r=await api(`/accounts/${a.id}/exclude-folders`,{method:'POST',body:{folders:d.broken_folders}});
+      toast('Папки исключены', r.added.length?`Добавлено: ${r.added.length}`:'Они уже были в списке');
+      ex.disabled=true;
+    }catch(e){ toastErr(e); }
+  };
+}
+
 function accountMenu(a){
   const m=modal(`Ящик: ${a.name}`, `<div class="btn-row" style="flex-direction:column;align-items:stretch;gap:10px">
     <button class="btn primary" data-a="backup" ${a.enabled?'':'disabled title="Ящик выключен — включите его, чтобы делать копии"'}>💾 Сделать резервную копию сейчас</button>
@@ -679,6 +735,7 @@ function accountMenu(a){
     <button class="btn" data-a="import">📥 Импорт из .pst</button>
     <button class="btn" data-a="retention">🗓️ Хранение копий (3 дня / неделя)</button>
     <button class="btn" data-a="verify">🔍 Проверить целостность копии</button>
+    <button class="btn" data-a="folders">🗂️ Проверить папки на сервере</button>
     <button class="btn danger" data-a="del">🗑️ Удалить ящик</button>
   </div>`);
   m.body.querySelectorAll('[data-a]').forEach(b=>b.onclick=async()=>{
@@ -690,6 +747,7 @@ function accountMenu(a){
     else if(act==='restore') restoreModal(a);
     else if(act==='import') importModal(a);
     else if(act==='retention') retentionModal(a);
+    else if(act==='folders') folderDiagnoseModal(a);
     else if(act==='verify'){ try{await api(`/accounts/${a.id}/verify`,{method:'POST'}); toast('Запущено','Проверка целостности в очереди'); location.hash='#/jobs';}catch(e){toastErr(e);} }
     else if(act==='del'){ if(await confirmDlg('Удалить ящик?', `Ящик «${a.name}» и его настройки будут удалены. Локальные копии писем на диске останутся. Продолжить?`)){ try{await api(`/accounts/${a.id}`,{method:'DELETE'}); toast('Удалено'); route();}catch(e){toastErr(e);} } }
   });

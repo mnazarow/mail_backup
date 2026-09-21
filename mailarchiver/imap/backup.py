@@ -61,6 +61,10 @@ class BackupResult:
     # полной — иначе каждый прогон навсегда помечался бы «частично выполнен»
     # из-за битых пустых папок, которые на сервере уже не восстановить.
     empty_unreadable_folders: List[str] = field(default_factory=list)
+    # Папки-контейнеры: сервер их не открывает, но у них есть вложенные папки.
+    # Своих писем такие папки не хранят (сервер просто забыл пометить их
+    # флагом \Noselect), поэтому потерей это не является.
+    container_folders: List[str] = field(default_factory=list)
     cancelled: bool = False
 
     @property
@@ -212,6 +216,18 @@ class BackupEngine:
                     # это мусор на сервере, а не потеря писем.
                     status = conn.folder_status(f.name)
                     twin = _duplicate_hint(f.name, [x.name for x in folders])
+                    children = conn.folder_children(f.name, f.delimiter)
+                    if children:
+                        # Папка-контейнер: письма лежат во вложенных папках, а
+                        # они копируются сами по себе. Ошибкой это не считаем —
+                        # иначе каждый ящик с деревом папок вечно числился бы
+                        # скопированным частично.
+                        result.container_folders.append(f.name)
+                        emit("INFO",
+                             f"Папка «{f.name}» не открывается, но у неё есть вложенные папки "
+                             f"({len(children)}) — это папка-контейнер, своих писем она не хранит; "
+                             f"вложенные папки копируются отдельно.")
+                        continue
                     if status is not None and status.get("messages") == 0:
                         result.empty_unreadable_folders.append(f.name)
                         emit("WARNING",
@@ -372,6 +388,13 @@ class BackupEngine:
 
         summary = (f"Бэкап завершён: новых писем {result.messages_new}, "
                    f"пропущено по размеру {result.messages_skipped}, ошибок {result.errors}.")
+        if result.container_folders:
+            shown = ", ".join(result.container_folders[:MAX_SKIPPED_FOLDERS_IN_SUMMARY])
+            rest = len(result.container_folders) - MAX_SKIPPED_FOLDERS_IN_SUMMARY
+            tail = f" и ещё {rest}" if rest > 0 else ""
+            summary += (f" Папок-контейнеров, которые сервер не открывает "
+                        f"({len(result.container_folders)}): {shown}{tail} — своих писем они не "
+                        f"хранят, вложенные папки скопированы.")
         if result.empty_unreadable_folders:
             # Про такие папки сообщаем, но копию неполной не объявляем: писем в
             # них нет, и администратору важно лишь знать, что на сервере мусор.

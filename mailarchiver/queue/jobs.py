@@ -131,6 +131,9 @@ def handle_backup(ctx: JobContext) -> Dict:
     if res.messages_skipped:
         # письма, не скачанные из-за лимита размера, иначе «потерялись» бы без объяснений
         summary += f" Пропущено по лимиту размера: {res.messages_skipped}."
+    if res.container_folders:
+        summary += (f" Папок-контейнеров, которые сервер не открывает "
+                    f"({len(res.container_folders)}): своих писем они не хранят.")
     if res.empty_unreadable_folders:
         # Пустые папки, которые сервер не даёт открыть, копию неполной не делают:
         # писем в них нет. Но администратор должен знать, что на сервере мусор.
@@ -155,7 +158,8 @@ def handle_backup(ctx: JobContext) -> Dict:
     return {"final_status": res.status_label, "summary": summary,
             "messages_new": res.messages_new, "bytes_new": res.bytes_new, "errors": res.errors,
             "skipped_folders": res.skipped_folders,
-            "empty_unreadable_folders": res.empty_unreadable_folders}
+            "empty_unreadable_folders": res.empty_unreadable_folders,
+            "container_folders": res.container_folders}
 
 
 # ---------------------------------------------------------------------------
