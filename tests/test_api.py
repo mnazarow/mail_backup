@@ -91,3 +91,67 @@ def test_validation_error(client):
     })
     assert r.status_code == 400
     assert r.json()["error"] is True and "message" in r.json()
+
+
+# ---------------------------------------------------------------------------
+#  Источник списка сотрудников и шаблон создаваемых ящиков
+# ---------------------------------------------------------------------------
+def test_employee_source_defaults_to_file(client):
+    _login(client)
+    src = client.get("/api/employees/source").json()["source"]
+    assert src["type"] == "file" and src["configured"] is False
+    # без настроенного источника синхронизация не запускается, а объясняет почему
+    r = client.post("/api/employees/sync")
+    assert r.status_code >= 400
+    assert "файл" in r.json().get("message", "").lower()
+
+
+def test_employee_source_url_requires_address(client):
+    _login(client)
+    assert client.put("/api/settings", json={"values": {"employees.source_type": "url"}}).status_code == 200
+    src = client.get("/api/employees/source").json()["source"]
+    assert src["type"] == "url" and src["configured"] is False
+    r = client.post("/api/employees/sync")
+    assert r.status_code >= 400
+    assert "адрес" in r.json().get("message", "").lower()
+
+
+def test_employee_source_url_password_is_secret(client):
+    """Пароль к источнику не должен уезжать обратно в браузер."""
+    _login(client)
+    client.put("/api/settings", json={"values": {
+        "employees.source_type": "url",
+        "employees.source_url": "https://hr.example.ru/e.csv",
+        "employees.source_url_user": "ma",
+        "employees.source_url_password": "s3cret",
+    }})
+    data = client.get("/api/settings").json()
+    assert data["values"]["employees"]["source_url_password"] == ""
+    assert data["secrets_set"]["employees.source_url_password"] is True
+    # пустое значение при сохранении не затирает сохранённый пароль
+    client.put("/api/settings", json={"values": {"employees.source_url_password": ""}})
+    assert client.get("/api/settings").json()["secrets_set"]["employees.source_url_password"] is True
+    # и наружу он не просачивается через сведения об источнике
+    assert "s3cret" not in client.get("/api/employees/source").text
+
+
+def test_employee_account_template_preview(client):
+    _login(client)
+    client.put("/api/settings", json={"values": {
+        "employees.account_host": "imap.example.ru",
+        "employees.account_name_template": "{full_name} ({department})",
+        "employees.account_username_template": "{local}",
+    }})
+    data = client.get("/api/employees/account-template").json()
+    assert data["preview"]["name"] == "Иванов Иван Иванович (Отдел продаж)"
+    assert data["preview"]["username"] == "ivanov"
+    assert data["preview"]["host"] == "imap.example.ru"
+    assert "full_name" in data["placeholders"]
+
+
+def test_employee_account_schedule_cron_is_validated(client):
+    _login(client)
+    bad = client.put("/api/settings", json={"values": {"employees.account_schedule_cron": "каждый день"}})
+    assert bad.status_code >= 400
+    ok = client.put("/api/settings", json={"values": {"employees.account_schedule_cron": "30 3 * * *"}})
+    assert ok.status_code == 200

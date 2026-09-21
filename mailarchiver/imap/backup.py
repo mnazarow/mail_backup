@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Set
 
 from ..errors import JobCancelled, MailArchiverError
 from ..logging_setup import get_logger
@@ -36,6 +36,10 @@ CancelCB = Callable[[], bool]
 EventCB = Callable[[str, str], None]  # (level, message)
 
 
+# Сколько имён пропущенных папок показывать в итоговой строке целиком.
+MAX_SKIPPED_FOLDERS_IN_SUMMARY = 10
+
+
 @dataclass
 class BackupResult:
     messages_new: int = 0
@@ -44,15 +48,25 @@ class BackupResult:
     messages_skipped: int = 0  # не скачаны: больше лимита размера
     folders_processed: int = 0
     folders_total: int = 0
+    folders_read: int = 0      # папок, которые сервер дал открыть (SELECT прошёл)
     errors: int = 0
     error_details: List[str] = field(default_factory=list)
+    # Папки, которые не удалось открыть (SELECT/EXAMINE отклонён сервером).
+    # Их письма в копию НЕ попали — список нужен, чтобы неполнота копии была
+    # видна и в итоге задания, и в его результате, а не только в счётчике ошибок.
+    skipped_folders: List[str] = field(default_factory=list)
     cancelled: bool = False
 
     @property
     def status_label(self) -> str:
         if self.cancelled:
             return "cancelled"
-        if self.errors and self.messages_new:
+        # «Частично» — когда часть работы всё же сделана: что-то скачано ИЛИ
+        # хотя бы часть папок прочитана. Второе условие важно для прогона, в
+        # котором новых писем не было, но пара папок не открылась: раньше такой
+        # прогон объявлялся полным провалом («failed»), хотя остальной ящик
+        # проверен успешно.
+        if self.errors and (self.messages_new or self.folders_read):
             return "partial"
         if self.errors:
             return "failed"
@@ -82,16 +96,60 @@ class BackupEngine:
         self.global_exclude = global_exclude or []
         self.global_include = global_include or []
 
-    def _select_folders(self, conn: ImapConnection, account: Account) -> List:
-        folders = [f for f in conn.list_folders() if f.selectable]
+    def _select_folders(self, conn: ImapConnection, account: Account,
+                        emit: Optional[EventCB] = None) -> List:
+        """
+        Папки к копированию: выкинуть неоткрываемые (\\Noselect/\\NonExistent),
+        применить include/exclude и СНЯТЬ ДУБЛИ.
+
+        Дубли — не теория: сервер (замечено на Axigen) возвращает одну и ту же
+        папку в ответе LIST дважды — повтор записи или пересечение пространств
+        имён. Без дедупликации папка планируется и качается ДВА раза: её письма
+        дважды считаются в «Новых писем к загрузке», дважды скачиваются с
+        сервера и дважды пишутся в Maildir (в индексе БД остаётся первая
+        запись, второй файл становится «сиротой»).
+
+        Дедупликация идёт по ТОЧНОМУ имени и сохраняет порядок сервера.
+        Регистр намеренно НЕ игнорируем: на одних серверах «Отправленные» и
+        «отправленные» — одна папка, на других (регистрозависимое хранилище)
+        это ДВЕ РАЗНЫЕ папки, и их склейка молча потеряла бы письма. Совпадение
+        без учёта регистра только сообщаем — как повод проверить ящик руками.
+        """
         include = list(account.folder_include or []) + list(self.global_include or [])
         exclude = list(account.folder_exclude or []) + list(self.global_exclude or [])
+
+        def notice(msg: str) -> None:
+            # emit пишет и в журнал задания, и в лог; без него (прямой вызов
+            # из кода/тестов) остаётся обычный лог.
+            if emit:
+                emit("WARNING", msg)
+            else:
+                log.warning("%s", msg)
+
         result = []
-        for f in folders:
+        seen: Set[str] = set()
+        seen_lower: Dict[str, str] = {}
+        for f in conn.list_folders():
+            if not f.selectable:
+                # Контейнер (\\Noselect) или уже несуществующая запись: писем в
+                # ней нет, а SELECT по ней гарантированно даст «ошибку».
+                log.debug("Папка «%s» не копируется: не открывается, флаги: %s",
+                          f.name, ", ".join(f.flags) or "—")
+                continue
             if include and not _folder_matches(f.name, include, f.delimiter):
                 continue
             if exclude and _folder_matches(f.name, exclude, f.delimiter):
                 continue
+            if f.name in seen:
+                notice(f"Сервер вернул папку «{f.name}» в списке повторно — вторая запись "
+                       f"пропущена (иначе папка копировалась бы дважды и удваивала счётчики).")
+                continue
+            seen.add(f.name)
+            twin = seen_lower.setdefault(f.name.lower(), f.name)
+            if twin != f.name:
+                notice(f"Сервер вернул две папки, различающиеся только регистром: «{twin}» и "
+                       f"«{f.name}». Копируем обе как разные папки — проверьте, так ли это "
+                       f"на сервере.")
             result.append(f)
         return result
 
@@ -111,7 +169,7 @@ class BackupEngine:
 
         emit("INFO", f"Подключение к ящику «{account.name}» ({account.host})…")
         with ImapConnection(account, self.options) as conn:
-            folders = self._select_folders(conn, account)
+            folders = self._select_folders(conn, account, emit)
             result.folders_total = len(folders)
             emit("INFO", f"Найдено папок к копированию: {len(folders)}")
 
@@ -123,10 +181,17 @@ class BackupEngine:
                 try:
                     info = conn.select(f.name, readonly=True)
                 except MailArchiverError as exc:
+                    # Папка не открылась: её письма в копию НЕ попадут. Кроме
+                    # счётчика ошибок запоминаем ИМЯ папки (для итога и для
+                    # результата задания) и показываем подсказку, что смотреть
+                    # на сервере.
                     result.errors += 1
-                    result.error_details.append(f"Папка «{f.name}»: {exc.message}")
-                    emit("WARNING", f"Пропуск папки «{f.name}»: {exc.message}")
+                    result.skipped_folders.append(f.name)
+                    detail = exc.message + (f" {exc.hint}" if exc.hint else "")
+                    result.error_details.append(f"Папка «{f.name}»: {detail}")
+                    emit("WARNING", f"Пропуск папки «{f.name}»: {detail}")
                     continue
+                result.folders_read += 1
                 uidvalidity = info["uidvalidity"]
                 state = self.db.get_folder_state(account.id, f.name)
                 old_uidvalidity = int(state["uidvalidity"]) if state else 0
@@ -269,8 +334,17 @@ class BackupEngine:
                 elapsed = max(0.001, time.time() - started)
                 progress_cb(done, total_new, "Готово", bytes_done, bytes_done / elapsed)
 
-        emit("INFO", f"Бэкап завершён: новых писем {result.messages_new}, "
-                     f"пропущено по размеру {result.messages_skipped}, ошибок {result.errors}.")
+        summary = (f"Бэкап завершён: новых писем {result.messages_new}, "
+                   f"пропущено по размеру {result.messages_skipped}, ошибок {result.errors}.")
+        if result.skipped_folders:
+            # Неполная копия должна быть ВИДНА: из «ошибок 2» не понять, что
+            # именно не скопировано, поэтому перечисляем сами папки.
+            shown = ", ".join(result.skipped_folders[:MAX_SKIPPED_FOLDERS_IN_SUMMARY])
+            rest = len(result.skipped_folders) - MAX_SKIPPED_FOLDERS_IN_SUMMARY
+            tail = f" и ещё {rest}" if rest > 0 else ""
+            summary += (f" КОПИЯ НЕПОЛНАЯ: не удалось прочитать папки "
+                        f"({len(result.skipped_folders)}): {shown}{tail}.")
+        emit("WARNING" if result.skipped_folders else "INFO", summary)
         return result
 
     @staticmethod

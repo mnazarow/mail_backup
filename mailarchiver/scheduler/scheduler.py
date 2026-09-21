@@ -91,6 +91,50 @@ class SchedulerService:
                 self._add_job(row)
             except Exception as exc:  # noqa: BLE001
                 log.error("Не удалось добавить расписание #%s: %s", row["id"], exc)
+        self._reload_employees_sync()
+
+    # -- синхронизация сотрудников ------------------------------------------
+    #: Идентификатор служебного задания (не из таблицы schedules, поэтому и не
+    #: попадает под общую чистку заданий «sched_*» в reload()).
+    EMPLOYEES_JOB_ID = "employees_sync"
+
+    def _reload_employees_sync(self) -> None:
+        """Пересоздать задание синхронизации сотрудников по настройкам.
+
+        Вызывается из reload(), то есть при каждом сохранении настроек: и
+        включение/выключение, и смена cron-выражения применяются сразу, без
+        перезапуска сервиса.
+        """
+        if not self._sched:
+            return
+        if self._sched.get_job(self.EMPLOYEES_JOB_ID):
+            self._sched.remove_job(self.EMPLOYEES_JOB_ID)
+        if not bool(self.services.rt("employees", "sync_enabled")):
+            return
+        expr = str(self.services.rt("employees", "cron") or "").strip()
+        if len(expr.split()) != 5:
+            log.error("Некорректное cron-выражение синхронизации сотрудников: «%s» (нужно 5 полей).", expr)
+            return
+        try:
+            trigger = CronTrigger.from_crontab(expr, timezone=self._timezone())
+        except Exception as exc:  # noqa: BLE001
+            log.error("Не удалось разобрать cron синхронизации сотрудников «%s»: %s", expr, exc)
+            return
+        self._sched.add_job(
+            self._fire_employees_sync, trigger, id=self.EMPLOYEES_JOB_ID,
+            replace_existing=True, coalesce=bool(self.services.rt("scheduler", "coalesce")),
+            misfire_grace_time=int(self.services.rt("scheduler", "misfire_grace_time_s") or 3600),
+        )
+        log.info("Синхронизация сотрудников запланирована: «%s».", expr)
+
+    def _fire_employees_sync(self) -> None:
+        """Поставить в очередь общесистемное задание синхронизации сотрудников."""
+        try:
+            job_id = self.services.queue.enqueue(
+                JobType.SYNC_EMPLOYEES, None, {}, created_by="scheduler")
+            log.info("Синхронизация сотрудников по расписанию → задание #%s.", job_id)
+        except Exception:  # noqa: BLE001
+            log.exception("Ошибка при постановке синхронизации сотрудников")
 
     def _add_job(self, row) -> None:
         trigger = self._build_trigger(row)

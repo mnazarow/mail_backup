@@ -18,8 +18,9 @@ class JobType:
     RETENTION = "retention"    # очистка по политике хранения
     VERIFY = "verify"          # проверка целостности локальной копии
     ANALYZE = "analyze"        # глубокий анализ содержимого писем (аналитика)
+    SYNC_EMPLOYEES = "sync_employees"  # синхронизация справочника сотрудников с файлом
 
-    ALL = [BACKUP, RESTORE, EXPORT, IMPORT_PST, TEST, RETENTION, VERIFY, ANALYZE]
+    ALL = [BACKUP, RESTORE, EXPORT, IMPORT_PST, TEST, RETENTION, VERIFY, ANALYZE, SYNC_EMPLOYEES]
     LABELS = {
         BACKUP: "Резервное копирование",
         RESTORE: "Восстановление",
@@ -29,6 +30,7 @@ class JobType:
         RETENTION: "Очистка (ретеншн)",
         VERIFY: "Проверка целостности",
         ANALYZE: "Глубокий анализ писем",
+        SYNC_EMPLOYEES: "Синхронизация сотрудников",
     }
 
 

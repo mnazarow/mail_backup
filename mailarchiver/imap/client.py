@@ -6,8 +6,10 @@ OAuth2 (XOAUTH2).
 from __future__ import annotations
 
 import imaplib
+import re
 import socket
 import ssl
+import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterator, List, Optional, Set
 
@@ -41,6 +43,27 @@ UNKNOWN_SIZE_ASSUMPTION = 256 * 1024
 # Признаки ответа «папка уже существует». Подстрока «exist» для этого не
 # годится: ответ вида `NO [TRYCREATE] Mailbox doesn't exist` — это ОТКАЗ.
 _ALREADY_EXISTS_MARKERS = ("alreadyexists", "already exist", "duplicate folder", "duplicate mailbox")
+
+# Флаги LIST, означающие «эту папку открыть нельзя» (контейнер или уже
+# несуществующая запись). Сравниваем В НИЖНЕМ РЕГИСТРЕ: серверы пишут флаги
+# по-разному (\Noselect, \NoSelect, \NOSELECT), а точное сравнение молча
+# пропускало бы такие папки в бэкап — и каждая давала бы «ошибку» SELECT.
+_UNSELECTABLE_FLAGS = ("\\noselect", "\\nonexistent")
+
+# Сколько ВСЕГО попыток открыть папку и пауза между ними. Часть отказов
+# SELECT/EXAMINE временные: ящик занят другой сессией, сервер держит блокировку,
+# кратковременная перегрузка. Одна повторная попытка дешевле, чем потерянная
+# из копии папка. Значения модульные — их подменяют тесты.
+SELECT_ATTEMPTS = 2
+SELECT_RETRY_DELAY_S = 1.5
+
+# Общая формулировка библиотеки вокруг ответа сервера: imapclient формирует
+# сообщение как "<команда> failed: <ответ сервера>". Разворачиваем её, чтобы
+# в лог попали именно слова сервера.
+_LIB_WRAPPER_RE = re.compile(r"^\s*[A-Za-z]+ (?:failed|command error):\s*(?P<reply>.+)$", re.S)
+
+# Untagged-строки, в которых серверы объясняют отказ.
+_SERVER_NOTICE_KEYS = ("NO", "BAD", "ALERT", "BYE")
 
 
 @dataclass
@@ -94,6 +117,57 @@ def _is_already_exists_error(exc: BaseException) -> bool:
     """
     text = str(exc).lower()
     return any(marker in text for marker in _ALREADY_EXISTS_MARKERS)
+
+
+def _as_text(value) -> str:
+    """Привести кусок ответа сервера (bytes/str/что угодно) к строке."""
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).decode("utf-8", "replace")
+    return str(value)
+
+
+def _server_reply(exc: BaseException) -> str:
+    """
+    Достать ФАКТИЧЕСКИЙ ответ сервера из исключения imapclient/imaplib.
+
+    Текст ответа лежит в args исключения (иногда как bytes), обычно завёрнутый
+    в общую формулировку библиотеки вида «select failed: <ответ>». Её мы
+    разворачиваем: по «select failed» администратор не поймёт ничего, а по
+    словам сервера — поймёт, отказано ли в доступе, занята ли папка или её нет.
+    """
+    parts: List[str] = []
+    for arg in getattr(exc, "args", ()) or ():
+        text = _as_text(arg).strip()
+        if not text:
+            continue
+        match = _LIB_WRAPPER_RE.match(text)
+        if match:
+            text = match.group("reply").strip()
+        if text and text not in parts:
+            parts.append(text)
+    return "; ".join(parts)
+
+
+def _server_notices(client) -> str:
+    """
+    Незапрошенные (untagged) строки последнего обмена: `* NO …`, `* BAD …`,
+    `[ALERT] …`, `* BYE …`.
+
+    Часть серверов (в том числе Axigen) отдаёт в теге короткое «failed», а
+    причину пишет именно в untagged-строке. Best-effort: на другой версии
+    imaplib этой структуры может не быть — тогда просто вернём пустую строку.
+    """
+    try:
+        responses = client._imap.untagged_responses  # noqa: SLF001
+        out: List[str] = []
+        for key in _SERVER_NOTICE_KEYS:
+            for value in (responses.get(key) or ()):
+                text = _as_text(value).strip()
+                if text:
+                    out.append(f"{key}: {text}")
+    except Exception:  # noqa: BLE001
+        return ""
+    return "; ".join(out)
 
 
 def _header_message_id(raw_header) -> str:
@@ -265,11 +339,14 @@ class ImapConnection:
             raise _map_exception(exc) from exc
         result: List[FolderInfo] = []
         for flags, delimiter, name in raw:
-            deli = delimiter.decode() if isinstance(delimiter, bytes) else (delimiter or "/")
+            deli = _as_text(delimiter) if delimiter else ""
             self._delimiter = deli or self._delimiter
-            flag_list = [f.decode() if isinstance(f, bytes) else str(f) for f in (flags or ())]
-            selectable = "\\Noselect" not in flag_list and "\\NonExistent" not in flag_list
-            result.append(FolderInfo(name=name, delimiter=deli or "/", flags=flag_list, selectable=selectable))
+            flag_list = [_as_text(f) for f in (flags or ())]
+            # Регистр флага значения не имеет: \Noselect, \NoSelect и \NOSELECT —
+            # один и тот же запрет открывать папку.
+            selectable = not any(f.strip().lower() in _UNSELECTABLE_FLAGS for f in flag_list)
+            result.append(FolderInfo(name=_as_text(name), delimiter=deli or "/",
+                                     flags=flag_list, selectable=selectable))
         return result
 
     @property
@@ -277,15 +354,59 @@ class ImapConnection:
         return self._delimiter
 
     def select(self, folder: str, readonly: bool = True) -> Dict[str, int]:
-        try:
-            info = self.client.select_folder(folder, readonly=readonly)
-        except Exception as exc:  # noqa: BLE001
-            raise _map_exception(exc) from exc
-        return {
-            "uidvalidity": int(info.get(b"UIDVALIDITY", 0) or 0),
-            "uidnext": int(info.get(b"UIDNEXT", 0) or 0),
-            "exists": int(info.get(b"EXISTS", 0) or 0),
-        }
+        """
+        Открыть папку: EXAMINE при readonly, иначе SELECT.
+
+        Делаем до ``SELECT_ATTEMPTS`` попыток с паузой: часть отказов временная
+        (ящик занят другой сессией, блокировка, кратковременная перегрузка).
+        Если открыть так и не удалось — в сообщение кладём ФАКТИЧЕСКИЙ ответ
+        сервера и его untagged-уведомления: без них в журнале остаётся лишь
+        общий текст библиотеки («select failed: …»), по которому причину на
+        стороне сервера определить невозможно.
+        """
+        attempts = max(1, int(SELECT_ATTEMPTS))
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                info = self.client.select_folder(folder, readonly=readonly)
+            except Exception as exc:  # noqa: BLE001
+                if attempt >= attempts:
+                    raise self._select_error(folder, exc, attempt) from exc
+                log.warning("Папка «%s» не открылась (%s). Повтор попытки %d из %d через %.1f с…",
+                            folder, _server_reply(exc) or exc, attempt + 1, attempts, SELECT_RETRY_DELAY_S)
+                time.sleep(max(0.0, float(SELECT_RETRY_DELAY_S)))
+                continue
+            return {
+                "uidvalidity": int(info.get(b"UIDVALIDITY", 0) or 0),
+                "uidnext": int(info.get(b"UIDNEXT", 0) or 0),
+                "exists": int(info.get(b"EXISTS", 0) or 0),
+            }
+
+    def _select_error(self, folder: str, exc: BaseException, attempts: int) -> Exception:
+        """
+        Собрать ошибку открытия папки так, чтобы администратор увидел ПРИЧИНУ:
+        какую папку не удалось открыть, сколько раз пробовали, что именно
+        ответил сервер и что он прислал в untagged-строках.
+        """
+        mapped = _map_exception(exc)
+        reply = _server_reply(exc)
+        notices = _server_notices(self.client)
+        parts = [f"Не удалось открыть папку «{folder}» (попыток: {attempts}): {mapped.message}"]
+        if reply:
+            # Дублирование с текстом библиотеки допускаем осознанно: так в логе
+            # всегда есть строка «ответ сервера», которую можно показать
+            # администратору почтового сервера как есть.
+            parts.append(f"Ответ сервера: «{reply}»")
+        if notices:
+            parts.append(f"Уведомления сервера: {notices}")
+        message = ". ".join(parts) + "."
+        hint = getattr(mapped, "hint", None) or (
+            "Что проверить на сервере: существует ли папка и открывается ли она (не контейнер ли "
+            "это); права (ACL) этой учётной записи на папку; не заблокирован ли ящик другим "
+            "процессом; имя папки и его кодировка (IMAP UTF-7)."
+        )
+        return type(mapped)(message, hint=hint, cause=exc)
 
     def search_all_uids(self) -> List[int]:
         try:
@@ -497,20 +618,43 @@ class ImapConnection:
 def probe_account(account: Account, options: Optional[ConnectOptions] = None) -> dict:
     """
     Проверить подключение к ящику. Возвращает структуру для интерфейса:
-    {ok, error, hint, capabilities, folders:[{name, selectable, messages?}]}.
+    {ok, error, hint, capabilities, duplicate_folders:[имя],
+     folders:[{name, delimiter, selectable, special, flags, duplicate}]}.
+
+    ``duplicate`` — сервер вернул эту папку в LIST повторно; ``flags`` — её
+    флаги как есть (по ним видно, почему папка не открывается: \\Noselect).
     Никогда не бросает исключение — всё упаковывается в результат.
     """
-    result = {"ok": False, "error": None, "hint": None, "capabilities": [], "folders": []}
+    result = {"ok": False, "error": None, "hint": None, "capabilities": [], "folders": [],
+              "duplicate_folders": []}
     try:
         with ImapConnection(account, options) as conn:
             result["capabilities"] = conn.capabilities()
+            # Отдельно помечаем ПОВТОРЫ в ответе LIST: сервер иногда возвращает
+            # одну и ту же папку дважды, и без такой пометки причину «папка
+            # скопирована дважды» на боевом сервере не увидеть. Проверка
+            # бесплатная — SELECT для неё не нужен.
+            # Признак «папка реально открывается» здесь НЕ проверяем намеренно:
+            # это потребовало бы SELECT/EXAMINE на каждую папку (отдельный
+            # запрос к серверу на каждую из десятков папок) — слишком дорого
+            # для кнопки «Проверить подключение».
+            seen: Dict[str, int] = {}
             for fi in conn.list_folders():
+                seen[fi.name] = seen.get(fi.name, 0) + 1
+                duplicate = seen[fi.name] > 1
+                if duplicate and fi.name not in result["duplicate_folders"]:
+                    result["duplicate_folders"].append(fi.name)
                 result["folders"].append({
                     "name": fi.name,
                     "delimiter": fi.delimiter,
                     "selectable": fi.selectable,
                     "special": [f for f in fi.flags if f not in ("\\HasNoChildren", "\\HasChildren")],
+                    "flags": list(fi.flags),
+                    "duplicate": duplicate,
                 })
+            if result["duplicate_folders"]:
+                log.warning("Сервер вернул повторяющиеся папки в LIST: %s",
+                            ", ".join(result["duplicate_folders"]))
             result["ok"] = True
     except Exception as exc:  # noqa: BLE001
         from ..errors import MailArchiverError

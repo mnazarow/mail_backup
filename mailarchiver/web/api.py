@@ -13,6 +13,11 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Resp
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
+from ..employees import (
+    ACCOUNT_PLACEHOLDERS, TEMPLATE_CSV, TEMPLATE_FILENAME, ensure_account_for_employee,
+    fetch_employee_source, looks_like_email, normalize_email, parse_employee_file,
+    preview_account_template, sync_employees,
+)
 from ..errors import ValidationError
 from ..imap.client import probe_account
 from ..models import Account, AuthType, JobStatus, JobType, ScheduleKind, Security
@@ -28,13 +33,21 @@ router = APIRouter(prefix="/api")
 # поэтому держим лимит константой: без него один запрос мог бы забить диск.
 MAX_PST_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024   # 2 ГБ
 
+# Максимальный размер загружаемого списка сотрудников. Выгрузка кадровой
+# системы — это таблица на несколько тысяч строк, 20 МБ хватает с запасом;
+# ограничение защищает от загрузки чего-то постороннего.
+MAX_EMPLOYEE_UPLOAD_BYTES = 20 * 1024 * 1024    # 20 МБ
+
+# Допустимые статусы сотрудника (колонка employees.status).
+EMPLOYEE_STATUSES = ("active", "archived")
+
 # Минимальный интервал расписания (совпадает с проверкой в планировщике):
 # более частое расписание планировщик не примет и оно молча не сработает.
 MIN_SCHEDULE_INTERVAL_S = 60
 
 # Параметры-секреты: не отдаются через GET /settings и не затираются пустым
 # значением при сохранении (пустое поле = «оставить как есть»).
-SECRET_SETTINGS = {"notifications.smtp_password"}
+SECRET_SETTINGS = {"notifications.smtp_password", "employees.source_url_password"}
 
 
 def svc_dep(request: Request):
@@ -137,6 +150,22 @@ class ScheduleBody(BaseModel):
 
 class SettingsBody(BaseModel):
     values: dict  # {"section.key": value}
+
+
+class EmployeeBody(BaseModel):
+    full_name: str
+    email: str = ""
+    position: str = ""
+    department: str = ""
+    phone: str = ""
+    external_id: str = ""
+    status: str = "active"
+    notes: str = ""
+
+
+class EmployeeCreateBody(EmployeeBody):
+    #: завести сотруднику почтовый ящик (создаётся ВЫКЛЮЧЕННЫМ, без пароля)
+    create_account: bool = False
 
 
 class UserBody(BaseModel):
@@ -715,6 +744,19 @@ def list_schedules(request: Request, user: dict = Depends(auth_mod.require_user)
     return out
 
 
+def _validate_cron(expr: str) -> None:
+    """Проверить cron-выражение (5 полей и понятный APScheduler синтаксис)."""
+    expr = (expr or "").strip()
+    hint = "Пример: «0 3 * * *» — каждый день в 03:00."
+    if len(expr.split()) != 5:
+        raise ValidationError(f"Некорректное cron-выражение: «{expr}» (нужно 5 полей).", hint=hint)
+    try:
+        from apscheduler.triggers.cron import CronTrigger
+        CronTrigger.from_crontab(expr)
+    except Exception as exc:  # noqa: BLE001
+        raise ValidationError(f"Некорректное cron-выражение: «{expr}» ({exc}).", hint=hint) from exc
+
+
 def _validate_schedule(body: ScheduleBody) -> None:
     """Проверить расписание ДО записи в БД.
 
@@ -725,15 +767,7 @@ def _validate_schedule(body: ScheduleBody) -> None:
     if body.job_type not in JobType.ALL:
         raise ValidationError(f"Неизвестный тип задания: {body.job_type}")
     if body.kind == ScheduleKind.CRON:
-        expr = (body.cron_expr or "").strip()
-        hint = "Пример: «0 3 * * *» — каждый день в 03:00."
-        if len(expr.split()) != 5:
-            raise ValidationError(f"Некорректное cron-выражение: «{expr}» (нужно 5 полей).", hint=hint)
-        try:
-            from apscheduler.triggers.cron import CronTrigger
-            CronTrigger.from_crontab(expr)
-        except Exception as exc:  # noqa: BLE001
-            raise ValidationError(f"Некорректное cron-выражение: «{expr}» ({exc}).", hint=hint) from exc
+        _validate_cron(body.cron_expr)
     elif body.kind == ScheduleKind.INTERVAL:
         if int(body.interval_seconds or 0) < MIN_SCHEDULE_INTERVAL_S:
             raise ValidationError(f"Интервал не может быть меньше {MIN_SCHEDULE_INTERVAL_S} секунд.",
@@ -830,6 +864,11 @@ def update_settings(request: Request, body: SettingsBody, user: dict = Depends(a
         # сохранение формы затирало бы сохранённый пароль.
         if full_key in SECRET_SETTINGS and (value is None or value == ""):
             continue
+        # Расписание синхронизации сотрудников проверяем сразу: иначе кривое
+        # выражение обнаружилось бы только в логах планировщика, а задание
+        # молча не запускалось бы.
+        if full_key in ("employees.cron", "employees.account_schedule_cron"):
+            _validate_cron(str(value or ""))
         # Валидация типа по значению по умолчанию (защита от «битых» настроек,
         # которые могли бы, например, остановить очередь).
         default = DEFAULTS.get(section, {}).get(key)
@@ -947,6 +986,316 @@ def analytics_mail_scan(request: Request, account_id: Optional[int] = None,
     jid = svc.queue.enqueue(JobType.ANALYZE, account_id, {}, created_by=user["username"])
     svc.db.add_audit(user["username"], "analytics_scan", f"account={account_id}")
     return {"ok": True, "job_id": jid}
+
+
+# =====================================================================
+#  Сотрудники (только администратор)
+#
+#  ВНИМАНИЕ: маршруты с постоянными путями (/template.csv, /import, /sync)
+#  объявлены ДО /employees/{employee_id} — иначе FastAPI сопоставит их с
+#  маршрутом по идентификатору и попытается разобрать «template.csv» как int.
+# =====================================================================
+def _employee_out(row) -> dict:
+    """Карточка сотрудника для интерфейса (вместе с состоянием ящика)."""
+    account_enabled = row["account_enabled"]
+    return {
+        "id": row["id"],
+        "external_id": row["external_id"] or "",
+        "full_name": row["full_name"] or "",
+        "email": row["email"] or "",
+        "position": row["position"] or "",
+        "department": row["department"] or "",
+        "phone": row["phone"] or "",
+        "status": row["status"] or "active",
+        "account_id": row["account_id"],
+        "account_name": row["account_name"] or "" if row["account_id"] else "",
+        "account_enabled": bool(account_enabled) if account_enabled is not None else False,
+        "notes": row["notes"] or "",
+        "source": row["source"] or "manual",
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "last_seen_at": row["last_seen_at"],
+    }
+
+
+def _employee_values(body: "EmployeeBody") -> dict:
+    """Нормализованные поля карточки из тела запроса."""
+    status = (body.status or "active").strip().lower()
+    if status not in EMPLOYEE_STATUSES:
+        raise ValidationError(f"Неизвестный статус сотрудника: «{body.status}».",
+                              hint="Допустимы «active» (работает) и «archived» (в архиве).")
+    full_name = (body.full_name or "").strip()
+    if not full_name:
+        raise ValidationError("Укажите ФИО сотрудника.")
+    email = normalize_email(body.email)
+    if email and not looks_like_email(email):
+        raise ValidationError(f"Некорректный e-mail: «{body.email}».",
+                              hint="Адрес должен быть вида ivanov@example.ru.")
+    return {
+        "full_name": full_name,
+        "email": email,
+        "position": (body.position or "").strip(),
+        "department": (body.department or "").strip(),
+        "phone": (body.phone or "").strip(),
+        "external_id": (body.external_id or "").strip(),
+        "status": status,
+        "notes": (body.notes or "").strip(),
+    }
+
+
+@router.get("/employees")
+def list_employees(request: Request, query: Optional[str] = None, status: Optional[str] = None,
+                   limit: int = 100, offset: int = 0, user: dict = Depends(auth_mod.require_admin)):
+    svc = svc_dep(request)
+    limit = max(1, min(int(limit or 100), 1000))
+    offset = max(0, int(offset or 0))
+    rows = svc.db.list_employees(query=query, status=status, limit=limit, offset=offset)
+    return {
+        "employees": [_employee_out(r) for r in rows],
+        # total — сколько строк подходит под фильтр (для постраничной навигации),
+        # counts — общая сводка по всему справочнику (для плашек в шапке).
+        "total": svc.db.count_employees(status=status, query=query),
+        "counts": svc.db.employee_counts(),
+    }
+
+
+@router.get("/employees/template.csv")
+def employees_template(user: dict = Depends(auth_mod.require_admin)):
+    """Файл-образец: заголовки и одна строка для примера."""
+    # BOM — чтобы Excel открыл файл в UTF-8, а не показал кракозябры.
+    data = "﻿".encode("utf-8") + TEMPLATE_CSV.encode("utf-8")
+    return Response(
+        content=data, media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{TEMPLATE_FILENAME}"'},
+    )
+
+
+@router.post("/employees/import")
+def import_employees(request: Request, file: UploadFile = File(...),
+                     user: dict = Depends(auth_mod.require_admin)):
+    """Загрузить файл CSV/XLSX и сразу применить его к справочнику."""
+    svc = svc_dep(request)
+    # имя файла приходит от клиента: берём только базовое имя и чистим его,
+    # иначе «../../» в имени увело бы запись за пределы каталога временных файлов
+    origin_name = os.path.basename(file.filename or "")
+    fname = safe_filename(origin_name, default="employees.csv")
+    dest = os.path.join(svc.cfg.tmp_dir, f"employees_{os.getpid()}_{fname}")
+    written = 0
+    try:
+        with open(dest, "wb") as fh:
+            while True:
+                chunk = file.file.read(1024 * 1024)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > MAX_EMPLOYEE_UPLOAD_BYTES:
+                    raise ValidationError(
+                        f"Файл слишком большой: допустимо не более {human_size(MAX_EMPLOYEE_UPLOAD_BYTES)}.",
+                        hint="Выгрузите сотрудников по частям или уберите лишние листы и колонки.")
+                fh.write(chunk)
+        if not written:
+            raise ValidationError("Файл пуст.", hint="Выберите выгрузку из кадровой системы (CSV или XLSX).")
+        rows, problems = parse_employee_file(dest, origin_name or fname)
+        result = sync_employees(svc, rows, create_accounts=bool(svc.rt("employees", "create_accounts")))
+    finally:
+        # временный файл не нужен ни при успехе, ни при ошибке
+        try:
+            os.unlink(dest)
+        except OSError:
+            pass
+    problems = problems + list(result["problems"])
+    svc.db.add_audit(user["username"], "employees_import",
+                     f"файл={origin_name or fname} создано={result['created']} обновлено={result['updated']}")
+    return {"ok": True, "created": result["created"], "updated": result["updated"],
+            "accounts_created": result["accounts_created"], "accounts_linked": result["accounts_linked"],
+            "total_rows": result["total_rows"], "problems": problems}
+
+
+def _employee_source(svc) -> dict:
+    """Текущий источник списка сотрудников в виде, пригодном для интерфейса.
+
+    Пароль наружу не отдаём — только признак того, что он задан.
+    """
+    stype = str(svc.rt("employees", "source_type") or "file").strip().lower()
+    if stype not in ("file", "url"):
+        stype = "file"
+    path = str(svc.rt("employees", "source_file") or "").strip()
+    url = str(svc.rt("employees", "source_url") or "").strip()
+    return {
+        "type": stype,
+        "path": path,
+        "url": url,
+        "target": url if stype == "url" else path,
+        "configured": bool(url if stype == "url" else path),
+        "auth": bool(str(svc.rt("employees", "source_url_user") or "").strip()),
+        "verify_ssl": bool(svc.rt("employees", "source_url_verify_ssl")),
+        "format": str(svc.rt("employees", "source_url_format") or "auto"),
+        "timeout_s": int(svc.rt("employees", "source_url_timeout_s") or 60),
+        "sync_enabled": bool(svc.rt("employees", "sync_enabled")),
+        "cron": str(svc.rt("employees", "cron") or ""),
+    }
+
+
+def _check_employee_source(svc) -> dict:
+    """Проверить источник: он доступен и читается? Справочник не меняем."""
+    src = _employee_source(svc)
+    if src["type"] == "url":
+        if not src["url"]:
+            raise ValidationError(
+                "Не задан адрес выгрузки сотрудников.",
+                hint="Заполните «Адрес выгрузки (URL)» в настройках, раздел «Сотрудники», "
+                     "либо переключите источник на «Файл на сервере».")
+        data, name = fetch_employee_source(
+            src["url"],
+            username=str(svc.rt("employees", "source_url_user") or ""),
+            password=str(svc.rt("employees", "source_url_password") or ""),
+            verify_ssl=src["verify_ssl"], timeout_s=src["timeout_s"], fmt=src["format"])
+        rows, problems = parse_employee_file(data, name)
+        return {"ok": True, "source": src, "filename": name, "bytes": len(data),
+                "rows": len(rows), "problems": problems[:50], "problem_count": len(problems)}
+
+    if not src["path"]:
+        raise ValidationError(
+            "Не задан файл со списком сотрудников.",
+            hint="Укажите путь к файлу CSV/XLSX в настройках, раздел «Сотрудники» → «Файл-источник». "
+                 "Либо загрузите файл кнопкой «Импорт из файла».")
+    if not os.path.isfile(src["path"]):
+        raise ValidationError(
+            f"Файл со списком сотрудников не найден: {src['path']}",
+            hint="Проверьте путь и права доступа: файл читает служба mailarchiver.")
+    rows, problems = parse_employee_file(src["path"], os.path.basename(src["path"]))
+    return {"ok": True, "source": src, "filename": os.path.basename(src["path"]),
+            "bytes": os.path.getsize(src["path"]), "rows": len(rows),
+            "problems": problems[:50], "problem_count": len(problems)}
+
+
+@router.get("/employees/source")
+def employee_source(request: Request, user: dict = Depends(auth_mod.require_admin)):
+    """Какой источник списка настроен — для подсказок в разделе «Сотрудники»."""
+    return {"source": _employee_source(svc_dep(request))}
+
+
+@router.post("/employees/source/check")
+def employee_source_check(request: Request, user: dict = Depends(auth_mod.require_admin)):
+    """Проверить источник, ничего не записывая в справочник.
+
+    Нужна, чтобы администратор убедился в правильности адреса или пути до
+    того, как включит синхронизацию по расписанию: иначе первая же ошибка
+    всплыла бы ночью, в журнале планировщика.
+    """
+    result = _check_employee_source(svc_dep(request))
+    svc_dep(request).db.add_audit(user["username"], "employees_source_check",
+                                  f"{result['source']['type']}: {result['source']['target']}"[:500])
+    return result
+
+
+@router.get("/employees/account-template")
+def employee_account_template(request: Request, full_name: str = "Иванов Иван Иванович",
+                              email: str = "ivanov@example.ru", position: str = "Менеджер",
+                              department: str = "Отдел продаж",
+                              user: dict = Depends(auth_mod.require_admin)):
+    """Показать, какой ящик получится по шаблону из настроек.
+
+    Нужен, чтобы не проверять шаблон «вживую»: ошибку в подстановке иначе
+    видно только после синхронизации, когда ящики уже созданы.
+    """
+    svc = svc_dep(request)
+    row = {"position": position, "department": department, "external_id": "1234"}
+    return {"preview": preview_account_template(svc, full_name=full_name, email=email, row=row),
+            "placeholders": list(ACCOUNT_PLACEHOLDERS),
+            "create_accounts": bool(svc.rt("employees", "create_accounts"))}
+
+
+@router.post("/employees/sync")
+def sync_employees_now(request: Request, user: dict = Depends(auth_mod.require_admin)):
+    """Поставить в очередь синхронизацию с источником, указанным в настройках.
+
+    Источник — файл на сервере или адрес выгрузки; что именно, решает настройка
+    «Источник списка». Наличие источника проверяем здесь же, чтобы ошибка
+    показалась сразу в интерфейсе, а не только в журнале задания.
+    """
+    svc = svc_dep(request)
+    src = _employee_source(svc)
+    if src["type"] == "url":
+        if not src["url"]:
+            raise ValidationError(
+                "Не задан адрес выгрузки сотрудников.",
+                hint="Заполните «Адрес выгрузки (URL)» в настройках, раздел «Сотрудники», "
+                     "либо переключите источник на «Файл на сервере».")
+    else:
+        if not src["path"]:
+            raise ValidationError(
+                "Не задан файл со списком сотрудников.",
+                hint="Укажите путь к файлу CSV/XLSX в настройках, раздел «Сотрудники» → «Файл-источник». "
+                     "Либо загрузите файл кнопкой «Импорт из файла».")
+        if not os.path.isfile(src["path"]):
+            raise ValidationError(
+                f"Файл со списком сотрудников не найден: {src['path']}",
+                hint="Проверьте путь и права доступа: файл читает служба mailarchiver.")
+    jid = svc.queue.enqueue(JobType.SYNC_EMPLOYEES, None, {}, created_by=user["username"])
+    svc.db.add_audit(user["username"], "employees_sync_start", f"{src['type']}: {src['target']}"[:500])
+    return {"ok": True, "job_id": jid, "source": src}
+
+
+@router.post("/employees")
+def create_employee(request: Request, body: EmployeeCreateBody, user: dict = Depends(auth_mod.require_admin)):
+    svc = svc_dep(request)
+    values = _employee_values(body)
+    employee_id = svc.db.create_employee(source="manual", **values)
+    account_id = None
+    if body.create_account:
+        if not values["email"]:
+            raise ValidationError("Чтобы завести ящик, укажите e-mail сотрудника.")
+        # ящик создаётся по тому же шаблону, что и при синхронизации
+        account_id, _ = ensure_account_for_employee(svc, employee_id, values["full_name"],
+                                                    values["email"], row=values)
+    svc.db.add_audit(user["username"], "employee_create", values["full_name"])
+    return {"ok": True, "id": employee_id, "account_id": account_id}
+
+
+@router.put("/employees/{employee_id}")
+def update_employee(request: Request, employee_id: int, body: EmployeeBody,
+                    user: dict = Depends(auth_mod.require_admin)):
+    svc = svc_dep(request)
+    if svc.db.get_employee(employee_id) is None:
+        raise HTTPException(404, "Сотрудник не найден")
+    values = _employee_values(body)
+    svc.db.update_employee(employee_id, **values)
+    svc.db.add_audit(user["username"], "employee_update", values["full_name"])
+    return {"ok": True}
+
+
+@router.delete("/employees/{employee_id}")
+def delete_employee(request: Request, employee_id: int, user: dict = Depends(auth_mod.require_admin)):
+    """Удалить карточку сотрудника. Почтовый ящик и локальные копии писем
+    остаются на месте — их удаляют отдельно в разделе «Ящики»."""
+    svc = svc_dep(request)
+    row = svc.db.get_employee(employee_id)
+    if row is None:
+        raise HTTPException(404, "Сотрудник не найден")
+    svc.db.delete_employee(employee_id)
+    svc.db.add_audit(user["username"], "employee_delete", row["full_name"] or str(employee_id))
+    return {"ok": True}
+
+
+@router.post("/employees/{employee_id}/link-account")
+def link_employee_account(request: Request, employee_id: int, account_id: int = 0,
+                          user: dict = Depends(auth_mod.require_admin)):
+    """Привязать сотруднику существующий ящик (account_id=0 — отвязать)."""
+    svc = svc_dep(request)
+    row = svc.db.get_employee(employee_id)
+    if row is None:
+        raise HTTPException(404, "Сотрудник не найден")
+    if account_id:
+        if svc.db.get_account(int(account_id)) is None:
+            raise HTTPException(404, "Ящик не найден")
+        svc.db.set_employee_account(employee_id, int(account_id))
+    else:
+        # Отвязка НЕ удаляет ящик: он просто перестаёт числиться за сотрудником.
+        svc.db.set_employee_account(employee_id, None)
+    svc.db.add_audit(user["username"], "employee_link_account",
+                     f"employee={employee_id} account={account_id or 'нет'}")
+    return {"ok": True}
 
 
 # =====================================================================

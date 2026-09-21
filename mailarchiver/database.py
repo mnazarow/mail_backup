@@ -34,6 +34,20 @@ log = get_logger("db")
 _ENCRYPTED_SETTINGS = {"notifications.smtp_password"}
 
 
+#: Выборка сотрудника вместе с названием и состоянием привязанного ящика:
+#: интерфейсу нужны account_name/account_enabled, а отдельный запрос на строку
+#: превратил бы список в N+1 обращений к БД.
+_EMPLOYEE_SELECT = (
+    "SELECT e.*, a.name AS account_name, a.enabled AS account_enabled "
+    "FROM employees e LEFT JOIN accounts a ON a.id = e.account_id"
+)
+
+
+def _ma_lower(value):
+    """LOWER() с поддержкой кириллицы (регистрируется в каждом соединении)."""
+    return value.lower() if isinstance(value, str) else value
+
+
 class Database:
     def __init__(self, path: str, secret_box: SecretBox, *, busy_timeout_ms: int = 10000, wal: bool = True) -> None:
         self.path = path
@@ -51,6 +65,9 @@ class Database:
             conn.row_factory = sqlite3.Row
             conn.execute(f"PRAGMA busy_timeout={int(self.busy_timeout_ms)}")
             conn.execute("PRAGMA foreign_keys=ON")
+            # Встроенные LOWER()/LIKE в SQLite понимают только латиницу: поиск
+            # «иванов» не нашёл бы «Иванов». Регистр приводим средствами Python.
+            conn.create_function("ma_lower", 1, _ma_lower, deterministic=True)
             if self.wal:
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute("PRAGMA synchronous=NORMAL")
@@ -390,6 +407,135 @@ class Database:
 
     def delete_account(self, account_id: int) -> None:
         self.execute("DELETE FROM accounts WHERE id=?", (account_id,))
+
+    # ======================================================================
+    #  Сотрудники
+    # ======================================================================
+    #: Поля карточки сотрудника, которые можно изменять из интерфейса и при
+    #: синхронизации. Белый список нужен, чтобы update_employee нельзя было
+    #: заставить переписать служебные колонки (id, created_at и т.п.).
+    EMPLOYEE_FIELDS = ("external_id", "full_name", "email", "position", "department",
+                       "phone", "status", "account_id", "notes", "source", "last_seen_at")
+
+    @staticmethod
+    def _employee_filter(query: Optional[str], status: Optional[str]) -> tuple:
+        """Собрать условие WHERE для списка и счётчика сотрудников."""
+        conds: List[str] = []
+        params: List[Any] = []
+        if status:
+            conds.append("e.status=?")
+            params.append(status)
+        text = (query or "").strip()
+        if text:
+            # % и _ внутри запроса — обычные символы, а не шаблон LIKE,
+            # иначе поиск «100%» выдавал бы всё подряд.
+            escaped = text.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            like = f"%{escaped}%"
+            cols = ("full_name", "email", "position", "department", "phone", "external_id")
+            conds.append("(" + " OR ".join(f"ma_lower(e.{c}) LIKE ? ESCAPE '\\'" for c in cols) + ")")
+            params.extend([like] * len(cols))
+        where = (" WHERE " + " AND ".join(conds)) if conds else ""
+        return where, tuple(params)
+
+    def create_employee(self, *, full_name: str, email: str = "", external_id: str = "",
+                        position: str = "", department: str = "", phone: str = "",
+                        status: str = "active", account_id: Optional[int] = None,
+                        notes: str = "", source: str = "manual",
+                        last_seen_at: Optional[str] = None) -> int:
+        now = utcnow_iso()
+        cur = self.execute(
+            """INSERT INTO employees(external_id, full_name, email, position, department, phone,
+                                     status, account_id, notes, source, created_at, updated_at, last_seen_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (external_id, full_name, email, position, department, phone,
+             status or "active", account_id, notes, source, now, now, last_seen_at),
+        )
+        return int(cur.lastrowid)
+
+    def update_employee(self, employee_id: int, **fields: Any) -> None:
+        """Обновить карточку сотрудника. Изменяются ТОЛЬКО переданные поля."""
+        sets: List[str] = []
+        params: List[Any] = []
+        for key, value in fields.items():
+            if key not in self.EMPLOYEE_FIELDS:
+                continue
+            sets.append(f"{key}=?")
+            params.append(value)
+        if not sets:
+            return
+        sets.append("updated_at=?")
+        params.append(utcnow_iso())
+        params.append(employee_id)
+        self.execute(f"UPDATE employees SET {', '.join(sets)} WHERE id=?", tuple(params))
+
+    def get_employee(self, employee_id: int) -> Optional[sqlite3.Row]:
+        return self.query_one(f"{_EMPLOYEE_SELECT} WHERE e.id=?", (employee_id,))
+
+    def get_employee_by_email(self, email: str) -> Optional[sqlite3.Row]:
+        if not email:
+            return None
+        return self.query_one(
+            f"{_EMPLOYEE_SELECT} WHERE e.email=? COLLATE NOCASE ORDER BY e.id LIMIT 1", (email,))
+
+    def get_employee_by_external_id(self, external_id: str) -> Optional[sqlite3.Row]:
+        if not external_id:
+            return None
+        return self.query_one(
+            f"{_EMPLOYEE_SELECT} WHERE e.external_id=? ORDER BY e.id LIMIT 1", (external_id,))
+
+    def get_employee_by_full_name(self, full_name: str, *, only_unidentified: bool = False) -> Optional[sqlite3.Row]:
+        """Найти сотрудника по ФИО (без учёта регистра).
+
+        ``only_unidentified`` — искать только среди карточек БЕЗ табельного
+        номера и БЕЗ почты. В таком виде поиском пользуется синхронизация:
+        строку файла, где нет ни номера, ни адреса, опознать больше нечем, а
+        без этого каждый прогон плодил бы копии одного и того же человека.
+        """
+        if not full_name:
+            return None
+        sql = f"{_EMPLOYEE_SELECT} WHERE ma_lower(e.full_name)=ma_lower(?)"
+        if only_unidentified:
+            sql += " AND COALESCE(e.external_id,'')='' AND COALESCE(e.email,'')=''"
+        return self.query_one(sql + " ORDER BY e.id LIMIT 1", (full_name,))
+
+    def list_employees(self, query: Optional[str] = None, status: Optional[str] = None,
+                       limit: int = 100, offset: int = 0) -> List[sqlite3.Row]:
+        where, params = self._employee_filter(query, status)
+        return self.query(
+            f"{_EMPLOYEE_SELECT}{where} ORDER BY e.full_name COLLATE NOCASE, e.id LIMIT ? OFFSET ?",
+            params + (limit, offset),
+        )
+
+    def count_employees(self, status: Optional[str] = None, query: Optional[str] = None) -> int:
+        where, params = self._employee_filter(query, status)
+        return int(self.scalar(f"SELECT COUNT(*) FROM employees e{where}", params) or 0)
+
+    def employee_counts(self) -> Dict[str, int]:
+        """Сводка для шапки раздела: по статусам и по наличию ящика."""
+        row = self.query_one(
+            """SELECT
+                   COALESCE(SUM(CASE WHEN status='active'   THEN 1 ELSE 0 END), 0) AS active,
+                   COALESCE(SUM(CASE WHEN status='archived' THEN 1 ELSE 0 END), 0) AS archived,
+                   COALESCE(SUM(CASE WHEN account_id IS NOT NULL THEN 1 ELSE 0 END), 0) AS with_account,
+                   COALESCE(SUM(CASE WHEN account_id IS NULL THEN 1 ELSE 0 END), 0) AS without_account
+               FROM employees"""
+        )
+        return {
+            "active": int(row["active"] or 0),
+            "archived": int(row["archived"] or 0),
+            "with_account": int(row["with_account"] or 0),
+            "without_account": int(row["without_account"] or 0),
+        }
+
+    def delete_employee(self, employee_id: int) -> None:
+        """Удалить карточку сотрудника. Почтовый ящик и локальные копии писем
+        при этом НЕ трогаются — они живут своей жизнью (см. delete_account)."""
+        self.execute("DELETE FROM employees WHERE id=?", (employee_id,))
+
+    def set_employee_account(self, employee_id: int, account_id: Optional[int]) -> None:
+        """Привязать сотрудника к ящику (None — отвязать)."""
+        self.execute("UPDATE employees SET account_id=?, updated_at=? WHERE id=?",
+                     (account_id, utcnow_iso(), employee_id))
 
     # ======================================================================
     #  Состояние папок и индекс сообщений
@@ -1044,6 +1190,31 @@ CREATE TABLE IF NOT EXISTS accounts (
     created_at                TEXT,
     updated_at                TEXT
 );
+
+-- Сотрудники организации. Ящик (accounts) необязателен: сотрудник может
+-- существовать без почты, а удаление ящика НЕ удаляет карточку сотрудника
+-- (ON DELETE SET NULL — связь просто обнуляется).
+CREATE TABLE IF NOT EXISTS employees (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    external_id  TEXT,
+    full_name    TEXT NOT NULL,
+    email        TEXT,
+    position     TEXT,
+    department   TEXT,
+    phone        TEXT,
+    status       TEXT NOT NULL DEFAULT 'active',
+    account_id   INTEGER,
+    notes        TEXT DEFAULT '',
+    source       TEXT DEFAULT 'manual',
+    created_at   TEXT,
+    updated_at   TEXT,
+    last_seen_at TEXT,
+    FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE SET NULL
+);
+-- поиск сотрудника по почте идёт с COLLATE NOCASE — индексу нужна та же сортировка
+CREATE INDEX IF NOT EXISTS idx_employees_email ON employees(email COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_employees_ext ON employees(external_id);
+CREATE INDEX IF NOT EXISTS idx_employees_acc ON employees(account_id);
 
 CREATE TABLE IF NOT EXISTS folders (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,

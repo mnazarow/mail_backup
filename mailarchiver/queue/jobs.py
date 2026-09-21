@@ -131,6 +131,13 @@ def handle_backup(ctx: JobContext) -> Dict:
     if res.messages_skipped:
         # письма, не скачанные из-за лимита размера, иначе «потерялись» бы без объяснений
         summary += f" Пропущено по лимиту размера: {res.messages_skipped}."
+    if res.skipped_folders:
+        # Непрочитанные папки означают НЕПОЛНУЮ копию ящика — это должно быть
+        # видно в карточке задания и в письме-уведомлении, а не только в логе.
+        shown = ", ".join(res.skipped_folders[:10])
+        more = len(res.skipped_folders) - 10
+        summary += (f" КОПИЯ НЕПОЛНАЯ: не удалось прочитать папки "
+                    f"({len(res.skipped_folders)}): {shown}{f' и ещё {more}' if more > 0 else ''}.")
     svc.notifier.notify_job(JobType.BACKUP, res.status_label,
                             f"[MailArchiver] Бэкап «{acc.name}»: {res.status_label}", summary)
     # авто-ретеншн истории прогонов
@@ -138,7 +145,8 @@ def handle_backup(ctx: JobContext) -> Dict:
     if keep_runs:
         ctx.db.purge_old_runs(acc.id, keep_runs)
     return {"final_status": res.status_label, "summary": summary,
-            "messages_new": res.messages_new, "bytes_new": res.bytes_new, "errors": res.errors}
+            "messages_new": res.messages_new, "bytes_new": res.bytes_new, "errors": res.errors,
+            "skipped_folders": res.skipped_folders}
 
 
 # ---------------------------------------------------------------------------
@@ -479,6 +487,64 @@ def handle_analyze(ctx: JobContext) -> Dict:
             "errors": result["errors"]}
 
 
+# ---------------------------------------------------------------------------
+#  SYNC_EMPLOYEES (синхронизация справочника сотрудников с файлом-выгрузкой)
+# ---------------------------------------------------------------------------
+def handle_sync_employees(ctx: JobContext) -> Dict:
+    """Прочитать список сотрудников из источника и применить его к справочнику.
+
+    Задание общесистемное (account_id=None). Источник задаётся настройкой
+    ``employees.source_type``: файл на сервере (``employees.source_file``) или
+    адрес выгрузки (``employees.source_url``). В параметрах задания источник
+    можно переопределить — ключами ``source_type``, ``path`` и ``url``; этим
+    пользуется ручной запуск из интерфейса.
+    """
+    from ..employees import load_employee_source, sync_employees
+    svc = ctx.services
+    source_type = str(ctx.params.get("source_type")
+                      or svc.rt("employees", "source_type") or "file").strip().lower()
+    if source_type not in ("file", "url"):
+        source_type = "file"
+
+    create_accounts = ctx.params.get("create_accounts")
+    if create_accounts is None:
+        create_accounts = bool(svc.rt("employees", "create_accounts"))
+
+    rows, problems, origin = load_employee_source(
+        source_type=source_type,
+        path=str(ctx.params.get("path") or svc.rt("employees", "source_file") or ""),
+        url=str(ctx.params.get("url") or svc.rt("employees", "source_url") or ""),
+        username=str(svc.rt("employees", "source_url_user") or ""),
+        password=str(svc.rt("employees", "source_url_password") or ""),
+        verify_ssl=bool(svc.rt("employees", "source_url_verify_ssl")),
+        timeout_s=int(svc.rt("employees", "source_url_timeout_s") or 60),
+        fmt=str(svc.rt("employees", "source_url_format") or "auto"),
+    )
+    ctx.event("INFO", f"Синхронизация сотрудников, источник: {origin}.")
+    ctx.event("INFO", f"Разобрано строк: {len(rows)}; проблемных строк: {len(problems)}.")
+    ctx.progress(0, len(rows) or 1, "Разбор списка завершён")
+
+    result = sync_employees(svc, rows, create_accounts=bool(create_accounts), progress_cb=ctx.progress)
+    problems = problems + list(result["problems"])
+    for problem in problems[:50]:   # в журнал пишем разумную выборку, не весь файл
+        ctx.event("WARNING", f"Строка {problem['row']}: {problem['reason']}")
+    if len(problems) > 50:
+        ctx.event("WARNING", f"…и ещё {len(problems) - 50} проблемных строк.")
+
+    ctx.progress(len(rows), len(rows) or 1, "Готово")
+    summary = (f"Сотрудников добавлено {result['created']}, обновлено {result['updated']}; "
+               f"ящиков создано {result['accounts_created']}, привязано {result['accounts_linked']}; "
+               f"строк в источнике {result['total_rows']}, проблемных {len(problems)}.")
+    ctx.event("INFO", summary)
+    svc.db.add_audit("system", "employees_sync", summary[:500])
+    status = JobStatus.SUCCESS if not problems else JobStatus.PARTIAL
+    return {"final_status": status, "summary": summary,
+            "created": result["created"], "updated": result["updated"],
+            "accounts_created": result["accounts_created"],
+            "accounts_linked": result["accounts_linked"],
+            "total_rows": result["total_rows"], "problems": problems[:200]}
+
+
 HANDLERS: Dict[str, Callable[[JobContext], Dict]] = {
     JobType.BACKUP: handle_backup,
     JobType.RESTORE: handle_restore,
@@ -488,4 +554,5 @@ HANDLERS: Dict[str, Callable[[JobContext], Dict]] = {
     JobType.RETENTION: handle_retention,
     JobType.VERIFY: handle_verify,
     JobType.ANALYZE: handle_analyze,
+    JobType.SYNC_EMPLOYEES: handle_sync_employees,
 }

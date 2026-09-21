@@ -113,6 +113,36 @@ DEFAULTS: Dict[str, Any] = {
         "on_success": False,
         "on_failure": True,
     },
+    "employees": {
+        "sync_enabled": False,         # синхронизировать справочник сотрудников по расписанию
+        "source_type": "file",        # откуда берём список: file (файл на сервере) | url
+        "source_file": "",            # путь к файлу CSV/XLSX на сервере (выгрузка из кадровой системы)
+        "source_url": "",             # адрес выгрузки http(s):// (когда source_type = url)
+        "source_url_user": "",        # логин HTTP Basic, если адрес закрыт авторизацией
+        "source_url_password": "",    # пароль HTTP Basic (хранится в БД зашифрованным)
+        "source_url_verify_ssl": True,  # проверять сертификат сервера-источника
+        "source_url_timeout_s": 60,    # сколько ждать ответа от сервера-источника, секунды
+        "source_url_format": "auto",  # чем разбирать ответ: auto | csv | xlsx
+        "cron": "0 5 * * *",          # когда синхронизировать (минуты часы день месяц день_недели)
+        "create_accounts": True,       # заводить почтовые ящики для новых сотрудников
+        # --- шаблон настроек создаваемых ящиков ---
+        # Всё, что ниже, применяется к ящику, который заводится автоматически
+        # при появлении сотрудника. В шаблонах строк доступны подстановки
+        # {email} {local} {domain} {full_name} {position} {department}
+        # {external_id} (см. mailarchiver/employees.py: render_account_field).
+        "account_host": "",           # IMAP-сервер создаваемых ящиков
+        "account_port": 993,           # порт создаваемых ящиков
+        "account_security": "ssl",    # шифрование создаваемых ящиков: ssl | starttls | plain
+        "account_name_template": "{full_name}",  # название ящика в списке
+        "account_username_template": "{email}",  # логин для входа в почту
+        "account_notes_template": "Создан автоматически для сотрудника.",  # заметка в карточке ящика
+        "account_enabled": False,      # включать созданный ящик сразу (без пароля копирование не пойдёт)
+        "account_folder_include": [],  # какие папки копировать (пусто = все)
+        "account_folder_exclude": [],  # какие папки пропускать
+        "account_retention_days": -1,  # срок хранения: -1 = как в общих настройках, 0 = вечно, N = дней
+        "account_schedule_enabled": False,  # заводить расписание копирования новому ящику
+        "account_schedule_cron": "0 2 * * *",  # расписание копирования (минуты часы день месяц день_недели)
+    },
 }
 
 
@@ -369,4 +399,13 @@ notifications:
   mail_to: []
   on_failure: true
   on_success: false
+
+employees:
+  sync_enabled: false        # true — синхронизировать справочник по расписанию
+  source_file: ""            # напр. "/var/lib/mailarchiver/hr/employees.csv"
+  cron: "0 5 * * *"          # ежедневно в 05:00
+  create_accounts: true      # заводить ящики новым сотрудникам (создаются ВЫКЛЮЧЕННЫМИ)
+  account_host: ""           # напр. "imap.example.ru"
+  account_port: 993
+  account_security: "ssl"    # ssl | starttls | plain
 """

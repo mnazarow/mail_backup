@@ -215,6 +215,10 @@ table.tbl tr:last-child td { border-bottom: none; }
 .muted { color: var(--text-dim); }
 .small { font-size: .82rem; }
 .tag { display:inline-block; padding: 1px 7px; background: var(--bg-soft); border-radius: 5px; font-size: .78rem; color: var(--text-dim); }
+.tag.ok { background: var(--success-soft); color: var(--success); }
+.tag.warn { background: var(--warn-soft); color: var(--warn); }
+.tag.bad { background: var(--danger-soft); color: var(--danger); }
+.btn.small { padding: 5px 10px; font-size: .82rem; }
 .empty { text-align: center; padding: 40px 20px; color: var(--text-dim); }
 .empty .big { font-size: 2.4rem; margin-bottom: 8px; }
 .section-title { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }

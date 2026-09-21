@@ -137,6 +137,7 @@ const NAV = [
   {id:'mailanalytics', icon:'🔎', title:'Аналитика писем', admin:true},
   {id:'mail', icon:'📧', title:'Почта', mb:true},
   {id:'accounts', icon:'📬', title:'Почтовые ящики'},
+  {id:'employees', icon:'🧑‍💼', title:'Сотрудники', admin:true},
   {id:'jobs', icon:'⚙️', title:'Очередь и задания', mb:true},
   {id:'exports', icon:'📤', title:'Экспорт (PST)', mb:true},
   {id:'schedules', icon:'⏰', title:'Расписания'},
@@ -204,7 +205,7 @@ function route(){
   // почтовому клиенту нужна вся ширина экрана — три колонки в 1240px тесно
   c.classList.toggle('wide', view==='mail');
   c.innerHTML='<div class="empty"><div class="spinner"></div></div>';
-  const map={dashboard:viewDashboard,analytics:viewAnalytics,mailanalytics:viewMailAnalytics,mail:viewMail,accounts:viewAccounts,jobs:viewJobs,exports:viewExports,schedules:viewSchedules,logs:viewLogs,settings:viewSettings,users:viewUsers,audit:viewAudit};
+  const map={dashboard:viewDashboard,analytics:viewAnalytics,mailanalytics:viewMailAnalytics,mail:viewMail,accounts:viewAccounts,employees:viewEmployees,jobs:viewJobs,exports:viewExports,schedules:viewSchedules,logs:viewLogs,settings:viewSettings,users:viewUsers,audit:viewAudit};
   (map[view]||viewDashboard)(c).catch(toastErr);
 }
 
@@ -305,6 +306,296 @@ function renderAccountMini(accounts, box){
 // ===================================================================
 //  Ящики
 // ===================================================================
+// ===================================================================
+//  Сотрудники
+// ===================================================================
+const Emp = { query:'', status:'', offset:0, limit:100 };
+
+async function viewEmployees(c){
+  let d;
+  const q = new URLSearchParams({limit:Emp.limit, offset:Emp.offset});
+  if(Emp.query) q.set('query', Emp.query);
+  if(Emp.status) q.set('status', Emp.status);
+  try{ d = await api('/employees?'+q.toString()); }
+  catch(e){ toastErr(e); c.innerHTML='<div class="card"><div class="empty">Не удалось загрузить список сотрудников</div></div>'; return; }
+  // Сведения об источнике не критичны: если запрос не прошёл, список всё равно показываем.
+  let src=null; try{ src=(await api('/employees/source')).source; }catch(e){}
+  const cnt = d.counts||{};
+  c.innerHTML='';
+
+  const head=h(`<div class="section-title"><h2 style="margin:0">Сотрудники</h2>
+    <span class="tag" title="Всего в справочнике">всего: ${cnt.active+cnt.archived||0}${cnt.archived?` · в архиве: ${cnt.archived}`:''}</span>
+    <div class="spacer"></div>
+    <button class="btn" id="empTemplate" title="Скачать образец файла со списком сотрудников">📄 Образец файла</button>
+    <button class="btn" id="empImport" title="Загрузить список сотрудников из файла CSV или Excel">⬆️ Импорт из файла</button>
+    <button class="btn" id="empAccTpl" title="Шаблон настроек ящиков, которые заводятся сотрудникам автоматически">🧩 Шаблон ящиков</button>
+    <button class="btn" id="empSync" title="Синхронизировать с источником, указанным в настройках">↻ Синхронизировать</button>
+    <button class="btn primary" id="empAdd">+ Добавить сотрудника</button></div>`);
+  c.appendChild(head);
+  $('#empAdd',c).onclick=()=>employeeModal(null);
+  $('#empImport',c).onclick=()=>employeeImportModal();
+  $('#empSync',c).onclick=()=>employeeSyncNow();
+  $('#empAccTpl',c).onclick=()=>employeeAccountTemplateModal();
+  $('#empTemplate',c).onclick=()=>{ location.href='/api/employees/template.csv'; };
+
+  // Плашка источника: сразу видно, откуда берётся список и включено ли расписание.
+  if(src){
+    const isUrl = src.type==='url';
+    const target = src.target ? esc(src.target) : '<i>не задан</i>';
+    const state = src.configured
+      ? (src.sync_enabled ? `<span class="tag ok">по расписанию: ${esc(src.cron||'')}</span>`
+                          : '<span class="tag">только по кнопке</span>')
+      : '<span class="tag warn">не настроен</span>';
+    const bar=h(`<div class="card" style="margin-bottom:14px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+      <span>${isUrl?'🔗':'📁'} <b>Источник:</b> ${isUrl?'адрес':'файл на сервере'}</span>
+      <code class="mono small" style="word-break:break-all">${target}</code>
+      ${isUrl&&src.auth?'<span class="tag">с авторизацией</span>':''}
+      ${isUrl&&!src.verify_ssl?'<span class="tag warn">без проверки сертификата</span>':''}
+      ${state}
+      <div class="spacer"></div>
+      <button class="btn small" id="empSrcCheck">🔍 Проверить источник</button>
+      <button class="btn small ghost" id="empSrcSettings">⚙️ Настроить</button></div>`);
+    c.appendChild(bar);
+    $('#empSrcCheck',bar).onclick=()=>employeeSourceCheck($('#empSrcCheck',bar));
+    $('#empSrcSettings',bar).onclick=()=>{ location.hash='#/settings'; };
+  }
+
+  // сводка
+  c.appendChild(h(`<div class="an-kpis">
+    <div class="kpi accent"><div class="k-label">🧑‍💼 Сотрудников</div><div class="k-value">${fmtNum(cnt.active||0)}</div><div class="k-sub">${cnt.archived?`в архиве: ${cnt.archived}`:'активных'}</div></div>
+    <div class="kpi"><div class="k-label">📬 С ящиком</div><div class="k-value">${fmtNum(cnt.with_account||0)}</div><div class="k-sub">привязан почтовый ящик</div></div>
+    <div class="kpi"><div class="k-label">➖ Без ящика</div><div class="k-value">${fmtNum(cnt.without_account||0)}</div><div class="k-sub">копирование не настроено</div></div>
+  </div>`));
+
+  // поиск и фильтр
+  const bar=h(`<div class="an-toolbar">
+    <input id="empQ" type="text" placeholder="Поиск по ФИО, почте, отделу…" value="${esc(Emp.query)}"
+      style="width:320px;padding:8px 11px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg-elev);color:var(--text)">
+    <select id="empStatus">
+      <option value="">Все статусы</option>
+      <option value="active"${Emp.status==='active'?' selected':''}>Активные</option>
+      <option value="archived"${Emp.status==='archived'?' selected':''}>В архиве</option>
+    </select>
+    <span class="spacer" style="flex:1"></span>
+    <span class="muted small">показано ${d.employees.length} из ${d.total}</span></div>`);
+  c.appendChild(bar);
+  let t=null;
+  $('#empQ',bar).oninput=(e)=>{ clearTimeout(t); t=setTimeout(()=>{ Emp.query=e.target.value.trim(); Emp.offset=0; viewEmployees(c); }, 400); };
+  $('#empStatus',bar).onchange=(e)=>{ Emp.status=e.target.value; Emp.offset=0; viewEmployees(c); };
+
+  if(!d.employees.length){
+    c.appendChild(h(`<div class="card"><div class="empty"><div class="big">🧑‍💼</div>
+      ${Emp.query||Emp.status?'Ничего не найдено по заданному условию.':'Справочник пуст.<br>Добавьте сотрудника вручную или загрузите список из файла.'}</div></div>`));
+    return;
+  }
+
+  const wrap=h(`<div class="card table-wrap"><table class="tbl"><thead><tr>
+    <th>ФИО</th><th>E-mail</th><th>Должность</th><th>Отдел</th><th>Почтовый ящик</th><th>Статус</th><th></th>
+  </tr></thead><tbody></tbody></table></div>`);
+  const tb=wrap.querySelector('tbody');
+  d.employees.forEach(e=>{
+    const box = e.account_id
+      ? `<span class="tag" title="${esc(e.account_name)}">${esc(trunc(e.account_name||'ящик',20))}</span>
+         <span class="badge ${e.account_enabled?'success':'queued'}" title="${e.account_enabled?'Ящик участвует в копировании':'Ящик выключен: задайте пароль и включите его в разделе «Почтовые ящики»'}">${e.account_enabled?'вкл':'выкл'}</span>`
+      : '<span class="muted small">—</span>';
+    const tr=h(`<tr>
+      <td><strong>${esc(e.full_name)}</strong>${e.external_id?`<div class="muted small">таб. № ${esc(e.external_id)}</div>`:''}</td>
+      <td class="small">${esc(e.email||'—')}</td>
+      <td class="small">${esc(e.position||'—')}</td>
+      <td class="small">${esc(e.department||'—')}</td>
+      <td>${box}</td>
+      <td><span class="badge ${e.status==='active'?'success':'queued'}">${e.status==='active'?'работает':'в архиве'}</span></td>
+      <td style="text-align:right;white-space:nowrap">
+        <button class="btn sm" data-edit>✏️</button>
+        <button class="btn danger sm" data-del>✕</button>
+      </td></tr>`);
+    tr.querySelector('[data-edit]').onclick=()=>employeeModal(e);
+    tr.querySelector('[data-del]').onclick=async()=>{
+      if(await confirmDlg('Удалить сотрудника?',
+          `Запись «${e.full_name}» будет удалена из справочника. Почтовый ящик и уже сделанные копии писем НЕ удаляются.`)){
+        try{ await api(`/employees/${e.id}`,{method:'DELETE'}); toast('Удалено'); viewEmployees(c); }catch(err){ toastErr(err); }
+      }
+    };
+    tb.appendChild(tr);
+  });
+  c.appendChild(wrap);
+
+  // постраничная навигация
+  if(d.total > Emp.limit){
+    const pages=Math.ceil(d.total/Emp.limit), cur=Math.floor(Emp.offset/Emp.limit)+1;
+    const nav=h(`<div class="an-toolbar" style="margin-top:14px;justify-content:center">
+      <button class="btn sm" ${Emp.offset<=0?'disabled':''} data-prev>← Назад</button>
+      <span class="muted small">страница ${cur} из ${pages}</span>
+      <button class="btn sm" ${Emp.offset+Emp.limit>=d.total?'disabled':''} data-next>Вперёд →</button></div>`);
+    nav.querySelector('[data-prev]').onclick=()=>{ Emp.offset=Math.max(0,Emp.offset-Emp.limit); viewEmployees(c); };
+    nav.querySelector('[data-next]').onclick=()=>{ Emp.offset+=Emp.limit; viewEmployees(c); };
+    c.appendChild(nav);
+  }
+}
+
+/** Создание и редактирование карточки сотрудника. */
+function employeeModal(e){
+  const isNew=!e;
+  e = e || {full_name:'',email:'',position:'',department:'',phone:'',external_id:'',status:'active',notes:''};
+  const body=`
+    <div class="form-row"><label>ФИО <span style="color:var(--danger)">*</span></label>
+      <input id="e-name" type="text" value="${esc(e.full_name)}" placeholder="Иванов Иван Иванович"></div>
+    <div class="grid cols-2">
+      <div class="form-row"><label>E-mail</label><input id="e-mail" type="text" value="${esc(e.email||'')}" placeholder="ivanov@example.ru">
+        <div class="hint">По адресу сотрудник связывается с почтовым ящиком.</div></div>
+      <div class="form-row"><label>Табельный номер</label><input id="e-ext" type="text" value="${esc(e.external_id||'')}" placeholder="1024">
+        <div class="hint">Используется для сопоставления при синхронизации.</div></div>
+    </div>
+    <div class="grid cols-2">
+      <div class="form-row"><label>Должность</label><input id="e-pos" type="text" value="${esc(e.position||'')}"></div>
+      <div class="form-row"><label>Отдел</label><input id="e-dep" type="text" value="${esc(e.department||'')}"></div>
+    </div>
+    <div class="grid cols-2">
+      <div class="form-row"><label>Телефон</label><input id="e-phone" type="text" value="${esc(e.phone||'')}"></div>
+      <div class="form-row"><label>Статус</label><select id="e-status">
+        <option value="active"${e.status==='active'?' selected':''}>Работает</option>
+        <option value="archived"${e.status==='archived'?' selected':''}>В архиве</option></select></div>
+    </div>
+    <div class="form-row"><label>Заметки</label><input id="e-notes" type="text" value="${esc(e.notes||'')}"></div>
+    ${isNew?`<div class="form-row check"><span class="switch"><input type="checkbox" id="e-acc"><span class="track"></span></span>
+      <label>Завести почтовый ящик для резервного копирования</label></div>
+      <div class="hint">Ящик создаётся <b>выключенным</b> и без пароля — задайте пароль и включите его в разделе «Почтовые ящики».
+      Адрес ящика берётся из поля E-mail, сервер — из настроек (раздел «Сотрудники»).</div>`:
+      (e.account_id?`<div class="hint">Привязанный ящик: <b>${esc(e.account_name||'')}</b> ${e.account_enabled?'(включён)':'(выключен)'}</div>`:'')}`;
+  const m=modal(isNew?'Новый сотрудник':`Сотрудник: ${e.full_name}`, body,
+    {wide:true, footer:`<button class="btn ghost" data-c>Отмена</button><button class="btn primary" data-save>Сохранить</button>`});
+  const g=x=>m.body.querySelector(x);
+  m.foot.querySelector('[data-c]').onclick=m.close;
+  m.foot.querySelector('[data-save]').onclick=async()=>{
+    const payload={full_name:g('#e-name').value.trim(), email:g('#e-mail').value.trim(), position:g('#e-pos').value.trim(),
+      department:g('#e-dep').value.trim(), phone:g('#e-phone').value.trim(), external_id:g('#e-ext').value.trim(),
+      status:g('#e-status').value, notes:g('#e-notes').value.trim()};
+    if(!payload.full_name) return toast('Укажите ФИО','Поле обязательно','warn');
+    try{
+      if(isNew){
+        payload.create_account = g('#e-acc').checked;
+        const r=await api('/employees',{method:'POST',body:payload});
+        toast('Сотрудник добавлен', r.account_id?'Почтовый ящик создан выключенным':'');
+      } else {
+        await api(`/employees/${e.id}`,{method:'PUT',body:payload});
+        toast('Сохранено');
+      }
+      m.close(); route();
+    }catch(err){ toastErr(err); }
+  };
+}
+
+/** Загрузка списка сотрудников файлом. */
+function employeeImportModal(){
+  const m=modal('Импорт сотрудников из файла', `
+    <p class="muted">Поддерживаются файлы <b>CSV</b> и <b>Excel (.xlsx)</b>. Первая строка — заголовки столбцов.
+    Распознаются названия: ФИО, E-mail, Должность, Отдел, Телефон, Табельный номер (в любом регистре,
+    принимаются и английские варианты).</p>
+    <p class="muted small">Сотрудники сопоставляются по табельному номеру, а если его нет — по адресу почты.
+    Уже заведённые карточки обновляются, новые добавляются. Никто не удаляется и не выключается.</p>
+    <div class="form-row"><label>Файл со списком</label><input id="i-emp" type="file" accept=".csv,.xlsx,.xlsm,text/csv"></div>
+    <div class="hint">Не уверены в формате — скачайте «📄 Образец файла» и заполните его.</div>`,
+    {footer:`<button class="btn ghost" data-c>Отмена</button><button class="btn primary" data-go>Загрузить</button>`});
+  m.foot.querySelector('[data-c]').onclick=m.close;
+  m.foot.querySelector('[data-go]').onclick=async()=>{
+    const f=m.body.querySelector('#i-emp').files[0];
+    if(!f) return toast('Выберите файл','','warn');
+    const btn=m.foot.querySelector('[data-go]'); btn.disabled=true; btn.innerHTML='<span class="spinner"></span> Загрузка…';
+    const fd=new FormData(); fd.append('file', f);
+    try{
+      const r=await api('/employees/import',{method:'POST',body:fd});
+      m.close();
+      employeeSyncReport(r);
+      route();
+    }catch(err){ toastErr(err); btn.disabled=false; btn.textContent='Загрузить'; }
+  };
+}
+
+/** Показать итоги импорта/синхронизации, включая проблемные строки. */
+function employeeSyncReport(r){
+  const problems=r.problems||[];
+  const rows=problems.length
+    ? `<h3 style="margin-top:14px">Строки, которые не удалось разобрать (${problems.length})</h3>
+       <div class="table-wrap" style="max-height:260px;overflow:auto"><table class="tbl">
+       <thead><tr><th>Строка</th><th>Причина</th></tr></thead><tbody>
+       ${problems.map(p=>`<tr><td>${p.row}</td><td class="small">${esc(p.reason)}</td></tr>`).join('')}
+       </tbody></table></div>`
+    : '<div class="hint" style="margin-top:12px">Все строки файла разобраны без ошибок.</div>';
+  modal('Итоги загрузки списка', `
+    <div class="an-kpis">
+      <div class="kpi accent"><div class="k-label">Добавлено</div><div class="k-value">${fmtNum(r.created||0)}</div><div class="k-sub">новых карточек</div></div>
+      <div class="kpi"><div class="k-label">Обновлено</div><div class="k-value">${fmtNum(r.updated||0)}</div><div class="k-sub">существующих</div></div>
+      <div class="kpi"><div class="k-label">Ящиков создано</div><div class="k-value">${fmtNum(r.accounts_created||0)}</div><div class="k-sub">выключенными</div></div>
+      <div class="kpi"><div class="k-label">Ящиков привязано</div><div class="k-value">${fmtNum(r.accounts_linked||0)}</div><div class="k-sub">уже существовали</div></div>
+    </div>
+    <div class="muted small">Строк в файле: ${fmtNum(r.total_rows||0)}.</div>
+    ${(r.accounts_created?`<div class="hint" style="margin-top:10px">Созданные ящики <b>выключены</b> и без пароля. Чтобы начать копирование, откройте «Почтовые ящики», задайте пароль и включите нужные.</div>`:'')}
+    ${rows}`, {wide:true});
+}
+
+/** Проверить источник (файл или URL), ничего не записывая в справочник. */
+async function employeeSourceCheck(btn){
+  const old = btn ? btn.textContent : '';
+  if(btn){ btn.disabled=true; btn.textContent='⏳ Проверяем…'; }
+  try{
+    const r = await api('/employees/source/check', {method:'POST'});
+    const src = r.source||{};
+    const problems = (r.problems||[]).map(p=>`<tr><td>${p.row}</td><td>${esc(p.reason)}</td></tr>`).join('');
+    modal('Проверка источника', `
+      <div class="kv"><b>Источник</b><div class="spacer"></div>${src.type==='url'?'адрес':'файл на сервере'}</div>
+      <div class="kv"><b>Адрес</b><div class="spacer"></div><code class="mono small" style="word-break:break-all">${esc(src.target||'')}</code></div>
+      <div class="kv"><b>Прочитано</b><div class="spacer"></div>${esc(r.filename||'')} · ${fmtBytes(r.bytes||0)}</div>
+      <div class="kv"><b>Строк с сотрудниками</b><div class="spacer"></div>${fmtNum(r.rows||0)}</div>
+      <div class="kv"><b>Проблемных строк</b><div class="spacer"></div>${fmtNum(r.problem_count||0)}</div>
+      ${problems?`<h3 style="margin:14px 0 6px">Проблемные строки</h3>
+        <table class="tbl"><thead><tr><th>Строка</th><th>Что не так</th></tr></thead><tbody>${problems}</tbody></table>`:''}
+      <div class="hint" style="margin-top:12px">Справочник не изменён — это только проверка. Чтобы применить список,
+        нажмите «Синхронизировать».</div>`, {wide:true});
+  }catch(e){ toastErr(e); }
+  finally{ if(btn){ btn.disabled=false; btn.textContent=old; } }
+}
+
+/** Шаблон настроек ящиков, создаваемых сотрудникам: предпросмотр и переход к настройкам. */
+async function employeeAccountTemplateModal(){
+  let r;
+  try{ r = await api('/employees/account-template'); }catch(e){ return toastErr(e); }
+  const p = r.preview||{};
+  const SEC = {ssl:'SSL/TLS', starttls:'STARTTLS', plain:'без шифрования'};
+  const list = a => (a&&a.length) ? esc(a.join(', ')) : '<i>все</i>';
+  const keep = p.retention_days<0 ? 'как в общих настройках'
+             : (p.retention_days===0 ? 'хранить вечно' : `${p.retention_days} дн.`);
+  const vars = (r.placeholders||[]).map(v=>`<code class="mono">{${v}}</code>`).join(' ');
+  const m = modal('Шаблон ящиков для сотрудников', `
+    <p class="muted">По этому шаблону заводится почтовый ящик, когда у сотрудника
+      появляется e-mail — при синхронизации и при добавлении вручную.
+      ${r.create_accounts?'':'<b>Сейчас автосоздание ящиков выключено</b> — шаблон не применяется.'}</p>
+    <h3 style="margin:14px 0 6px">Пример: Иванов Иван Иванович &lt;ivanov@example.ru&gt;, Менеджер, Отдел продаж</h3>
+    <div class="kv"><b>Название</b><div class="spacer"></div>${esc(p.name||'')}</div>
+    <div class="kv"><b>Логин</b><div class="spacer"></div><code class="mono">${esc(p.username||'')}</code></div>
+    <div class="kv"><b>Сервер</b><div class="spacer"></div>${p.host?esc(p.host):'<span class="tag warn">не задан</span>'}:${p.port} · ${SEC[p.security]||esc(p.security||'')}</div>
+    <div class="kv"><b>Состояние</b><div class="spacer"></div>${p.enabled?'<span class="tag ok">включён</span>':'<span class="tag">выключен до ввода пароля</span>'}</div>
+    <div class="kv"><b>Копировать папки</b><div class="spacer"></div>${list(p.folder_include)}</div>
+    <div class="kv"><b>Пропускать папки</b><div class="spacer"></div>${list(p.folder_exclude)}</div>
+    <div class="kv"><b>Срок хранения</b><div class="spacer"></div>${esc(keep)}</div>
+    <div class="kv"><b>Расписание копирования</b><div class="spacer"></div>${p.schedule_enabled?`<span class="tag ok">${esc(p.schedule_cron||'')}</span>`:'<span class="tag">не создаётся</span>'}</div>
+    <div class="kv"><b>Заметка</b><div class="spacer"></div>${esc(p.notes||'—')}</div>
+    <div class="hint" style="margin-top:12px">Пароль шаблон не задаёт: копирование начнётся только после того,
+      как администратор впишет пароль в карточке ящика.</div>
+    <div class="hint" style="margin-top:8px">Подстановки в шаблонах названия, логина и заметки: ${vars}</div>`,
+    {wide:true, footer:'<button class="btn ghost" data-c>Закрыть</button><button class="btn primary" data-s>⚙️ Изменить шаблон</button>'});
+  m.foot.querySelector('[data-c]').onclick=()=>m.close();
+  m.foot.querySelector('[data-s]').onclick=()=>{ m.close(); location.hash='#/settings'; };
+}
+
+/** Синхронизация с источником из настроек — файлом или URL (фоновое задание). */
+async function employeeSyncNow(){
+  try{
+    const r=await api('/employees/sync',{method:'POST'});
+    toast('Синхронизация запущена','Следите за ходом в разделе «Очередь и задания»');
+    location.hash='#/jobs';
+  }catch(e){ toastErr(e); }
+}
+
 // ---------- Резервное копирование по кнопке ----------
 function plural(n, one, few, many){
   const m10=n%10, m100=n%100;
@@ -743,12 +1034,58 @@ const ENUM_OPTS = {
   'export.pst_format':[['unicode','Unicode (Outlook 2003+)'],['ansi','ANSI (Outlook 97–2002)']],
   'export.outlook_target':[['2016+','2016+'],['2013','2013'],['2010','2010'],['2007','2007'],['2003','2003'],['2002','2002 и старше'],['365','365']],
   'notifications.smtp_security':[['starttls','STARTTLS'],['ssl','SSL'],['none','Без шифрования']],
+  'employees.source_type':[['file','Файл на сервере'],['url','Адрес (URL)']],
+  'employees.source_url_format':[['auto','Определять автоматически'],['csv','CSV'],['xlsx','Excel (XLSX)']],
+  'employees.account_security':[['ssl','SSL/TLS'],['starttls','STARTTLS'],['plain','Без шифрования']],
+};
+// Параметры, которые имеют смысл не всегда: показываем только когда включено то,
+// от чего они зависят. Иначе в разделе «Сотрудники» рядом стоят путь к файлу и
+// адрес выгрузки, и непонятно, что из этого работает.
+const SETTING_DEPS = {
+  'employees.source_file':          v=>v['employees.source_type']!=='url',
+  'employees.source_url':           v=>v['employees.source_type']==='url',
+  'employees.source_url_user':      v=>v['employees.source_type']==='url',
+  'employees.source_url_password':  v=>v['employees.source_type']==='url',
+  'employees.source_url_verify_ssl':v=>v['employees.source_type']==='url',
+  'employees.source_url_timeout_s': v=>v['employees.source_type']==='url',
+  'employees.source_url_format':    v=>v['employees.source_type']==='url',
+  'employees.cron':                 v=>!!v['employees.sync_enabled'],
+  'employees.account_host':          v=>!!v['employees.create_accounts'],
+  'employees.account_port':          v=>!!v['employees.create_accounts'],
+  'employees.account_security':      v=>!!v['employees.create_accounts'],
+  'employees.account_name_template': v=>!!v['employees.create_accounts'],
+  'employees.account_username_template': v=>!!v['employees.create_accounts'],
+  'employees.account_notes_template':    v=>!!v['employees.create_accounts'],
+  'employees.account_enabled':           v=>!!v['employees.create_accounts'],
+  'employees.account_folder_include':    v=>!!v['employees.create_accounts'],
+  'employees.account_folder_exclude':    v=>!!v['employees.create_accounts'],
+  'employees.account_retention_days':    v=>!!v['employees.create_accounts'],
+  'employees.account_schedule_enabled':  v=>!!v['employees.create_accounts'],
+  'employees.account_schedule_cron': v=>!!v['employees.create_accounts'] && !!v['employees.account_schedule_enabled'],
+  'notifications.smtp_host':     v=>!!v['notifications.enabled'],
+  'notifications.smtp_port':     v=>!!v['notifications.enabled'],
+  'notifications.smtp_security': v=>!!v['notifications.enabled'],
+  'notifications.smtp_user':     v=>!!v['notifications.enabled'],
+  'notifications.smtp_password': v=>!!v['notifications.enabled'],
+  'notifications.mail_from':     v=>!!v['notifications.enabled'],
+  'notifications.mail_to':       v=>!!v['notifications.enabled'],
+  'notifications.on_success':    v=>!!v['notifications.enabled'],
+  'notifications.on_failure':    v=>!!v['notifications.enabled'],
 };
 async function viewSettings(c){
   const data=await api('/settings');
   c.innerHTML=''; c.appendChild(h('<div class="section-title"><h2 style="margin:0">Настройки</h2><div class="spacer"></div><button class="btn primary" id="saveAll">💾 Сохранить всё</button></div>'));
   const help=data.help.params||{};
   const changed={};
+  // Текущие значения всех параметров — по ним решается, какие поля показывать.
+  const cur={}; data.sections.forEach(sec=>sec.keys.forEach(k=>{ cur[sec.section+'.'+k]=(data.values[sec.section]||{})[k]; }));
+  const rows={};
+  const set=(full,value)=>{ changed[full]=value; cur[full]=value; applyDeps(); };
+  const applyDeps=()=>{ Object.entries(SETTING_DEPS).forEach(([full,test])=>{
+      const row=rows[full]; if(!row) return;
+      let show=true; try{ show=test(cur); }catch(e){}
+      row.style.display = show ? '' : 'none';
+    }); };
   data.sections.forEach(sec=>{
     const card=h(`<div class="card" style="margin-bottom:16px"><h3>${sec.icon||''} ${esc(sec.title)}</h3><div class="settings-grid"></div></div>`);
     const grid=card.querySelector('.settings-grid');
@@ -758,26 +1095,28 @@ async function viewSettings(c){
       let input;
       if(typeof val==='boolean'){
         input=h(`<div class="form-row check"><span class="switch"><input type="checkbox" ${val?'checked':''}><span class="track"></span></span><label>${label}</label></div>`);
-        input.querySelector('input').onchange=e=>changed[full]=e.target.checked;
+        input.querySelector('input').onchange=e=>set(full, e.target.checked);
       } else if(ENUM_OPTS[full]){
         const o=ENUM_OPTS[full].map(([v,t])=>`<option value="${v}" ${String(v)===String(val)?'selected':''}>${esc(t)}</option>`).join('');
         input=h(`<div class="form-row"><label>${label}</label><select>${o}</select></div>`);
-        input.querySelector('select').onchange=e=>changed[full]=e.target.value;
+        input.querySelector('select').onchange=e=>set(full, e.target.value);
       } else if(Array.isArray(val)){
         input=h(`<div class="form-row"><label>${label}</label><input type="text" value="${esc(val.join(', '))}"></div>`);
-        input.querySelector('input').oninput=e=>changed[full]=e.target.value.split(',').map(s=>s.trim()).filter(Boolean);
+        input.querySelector('input').oninput=e=>set(full, e.target.value.split(',').map(s=>s.trim()).filter(Boolean));
       } else if(typeof val==='number'){
         input=h(`<div class="form-row"><label>${label}</label><input type="number" value="${val}" step="${full.includes('backoff')?'0.1':'1'}"></div>`);
-        input.querySelector('input').oninput=e=>changed[full]=full.includes('backoff')?parseFloat(e.target.value):parseInt(e.target.value);
+        input.querySelector('input').oninput=e=>set(full, full.includes('backoff')?parseFloat(e.target.value):parseInt(e.target.value));
       } else {
         const isPw=key.includes('password')||key.includes('secret');
         input=h(`<div class="form-row"><label>${label}</label><input type="${isPw?'password':'text'}" value="${esc(val==null?'':val)}" ${isPw?'placeholder="без изменений"':''}></div>`);
-        input.querySelector('input').oninput=e=>changed[full]=e.target.value;
+        input.querySelector('input').oninput=e=>set(full, e.target.value);
       }
+      rows[full]=input;
       grid.appendChild(input);
     });
     c.appendChild(card);
   });
+  applyDeps();
   // grid layout
   $$('.settings-grid',c).forEach(g=>{ g.style.display='grid'; g.style.gap='4px 24px'; g.style.gridTemplateColumns='repeat(auto-fill,minmax(300px,1fr))'; });
   $('#saveAll').onclick=async()=>{
