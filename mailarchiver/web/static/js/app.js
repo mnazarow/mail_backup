@@ -635,6 +635,58 @@ async function backupAllNow(){
   }catch(e){ toastErr(e); }
 }
 
+/** Массовая загрузка паролей ящиков из файла «адрес — пароль». */
+function passwordImportModal(){
+  const m=modal('Загрузить пароли ящиков', `
+    <p class="muted">Файл <b>XLSX</b> или <b>CSV</b> из двух колонок: <b>адрес ящика</b> и <b>пароль</b>.
+      Заголовки («email», «пароль») можно не писать — формат распознаётся и без них.</p>
+    <div class="table-wrap" style="margin:10px 0"><table class="tbl">
+      <thead><tr><th>email</th><th>пароль</th></tr></thead>
+      <tbody>
+        <tr><td class="mono small">ivanov@company.ru</td><td class="mono small">••••••••</td></tr>
+        <tr><td class="mono small">petrova@company.ru</td><td class="mono small">••••••••</td></tr>
+      </tbody></table></div>
+    <div class="form-row"><label>Файл с паролями</label>
+      <input id="i-pw" type="file" accept=".xlsx,.xlsm,.csv,.xml,text/csv"></div>
+    <div class="form-row check"><span class="switch"><input type="checkbox" id="i-pw-enable" checked><span class="track"></span></span>
+      <label>Включить ящики после установки пароля</label></div>
+    <div class="hint">Ящик ищется по логину, а если такого логина нет — по адресу сотрудника из
+      справочника. Пароли сохраняются в базе в зашифрованном виде: ни в журнал, ни обратно в
+      интерфейс они не попадают, а загруженный файл удаляется сразу после разбора.</div>`,
+    {wide:true, footer:'<button class="btn ghost" data-c>Отмена</button><button class="btn primary" data-go>Загрузить</button>'});
+  m.foot.querySelector('[data-c]').onclick=m.close;
+  m.foot.querySelector('[data-go]').onclick=async()=>{
+    const f=m.body.querySelector('#i-pw').files[0];
+    if(!f) return toast('Выберите файл','','warn');
+    const btn=m.foot.querySelector('[data-go]'); btn.disabled=true; btn.innerHTML='<span class="spinner"></span> Загрузка…';
+    const fd=new FormData(); fd.append('file', f);
+    fd.append('enable', m.body.querySelector('#i-pw-enable').checked ? 'true' : 'false');
+    try{
+      const r=await api('/accounts/import-passwords',{method:'POST',body:fd});
+      m.close(); passwordImportReport(r); route();
+    }catch(err){ toastErr(err); btn.disabled=false; btn.textContent='Загрузить'; }
+  };
+}
+
+/** Итог загрузки паролей: что обновилось и что не нашлось. */
+function passwordImportReport(r){
+  const notFound=(r.not_found||[]).map(e=>`<tr><td class="mono small">${esc(e)}</td></tr>`).join('');
+  const problems=(r.problems||[]).map(p=>`<tr><td>${p.row}</td><td>${esc(p.reason)}</td></tr>`).join('');
+  modal('Пароли загружены', `
+    <div class="an-kpis">
+      <div class="kpi accent"><div class="k-label">🔑 Обновлено</div><div class="k-value">${fmtNum(r.updated||0)}</div><div class="k-sub">ящиков с новым паролем</div></div>
+      <div class="kpi"><div class="k-label">✅ Включено</div><div class="k-value">${fmtNum(r.enabled||0)}</div><div class="k-sub">были выключены</div></div>
+      <div class="kpi"><div class="k-label">❓ Не найдено</div><div class="k-value">${fmtNum(r.not_found_count||0)}</div><div class="k-sub">адресов без ящика</div></div>
+    </div>
+    <div class="muted small" style="margin-top:10px">Строк в файле: ${fmtNum(r.total_rows||0)}${r.problem_count?` · проблемных: ${fmtNum(r.problem_count)}`:''}.</div>
+    ${notFound?`<h3 style="margin-top:14px">Адреса, для которых ящик не найден (${r.not_found_count})</h3>
+      <div class="table-wrap" style="max-height:220px;overflow:auto"><table class="tbl"><tbody>${notFound}</tbody></table></div>
+      <div class="hint" style="margin-top:8px">Заведите ящики этим сотрудникам (раздел «Сотрудники» → синхронизация) и загрузите файл ещё раз.</div>`:''}
+    ${problems?`<h3 style="margin-top:14px">Проблемные строки (${r.problem_count})</h3>
+      <div class="table-wrap" style="max-height:220px;overflow:auto"><table class="tbl"><thead><tr><th>Строка</th><th>Что не так</th></tr></thead><tbody>${problems}</tbody></table></div>`:''}`,
+    {wide:true});
+}
+
 async function viewAccounts(c){
   const accs=await api('/accounts'); State.accounts=accs;
   c.innerHTML='';
@@ -642,11 +694,13 @@ async function viewAccounts(c){
   const head=h(`<div class="section-title"><h2 style="margin:0">Почтовые ящики</h2>
     <span class="tag" title="Всего ящиков в системе">всего: ${accs.length}${accs.length!==enabledCnt?` · включено: ${enabledCnt}`:''}</span>
     <div class="spacer"></div>
+    <button class="btn" id="pwImport" title="Массово проставить пароли ящикам из файла «адрес — пароль»">🔑 Загрузить пароли</button>
     <button class="btn" id="bkAll" ${enabledCnt?'':'disabled'} title="Поставить в очередь резервное копирование всех включённых ящиков">💾 Копия всех ящиков сейчас</button>
     <button class="btn primary" id="add">+ Добавить ящик</button></div>`);
   c.appendChild(head);
   $('#add',c).onclick=()=>accountModal();
   $('#bkAll',c).onclick=()=>backupAllNow();
+  $('#pwImport',c).onclick=()=>passwordImportModal();
   if(!accs.length){ c.appendChild(h('<div class="card"><div class="empty"><div class="big">📭</div>Пока нет ни одного ящика.<br>Нажмите «Добавить ящик», чтобы начать.</div></div>')); return; }
   const wrap=h('<div class="card table-wrap"><table class="tbl"><thead><tr><th>Название</th><th>Сервер</th><th>Логин</th><th>Статус</th><th></th></tr></thead><tbody></tbody></table></div>');
   const tb=wrap.querySelector('tbody');

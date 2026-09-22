@@ -10,13 +10,13 @@ import os
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Response, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from ..employees import (
-    ACCOUNT_PLACEHOLDERS, TEMPLATE_CSV, TEMPLATE_FILENAME, ensure_account_for_employee,
-    fetch_employee_source, looks_like_email, normalize_email, parse_employee_file,
-    preview_account_template, sync_employees,
+    ACCOUNT_PLACEHOLDERS, TEMPLATE_CSV, TEMPLATE_FILENAME, apply_passwords,
+    ensure_account_for_employee, fetch_employee_source, looks_like_email, normalize_email,
+    parse_employee_file, parse_password_file, preview_account_template, sync_employees,
 )
 from ..errors import ValidationError
 from ..imap.client import diagnose_folders, probe_account
@@ -417,6 +417,54 @@ def test_account(request: Request, account_id: int, user: dict = Depends(auth_mo
         raise HTTPException(404, "Ящик не найден")
     result = probe_account(acc, svc.connect_options())
     return result
+
+
+@router.post("/accounts/import-passwords")
+def import_account_passwords(request: Request, file: UploadFile = File(...),
+                             enable: str = Form("false"),
+                             user: dict = Depends(auth_mod.require_admin)):
+    """Массово проставить пароли ящикам из файла «адрес — пароль».
+
+    Ящики, заведённые сотрудникам автоматически, создаются без пароля: без этой
+    загрузки администратору пришлось бы открывать сотни карточек по одной.
+    Пароли сохраняются в базе зашифрованными, в журнал и в ответ не попадают —
+    наружу уходят только счётчики и адреса, для которых ящик не нашёлся.
+    """
+    svc = svc_dep(request)
+    origin_name = os.path.basename(file.filename or "")
+    fname = safe_filename(origin_name, default="passwords.xlsx")
+    dest = os.path.join(svc.cfg.tmp_dir, f"passwords_{os.getpid()}_{fname}")
+    written = 0
+    try:
+        with open(dest, "wb") as fh:
+            while True:
+                chunk = file.file.read(1024 * 1024)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > MAX_EMPLOYEE_UPLOAD_BYTES:
+                    raise ValidationError(
+                        f"Файл слишком большой: допустимо не более {human_size(MAX_EMPLOYEE_UPLOAD_BYTES)}.",
+                        hint="В файле нужны всего две колонки — адрес и пароль.")
+                fh.write(chunk)
+        if not written:
+            raise ValidationError("Файл пуст.",
+                                  hint="Нужны две колонки: адрес ящика и пароль (XLSX или CSV).")
+        rows, problems = parse_password_file(dest, origin_name or fname)
+        result = apply_passwords(svc, rows, enable=str(enable).lower() in ("1", "true", "yes", "on"))
+    finally:
+        # Файл с паролями не должен остаться на диске ни при успехе, ни при ошибке.
+        try:
+            os.unlink(dest)
+        except OSError:
+            pass
+    svc.db.add_audit(user["username"], "accounts_import_passwords",
+                     f"файл={origin_name or fname} обновлено={result['updated']} "
+                     f"включено={result['enabled']} не найдено={len(result['not_found'])}")
+    return {"ok": True, "updated": result["updated"], "enabled": result["enabled"],
+            "not_found": result["not_found"][:200], "not_found_count": len(result["not_found"]),
+            "total_rows": result["total_rows"], "problems": problems[:200],
+            "problem_count": len(problems)}
 
 
 @router.post("/accounts/{account_id}/folders/diagnose")

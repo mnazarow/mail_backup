@@ -620,6 +620,15 @@ def handle_sync_employees(ctx: JobContext) -> Dict:
     summary = (f"Сотрудников добавлено {result['created']}, обновлено {result['updated']}; "
                f"ящиков создано {result['accounts_created']}, привязано {result['accounts_linked']}; "
                f"строк в источнике {result['total_rows']}, проблемных {len(problems)}.")
+    if result.get("duplicate_rows"):
+        shown = ", ".join(result["duplicate_emails"][:5])
+        more = len(result["duplicate_emails"]) - 5
+        summary += (f" Адресов, повторяющихся в файле: {len(result['duplicate_emails'])} "
+                    f"({result['duplicate_rows']} строк) — {shown}{f' и ещё {more}' if more > 0 else ''}; "
+                    f"на один адрес заводится одна карточка.")
+    if result.get("skipped_inactive"):
+        summary += (f" Пропущено помеченных в файле как не работающие: "
+                    f"{result['skipped_inactive']}.")
     ctx.event("INFO", summary)
     svc.db.add_audit("system", "employees_sync", summary[:500])
     status = JobStatus.SUCCESS if not problems else JobStatus.PARTIAL
@@ -627,7 +636,10 @@ def handle_sync_employees(ctx: JobContext) -> Dict:
             "created": result["created"], "updated": result["updated"],
             "accounts_created": result["accounts_created"],
             "accounts_linked": result["accounts_linked"],
-            "total_rows": result["total_rows"], "problems": problems[:200]}
+            "total_rows": result["total_rows"], "problems": problems[:200],
+            "skipped_inactive": result.get("skipped_inactive", 0),
+            "duplicate_rows": result.get("duplicate_rows", 0),
+            "duplicate_emails": result.get("duplicate_emails", [])[:50]}
 
 
 HANDLERS: Dict[str, Callable[[JobContext], Dict]] = {

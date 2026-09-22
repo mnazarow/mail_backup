@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import base64
 import csv
+import html
 import io
 import os
 import re
@@ -66,14 +67,33 @@ DEFAULT_URL_TIMEOUT_S = 60
 COLUMN_ALIASES: Dict[str, str] = {}
 for _field, _names in {
     "full_name": ("фио", "ф.и.о.", "имя", "сотрудник", "full_name", "name"),
-    "email": ("email", "e-mail", "почта", "адрес", "mail"),
+    # ФИО по отдельным колонкам — так выгружают кадровые системы и интранет.
+    "last_name": ("фамилия", "last_name", "surname", "lastname"),
+    "first_name": ("first_name", "firstname", "givenname"),
+    "middle_name": ("отчество", "middle_name", "middlename", "patronymic"),
+    "email": ("email", "e-mail", "почта", "электропочта", "эл.почта", "адрес", "mail"),
     "position": ("должность", "position", "title"),
     "department": ("отдел", "подразделение", "department"),
     "phone": ("телефон", "phone", "тел"),
+    "phone_mobile": ("тел.мобильный", "мобильный", "сотовый", "mobile", "cell"),
+    "phone_work": ("тел.рабочий", "рабочий", "workphone"),
+    "phone_ext": ("тел.внутренний", "внутренний", "добавочный", "extension"),
+    "employed": ("работает", "активен", "статус", "active"),
+    "employed_until": ("работаетдо", "уволен", "датаувольнения"),
     "external_id": ("id", "табельный", "табельный номер", "external_id", "код"),
 }.items():
     for _name in _names:
         COLUMN_ALIASES[_name.replace(" ", "")] = _field
+
+#: Значения колонки «работает», означающие, что сотрудник уже НЕ работает.
+NOT_EMPLOYED_VALUES = {"нет", "no", "0", "-", "уволен", "уволена", "false", "неактивен"}
+#: …и что работает. Нужны, чтобы распознать колонку «да/нет» без заголовка.
+EMPLOYED_VALUES = {"да", "yes", "1", "+", "true", "активен", "работает"}
+
+#: Поля, которые распознаются в файле помимо основных (см. FILE_FIELDS).
+EXTRA_FILE_FIELDS = ("last_name", "first_name", "middle_name",
+                     "phone_mobile", "phone_work", "phone_ext",
+                     "employed", "employed_until")
 
 #: Поля, которые переносятся из файла в карточку сотрудника.
 FILE_FIELDS = ("full_name", "email", "position", "department", "phone", "external_id")
@@ -178,6 +198,82 @@ def _read_csv_table(data: bytes) -> List[List[str]]:
     return [[_cell(c) for c in row] for row in reader]
 
 
+#: Признаки выгрузки в формате SpreadsheetML 2003 («XML-таблица» из Excel и
+#: многих корпоративных систем). Определяем по содержимому, а не по имени
+#: файла: по ссылке такой файл часто приходит как .xls, .xml или вовсе без
+#: расширения.
+SPREADSHEETML_MARKERS = (b"<?mso-application", b"<Workbook", b"urn:schemas-microsoft-com:office:spreadsheet")
+
+#: Разметка внутри ячейки SpreadsheetML: выгрузки из интранета кладут в ячейку
+#: HTML («Отдел <span>(ЧЛБ)</span>», ссылки, переводы строк).
+_TAG_RE = re.compile(r"<[^>]+>")
+_ROW_RE = re.compile(r"<Row\b[^>]*>(.*?)</Row>", re.S | re.I)
+_EMPTY_ROW_RE = re.compile(r"<Row\b[^>]*/>", re.I)
+_CELL_RE = re.compile(r"<Cell\b([^>]*)(?:/>|>(.*?)</Cell>)", re.S | re.I)
+_DATA_RE = re.compile(r"<Data\b[^>]*(?:/>|>(.*?)</Data>)", re.S | re.I)
+_INDEX_RE = re.compile(r'ss:Index\s*=\s*"(\d+)"', re.I)
+
+
+def looks_like_spreadsheetml(data: bytes) -> bool:
+    head = (data or b"")[:4096].lstrip()
+    return any(marker in head for marker in SPREADSHEETML_MARKERS)
+
+
+def _spreadsheetml_text(raw: str) -> str:
+    """Текст ячейки: снять разметку, раскрыть сущности, схлопнуть пробелы."""
+    text = raw or ""
+    text = re.sub(r"<br\s*/?>", " ", text, flags=re.I)
+    text = _TAG_RE.sub("", text)
+    text = html.unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _read_spreadsheetml_table(data: bytes) -> List[List[str]]:
+    """Прочитать таблицу из SpreadsheetML 2003 (Excel XML).
+
+    Разбираем регулярными выражениями, а не XML-парсером, намеренно: реальные
+    выгрузки такого вида сплошь и рядом невалидны как XML — префикс ``ss:``
+    используется без объявления пространства имён, внутри ячеек встречаются
+    незакрытые ``<br>``, а перед объявлением бывает лишний отступ. Строгий
+    парсер на таком файле падает, хотя данные в нём читаются однозначно.
+
+    Учитывается ``ss:Index`` — им сервер «перепрыгивает» пустые ячейки, и без
+    его обработки колонки поехали бы.
+    """
+    text = data.decode("utf-8", errors="replace") if isinstance(data, (bytes, bytearray)) else str(data)
+    if "﻿" in text[:4]:
+        text = text.lstrip("﻿")
+    # Берём первую таблицу: лист с данными в таких выгрузках всегда один.
+    table_match = re.search(r"<Table\b[^>]*>(.*?)</Table>", text, re.S | re.I)
+    body = table_match.group(1) if table_match else text
+
+    rows: List[List[str]] = []
+    for chunk in re.split(r"(?i)</Row>", body):
+        if "<Row" not in chunk:
+            continue
+        if _EMPTY_ROW_RE.search(chunk) and "<Cell" not in chunk:
+            rows.append([])
+            continue
+        row_body = chunk.split(">", 1)[1] if ">" in chunk else ""
+        cells: List[str] = []
+        for attrs, inner in _CELL_RE.findall(row_body):
+            index = _INDEX_RE.search(attrs or "")
+            if index:
+                # ss:Index — номер колонки (с единицы): дополняем пропуск.
+                target = max(0, int(index.group(1)) - 1)
+                while len(cells) < target:
+                    cells.append("")
+            data_match = _DATA_RE.search(inner or "")
+            cells.append(_spreadsheetml_text(data_match.group(1) if data_match and data_match.group(1) else ""))
+        rows.append(cells)
+    if not rows:
+        raise ValidationError(
+            "В XML-таблице не найдено ни одной строки.",
+            hint="Проверьте, что по ссылке отдаётся выгрузка сотрудников, а не пустой шаблон.")
+    width = max(len(r) for r in rows)
+    return [r + [""] * (width - len(r)) for r in rows]
+
+
 def _read_excel_table(data: bytes) -> List[List[str]]:
     try:
         from openpyxl import load_workbook
@@ -265,6 +361,10 @@ def _guess_source_name(fmt: str, disposition: str, content_type: str, url: str, 
     is_zip = data[:4] == b"PK\x03\x04"
     if is_zip and not name.lower().endswith(EXCEL_EXTENSIONS):
         name = "employees.xlsx"
+    elif looks_like_spreadsheetml(data) and not name.lower().endswith(".xml"):
+        # XML-таблица Excel: пусть в отчёте будет видно, что пришла именно она,
+        # а не «какой-то csv».
+        name = "employees.xml"
     elif not is_zip and name.lower().endswith(EXCEL_EXTENSIONS):
         name = "employees.csv"
     return name
@@ -456,14 +556,72 @@ def parse_employee_file(path_or_bytes: Any, filename: str = "") -> Tuple[List[di
     """
     name = (filename or (path_or_bytes if isinstance(path_or_bytes, str) else "")).lower()
     data = _as_bytes(path_or_bytes)
-    if name.endswith(EXCEL_EXTENSIONS):
+    # Формат определяем по СОДЕРЖИМОМУ, а не по имени: по ссылке выгрузка
+    # приходит то как .xls, то как .xml, то вовсе без расширения, и имя файла
+    # сплошь и рядом врёт.
+    if looks_like_spreadsheetml(data):
+        table = _read_spreadsheetml_table(data)
+    elif data[:4] == b"PK\x03\x04" or name.endswith(EXCEL_EXTENSIONS):
         table = _read_excel_table(data)
-    elif name.endswith(".xls"):
-        raise ValidationError("Старый формат Excel (.xls) не поддерживается.",
-                              hint="Откройте файл и сохраните как .xlsx или CSV.")
+    elif data[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" or name.endswith(".xls"):
+        raise ValidationError("Старый двоичный формат Excel (.xls) не поддерживается.",
+                              hint="Откройте файл и сохраните как .xlsx, CSV или «Таблица XML 2003».")
     else:
         table = _read_csv_table(data)
     return _rows_from_table(table)
+
+
+def _map_header(header: Sequence[str], table: Sequence[Sequence[str]],
+                header_idx: int) -> Dict[int, str]:
+    """Сопоставить колонки файла полям карточки.
+
+    Кроме прямых совпадений с псевдонимами здесь разбираются две вещи, которые
+    встречаются в реальных выгрузках из интранета:
+
+    * колонка «имя» рядом с колонкой «фамилия» — это ИМЯ, а не ФИО целиком
+      (само по себе «имя» чаще всего значит «ФИО», поэтому решаем по соседям);
+    * колонки БЕЗ заголовка: пустой столбец сразу за «именем» — это отчество,
+      а столбец, в котором стоят только «да»/«нет», — признак «работает».
+      Без этого разбора такие колонки просто терялись бы.
+    """
+    mapping: Dict[int, str] = {}
+    aliases: Dict[int, str] = {}
+    for col, title in enumerate(header):
+        norm = _norm_header(title)
+        field = COLUMN_ALIASES.get(norm)
+        if field and field not in mapping.values():
+            mapping[col] = field
+            aliases[col] = norm
+
+    # «Фамилия» + «имя» → это раздельные части ФИО.
+    if "last_name" in mapping.values():
+        for col, field in list(mapping.items()):
+            if field == "full_name" and aliases.get(col) in ("имя", "name"):
+                mapping[col] = "first_name"
+
+    def column_values(col: int, limit: int = 60) -> List[str]:
+        values = []
+        for idx in range(header_idx + 1, min(len(table), header_idx + 1 + limit)):
+            row = table[idx]
+            if col < len(row):
+                value = _cell(row[col]).strip()
+                if value:
+                    values.append(value.lower())
+        return values
+
+    first_name_col = next((c for c, f in mapping.items() if f == "first_name"), None)
+    for col, title in enumerate(header):
+        if col in mapping or _norm_header(title):
+            continue                      # заголовок есть — гадать не нужно
+        values = column_values(col)
+        if not values:
+            continue
+        if "employed" not in mapping.values() and set(values) <= (EMPLOYED_VALUES | NOT_EMPLOYED_VALUES):
+            mapping[col] = "employed"
+        elif (first_name_col is not None and col == first_name_col + 1
+              and "middle_name" not in mapping.values()):
+            mapping[col] = "middle_name"
+    return mapping
 
 
 def _rows_from_table(table: Sequence[Sequence[str]]) -> Tuple[List[dict], List[dict]]:
@@ -480,16 +638,14 @@ def _rows_from_table(table: Sequence[Sequence[str]]) -> Tuple[List[dict], List[d
         raise ValidationError("Файл пуст — в нём нет ни одной строки с данными.",
                               hint="Выгрузите список сотрудников заново или скачайте файл-образец.")
 
-    mapping: Dict[int, str] = {}
-    for col, title in enumerate(table[header_idx]):
-        field = COLUMN_ALIASES.get(_norm_header(title))
-        if field and field not in mapping.values():
-            mapping[col] = field
-    if "full_name" not in mapping.values() and "email" not in mapping.values():
+    mapping = _map_header(table[header_idx], table, header_idx)
+    known = set(mapping.values())
+    if not known & {"full_name", "email", "last_name"}:
         raise ValidationError(
             "В файле не найдены колонки «ФИО» и «E-mail».",
             hint="Первая строка должна содержать заголовки. Подойдут названия: "
-                 "ФИО / Ф.И.О. / Имя / Сотрудник / Name, E-mail / Почта / Mail. "
+                 "ФИО / Ф.И.О. / Имя / Сотрудник / Name (или «Фамилия» + «Имя» + «Отчество» "
+                 "отдельными колонками), E-mail / Почта / Электропочта / Mail. "
                  "Скачайте файл-образец, если не уверены в формате.",
         )
 
@@ -499,17 +655,31 @@ def _rows_from_table(table: Sequence[Sequence[str]]) -> Tuple[List[dict], List[d
         if not any(_cell(c) for c in raw):
             continue               # пустые строки просто пропускаем
         item = {"row": line_no}
-        for field in FILE_FIELDS:
+        for field in FILE_FIELDS + EXTRA_FILE_FIELDS:
             item[field] = ""
         for col, field in mapping.items():
             if col < len(raw):
                 item[field] = _cell(raw[col]).strip()
+
+        # ФИО из отдельных колонок — только если целого ФИО в файле нет.
+        if not item["full_name"]:
+            item["full_name"] = " ".join(
+                part for part in (item["last_name"], item["first_name"], item["middle_name"]) if part
+            ).strip()
+        # Телефон: мобильный полезнее рабочего, внутренний — на крайний случай.
+        if not item["phone"]:
+            item["phone"] = item["phone_mobile"] or item["phone_work"] or item["phone_ext"]
 
         email = normalize_email(item["email"])
         if email and not looks_like_email(email):
             problems.append({"row": line_no, "reason": f"некорректный e-mail: «{item['email']}»"})
             email = ""
         item["email"] = email
+
+        # Сотрудник, помеченный в файле как не работающий, в справочник не
+        # добавляется и ящик ему не заводится. Уже заведённые карточки при этом
+        # НЕ трогаются — увольнение остаётся решением человека.
+        item["inactive"] = item["employed"].strip().lower() in NOT_EMPLOYED_VALUES
 
         if not item["full_name"] and not item["email"]:
             # Строка без ФИО и без почты — опознать сотрудника нечем.
@@ -706,17 +876,38 @@ def sync_employees(svc, rows: Sequence[dict], *, create_accounts: bool,
     db = svc.db
     result: Dict[str, Any] = {
         "created": 0, "updated": 0, "accounts_created": 0, "accounts_linked": 0,
-        "total_rows": len(rows), "problems": [],
+        "skipped_inactive": 0, "total_rows": len(rows), "problems": [],
+        "duplicate_emails": [], "duplicate_rows": 0,
     }
+    seen_emails: Dict[str, int] = {}
     total = len(rows)
     for num, row in enumerate(rows, 1):
         line_no = int(row.get("row") or num)
+        if row.get("inactive"):
+            # В файле сотрудник помечен как не работающий: карточку не заводим
+            # и ящик не создаём. Уже заведённые карточки не трогаем — увольнение
+            # остаётся решением человека (см. заголовок модуля).
+            result["skipped_inactive"] += 1
+            if progress_cb is not None:
+                progress_cb(num, total, f"Обработано {num}/{total}")
+            continue
         full_name = (row.get("full_name") or "").strip()
         email = normalize_email(row.get("email"))
         external_id = (row.get("external_id") or "").strip()
         if not full_name and not email:
             result["problems"].append({"row": line_no, "reason": "нет ФИО и e-mail"})
             continue
+
+        if email:
+            # Один адрес у нескольких строк — это общий ящик (склад, сервис) или
+            # задвоенная строка. Карточка на адрес всё равно одна, но молчать об
+            # этом нельзя: иначе «обновлено N» выглядит как обычное обновление.
+            if email in seen_emails:
+                result["duplicate_rows"] += 1
+                if email not in result["duplicate_emails"]:
+                    result["duplicate_emails"].append(email)
+            else:
+                seen_emails[email] = line_no
 
         existing = db.get_employee_by_external_id(external_id) if external_id else None
         if existing is None and email:
@@ -757,6 +948,133 @@ def sync_employees(svc, rows: Sequence[dict], *, create_accounts: bool,
             elif action == "linked":
                 result["accounts_linked"] += 1
 
+        if progress_cb is not None:
+            progress_cb(num, total, f"Обработано {num}/{total}")
+    return result
+
+
+# ---------------------------------------------------------------------------
+#  Пароли ящиков из файла
+# ---------------------------------------------------------------------------
+#: Псевдонимы заголовков в файле паролей.
+PASSWORD_ALIASES = {
+    "email": ("email", "e-mail", "почта", "электропочта", "адрес", "mail", "логин", "login",
+              "username", "ящик", "пользователь"),
+    "password": ("пароль", "password", "pass", "pwd", "парольпочты"),
+}
+PASSWORD_COLUMNS: Dict[str, str] = {}
+for _field, _names in PASSWORD_ALIASES.items():
+    for _name in _names:
+        PASSWORD_COLUMNS[_name.replace(" ", "")] = _field
+
+
+def parse_password_file(path_or_bytes: Any, filename: str = "") -> Tuple[List[dict], List[dict]]:
+    """Разобрать файл «адрес — пароль» для массовой установки паролей ящиков.
+
+    Понимает те же форматы, что и список сотрудников: XLSX, CSV и XML-таблицу.
+    Заголовки необязательны — если первая строка уже похожа на пару «адрес и
+    пароль», она считается данными: такие файлы чаще всего готовят вручную, и
+    требовать заголовки было бы лишней придиркой.
+
+    :returns: ``(rows, problems)``; ``rows`` — ``[{"row": N, "email": …,
+        "password": …}]``. Пароли НИКУДА не логируются и не возвращаются
+        наружу дальше вызывающего кода.
+    """
+    name = (filename or (path_or_bytes if isinstance(path_or_bytes, str) else "")).lower()
+    data = _as_bytes(path_or_bytes)
+    if looks_like_spreadsheetml(data):
+        table = _read_spreadsheetml_table(data)
+    elif data[:4] == b"PK\x03\x04" or name.endswith(EXCEL_EXTENSIONS):
+        table = _read_excel_table(data)
+    elif data[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" or name.endswith(".xls"):
+        raise ValidationError("Старый двоичный формат Excel (.xls) не поддерживается.",
+                              hint="Сохраните файл как .xlsx или CSV.")
+    else:
+        table = _read_csv_table(data)
+
+    rows: List[dict] = []
+    problems: List[dict] = []
+    if not table:
+        raise ValidationError("Файл пуст.", hint="Нужны две колонки: адрес ящика и пароль.")
+
+    email_col, password_col, start = 0, 1, 0
+    header = [_norm_header(c) for c in table[0]]
+    mapped = {PASSWORD_COLUMNS.get(h): i for i, h in enumerate(header) if PASSWORD_COLUMNS.get(h)}
+    if "email" in mapped and "password" in mapped:
+        email_col, password_col, start = mapped["email"], mapped["password"], 1
+    else:
+        # Заголовков нет. Определяем колонку с адресами по содержимому: пароль
+        # похож на что угодно, а адрес — только на адрес.
+        first = [_cell(c).strip() for c in table[0]]
+        if not any(looks_like_email(normalize_email(c)) for c in first):
+            start = 1                      # первая строка — «шапка» без опознанных названий
+        probe = table[start] if start < len(table) else []
+        for idx, value in enumerate(probe):
+            if looks_like_email(normalize_email(_cell(value))):
+                email_col = idx
+                password_col = idx + 1 if idx + 1 < len(probe) else max(0, idx - 1)
+                break
+
+    seen: Dict[str, int] = {}
+    for idx in range(start, len(table)):
+        raw = table[idx]
+        line_no = idx + 1
+        if not any(_cell(c) for c in raw):
+            continue
+        email = normalize_email(raw[email_col] if email_col < len(raw) else "")
+        password = _cell(raw[password_col]).strip() if password_col < len(raw) else ""
+        if not email:
+            problems.append({"row": line_no, "reason": "не указан адрес ящика"})
+            continue
+        if not looks_like_email(email):
+            problems.append({"row": line_no, "reason": f"некорректный адрес: «{email}»"})
+            continue
+        if not password:
+            problems.append({"row": line_no, "reason": f"пустой пароль для {email}"})
+            continue
+        if email in seen:
+            # Два пароля на один ящик — почти наверняка ошибка подготовки файла,
+            # и молча брать последний нельзя: пароль может оказаться не тем.
+            problems.append({"row": line_no,
+                             "reason": f"адрес {email} встречается повторно (строка {seen[email]})"})
+            continue
+        seen[email] = line_no
+        rows.append({"row": line_no, "email": email, "password": password})
+    return rows, problems
+
+
+def apply_passwords(svc, rows: Sequence[dict], *, enable: bool = False,
+                    progress_cb: Optional[Callable[..., None]] = None) -> Dict[str, Any]:
+    """Проставить пароли ящикам по списку «адрес — пароль».
+
+    Ящик ищется по логину, а если такого логина нет — по адресу сотрудника из
+    справочника (в интранете логин и адрес иногда различаются). Пароль
+    сохраняется в базе зашифрованным; в журнал и в ответ он не попадает.
+
+    :param enable: включить ящик после установки пароля. Ящики, заведённые
+        автоматически, создаются выключенными, и без этого их пришлось бы
+        включать по одному руками.
+    """
+    result: Dict[str, Any] = {"updated": 0, "enabled": 0, "not_found": [], "total_rows": len(rows)}
+    total = len(rows)
+    for num, row in enumerate(rows, 1):
+        email = row.get("email") or ""
+        password = row.get("password") or ""
+        account = svc.db.get_account_by_username(email)
+        if account is None:
+            employee = svc.db.get_employee_by_email(email)
+            if employee is not None and employee["account_id"]:
+                account = svc.db.get_account(int(employee["account_id"]))
+        if account is None:
+            result["not_found"].append(email)
+            continue
+        account.password = password
+        if enable and not account.enabled:
+            account.enabled = True
+            result["enabled"] += 1
+        svc.db.update_account(account, update_password=True,
+                              update_oauth_secret=False, update_oauth_token=False)
+        result["updated"] += 1
         if progress_cb is not None:
             progress_cb(num, total, f"Обработано {num}/{total}")
     return result

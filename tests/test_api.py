@@ -258,3 +258,35 @@ def test_purge_account_index_clears_everything(client):
     assert svc.db.count_messages(acc_id) == 0
     assert svc.db.get_folder_state(acc_id, "INBOX") is None
     assert svc.db.list_folder_problems(acc_id) == []
+
+
+def test_import_passwords_endpoint(client):
+    """Загрузка паролей: ящик получает пароль, наружу пароль не возвращается."""
+    _login(client)
+    r = client.post("/api/accounts", json={
+        "name": "Иванов", "host": "imap.example.ru", "port": 993, "username": "ivanov@example.ru",
+        "password": "", "security": "ssl", "enabled": False,
+    })
+    acc_id = r.json()["id"]
+
+    csv_data = "email;пароль\nivanov@example.ru;Secret1!\nnobody@example.ru;Secret2!\n"
+    files = {"file": ("passwords.csv", csv_data.encode("utf-8"), "text/csv")}
+    resp = client.post("/api/accounts/import-passwords", files=files, data={"enable": "true"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["updated"] == 1 and body["enabled"] == 1
+    assert body["not_found"] == ["nobody@example.ru"]
+    assert "Secret1!" not in resp.text            # пароль наружу не уходит
+
+    acc = [a for a in client.get("/api/accounts").json() if a["id"] == acc_id][0]
+    assert acc["has_password"] is True and acc["enabled"] is True
+    # в аудите — только счётчики, без паролей
+    audit = [a for a in client.get("/api/audit?limit=20").json()
+             if a["action"] == "accounts_import_passwords"]
+    assert audit and "Secret1!" not in audit[0]["detail"]
+
+
+def test_import_passwords_rejects_empty_file(client):
+    _login(client)
+    files = {"file": ("passwords.csv", b"", "text/csv")}
+    assert client.post("/api/accounts/import-passwords", files=files).status_code >= 400
