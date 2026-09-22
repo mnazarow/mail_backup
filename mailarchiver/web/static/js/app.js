@@ -687,12 +687,30 @@ function passwordImportReport(r){
     {wide:true});
 }
 
+//: Состояние отбора в разделе «Почтовые ящики». Живёт между перерисовками,
+//: поэтому после правки ящика список остаётся отфильтрованным так же.
+const Acc = { query:'', filter:'' };
+
+/** Подходит ли ящик под текущий отбор. */
+function accountMatches(a){
+  const f=Acc.filter;
+  if(f==='enabled' && !a.enabled) return false;
+  if(f==='disabled' && a.enabled) return false;
+  if(f==='nopassword' && a.has_password) return false;
+  if(f==='ready' && !(a.enabled && a.has_password)) return false;
+  const q=(Acc.query||'').trim().toLowerCase();
+  if(!q) return true;
+  return [a.name, a.username, a.host].some(v=>String(v||'').toLowerCase().includes(q));
+}
+
 async function viewAccounts(c){
   const accs=await api('/accounts'); State.accounts=accs;
   c.innerHTML='';
   const enabledCnt=accs.filter(a=>a.enabled).length;
+  const disabledCnt=accs.length-enabledCnt;
+  const noPwCnt=accs.filter(a=>!a.has_password).length;
   const head=h(`<div class="section-title"><h2 style="margin:0">Почтовые ящики</h2>
-    <span class="tag" title="Всего ящиков в системе">всего: ${accs.length}${accs.length!==enabledCnt?` · включено: ${enabledCnt}`:''}</span>
+    <span class="tag" title="Всего ящиков в системе">всего: ${accs.length}${disabledCnt?` · выключено: ${disabledCnt}`:''}</span>
     <div class="spacer"></div>
     <button class="btn" id="pwImport" title="Массово проставить пароли ящикам из файла «адрес — пароль»">🔑 Загрузить пароли</button>
     <button class="btn" id="bkAll" ${enabledCnt?'':'disabled'} title="Поставить в очередь резервное копирование всех включённых ящиков">💾 Копия всех ящиков сейчас</button>
@@ -702,25 +720,58 @@ async function viewAccounts(c){
   $('#bkAll',c).onclick=()=>backupAllNow();
   $('#pwImport',c).onclick=()=>passwordImportModal();
   if(!accs.length){ c.appendChild(h('<div class="card"><div class="empty"><div class="big">📭</div>Пока нет ни одного ящика.<br>Нажмите «Добавить ящик», чтобы начать.</div></div>')); return; }
+
+  // Отбор: ящиков бывает несколько сотен (их заводит синхронизация сотрудников),
+  // и найти среди них выключенные или оставшиеся без пароля глазами нереально.
+  const opts=[['','Все ящики'+` (${accs.length})`],
+              ['enabled','Только включённые'+` (${enabledCnt})`],
+              ['disabled','Только выключенные'+` (${disabledCnt})`],
+              ['nopassword','Без пароля'+` (${noPwCnt})`],
+              ['ready','Готовые к копированию'+` (${accs.filter(a=>a.enabled&&a.has_password).length})`]];
+  const bar=h(`<div class="an-toolbar">
+    <input type="text" id="accQ" placeholder="Поиск по названию, логину, серверу…" style="flex:0 1 320px;min-width:200px" value="${esc(Acc.query)}">
+    <select id="accF">${opts.map(([v,t])=>`<option value="${v}" ${v===Acc.filter?'selected':''}>${esc(t)}</option>`).join('')}</select>
+    <button class="btn small ghost" id="accReset" ${(Acc.query||Acc.filter)?'':'style="display:none"'}>Сбросить</button>
+    <div class="spacer"></div><span class="muted small" id="accCount"></span></div>`);
+  c.appendChild(bar);
+
   const wrap=h('<div class="card table-wrap"><table class="tbl"><thead><tr><th>Название</th><th>Сервер</th><th>Логин</th><th>Статус</th><th></th></tr></thead><tbody></tbody></table></div>');
   const tb=wrap.querySelector('tbody');
-  accs.forEach(a=>{
-    const tr=h(`<tr>
-      <td><strong>${esc(a.name)}</strong>${a.enabled?'':' <span class="tag">выключен</span>'}</td>
-      <td class="mono small">${esc(a.host)}:${a.port} <span class="tag">${a.security}</span></td>
-      <td class="small">${esc(a.username)}</td>
-      <td><span class="tag">${a.auth_type==='oauth2'?'OAuth2':'пароль'}</span></td>
-      <td style="text-align:right;white-space:nowrap">
-        <button class="btn sm" data-test>Проверить</button>
-        <button class="btn sm primary" data-bk ${a.enabled?'':'disabled'} title="${a.enabled?'Сделать резервную копию этого ящика сейчас':'Ящик выключен — включите его, чтобы делать копии'}">💾 Копия сейчас</button>
-        <button class="btn sm" data-menu>⋯</button>
-      </td></tr>`);
-    tr.querySelector('[data-test]').onclick=()=>testAccount(a.id);
-    tr.querySelector('[data-bk]').onclick=()=>backupNow(a.id, a.name);
-    tr.querySelector('[data-menu]').onclick=()=>accountMenu(a);
-    tb.appendChild(tr);
-  });
+  const render=()=>{
+    tb.innerHTML='';
+    const shown=accs.filter(accountMatches);
+    $('#accCount',bar).textContent=`показано ${shown.length} из ${accs.length}`;
+    $('#accReset',bar).style.display=(Acc.query||Acc.filter)?'':'none';
+    if(!shown.length){
+      tb.appendChild(h('<tr><td colspan="5" class="empty">Под отбор не попал ни один ящик</td></tr>'));
+      return;
+    }
+    shown.forEach(a=>{
+      const state=a.enabled
+        ? (a.has_password?'<span class="tag ok">копируется</span>'
+                         :'<span class="tag warn">нет пароля</span>')
+        : '<span class="tag">выключен</span>';
+      const tr=h(`<tr>
+        <td><strong>${esc(a.name)}</strong></td>
+        <td class="mono small">${esc(a.host)}:${a.port} <span class="tag">${a.security}</span></td>
+        <td class="small">${esc(a.username)}</td>
+        <td>${state} <span class="tag">${a.auth_type==='oauth2'?'OAuth2':'пароль'}</span></td>
+        <td style="text-align:right;white-space:nowrap">
+          <button class="btn sm" data-test>Проверить</button>
+          <button class="btn sm primary" data-bk ${a.enabled?'':'disabled'} title="${a.enabled?'Сделать резервную копию этого ящика сейчас':'Ящик выключен — включите его, чтобы делать копии'}">💾 Копия сейчас</button>
+          <button class="btn sm" data-menu>⋯</button>
+        </td></tr>`);
+      tr.querySelector('[data-test]').onclick=()=>testAccount(a.id);
+      tr.querySelector('[data-bk]').onclick=()=>backupNow(a.id, a.name);
+      tr.querySelector('[data-menu]').onclick=()=>accountMenu(a);
+      tb.appendChild(tr);
+    });
+  };
+  $('#accQ',bar).oninput=e=>{ Acc.query=e.target.value; render(); };
+  $('#accF',bar).onchange=e=>{ Acc.filter=e.target.value; render(); };
+  $('#accReset',bar).onclick=()=>{ Acc.query=''; Acc.filter=''; $('#accQ',bar).value=''; $('#accF',bar).value=''; render(); };
   c.appendChild(wrap);
+  render();
 }
 
 /** Копирование заново: докачать потерянное или стереть копию и скачать всё. */
