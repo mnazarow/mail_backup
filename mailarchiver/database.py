@@ -860,10 +860,18 @@ class Database:
             count += 1
         return count
 
+    #: Предел длины одного события задания. Обрезка нужна, чтобы одна запись не
+    #: раздула базу, но она должна быть ВИДНА: раньше хвост сообщения молча
+    #: пропадал, а вместе с ним — самая полезная часть подсказки.
+    JOB_EVENT_MAX_CHARS = 2000
+
     def add_job_event(self, job_id: int, level: str, message: str) -> None:
+        text = message or ""
+        if len(text) > self.JOB_EVENT_MAX_CHARS:
+            text = text[:self.JOB_EVENT_MAX_CHARS - 24].rstrip() + "… (сообщение обрезано)"
         self.execute(
             "INSERT INTO job_events(job_id, ts, level, message) VALUES(?,?,?,?)",
-            (job_id, utcnow_iso(), level, message[:1000]),
+            (job_id, utcnow_iso(), level, text),
         )
 
     def list_job_events(self, job_id: int, limit: int = 500) -> List[sqlite3.Row]:

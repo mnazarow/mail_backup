@@ -528,22 +528,49 @@ class ImapConnection:
             "exists": int(info.get(b"EXISTS", 0) or 0),
         }, None
 
-    def _folder_diagnosis(self, folder: str) -> str:
-        """Собрать человеческий отчёт о том, что ещё известно про папку.
+    def _folder_facts(self, folder: str) -> dict:
+        """Собрать факты о папке, которую не удалось открыть.
 
-        Сюда попадает всё, что можно спросить у сервера, НЕ открывая папку:
-        STATUS (сколько писем), LIST по точному имени (знает ли сервер такое
-        имя) и разбор самого имени. Без этого отчёта администратор видит лишь
-        «failed EXAMINE» и не может понять, кто виноват и потеряно ли что-то.
+        Всё, что можно спросить у сервера, НЕ открывая папку: STATUS (сколько
+        писем), LIST по точному имени (знает ли сервер такое имя), вложенные
+        папки и разбор самого имени. По этим фактам строятся и короткая строка
+        для журнала задания, и подробное объяснение.
         """
-        parts: List[str] = []
         status = self.folder_status(folder)
-        if status is not None:
-            parts.append(f"по команде STATUS сервер сообщает: писем {status['messages']}")
+        return {
+            "status_messages": status["messages"] if status is not None else None,
+            "listed": self._folder_is_listed(folder),
+            "children": self.folder_children(folder),
+            "name_warnings": self._name_warnings(folder),
+        }
+
+    @staticmethod
+    def _folder_verdict(facts: dict) -> str:
+        """Одна фраза: чья это беда — имени или самой папки на сервере."""
+        if facts.get("name_warnings"):
+            return "в имени папки есть " + ", ".join(facts["name_warnings"])
+        if facts.get("children"):
+            return f"похоже на папку-контейнер (вложенных папок: {len(facts['children'])})"
+        if facts.get("listed") is False:
+            return "сервер не признаёт это имя своим (LIST по точному имени не находит папку)"
+        if facts.get("listed") is True:
+            return "имя верное, нерабочая сама папка на сервере"
+        return ""
+
+    def _folder_diagnosis(self, folder: str, facts: Optional[dict] = None) -> str:
+        """Подробное объяснение по фактам :meth:`_folder_facts`.
+
+        Без него администратор видит лишь «failed EXAMINE» и не может понять,
+        кто виноват и потеряно ли что-то.
+        """
+        facts = self._folder_facts(folder) if facts is None else facts
+        parts: List[str] = []
+        if facts["status_messages"] is not None:
+            parts.append(f"по команде STATUS сервер сообщает: писем {facts['status_messages']}")
         else:
             parts.append("на команду STATUS сервер тоже не ответил")
 
-        listed = self._folder_is_listed(folder)
+        listed = facts["listed"]
         if listed is True:
             parts.append("в списке папок сервера это имя есть (LIST по точному имени находит его) — "
                          "значит имя верное, а сама папка на сервере нерабочая")
@@ -551,16 +578,15 @@ class ImapConnection:
             parts.append("LIST по точному имени эту папку НЕ находит — сервер считает, что такого "
                          "имени у него нет: проверьте кодировку и точное написание имени")
 
-        children = self.folder_children(folder)
+        children = facts["children"]
         if children:
             shown = ", ".join(children[:5]) + (" и др." if len(children) > 5 else "")
             parts.append(f"у папки есть вложенные папки ({len(children)}): {shown} — "
                          f"похоже, это папка-контейнер, своих писем она не хранит, "
                          f"а вложенные копируются отдельно")
 
-        warnings = self._name_warnings(folder)
-        if warnings:
-            parts.append("в имени папки: " + ", ".join(warnings))
+        if facts["name_warnings"]:
+            parts.append("в имени папки: " + ", ".join(facts["name_warnings"]))
         return "; ".join(parts)
 
     def _select_error(self, folder: str, exc: BaseException, attempts: int,
@@ -577,9 +603,10 @@ class ImapConnection:
         tried = [f"EXAMINE — отказ (попыток: {attempts})"]
         if fallback_error is not None:
             tried.append(f"обычный SELECT — отказ ({fallback_error})")
+        facts = self._folder_facts(folder)
+        diagnosis = self._folder_diagnosis(folder, facts)
         parts = [f"Не удалось открыть папку «{folder}»: {mapped.message}",
                  "Что пробовали: " + "; ".join(tried)]
-        diagnosis = self._folder_diagnosis(folder)
         if diagnosis:
             parts.append("Дополнительно: " + diagnosis)
         if reply:
@@ -597,7 +624,16 @@ class ImapConnection:
             "добавьте её в «Пропускать папки» в карточке ящика — тогда копия перестанет "
             "считаться неполной из-за неё."
         )
-        return type(mapped)(message, hint=hint, cause=exc)
+        error = type(mapped)(message, hint=hint, cause=exc)
+        # Разобранные части нужны журналу задания: там строка должна быть
+        # КОРОТКОЙ, иначе полный текст упирается в предел длины события и
+        # обрезается ровно на самом полезном месте.
+        error.server_reply = reply or mapped.message
+        error.tried = "; ".join(tried)
+        error.diagnosis = diagnosis
+        error.verdict = self._folder_verdict(facts)
+        error.status_messages = facts["status_messages"]
+        return error
 
     def search_all_uids(self) -> List[int]:
         try:

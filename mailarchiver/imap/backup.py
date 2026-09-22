@@ -101,9 +101,17 @@ def _duplicate_hint(name: str, all_names: List[str]) -> str:
     twins = [other for other in all_names if other != name and _key(other) == _key(name)]
     if not twins:
         return ""
-    return (f" Похоже на дубликат папки «{twins[0]}», созданный самим почтовым сервером "
-            f"при конфликте имён (различие только в регистре или суффикс вида «_000»); "
-            f"такие папки обычно и не открываются — их удаляют на сервере.")
+    return f" Похоже на дубликат папки «{twins[0]}», созданный самим сервером."
+
+
+#: Пояснение про такие дубликаты — длинное, поэтому выводится один раз за
+#: прогон вместе с остальными подробностями, а не в строке про каждую папку.
+DUPLICATE_EXPLANATION = (
+    "Пара папок с именами, различающимися только регистром или суффиксом вида «_000», — "
+    "это дубликат, который почтовый сервер создал сам при конфликте имён (в файловой системе "
+    "«s2022» и «S2022» — одно и то же). Такие папки обычно и не открываются: их удаляют или "
+    "переименовывают на сервере."
+)
 
 
 def _folder_matches(name: str, patterns: List[str], delimiter: str) -> bool:
@@ -133,6 +141,34 @@ class BackupEngine:
         # переходит в «известные нечитаемые»: пробовать продолжаем, сообщать
         # продолжаем, но задание перестаёт быть неуспешным.
         self.unreadable_grace_runs = max(0, int(unreadable_grace_runs))
+        self._explained_unreadable = False
+
+    def _explain_unreadable(self, emit: EventCB, exc: BaseException, *, duplicate: bool = False) -> None:
+        """Один раз за прогон объяснить подробно, что значит «папка не открывается».
+
+        Подробности выводятся отдельным событием, а не в строке про папку:
+        у ящика с несколькими битыми папками один и тот же абзац повторялся бы
+        для каждой, а в строке про папку он упирался бы в предел длины события
+        и обрезался бы ровно на счётчике прогонов.
+        """
+        if self._explained_unreadable:
+            return
+        self._explained_unreadable = True
+        parts = []
+        tried = getattr(exc, "tried", "")
+        if tried:
+            parts.append(f"Что пробовали: {tried}")
+        diagnosis = getattr(exc, "diagnosis", "")
+        if diagnosis:
+            parts.append(f"Что известно о папке: {diagnosis}")
+        if duplicate:
+            parts.append(DUPLICATE_EXPLANATION)
+        hint = getattr(exc, "hint", "") or ""
+        if hint:
+            parts.append(hint)
+        if parts:
+            emit("INFO", "Подробности по папкам, которые сервер не даёт открыть. "
+                         + ". ".join(part.rstrip(". ") for part in parts) + ".")
 
     def _note_unreadable(self, account: Account, folder: str, error: str) -> int:
         """Запомнить очередную неудачу и вернуть, сколько их подряд."""
@@ -221,6 +257,8 @@ class BackupEngine:
             cancel_cb: Optional[CancelCB] = None, event_cb: Optional[EventCB] = None) -> BackupResult:
         result = BackupResult()
         started = time.time()
+        # Подробное объяснение про нечитаемые папки выводим один раз за прогон.
+        self._explained_unreadable = False
 
         def emit(level: str, msg: str) -> None:
             log.log({"INFO": 20, "WARNING": 30, "ERROR": 40}.get(level, 20), "[%s] %s", account.name, msg)
@@ -271,9 +309,21 @@ class BackupEngine:
                              f"Папка «{f.name}» не открывается, но по данным сервера она ПУСТАЯ "
                              f"(0 писем) — копировать нечего, потерь нет.{twin}")
                         continue
-                    # Письма этой папки в копию НЕ попадут.
+                    # Письма этой папки в копию НЕ попадут. В журнал пишем
+                    # КОРОТКУЮ строку: длинное объяснение упирается в предел
+                    # длины события и обрезается ровно на счётчике прогонов,
+                    # то есть на самом нужном. Подробности выводятся ниже, один
+                    # раз за прогон.
                     detail = exc.message + (f" {exc.hint}" if exc.hint else "")
+                    reply = getattr(exc, "server_reply", "") or exc.message
+                    verdict = getattr(exc, "verdict", "")
+                    msgs = getattr(exc, "status_messages", None)
                     fails = self._note_unreadable(account, f.name, exc.message)
+                    where = (f"писем в ней по данным сервера: {msgs}" if msgs
+                             else "сколько в ней писем, сервер не сообщает")
+                    body = f"не открывается: {reply}; {where}"
+                    if verdict:
+                        body += f"; {verdict}"
                     if self.unreadable_grace_runs and fails > self.unreadable_grace_runs:
                         # Папка не открывается уже давно — это состояние сервера,
                         # а не новость. Продолжаем пробовать и сообщать, но не
@@ -282,10 +332,9 @@ class BackupEngine:
                         result.known_unreadable_folders.append(f.name)
                         since = self._unreadable_since(account, f.name)
                         emit("WARNING",
-                             f"Папка «{f.name}» не открывается на сервере "
-                             f"{fails}-й прогон подряд{since} — ошибкой больше не считаем, "
-                             f"но и копировать её нечем. Чинить на почтовом сервере или "
-                             f"добавить в «Пропускать папки».{twin}")
+                             f"Папка «{f.name}» {body}. Не открывается {fails}-й прогон "
+                             f"подряд{since} — ошибкой больше не считаем.{twin}")
+                        self._explain_unreadable(emit, exc, duplicate=bool(twin))
                         continue
                     result.errors += 1
                     result.skipped_folders.append(f.name)
@@ -294,7 +343,8 @@ class BackupEngine:
                     tail = (f" Не открывается {fails}-й прогон подряд; ещё {left} — и папка перейдёт "
                             f"в «известные нечитаемые» (задание перестанет помечаться неполным)."
                             if left > 0 else "")
-                    emit("WARNING", f"Пропуск папки «{f.name}»: {detail}{twin}{tail}")
+                    emit("WARNING", f"Пропуск папки «{f.name}»: {body}.{twin}{tail}")
+                    self._explain_unreadable(emit, exc, duplicate=bool(twin))
                     continue
                 result.folders_read += 1
                 self._forget_unreadable(account, f.name)

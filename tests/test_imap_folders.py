@@ -434,9 +434,16 @@ def test_unreadable_folder_hints_at_server_made_duplicate(monkeypatch):
     assert res.skipped_folders == ["Отправленные/s2022_000"] and res.errors == 1
     skip = [m for lvl, m in events if lvl == "WARNING" and m.startswith("Пропуск папки")][0]
     assert "Похоже на дубликат папки «Отправленные/s2022»" in skip
-    assert "STATUS сервер сообщает: писем 4" in skip
-    # подсказка объясняет и как перестать получать «неполную копию»
-    assert "Пропускать папки" in skip
+    assert "писем в ней по данным сервера: 4" in skip
+    # строка про папку должна быть КОРОТКОЙ: длинная упирается в предел длины
+    # события и обрезается ровно на счётчике прогонов
+    assert len(skip) < 600, f"строка про папку слишком длинная: {len(skip)}"
+    # подробности выводятся отдельным событием — и только один раз за прогон
+    details = [m for lvl, m in events if lvl == "INFO" and m.startswith("Подробности по папкам")]
+    assert len(details) == 1
+    assert "Пропускать папки" in details[0]
+    assert "дубликат" in details[0]
+    assert "LIST по точному имени" in details[0]
 
 
 def test_status_unavailable_keeps_folder_as_loss(monkeypatch):
@@ -652,3 +659,28 @@ def test_grace_can_be_switched_off(monkeypatch):
         res = engine.run(acc)
     assert res.errors == 1 and res.skipped_folders == [bad]
     assert res.known_unreadable_folders == []
+
+
+def test_skip_message_fits_the_event_limit(monkeypatch):
+    """Строка про пропущенную папку не должна обрезаться пределом длины события.
+
+    Раньше полный текст (с подсказкой и пояснением про дубликат) занимал больше
+    тысячи символов и обрезался ровно на счётчике прогонов — самой нужной части.
+    """
+    from mailarchiver.database import Database
+
+    bad = "Отправленные/s2022"
+    fake = FakeIMAP(
+        folders=[((b"\\HasNoChildren",), b"/", bad),
+                 ((b"\\HasNoChildren",), b"/", bad + "_000")],
+        select_errors={bad: [_axigen_refusal()] * 3, bad + "_000": [_axigen_refusal()] * 3},
+    )
+    res, db, store, events = _run_backup(monkeypatch, fake)
+
+    skips = [m for lvl, m in events if m.startswith("Пропуск папки")]
+    assert len(skips) == 2
+    for message in skips:
+        assert len(message) < Database.JOB_EVENT_MAX_CHARS, f"{len(message)} символов"
+        assert "прогон подряд" in message           # счётчик виден, а не обрезан
+    # объяснение выводится один раз на весь прогон, а не для каждой папки
+    assert len([m for lvl, m in events if m.startswith("Подробности по папкам")]) == 1
