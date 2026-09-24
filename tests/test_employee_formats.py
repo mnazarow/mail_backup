@@ -160,8 +160,9 @@ def test_password_file_reports_bad_rows():
     assert len(rows) == 1
     reasons = " ".join(p["reason"] for p in problems)
     assert "пустой пароль" in reasons
-    assert "некорректный адрес" in reasons
-    assert "повторно" in reasons          # два пароля на один ящик — не берём молча
+    assert "не похоже на e-mail" in reasons     # само значение не печатаем: там может быть пароль
+    assert "повторно" in reasons                # два пароля на один ящик — не берём молча
+    assert "не адрес" not in reasons            # исходное значение наружу не уходит
 
 
 def test_password_file_reads_csv_and_spreadsheetml():
@@ -211,3 +212,67 @@ def test_sync_reports_shared_addresses(services):
     assert result["duplicate_rows"] == 1
     assert result["duplicate_emails"] == ["l.abdrakhmanova@vodokomfort.ru"]
     assert services.db.count_employees() == 1      # карточка на адрес одна
+
+
+def test_password_file_rejects_single_column():
+    """Одна колонка — раньше паролем становился сам адрес и затирал настоящий."""
+    with pytest.raises(ValidationError) as err:
+        parse_password_file(_xlsx([("ivanov@x.ru",), ("petrova@x.ru",)]), "p.xlsx")
+    assert "одна колонка" in str(err.value)
+
+
+def test_password_file_warns_about_dropped_header():
+    """Первая строка, принятая за заголовок, не пропадает молча."""
+    rows, problems = parse_password_file(_xlsx([("ivanov", "Pass1"), ("petrova@x.ru", "Pass2")]),
+                                         "p.xlsx")
+    assert [r["email"] for r in rows] == ["petrova@x.ru"]
+    assert any("как заголовок" in p["reason"] for p in problems)
+
+
+def test_password_equal_to_email_is_rejected():
+    rows, problems = parse_password_file(
+        _xlsx([("email", "пароль"), ("ivanov@x.ru", "ivanov@x.ru")]), "p.xlsx")
+    assert rows == []
+    assert any("совпадает с адресом" in p["reason"] for p in problems)
+
+
+def test_spreadsheetml_self_closing_cell_does_not_shift_columns():
+    """«<Cell ss:StyleID="s1"/>» раньше съедала следующую ячейку — колонки ехали."""
+    xml = ('<?mso-application progid="Excel.Sheet"?><Workbook><Worksheet><Table>'
+           '<Row><Cell><Data ss:Type="String">ФИО</Data></Cell>'
+           '<Cell><Data ss:Type="String">Должность</Data></Cell>'
+           '<Cell><Data ss:Type="String">E-mail</Data></Cell></Row>'
+           '<Row><Cell><Data ss:Type="String">Иванов Иван</Data></Cell>'
+           '<Cell ss:StyleID="s1"/>'
+           '<Cell><Data ss:Type="String">ivanov@x.ru</Data></Cell></Row>'
+           '</Table></Worksheet></Workbook>')
+    rows, problems = parse_employee_file(xml.encode("utf-8"), "x.xml")
+    assert problems == []
+    assert rows[0]["full_name"] == "Иванов Иван"
+    assert rows[0]["position"] == ""          # пустая ячейка осталась пустой
+    assert rows[0]["email"] == "ivanov@x.ru"  # адрес не уехал в «должность»
+
+
+def test_spreadsheetml_reads_windows_1251():
+    """Выгрузки 1С объявляют windows-1251 — читаем по объявленной кодировке."""
+    xml = ('<?xml version="1.0" encoding="windows-1251"?>'
+           '<?mso-application progid="Excel.Sheet"?><Workbook><Worksheet><Table>'
+           '<Row><Cell><Data>ФИО</Data></Cell><Cell><Data>E-mail</Data></Cell></Row>'
+           '<Row><Cell><Data>Иванов Иван</Data></Cell><Cell><Data>i@x.ru</Data></Cell></Row>'
+           '</Table></Worksheet></Workbook>')
+    rows, _ = parse_employee_file(xml.encode("cp1251"), "x.xml")
+    assert rows[0]["full_name"] == "Иванов Иван"
+
+
+def test_dash_column_is_not_a_dismissal_flag():
+    """Колонка-заглушка из прочерков не должна объявлять уволенными всех."""
+    csv_data = "ФИО;E-mail;\nИванов Иван;ivanov@x.ru;-\nПетров Пётр;petrov@x.ru;-\n"
+    rows, _ = parse_employee_file(csv_data.encode("utf-8"), "x.csv")
+    assert [r["inactive"] for r in rows] == [False, False]
+
+
+def test_url_is_redacted_in_logs_and_answers():
+    from mailarchiver.employees import redact_url
+    assert redact_url("https://hr/export?token=SECRET&id=5") == "https://hr/export?token=***&id=5"
+    assert redact_url("https://user:pass@hr/x.csv") == "https://***@hr/x.csv"
+    assert redact_url("http://hr/plain.csv") == "http://hr/plain.csv"

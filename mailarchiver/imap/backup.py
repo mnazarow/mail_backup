@@ -24,7 +24,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Set
 
-from ..errors import JobCancelled, MailArchiverError
+from ..errors import ImapConnectionError, ImapTimeoutError, JobCancelled, MailArchiverError
 from ..logging_setup import get_logger
 from ..models import Account
 from ..storage import MaildirStore
@@ -142,6 +142,7 @@ class BackupEngine:
         # продолжаем, но задание перестаёт быть неуспешным.
         self.unreadable_grace_runs = max(0, int(unreadable_grace_runs))
         self._explained_unreadable = False
+        self._problem_folders: Optional[Set[str]] = None
 
     def _explain_unreadable(self, emit: EventCB, exc: BaseException, *, duplicate: bool = False) -> None:
         """Один раз за прогон объяснить подробно, что значит «папка не открывается».
@@ -181,9 +182,18 @@ class BackupEngine:
             return 1
 
     def _forget_unreadable(self, account: Account, folder: str) -> None:
-        """Папка открылась — забыть её историю неудач."""
+        """Папка открылась — забыть её историю неудач.
+
+        Сначала сверяемся со списком проблемных папок, прочитанным один раз за
+        прогон: без этого на каждую исправную папку уходила пишущая транзакция,
+        которая ничего не удаляла (500 ящиков × 50 папок — 25 000 транзакций).
+        """
+        if self._problem_folders is not None and folder not in self._problem_folders:
+            return
         try:
             self.db.clear_folder_problem(account.id, folder)
+            if self._problem_folders is not None:
+                self._problem_folders.discard(folder)
         except Exception as exc:  # noqa: BLE001
             log.debug("Не удалось очистить историю папки «%s»: %s", folder, exc)
 
@@ -259,6 +269,10 @@ class BackupEngine:
         started = time.time()
         # Подробное объяснение про нечитаемые папки выводим один раз за прогон.
         self._explained_unreadable = False
+        try:
+            self._problem_folders = {row["folder"] for row in self.db.list_folder_problems(account.id)}
+        except Exception:  # noqa: BLE001 — у заглушек БД метода может не быть
+            self._problem_folders = None
 
         def emit(level: str, msg: str) -> None:
             log.log({"INFO": 20, "WARNING": 30, "ERROR": 40}.get(level, 20), "[%s] %s", account.name, msg)
@@ -282,14 +296,25 @@ class BackupEngine:
                 check_cancel()
                 try:
                     info = conn.select(f.name, readonly=True)
+                except (ImapConnectionError, ImapTimeoutError):
+                    # Связь оборвалась — это НЕ беда конкретной папки. Раньше
+                    # такой обрыв засчитывался всем оставшимся папкам как отказ:
+                    # счётчик «терпения» доходил до порога, и настоящая потеря
+                    # писем потом объявлялась «известной нечитаемой папкой».
+                    # Пробрасываем наружу — сработает штатный повтор задания.
+                    raise
                 except MailArchiverError as exc:
                     # Папка не открылась. Прежде чем объявлять копию неполной,
                     # спрашиваем сервер командой STATUS: сколько писем он вообще
                     # видит в этой папке. Пустая папка, которую не открыть, —
                     # это мусор на сервере, а не потеря писем.
-                    status = conn.folder_status(f.name)
+                    # STATUS и LIST уже выполнены при сборе ошибки — берём
+                    # готовые факты, а не повторяем те же запросы к серверу.
+                    msgs = getattr(exc, "status_messages", None)
+                    children = getattr(exc, "children", None)
+                    if children is None:
+                        children = conn.folder_children(f.name, f.delimiter)
                     twin = _duplicate_hint(f.name, [x.name for x in folders])
-                    children = conn.folder_children(f.name, f.delimiter)
                     if children:
                         # Папка-контейнер: письма лежат во вложенных папках, а
                         # они копируются сами по себе. Ошибкой это не считаем —
@@ -302,7 +327,7 @@ class BackupEngine:
                              f"({len(children)}) — это папка-контейнер, своих писем она не хранит; "
                              f"вложенные папки копируются отдельно.")
                         continue
-                    if status is not None and status.get("messages") == 0:
+                    if msgs == 0:
                         self._forget_unreadable(account, f.name)
                         result.empty_unreadable_folders.append(f.name)
                         emit("WARNING",
@@ -317,9 +342,8 @@ class BackupEngine:
                     detail = exc.message + (f" {exc.hint}" if exc.hint else "")
                     reply = getattr(exc, "server_reply", "") or exc.message
                     verdict = getattr(exc, "verdict", "")
-                    msgs = getattr(exc, "status_messages", None)
                     fails = self._note_unreadable(account, f.name, exc.message)
-                    where = (f"писем в ней по данным сервера: {msgs}" if msgs
+                    where = (f"писем в ней по данным сервера: {msgs}" if msgs is not None
                              else "сколько в ней писем, сервер не сообщает")
                     body = f"не открывается: {reply}; {where}"
                     if verdict:
@@ -476,8 +500,15 @@ class BackupEngine:
                     result.folders_processed += 1
                 except JobCancelled:
                     raise
+                except (ImapConnectionError, ImapTimeoutError):
+                    raise            # обрыв связи — задание должно повториться целиком
                 except MailArchiverError as exc:
                     result.errors += 1
+                    # Папку запоминаем и здесь: её письма в копию не попали, и
+                    # без этого «КОПИЯ НЕПОЛНАЯ» не появлялась именно в худшем
+                    # случае — когда сбой случился уже во время загрузки.
+                    if f.name not in result.skipped_folders:
+                        result.skipped_folders.append(f.name)
                     result.error_details.append(f"Папка «{f.name}»: {exc.message}")
                     emit("ERROR", f"Ошибка в папке «{f.name}»: {exc.message}")
                 finally:
@@ -490,6 +521,9 @@ class BackupEngine:
                 elapsed = max(0.001, time.time() - started)
                 progress_cb(done, total_new, "Готово", bytes_done, bytes_done / elapsed)
 
+        # folders_processed считает только папки, в которых БЫЛИ новые письма:
+        # на обычном прогоне это 0 из 50, что выглядит как «ничего не проверено».
+        # Для итога берём число реально прочитанных папок.
         summary = (f"Бэкап завершён: новых писем {result.messages_new}, "
                    f"пропущено по размеру {result.messages_skipped}, ошибок {result.errors}.")
         if result.known_unreadable_folders:

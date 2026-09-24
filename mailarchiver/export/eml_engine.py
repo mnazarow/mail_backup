@@ -12,11 +12,10 @@ from __future__ import annotations
 
 import email
 import os
-from email.header import decode_header, make_header
 from typing import Iterable, Optional
 
 from ..errors import ExportError
-from ..util import ensure_dir, safe_filename
+from ..util import decode_mime_header, ensure_dir, safe_filename
 from .base import (CancelCB, ExportEngine, ExportResult, MailItem, ProgressCB, folder_to_fs,
                    safe_export_path)
 
@@ -24,8 +23,7 @@ from .base import (CancelCB, ExportEngine, ExportResult, MailItem, ProgressCB, f
 def extract_subject(raw: bytes) -> str:
     try:
         msg = email.message_from_bytes(raw[:16384])
-        subj = msg.get("Subject", "")
-        return str(make_header(decode_header(subj))) if subj else ""
+        return decode_mime_header(msg.get("Subject", ""))
     except Exception:  # noqa: BLE001
         return ""
 

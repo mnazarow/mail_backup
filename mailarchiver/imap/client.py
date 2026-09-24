@@ -633,6 +633,8 @@ class ImapConnection:
         error.diagnosis = diagnosis
         error.verdict = self._folder_verdict(facts)
         error.status_messages = facts["status_messages"]
+        error.children = facts["children"]
+        error.listed = facts["listed"]
         return error
 
     def search_all_uids(self) -> List[int]:

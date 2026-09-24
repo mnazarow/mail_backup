@@ -209,9 +209,65 @@ SPREADSHEETML_MARKERS = (b"<?mso-application", b"<Workbook", b"urn:schemas-micro
 _TAG_RE = re.compile(r"<[^>]+>")
 _ROW_RE = re.compile(r"<Row\b[^>]*>(.*?)</Row>", re.S | re.I)
 _EMPTY_ROW_RE = re.compile(r"<Row\b[^>]*/>", re.I)
-_CELL_RE = re.compile(r"<Cell\b([^>]*)(?:/>|>(.*?)</Cell>)", re.S | re.I)
+#: Квантификатор ЛЕНИВЫЙ намеренно: с жадным «[^>]*» атрибуты самозакрывающейся
+#: ячейки «<Cell ss:StyleID="s1"/>» поглощали финальный «/», ветка «/>» не
+#: срабатывала, и такая ячейка «съедала» следующую — колонки уезжали влево.
+_CELL_RE = re.compile(r"<Cell\b([^>]*?)(?:/>|>(.*?)</Cell>)", re.S | re.I)
 _DATA_RE = re.compile(r"<Data\b[^>]*(?:/>|>(.*?)</Data>)", re.S | re.I)
 _INDEX_RE = re.compile(r'ss:Index\s*=\s*"(\d+)"', re.I)
+
+
+#: Имена query-параметров, значение которых нельзя показывать: выгрузку часто
+#: отдают по ссылке с токеном, и такой адрес ходит по логам и аудиту.
+_SECRET_QUERY_KEYS = ("token", "key", "secret", "password", "pass", "pwd", "auth", "sig", "access")
+
+
+def redact_url(url: str) -> str:
+    """Убрать из адреса всё, что является секретом: логин с паролем и токены.
+
+    Пароль источника хранится зашифрованным и наружу не отдаётся, но тот же
+    секрет часто сидит прямо в ссылке («?token=…»). Без этой чистки он попадал
+    бы в журнал, в аудит и в текст ошибки — то есть оседал надолго.
+    """
+    text = (url or "").strip()
+    if not text:
+        return ""
+    try:
+        parts = urllib.parse.urlsplit(text)
+    except ValueError:
+        return text
+    netloc = parts.netloc
+    if "@" in netloc:                      # https://user:pass@host → https://***@host
+        netloc = "***@" + netloc.rsplit("@", 1)[1]
+    query = []
+    for key, value in urllib.parse.parse_qsl(parts.query, keep_blank_values=True):
+        low = key.lower()
+        query.append((key, "***" if any(marker in low for marker in _SECRET_QUERY_KEYS) else value))
+    return urllib.parse.urlunsplit((parts.scheme, netloc, parts.path,
+                                    urllib.parse.urlencode(query, safe="*"), parts.fragment))
+
+
+class _NoAuthRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Редирект без переноса заголовка Authorization на чужой хост.
+
+    ``urllib`` по умолчанию тащит все заголовки в новый запрос. Если
+    сервер-источник (или тот, кто получил над ним контроль) ответит редиректом
+    на посторонний адрес, туда уехал бы логин и пароль от выгрузки.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is None:
+            return None
+        old_parts, new_parts = urllib.parse.urlsplit(req.full_url), urllib.parse.urlsplit(newurl)
+        if (old_parts.scheme, old_parts.netloc) != (new_parts.scheme, new_parts.netloc):
+            for name in ("Authorization", "Proxy-authorization"):
+                new.headers.pop(name, None)
+                new.headers.pop(name.capitalize(), None)
+            log.warning("Переадресация выгрузки на другой сервер (%s → %s): логин и пароль "
+                        "источника туда не передаём.",
+                        redact_url(req.full_url), redact_url(newurl))
+        return new
 
 
 def looks_like_spreadsheetml(data: bytes) -> bool:
@@ -228,6 +284,30 @@ def _spreadsheetml_text(raw: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+_XML_ENCODING_RE = re.compile(rb"""encoding\s*=\s*["']([\w.-]+)["']""", re.I)
+
+
+def _decode_xml(data: bytes) -> str:
+    """Расшифровать XML-таблицу: сначала по объявленной кодировке, потом перебором.
+
+    Выгрузки 1С и интранета часто объявляют windows-1251. Если читать такой
+    файл как UTF-8, все кириллические заголовки превращаются в мусор, колонка
+    «ФИО» не опознаётся, и сотрудники заводятся с адресом вместо имени.
+    """
+    declared = _XML_ENCODING_RE.search(data[:400])
+    encodings = []
+    if declared:
+        encodings.append(declared.group(1).decode("ascii", "ignore"))
+    encodings.extend(CSV_ENCODINGS)
+    for enc in encodings:
+        try:
+            return data.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    log.warning("Не удалось определить кодировку XML-таблицы, читаем с заменой символов.")
+    return data.decode("utf-8", errors="replace")
+
+
 def _read_spreadsheetml_table(data: bytes) -> List[List[str]]:
     """Прочитать таблицу из SpreadsheetML 2003 (Excel XML).
 
@@ -240,7 +320,7 @@ def _read_spreadsheetml_table(data: bytes) -> List[List[str]]:
     Учитывается ``ss:Index`` — им сервер «перепрыгивает» пустые ячейки, и без
     его обработки колонки поехали бы.
     """
-    text = data.decode("utf-8", errors="replace") if isinstance(data, (bytes, bytearray)) else str(data)
+    text = _decode_xml(data) if isinstance(data, (bytes, bytearray)) else str(data)
     if "﻿" in text[:4]:
         text = text.lstrip("﻿")
     # Берём первую таблицу: лист с данными в таких выгрузках всегда один.
@@ -445,9 +525,14 @@ def fetch_employee_source(
             context.check_hostname = False
             context.verify_mode = ssl.CERT_NONE
 
-    log.info("Загрузка списка сотрудников по адресу %s", url)
+    safe_url = redact_url(url)
+    log.info("Загрузка списка сотрудников по адресу %s", safe_url)
+    opener = urllib.request.build_opener(
+        _NoAuthRedirectHandler(),
+        urllib.request.HTTPSHandler(context=context) if context is not None else urllib.request.HTTPSHandler(),
+    )
     try:
-        with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
+        with opener.open(request, timeout=timeout) as response:
             declared = response.headers.get("Content-Length")
             if declared and declared.isdigit() and int(declared) > limit:
                 raise ValidationError(
@@ -477,13 +562,13 @@ def fetch_employee_source(
         if isinstance(reason, ssl.SSLError) or "CERTIFICATE" in text.upper():
             hint = ("Сертификат сервера не прошёл проверку. Если это внутренний сервер с "
                     "самоподписанным сертификатом, выключите «Проверять сертификат источника».")
-        raise ValidationError(f"Не удалось подключиться к {url}: {text}", hint=hint) from exc
+        raise ValidationError(f"Не удалось подключиться к {safe_url}: {text}", hint=hint) from exc
     except socket.timeout as exc:
         raise ValidationError(f"Сервер не ответил за {timeout} с.",
                               hint="Увеличьте «Таймаут загрузки» в настройках либо проверьте, "
                                    "не формируется ли выгрузка слишком долго.") from exc
     except (OSError, ValueError) as exc:
-        raise ValidationError(f"Не удалось загрузить {url}: {exc}",
+        raise ValidationError(f"Не удалось загрузить {safe_url}: {exc}",
                               hint="Проверьте адрес и доступность сервера-источника.") from exc
 
     if len(data) > limit:
@@ -491,9 +576,9 @@ def fetch_employee_source(
             f"Файл по адресу больше допустимых {human_size(limit)}.",
             hint="Убедитесь, что ссылка ведёт на выгрузку сотрудников, а не на архив или дамп базы.")
     if not data:
-        raise ValidationError(f"По адресу {url} вернулся пустой ответ.",
+        raise ValidationError(f"По адресу {safe_url} вернулся пустой ответ.",
                               hint="Проверьте, формируется ли выгрузка на стороне кадровой системы.")
-    _reject_html_page(data, url)
+    _reject_html_page(data, safe_url)
 
     name = _guess_source_name(fmt, disposition, content_type, final_url, data)
     log.info("Загружено %d байт, разбираем как «%s»", len(data), name)
@@ -525,7 +610,7 @@ def load_employee_source(
             url, username=username, password=password, verify_ssl=verify_ssl,
             timeout_s=timeout_s, fmt=fmt)
         rows, problems = parse_employee_file(data, name)
-        return rows, problems, f"URL {url}"
+        return rows, problems, f"URL {redact_url(url)}"
 
     path = (path or "").strip()
     if not path:
@@ -616,7 +701,17 @@ def _map_header(header: Sequence[str], table: Sequence[Sequence[str]],
         values = column_values(col)
         if not values:
             continue
-        if "employed" not in mapping.values() and set(values) <= (EMPLOYED_VALUES | NOT_EMPLOYED_VALUES):
+        unique = set(values)
+        # Колонка-заглушка из прочерков или нулей — НЕ признак увольнения.
+        # Раньше такой столбец (его создаёт, например, хвостовая «;» в CSV)
+        # объявлял уволенными сразу всех, и импорт молча не делал ничего.
+        looks_employed = (
+            "employed" not in mapping.values()
+            and unique <= (EMPLOYED_VALUES | NOT_EMPLOYED_VALUES)
+            and len(unique) > 1                                  # один и тот же символ ничего не различает
+            and bool(unique & (EMPLOYED_VALUES - {"1", "+"}))     # есть явное «да» / «yes» / «работает»
+        )
+        if looks_employed:
             mapping[col] = "employed"
         elif (first_name_col is not None and col == first_name_col + 1
               and "middle_name" not in mapping.values()):
@@ -806,7 +901,8 @@ def preview_account_template(svc, full_name: str = "Иванов Иван Ива
 
 
 def ensure_account_for_employee(svc, employee_id: int, full_name: str, email: str,
-                                row: Optional[dict] = None) -> Tuple[Optional[int], str]:
+                                row: Optional[dict] = None,
+                                tpl: Optional[Dict[str, Any]] = None) -> Tuple[Optional[int], str]:
     """Завести (или найти) почтовый ящик для сотрудника и привязать его.
 
     Ящик создаётся по ШАБЛОНУ из настроек раздела «Сотрудники»: сервер, порт,
@@ -821,7 +917,10 @@ def ensure_account_for_employee(svc, employee_id: int, full_name: str, email: st
     """
     if not email:
         return None, ""
-    tpl = account_template(svc)
+    # Шаблон читается из настроек (это ~13 обращений к БД). На синхронизации в
+    # 600 строк его пересчёт для каждой строки — тысячи лишних запросов, поэтому
+    # вызывающий код передаёт готовый шаблон.
+    tpl = account_template(svc) if tpl is None else tpl
     values = account_placeholders(full_name, email, row)
     username = render_account_field(tpl["username_template"], values) or email
 
@@ -855,8 +954,10 @@ def ensure_account_for_employee(svc, employee_id: int, full_name: str, email: st
         try:
             svc.db.create_schedule(account_id, ScheduleKind.CRON, JobType.BACKUP,
                                    cron_expr=tpl["schedule_cron"], enabled=True)
-            if getattr(svc, "scheduler", None) is not None:
-                svc.scheduler.reload()
+            # Перезагрузку планировщика делает вызывающий код ОДИН раз в конце:
+            # reload() перечитывает все расписания целиком, и вызов на каждый
+            # созданный ящик давал квадратичный рост (600 сотрудников — минута
+            # ожидания и сотни тысяч запросов к БД).
         except Exception as exc:  # noqa: BLE001
             # Ящик уже создан — падать из-за расписания нельзя, иначе
             # синхронизация оборвётся на середине файла.
@@ -880,6 +981,8 @@ def sync_employees(svc, rows: Sequence[dict], *, create_accounts: bool,
         "duplicate_emails": [], "duplicate_rows": 0,
     }
     seen_emails: Dict[str, int] = {}
+    tpl = account_template(svc) if create_accounts else None
+    schedules_created = False
     total = len(rows)
     for num, row in enumerate(rows, 1):
         line_no = int(row.get("row") or num)
@@ -942,14 +1045,22 @@ def sync_employees(svc, rows: Sequence[dict], *, create_accounts: bool,
 
         if create_accounts and email and account_id is None:
             _, action = ensure_account_for_employee(svc, employee_id, values["full_name"], email,
-                                                     row=values)
+                                                     row=values, tpl=tpl)
             if action == "created":
                 result["accounts_created"] += 1
+                schedules_created = schedules_created or bool(tpl and tpl["schedule_enabled"])
             elif action == "linked":
                 result["accounts_linked"] += 1
 
         if progress_cb is not None:
             progress_cb(num, total, f"Обработано {num}/{total}")
+
+    if schedules_created and getattr(svc, "scheduler", None) is not None:
+        # Один reload на всю синхронизацию — новые расписания подхватятся сразу.
+        try:
+            svc.scheduler.reload()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Не удалось перечитать расписания после синхронизации: %s", exc)
     return result
 
 
@@ -1007,13 +1118,26 @@ def parse_password_file(path_or_bytes: Any, filename: str = "") -> Tuple[List[di
         # похож на что угодно, а адрес — только на адрес.
         first = [_cell(c).strip() for c in table[0]]
         if not any(looks_like_email(normalize_email(c)) for c in first):
-            start = 1                      # первая строка — «шапка» без опознанных названий
+            # Первая строка — «шапка», названия в которой мы не опознали. Молча
+            # выбрасывать её нельзя: в ней мог быть ящик с логином без домена,
+            # и тогда он остался бы без пароля незаметно для администратора.
+            start = 1
+            problems.append({"row": 1, "reason": "первая строка пропущена как заголовок "
+                                                 "(в ней не найдено ни одного адреса)"})
         probe = table[start] if start < len(table) else []
         for idx, value in enumerate(probe):
             if looks_like_email(normalize_email(_cell(value))):
                 email_col = idx
-                password_col = idx + 1 if idx + 1 < len(probe) else max(0, idx - 1)
+                password_col = idx + 1 if idx + 1 < len(probe) else idx - 1
                 break
+    if password_col == email_col or password_col < 0:
+        # Файл из одной колонки. Раньше сюда попадал сам адрес, и каждому ящику
+        # ставился пароль, равный его адресу, — прежние пароли затирались
+        # безвозвратно, а с включённой галочкой ящики ещё и включались.
+        raise ValidationError(
+            "В файле только одна колонка — не видно, где пароли.",
+            hint="Нужны две колонки: адрес ящика и пароль. Заголовки «email» и «пароль» "
+                 "необязательны, но с ними формат определяется точно.")
 
     seen: Dict[str, int] = {}
     for idx in range(start, len(table)):
@@ -1027,7 +1151,15 @@ def parse_password_file(path_or_bytes: Any, filename: str = "") -> Tuple[List[di
             problems.append({"row": line_no, "reason": "не указан адрес ящика"})
             continue
         if not looks_like_email(email):
-            problems.append({"row": line_no, "reason": f"некорректный адрес: «{email}»"})
+            # Значение НЕ подставляем: при сбитых колонках в «адресе» окажется
+            # пароль, и он уехал бы в ответ API и в историю браузера.
+            problems.append({"row": line_no,
+                             "reason": "значение в колонке адреса не похоже на e-mail"})
+            continue
+        if password == email:
+            # Копия адреса вместо пароля — почти всегда съехавшие колонки.
+            problems.append({"row": line_no, "reason": f"пароль совпадает с адресом {email} — "
+                                                      f"похоже, колонки перепутаны"})
             continue
         if not password:
             problems.append({"row": line_no, "reason": f"пустой пароль для {email}"})

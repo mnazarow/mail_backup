@@ -657,13 +657,18 @@ class Database:
         return int(self.scalar("SELECT COALESCE(SUM(size),0) FROM messages WHERE account_id=?", (account_id,)) or 0)
 
     def list_messages(self, account_id: int, folder: Optional[str] = None, limit: int = 500, offset: int = 0) -> List[sqlite3.Row]:
+        # Сортировка с добавочным «id»: без него у писем с одинаковым (или
+        # пустым) internaldate порядок между запросами не гарантирован, и
+        # постраничный обход мог пропустить часть писем или выдать их дважды.
         if folder:
             return self.query(
-                "SELECT * FROM messages WHERE account_id=? AND folder=? ORDER BY internaldate DESC LIMIT ? OFFSET ?",
+                "SELECT * FROM messages WHERE account_id=? AND folder=? "
+                "ORDER BY internaldate DESC, id DESC LIMIT ? OFFSET ?",
                 (account_id, folder, limit, offset),
             )
         return self.query(
-            "SELECT * FROM messages WHERE account_id=? ORDER BY internaldate DESC LIMIT ? OFFSET ?",
+            "SELECT * FROM messages WHERE account_id=? ORDER BY internaldate DESC, id DESC "
+            "LIMIT ? OFFSET ?",
             (account_id, limit, offset),
         )
 
@@ -724,6 +729,25 @@ class Database:
     def reset_folder_states(self, account_id: int) -> None:
         """Забыть состояние папок ящика (UIDVALIDITY и последний UID)."""
         self.execute("DELETE FROM folders WHERE account_id=?", (account_id,))
+
+    def message_totals_by_account(self) -> Dict[int, Dict[str, int]]:
+        """Число писем и суммарный размер по всем ящикам ОДНИМ запросом.
+
+        Дашборд обновляется постоянно и у каждого открытого окна: на 500 ящиках
+        отдельные count/sum на ящик давали полторы тысячи запросов к той же
+        базе, в которую в это время пишет копирование.
+        """
+        rows = self.query("SELECT account_id, COUNT(*) AS cnt, COALESCE(SUM(size),0) AS bytes "
+                          "FROM messages GROUP BY account_id")
+        return {int(r["account_id"]): {"messages": int(r["cnt"]), "bytes": int(r["bytes"])}
+                for r in rows}
+
+    def last_runs_by_account(self) -> Dict[int, sqlite3.Row]:
+        """Последний прогон каждого ящика одним запросом."""
+        rows = self.query(
+            "SELECT r.* FROM runs r JOIN (SELECT account_id, MAX(id) AS last_id FROM runs "
+            "GROUP BY account_id) m ON m.last_id = r.id")
+        return {int(r["account_id"]): r for r in rows}
 
     def folders_summary(self, account_id: int) -> List[sqlite3.Row]:
         return self.query(
@@ -836,8 +860,16 @@ class Database:
         )
 
     def requeue_job(self, job_id: int) -> None:
+        """Вернуть задание в очередь для повторной попытки.
+
+        Флаг отмены снимаем обязательно: при нештатном перезапуске службы
+        задания остаются с проставленным cancel_requested, и после возврата в
+        очередь они мгновенно отменяли сами себя — ночное копирование тихо не
+        выполнялось.
+        """
         self.execute(
-            "UPDATE jobs SET status=?, worker_id=NULL, started_at=NULL, error='' WHERE id=?",
+            "UPDATE jobs SET status=?, worker_id=NULL, started_at=NULL, error='', "
+            "cancel_requested=0 WHERE id=?",
             (models.JobStatus.QUEUED, job_id),
         )
 
@@ -859,6 +891,20 @@ class Database:
                 self.finish_job(r["id"], models.JobStatus.FAILED, error="Прервано при перезапуске сервиса")
             count += 1
         return count
+
+    def reset_orphan_runs(self) -> int:
+        """При старте: закрыть записи прогонов, оставшиеся в статусе «выполняется».
+
+        Прогон закрывается вместе с заданием, но при жёстком перезапуске (или
+        после ошибки в старых версиях) запись оставалась открытой навсегда — и
+        карточка ящика вечно показывала «копирование идёт».
+        """
+        cur = self.execute(
+            "UPDATE runs SET status=?, finished_at=?, detail=? WHERE status=?",
+            (models.JobStatus.FAILED, utcnow_iso(), "Прервано при перезапуске сервиса",
+             models.JobStatus.RUNNING),
+        )
+        return int(cur.rowcount or 0)
 
     #: Предел длины одного события задания. Обрезка нужна, чтобы одна запись не
     #: раздула базу, но она должна быть ВИДНА: раньше хвост сообщения молча

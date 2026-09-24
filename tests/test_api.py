@@ -290,3 +290,14 @@ def test_import_passwords_rejects_empty_file(client):
     _login(client)
     files = {"file": ("passwords.csv", b"", "text/csv")}
     assert client.post("/api/accounts/import-passwords", files=files).status_code >= 400
+
+
+def test_orphan_runs_are_closed_on_start(client):
+    """Прогон, оставшийся «выполняется», не должен висеть вечно."""
+    _login(client)
+    acc_id = _make_account(client, "Прогоны")
+    svc = client.app.state.services
+    run_id = svc.db.start_run(acc_id, "backup", None)
+    assert svc.db.reset_orphan_runs() >= 1
+    row = svc.db.query_one("SELECT status, detail FROM runs WHERE id=?", (run_id,))
+    assert row["status"] == "failed" and "перезапуске" in row["detail"]

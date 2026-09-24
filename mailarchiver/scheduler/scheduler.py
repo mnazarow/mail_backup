@@ -193,6 +193,19 @@ class SchedulerService:
             job_type = row["job_type"] or JobType.BACKUP
             import json
             options = json.loads(row["options"] or "{}")
+            # Не ставим второе такое же задание, если предыдущее ещё в очереди
+            # или выполняется. Иначе на 500 ящиках при двух воркерах ночные
+            # задания копятся быстрее, чем выполняются, и очередь растёт
+            # бесконечно (старые чистятся только после завершения).
+            if row["account_id"] is not None:
+                busy = any(job["account_id"] == row["account_id"] and job["type"] == job_type
+                           for job in self.services.db.active_jobs())
+                if busy:
+                    log.warning("Расписание #%s пропущено: задание «%s» по этому ящику уже "
+                                "в очереди или выполняется.", schedule_id, job_type)
+                    self.services.db.set_schedule_runtimes(
+                        schedule_id, last_run=datetime.now(self._timezone()).isoformat())
+                    return
             max_attempts = int(self.services.rt("backup", "retry_attempts") or 1) if job_type == JobType.BACKUP else 1
             job_id = self.services.queue.enqueue(
                 job_type, row["account_id"], options,

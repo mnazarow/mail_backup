@@ -231,6 +231,30 @@ class MaildirStore:
         ensure_dir(acc_dir, 0o700)
         return count, total
 
+    def quarantine_account_files(self, account_id: int) -> Tuple[str, int, int]:
+        """Убрать файлы ящика в карантин вместо удаления (копия «с нуля»).
+
+        Каталог переименовывается в ``<каталог>_old_<дата-время>``: если прогон
+        оборвётся на середине, письма ещё на диске и их можно вернуть руками.
+        Мгновенная операция — в отличие от удаления сотен тысяч файлов.
+
+        :returns: ``(путь карантина, файлов, байт)``; путь пуст, если копировать
+            было нечего.
+        """
+        acc_dir = self.account_dir(account_id)
+        count, total = self.account_disk_usage(account_id)
+        quarantine = ""
+        if os.path.isdir(acc_dir) and count:
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            quarantine = f"{acc_dir}_old_{stamp}"
+            try:
+                os.rename(acc_dir, quarantine)
+            except OSError as exc:
+                raise StorageError(f"Не удалось убрать прежнюю копию ящика в карантин: {exc}",
+                                   hint="Проверьте права на каталог с почтой и свободное место.") from exc
+        ensure_dir(acc_dir, 0o700)
+        return quarantine, count, total
+
     @staticmethod
     def _safe_unlink(path: str) -> None:
         try:

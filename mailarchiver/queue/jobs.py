@@ -136,17 +136,37 @@ def _rebuild_missing(ctx: JobContext, acc) -> int:
 def _rebuild_full(ctx: JobContext, acc) -> Dict[str, int]:
     """Стереть локальную копию ящика целиком и начать её заново.
 
-    Удаляются и записи индекса, и файлы писем. Делается ТОЛЬКО по явной
-    команде администратора: письма, которых уже нет на почтовом сервере,
-    после этого не восстановить.
+    Порядок здесь важнее удобства:
+
+    1. СНАЧАЛА проверяем, что сервер доступен и ящик открывается. Стирать копию
+       раньше нельзя: при недоступном сервере или сменившемся пароле архив
+       оказался бы уничтожен, а скачать взамен нечего;
+    2. каталог с письмами не удаляем, а ПЕРЕИМЕНОВЫВАЕМ в карантин
+       ``<ящик>_old_<дата>``. Если прогон оборвётся посередине, файлы ещё на
+       диске — администратор сможет вернуть их руками;
+    3. и только потом чистим индекс.
+
+    Делается ТОЛЬКО по явной команде администратора: письма, которых уже нет на
+    почтовом сервере, после этого не восстановить.
     """
+    svc = ctx.services
+    ctx.event("INFO", "Проверяем подключение к ящику перед стиранием копии…")
+    probe = probe_account(acc, svc.connect_options())
+    if not probe.get("ok"):
+        raise ValidationError(
+            f"Копию не стираем: ящик недоступен — {probe.get('error') or 'нет связи с сервером'}.",
+            hint=probe.get("hint") or "Проверьте пароль и доступность почтового сервера, "
+                                      "затем запустите пересоздание копии заново.")
+
+    quarantine, files, freed = svc.store.quarantine_account_files(acc.id)
     removed_index = ctx.db.purge_account_index(acc.id)
-    files, freed = ctx.services.store.delete_account_files(acc.id)
+    where = f" Прежние файлы перемещены в «{os.path.basename(quarantine)}»." if quarantine else ""
     ctx.event("WARNING", f"Локальная копия ящика стёрта: записей индекса {removed_index}, "
-                         f"файлов {files} ({human_size(freed)}). Скачиваем всё заново.")
+                         f"файлов {files} ({human_size(freed)}).{where} Скачиваем всё заново.")
     ctx.db.add_audit("system", "backup_rebuild_full",
-                     f"{acc.name}: индекс {removed_index}, файлов {files}")
-    return {"index": removed_index, "files": files, "bytes": freed}
+                     f"{acc.name}: индекс {removed_index}, файлов {files}, карантин={quarantine or '—'}")
+    return {"index": removed_index, "files": files, "bytes": freed,
+            "quarantine": quarantine or ""}
 
 
 def handle_backup(ctx: JobContext) -> Dict:
@@ -180,14 +200,26 @@ def handle_backup(ctx: JobContext) -> Dict:
     except JobCancelled:
         ctx.db.finish_run(run_id, JobStatus.CANCELLED, detail="Отменено пользователем")
         raise
+    except MailArchiverError as exc:
+        # Любая другая ошибка (обрыв связи, отказ авторизации) тоже должна
+        # закрыть запись прогона: иначе карточка ящика вечно показывает
+        # «выполняется», а дневная статистика теряет этот день.
+        ctx.db.finish_run(run_id, JobStatus.FAILED, detail=exc.message[:500])
+        raise
+    except Exception as exc:  # noqa: BLE001
+        ctx.db.finish_run(run_id, JobStatus.FAILED, detail=str(exc)[:500])
+        raise
 
     ctx.db.finish_run(run_id, res.status_label, messages_new=res.messages_new, bytes_new=res.bytes_new,
                       messages_total=res.messages_total, errors=res.errors,
                       detail="; ".join(res.error_details[:5]))
     ctx.db.bump_daily_stats(acc.id, messages=res.messages_new, bytes_=res.bytes_new, jobs=1, errors=res.errors)
 
+    # Показываем ПРОЧИТАННЫЕ папки, а не только те, где нашлись новые письма:
+    # на обычном прогоне последних ноль, и сводка «папок 0/50» выглядела так,
+    # будто копирование ничего не проверило.
     summary = (f"Ящик «{acc.name}»: новых писем {res.messages_new} ({human_size(res.bytes_new)}), "
-               f"папок {res.folders_processed}/{res.folders_total}, ошибок {res.errors}.")
+               f"папок прочитано {res.folders_read}/{res.folders_total}, ошибок {res.errors}.")
     if rebuild == "missing":
         summary += f" Докачка потерянных: возвращено в очередь {rebuild_info.get('restored', 0)} писем."
     elif rebuild == "full":

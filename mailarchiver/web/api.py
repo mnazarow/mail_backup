@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Response, UploadFile
@@ -16,7 +17,8 @@ from pydantic import BaseModel
 from ..employees import (
     ACCOUNT_PLACEHOLDERS, TEMPLATE_CSV, TEMPLATE_FILENAME, apply_passwords,
     ensure_account_for_employee, fetch_employee_source, looks_like_email, normalize_email,
-    parse_employee_file, parse_password_file, preview_account_template, sync_employees,
+    parse_employee_file, parse_password_file, preview_account_template, redact_url,
+    sync_employees,
 )
 from ..errors import ValidationError
 from ..imap.client import diagnose_folders, probe_account
@@ -242,12 +244,15 @@ def state(request: Request, user: dict = Depends(auth_mod.require_user)):
     accounts = svc.db.list_accounts()
     if user.get("role") == "mailbox":
         accounts = [a for a in accounts if a.id == user.get("account_id")]
+    # Сводку по всем ящикам берём двумя групповыми запросами: по запросу на
+    # ящик дашборд заваливал базу на каждом обновлении (см. /state в ws).
+    totals_by_acc = svc.db.message_totals_by_account()
+    last_by_acc = svc.db.last_runs_by_account()
     acc_out = []
     for a in accounts:
-        cnt = svc.db.count_messages(a.id)
-        by = svc.db.sum_message_bytes(a.id)
-        runs = svc.db.list_runs(a.id, limit=1)
-        last = runs[0] if runs else None
+        stat = totals_by_acc.get(a.id) or {"messages": 0, "bytes": 0}
+        cnt, by = stat["messages"], stat["bytes"]
+        last = last_by_acc.get(a.id)
         acc_out.append({
             **a.redacted(),
             "messages": cnt, "bytes": by, "bytes_h": human_size(by),
@@ -433,7 +438,9 @@ def import_account_passwords(request: Request, file: UploadFile = File(...),
     svc = svc_dep(request)
     origin_name = os.path.basename(file.filename or "")
     fname = safe_filename(origin_name, default="passwords.xlsx")
-    dest = os.path.join(svc.cfg.tmp_dir, f"passwords_{os.getpid()}_{fname}")
+    # uuid, а не PID: два администратора (или один в двух вкладках) с файлами
+    # одинакового имени писали бы в один путь — и применился бы чужой файл.
+    dest = os.path.join(svc.cfg.tmp_dir, f"passwords_{uuid.uuid4().hex}_{fname}")
     written = 0
     try:
         with open(dest, "wb") as fh:
@@ -1233,7 +1240,7 @@ def import_employees(request: Request, file: UploadFile = File(...),
     # иначе «../../» в имени увело бы запись за пределы каталога временных файлов
     origin_name = os.path.basename(file.filename or "")
     fname = safe_filename(origin_name, default="employees.csv")
-    dest = os.path.join(svc.cfg.tmp_dir, f"employees_{os.getpid()}_{fname}")
+    dest = os.path.join(svc.cfg.tmp_dir, f"employees_{uuid.uuid4().hex}_{fname}")
     written = 0
     try:
         with open(dest, "wb") as fh:
@@ -1262,7 +1269,13 @@ def import_employees(request: Request, file: UploadFile = File(...),
                      f"файл={origin_name or fname} создано={result['created']} обновлено={result['updated']}")
     return {"ok": True, "created": result["created"], "updated": result["updated"],
             "accounts_created": result["accounts_created"], "accounts_linked": result["accounts_linked"],
-            "total_rows": result["total_rows"], "problems": problems}
+            "total_rows": result["total_rows"],
+            # Список режем: на кривом файле в 20 МБ это сотни тысяч записей —
+            # и в памяти, и в JSON-ответе.
+            "problems": problems[:200], "problem_count": len(problems),
+            "skipped_inactive": result.get("skipped_inactive", 0),
+            "duplicate_rows": result.get("duplicate_rows", 0),
+            "duplicate_emails": result.get("duplicate_emails", [])[:50]}
 
 
 def _employee_source(svc) -> dict:
@@ -1275,11 +1288,14 @@ def _employee_source(svc) -> dict:
         stype = "file"
     path = str(svc.rt("employees", "source_file") or "").strip()
     url = str(svc.rt("employees", "source_url") or "").strip()
+    # Адрес отдаём БЕЗ секретов: выгрузку часто открывают ссылкой с токеном,
+    # и этот токен не должен оседать в интерфейсе, аудите и журнале.
+    safe_url = redact_url(url)
     return {
         "type": stype,
         "path": path,
-        "url": url,
-        "target": url if stype == "url" else path,
+        "url": safe_url,
+        "target": safe_url if stype == "url" else path,
         "configured": bool(url if stype == "url" else path),
         "auth": bool(str(svc.rt("employees", "source_url_user") or "").strip()),
         "verify_ssl": bool(svc.rt("employees", "source_url_verify_ssl")),

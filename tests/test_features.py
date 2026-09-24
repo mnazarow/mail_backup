@@ -1,6 +1,8 @@
 """Тесты новых функций: просмотр писем, ретеншн на ящик, разбор письма."""
 import os
 
+import pytest
+
 from mailarchiver import models
 from mailarchiver.mailview import parse_message, get_attachment
 
@@ -175,3 +177,58 @@ def test_rebuild_full_wipes_index_and_files(services):
     assert not os.path.isfile(os.path.join(services.store.account_dir(acc_id), rel))
     # каталог ящика воссоздан пустым — следующая копия пишет туда же
     assert os.path.isdir(services.store.account_dir(acc_id))
+
+
+# ---------------------------------------------------------------------------
+#  Разбор заголовков писем (экспорт)
+# ---------------------------------------------------------------------------
+def test_decode_mime_header_handles_8bit_and_rfc2047():
+    """8-битная кириллица без RFC2047 раньше превращалась в «????» в .pst и .eml."""
+    import email as _email
+    from mailarchiver.util import decode_mime_header
+
+    cases = {
+        "cp1251 без кодирования": ("Тестовая тема".encode("cp1251"), "Тестовая тема"),
+        "utf-8 без кодирования": ("Отчёт за сентябрь".encode("utf-8"), "Отчёт за сентябрь"),
+        "RFC2047 utf-8": (b"=?utf-8?B?0J/RgNC40LLQtdGC?=", "Привет"),
+        "RFC2047 windows-1251": (b"=?windows-1251?Q?=D2=E5=EC=E0?=", "Тема"),
+        "ascii": (b"Hello there", "Hello there"),
+    }
+    for name, (raw_subject, expected) in cases.items():
+        msg = _email.message_from_bytes(b"Subject: " + raw_subject + b"\r\n\r\n")
+        assert decode_mime_header(msg.get("Subject")) == expected, name
+    assert decode_mime_header("") == ""
+    assert decode_mime_header(None) == ""
+
+
+def test_export_engines_use_the_same_decoder():
+    from mailarchiver.export import eml_engine, pst_native
+
+    raw = (b"Subject: " + "Тестовая тема".encode("cp1251") + b"\r\nFrom: "
+           + "Иванов".encode("cp1251") + b" <i@x.ru>\r\n\r\n" + "тело".encode("cp1251"))
+    import email as _email
+    msg = _email.message_from_bytes(raw)
+    assert pst_native._decode_hdr(msg.get("Subject")) == "Тестовая тема"
+    assert pst_native._decode_hdr(msg.get("From")) == "Иванов <i@x.ru>"
+    assert eml_engine.extract_subject(raw) == "Тестовая тема"
+
+
+def test_native_pst_reports_ansi_limit():
+    """Предел 2 ГБ — понятная ошибка, а не struct.error через час работы."""
+    from mailarchiver.errors import PstEngineError
+    from mailarchiver.export.pst_native import ANSI_PST_LIMIT_BYTES, PstWriter
+
+    writer = PstWriter()
+    assert ANSI_PST_LIMIT_BYTES < 2 * 1024 ** 3
+    # подсовываем узел, который заведомо переполняет файл
+    writer.nodes.append(type("N", (), {"nid": 1, "parent_nid": 0, "bid": 0,
+                                       "data": b"x" * 64})())
+    writer._buf = bytearray(512)
+    original = writer._block_bytes
+    writer._block_bytes = lambda data, bid, ib: b"x" * (ANSI_PST_LIMIT_BYTES + 1)
+    try:
+        with pytest.raises(PstEngineError) as err:
+            writer.build()
+        assert "ANSI" in str(err.value)
+    finally:
+        writer._block_bytes = original

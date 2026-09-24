@@ -28,12 +28,12 @@ import shutil
 import struct
 import tempfile
 import time
-from email.header import decode_header, make_header
 from html import unescape
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 from ..errors import PstEngineError
 from ..logging_setup import get_logger
+from ..util import decode_mime_header
 from .base import CancelCB, ExportEngine, ExportResult, MailItem, ProgressCB, folder_to_fs
 
 log = get_logger("export.native")
@@ -119,13 +119,18 @@ def _to_filetime(epoch: Optional[float]) -> int:
     return int((epoch + _FILETIME_EPOCH_DIFF) * 10_000_000)
 
 
-def _decode_hdr(value: str) -> str:
-    if not value:
-        return ""
-    try:
-        return str(make_header(decode_header(value)))
-    except Exception:  # noqa: BLE001
-        return value
+#: Предел формата ANSI PST. Реально спецификация даёт 2 ГБ; берём с запасом,
+#: чтобы служебные страницы BTree в конце файла гарантированно поместились.
+ANSI_PST_LIMIT_BYTES = 1_900_000_000
+
+
+def _decode_hdr(value) -> str:
+    """Заголовок письма в читаемом виде (см. util.decode_mime_header).
+
+    Принимает и ``str``, и объект ``Header``, который стандартный парсер
+    возвращает для заголовков с 8-битными байтами.
+    """
+    return decode_mime_header(value)
 
 
 def _part_text(part) -> str:
@@ -386,6 +391,15 @@ class PstWriter:
         for node in self.nodes:
             node.bid = self._alloc_bid()
             block = self._block_bytes(node.data, node.bid, ib)
+            if ib + len(block) > ANSI_PST_LIMIT_BYTES:
+                # Смещения в ANSI PST 32-битные, а сам формат ограничен 2 ГБ.
+                # Без этой проверки экспорт крупного ящика молча собирал бы
+                # нечитаемый файл, а за 4 ГБ падал с невнятным struct.error
+                # уже в самом конце — после часа работы.
+                raise PstEngineError(
+                    f"Файл .pst превысит предел формата ANSI ({ANSI_PST_LIMIT_BYTES // (1024**3)} ГБ).",
+                    hint="Разбейте экспорт по папкам или по датам, либо используйте движок Aspose "
+                         "(формат Unicode) или экспорт в EML/MBOX — у них такого ограничения нет.")
             self._buf += block
             # BBTENTRY (ANSI): bid(4), ib(4), cb(2), cRef(2)
             bbt_leaves.append((node.bid, struct.pack("<IIHH", node.bid, ib, len(node.data), 2)))
@@ -597,6 +611,15 @@ class NativePstExportEngine(ExportEngine):
                               warning="Файл .pst создан встроенным ЭКСПЕРИМЕНТАЛЬНЫМ движком. "
                                       "Обязательно проверьте открытие в вашей версии Outlook. "
                                       "Для гарантированного результата используйте движок Aspose или экспорт eml/mbox.")
+        # Встроенный движок пишет только ANSI. Молчать об этом нельзя: в диалоге
+        # экспорта по умолчанию выбран Unicode, и пользователь, выбравший его
+        # именно ради обхода предела 2 ГБ, получал бы ANSI-файл и тот же предел.
+        wanted_format = str((options or {}).get("pst_format") or "").strip().lower()
+        if wanted_format and wanted_format != "ansi":
+            result.warning = ("Встроенный движок умеет только формат ANSI (Outlook 97–2002) "
+                              "с пределом 2 ГБ — запрошенный Unicode он не поддерживает. "
+                              "Для Unicode используйте движок Aspose либо экспорт EML/MBOX. ") + result.warning
+            log.warning("Запрошен формат PST «%s», встроенный движок пишет ANSI.", wanted_format)
         writer = PstWriter()
         spool_dir = self._make_spool_dir(options)
         truncated = 0

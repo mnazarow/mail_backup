@@ -55,6 +55,9 @@ class Services:
         if self._started:
             return
         orphans = self.db.reset_orphan_jobs()
+        stale_runs = self.db.reset_orphan_runs()
+        if stale_runs:
+            log.info("Закрыто незавершённых записей прогонов: %d.", stale_runs)
         if orphans:
             log.warning("Обнаружено прерванных заданий при старте: %s (возвращены в очередь/помечены)", orphans)
         self.queue.start()
@@ -94,14 +97,28 @@ class Services:
     def iter_mail_items(self, account_id: int, folders: Optional[List[str]] = None,
                         date_from: Optional[str] = None, date_to: Optional[str] = None,
                         limit: int = 0) -> Iterator[MailItem]:
-        rows = []
-        if folders:
-            for fld in folders:
-                rows.extend(self.db.list_messages(account_id, folder=fld, limit=1_000_000))
-        else:
-            rows = self.db.list_messages(account_id, limit=1_000_000)
+        # Индекс читаем ПОСТРАНИЧНО. Раньше здесь был limit=1 000 000: весь
+        # индекс ящика материализовался в список до первого yield (на 200 000
+        # писем — сотни мегабайт сверх расхода самого движка экспорта), а ящик
+        # крупнее миллиона писем молча обрезался бы без единой ошибки.
+        page = 5000
+
+        def _rows() -> Iterator:
+            targets = list(folders) if folders else [None]
+            for fld in targets:
+                offset = 0
+                while True:
+                    chunk = self.db.list_messages(account_id, folder=fld, limit=page, offset=offset)
+                    if not chunk:
+                        break
+                    for item in chunk:
+                        yield item
+                    if len(chunk) < page:
+                        break
+                    offset += len(chunk)
+
         count = 0
-        for row in rows:
+        for row in _rows():
             idate = row["internaldate"] or ""
             # Сравниваем только календарные даты: internaldate хранится полной
             # меткой времени («2026-09-15T12:00:00+00:00»), а границы задаются

@@ -13,7 +13,7 @@ function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, c=>({'&':'&amp;
 function fmtDate(iso){ if(!iso) return '—'; try{ const d=new Date(iso); return d.toLocaleString('ru-RU',{day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'}); }catch(e){ return iso; } }
 function fmtBytes(n){ n=Number(n||0); const u=['Б','КБ','МБ','ГБ','ТБ']; let i=0; while(n>=1024&&i<u.length-1){n/=1024;i++;} return (i===0?n:n.toFixed(1))+' '+u[i]; }
 
-const State = { user:null, help:null, view:null, ws:null, wsTimer:null, engines:[], accounts:[] };
+const State = { user:null, help:null, view:null, ws:null, wsTimer:null, engines:[], accounts:[], logLevel:'' };
 
 async function api(path, opts={}){
   const o = Object.assign({headers:{}}, opts);
@@ -57,24 +57,39 @@ function helpIcon(entry){
 }
 
 // ---------- Модалки ----------
-function modal(title, bodyHtml, {wide=false, footer=''}={}){
-  const back = h(`<div class="modal-back"><div class="modal ${wide?'wide':''}">
-    <div class="modal-head"><h2>${esc(title)}</h2><span class="x">×</span></div>
+function modal(title, bodyHtml, {wide=false, footer='', onClose=null}={}){
+  const back = h(`<div class="modal-back" role="dialog" aria-modal="true"><div class="modal ${wide?'wide':''}">
+    <div class="modal-head"><h2>${esc(title)}</h2><button class="x" type="button" aria-label="Закрыть">×</button></div>
     <div class="modal-body">${bodyHtml}</div>
     ${footer?`<div class="modal-foot">${footer}</div>`:''}</div></div>`);
-  const onKey=(e)=>{ if(e.key==='Escape') close(); };
-  const close=()=>{ back.remove(); document.removeEventListener('keydown', onKey); };
+  // Escape закрывает только ВЕРХНИЙ диалог: раньше один Escape закрывал и
+  // подтверждение, и окно под ним.
+  const onKey=(e)=>{ if(e.key==='Escape' && back===document.querySelector('.modal-back:last-of-type')) close(); };
+  let closed=false;
+  const prevFocus=document.activeElement;
+  const close=()=>{
+    if(closed) return; closed=true;
+    back.remove(); document.removeEventListener('keydown', onKey);
+    if(prevFocus && prevFocus.focus) { try{ prevFocus.focus(); }catch(e){} }
+    if(onClose) onClose();               // закрытие крестиком/Escape/фоном — тоже ответ
+  };
   back.querySelector('.x').onclick=close;
   back.onclick=(e)=>{ if(e.target===back) close(); };
   document.addEventListener('keydown', onKey);
   document.body.appendChild(back);
+  const first=back.querySelector('input,select,textarea,button.primary,button');
+  if(first) { try{ first.focus(); }catch(e){} }
   return { el:back, close, body:back.querySelector('.modal-body'), foot:back.querySelector('.modal-foot') };
 }
 function confirmDlg(title, message, {okText='Подтвердить', okClass='danger'}={}){
   return new Promise(res=>{
-    const m=modal(title, `<p>${esc(message)}</p>`, {footer:`<button class="btn ghost" data-c>Отмена</button><button class="btn ${okClass}" data-ok>${esc(okText)}</button>`});
-    m.foot.querySelector('[data-c]').onclick=()=>{m.close();res(false);};
-    m.foot.querySelector('[data-ok]').onclick=()=>{m.close();res(true);};
+    // Промис обязан разрешиться при ЛЮБОМ закрытии: иначе «await confirmDlg»
+    // висел вечно, и кнопка выглядела сломанной.
+    const m=modal(title, `<p>${esc(message)}</p>`,
+      {onClose:()=>res(false),
+       footer:`<button class="btn ghost" data-c>Отмена</button><button class="btn ${okClass}" data-ok>${esc(okText)}</button>`});
+    m.foot.querySelector('[data-c]').onclick=()=>{m.close();};
+    m.foot.querySelector('[data-ok]').onclick=()=>{ res(true); m.close(); };
   });
 }
 
@@ -215,6 +230,10 @@ function startLive(){
     const proto = location.protocol==='https:'?'wss':'ws';
     const ws=new WebSocket(`${proto}://${location.host}/ws`);
     State.ws=ws;
+    // Как только сокет ожил — снимаем запасной опрос. Без этого после первого
+    // же обрыва связи опрос жил вечно ПАРАЛЛЕЛЬНО с сокетом, и каждая открытая
+    // вкладка постоянно дёргала /state (на 500 ящиках это заметная нагрузка).
+    ws.onopen=()=>{ if(State.wsTimer){ clearInterval(State.wsTimer); State.wsTimer=null; } };
     ws.onmessage=(ev)=>{ try{ const d=JSON.parse(ev.data); onLive(d); }catch(e){} };
     ws.onclose=()=>{ State.ws=null; if(!State.wsTimer) State.wsTimer=setInterval(pollLive, 3500); setTimeout(()=>{ if(!State.ws) startLive(); }, 8000); };
     ws.onerror=()=>{ try{ws.close();}catch(e){} };
@@ -225,7 +244,9 @@ function onLive(d){
   const ind=$('#schedInd'); if(ind) ind.innerHTML = d.scheduler_running ? '<span class="status-dot on"></span> Планировщик активен' : '<span class="status-dot off"></span> Планировщик выключен';
   if(State.view==='dashboard') updateDashboardLive(d);
   if(State.view==='jobs') updateJobsLive(d);
-  if(State.view==='logs' && d.logs) renderLogLines(d.logs);
+  // Живой поток отдаёт последние 40 строк ВСЕХ уровней: при выбранном фильтре
+  // он затирал отфильтрованный список, и фильтр выглядел сломанным.
+  if(State.view==='logs' && d.logs && !State.logLevel) renderLogLines(d.logs);
 }
 
 // ===================================================================
@@ -293,13 +314,21 @@ function accName(id){ const a=(State.accounts||[]).find(x=>x.id===id); return a?
 function renderAccountMini(accounts, box){
   if(!accounts.length){ box.innerHTML='<div class="empty">Нет ящиков. Добавьте первый.</div>'; return; }
   box.innerHTML='';
-  accounts.forEach(a=>{
+  // На дашборде показываем первые 12: рисовать все 500 строк с кнопками
+  // бессмысленно — полный список и отбор есть в разделе «Почтовые ящики».
+  const MINI_LIMIT=12;
+  const rest=accounts.length-MINI_LIMIT;
+  accounts.slice(0, MINI_LIMIT).forEach(a=>{
     const st=a.last_run?`<span class="badge ${a.last_run.status}">${esc(STATUS_LBL[a.last_run.status]||a.last_run.status)}</span>`:'<span class="tag">нет копий</span>';
     const row=h(`<div class="kv" style="align-items:center"><div style="flex:1"><strong>${esc(a.name)}</strong>${a.enabled?'':' <span class="tag">выключен</span>'}<div class="muted small">${esc(a.username)} · ${a.messages} писем · ${esc(a.bytes_h)}</div></div>${st}
       <button class="btn sm primary" data-bk="${a.id}" ${a.enabled?'':'disabled'} title="${a.enabled?'Сделать резервную копию этого ящика сейчас':'Ящик выключен — включите его, чтобы делать копии'}">💾 Копия сейчас</button></div>`);
     row.querySelector('[data-bk]').onclick=()=>backupNow(a.id, a.name);
     box.appendChild(row);
   });
+  if(rest>0){
+    const more=h(`<div class="kv" style="justify-content:center"><a href="#/accounts" class="muted small">…и ещё ${fmtNum(rest)} — открыть «Почтовые ящики»</a></div>`);
+    box.appendChild(more);
+  }
 }
 
 
@@ -767,7 +796,12 @@ async function viewAccounts(c){
       tb.appendChild(tr);
     });
   };
-  $('#accQ',bar).oninput=e=>{ Acc.query=e.target.value; render(); };
+  let accTimer=null;
+  $('#accQ',bar).oninput=e=>{
+    Acc.query=e.target.value;
+    // Задержка: без неё каждая буква пересобирала до 500 строк таблицы.
+    clearTimeout(accTimer); accTimer=setTimeout(render, 200);
+  };
   $('#accF',bar).onchange=e=>{ Acc.filter=e.target.value; render(); };
   $('#accReset',bar).onclick=()=>{ Acc.query=''; Acc.filter=''; $('#accQ',bar).value=''; $('#accF',bar).value=''; render(); };
   c.appendChild(wrap);
@@ -930,7 +964,9 @@ async function accountModal(id){
       <div class="form-row"><label>OAuth2 Refresh Token ${H('oauth_refresh_token')}</label><input id="f-ort" type="password" placeholder="${id?'без изменений':''}"></div>
       <div class="form-row"><label>OAuth2 Token URL ${H('oauth_token_url')}</label><input id="f-otu" type="text" value="${esc(a.oauth_token_url||'')}" placeholder="https://oauth2.googleapis.com/token"></div>
     </div>
+    <div class="form-row"><label>Копировать только папки ${H('folder_include')}</label><input id="f-inc" type="text" value="${esc((a.folder_include||[]).join(', '))}" placeholder="пусто — все папки"></div>
     <div class="form-row"><label>Исключить папки ${H('folder_exclude')}</label><input id="f-exc" type="text" value="${esc((a.folder_exclude||[]).join(', '))}" placeholder="Спам, Корзина"></div>
+    <div class="form-row"><label>Заметки</label><input id="f-notes" type="text" value="${esc(a.notes||'')}" placeholder="например: кто владелец ящика"></div>
     <div class="form-row"><label>Хранение локальных копий</label><select id="f-ret">
       <option value="-1"${(a.retention_days??-1)===-1?' selected':''}>По глобальной настройке</option>
       <option value="0"${a.retention_days===0?' selected':''}>Хранить всё (бессрочно)</option>
@@ -946,6 +982,11 @@ async function accountModal(id){
   const collect=()=>({name:g('#f-name').value,host:g('#f-host').value,port:parseInt(g('#f-port').value||'993'),username:g('#f-user').value,
      password:g('#f-pass').value,security:g('#f-sec').value,auth_type:g('#f-auth').value,enabled:g('#f-en').checked,
      folder_exclude:g('#f-exc').value.split(',').map(s=>s.trim()).filter(Boolean),
+     // Эти поля обязательно отправляем: сервер сохраняет их всегда, и раньше
+     // «Сохранить» (и даже «Проверить подключение») молча обнуляло белый список
+     // папок и заметки у ящиков, заведённых по шаблону сотрудников.
+     folder_include:g('#f-inc').value.split(',').map(s=>s.trim()).filter(Boolean),
+     notes:g('#f-notes').value,
      retention_days:parseInt(g('#f-ret').value),
      oauth_client_id:g('#f-ocid')?g('#f-ocid').value:'',oauth_client_secret:g('#f-ocs')?g('#f-ocs').value:'',
      oauth_refresh_token:g('#f-ort')?g('#f-ort').value:'',oauth_token_url:g('#f-otu')?g('#f-otu').value:''});
@@ -1078,9 +1119,15 @@ function importModal(a){
   m.foot.querySelector('[data-go]').onclick=async()=>{
     const f=m.body.querySelector('#i-file').files[0]; if(!f) return toast('Выберите файл','','warn');
     const fd=new FormData(); fd.append('file', f); fd.append('target_prefix', m.body.querySelector('#i-prefix').value);
-    try{ const btn=m.foot.querySelector('[data-go]'); btn.disabled=true; btn.innerHTML='<span class="spinner"></span> Загрузка…';
+    const btn=m.foot.querySelector('[data-go]');
+    btn.disabled=true; btn.innerHTML='<span class="spinner"></span> Загрузка…';
+    try{
       await api(`/accounts/${a.id}/import-pst`,{method:'POST',body:fd}); toast('Импорт запущен'); m.close(); location.hash='#/jobs';
-    }catch(e){toastErr(e);}
+    }catch(e){
+      // Без возврата кнопки диалог после ошибки приходилось закрывать и
+      // открывать заново — кнопка оставалась серой со спиннером.
+      toastErr(e); btn.disabled=false; btn.textContent='Загрузить и импортировать';
+    }
   };
 }
 
@@ -1251,7 +1298,8 @@ async function viewLogs(c){
   c.innerHTML=''; c.appendChild(h(`<div class="section-title"><h2 style="margin:0">Логи</h2><div class="spacer"></div>
     <select id="logLevel" style="width:auto;padding:6px 10px"><option value="">Все уровни</option><option>INFO</option><option>WARNING</option><option>ERROR</option></select></div>`));
   const box=h('<div class="card"><div class="log-view" id="logView"></div></div>'); c.appendChild(box);
-  const load=async()=>{ try{ const lv=$('#logLevel').value; const logs=await api('/logs?limit=400'+(lv?('&level='+lv):'')); renderLogLines(logs); }catch(e){toastErr(e);} };
+  const load=async()=>{ try{ const lv=$('#logLevel').value; State.logLevel=lv;
+    const logs=await api('/logs?limit=400'+(lv?('&level='+lv):'')); renderLogLines(logs); }catch(e){toastErr(e);} };
   $('#logLevel').onchange=load; await load();
 }
 function renderLogLines(logs){
@@ -1539,7 +1587,11 @@ function chartVBars(container, items, opts={}){
   });
 }
 function chartHBars(container, items, opts={}){
-  const rowH=opts.rowH||27, H=opts.height||(items.length*rowH+14), color=opts.color||cvar('--primary','#2f6fed');
+  const rowH=opts.rowH||27;
+  // Потолок высоты: холст выше ~8000 CSS-px после умножения на devicePixelRatio
+  // упирается в ограничение браузера и не рисуется вовсе.
+  const H=Math.min(8000, opts.height||(items.length*rowH+14));
+  const color=opts.color||cvar('--primary','#2f6fed');
   drawInto(container,H,(ctx,W)=>{
     const dim=cvar('--text-dim','#888'), txt=cvar('--text','#222');
     const n=items.length; if(!n){ cEmpty(ctx,W,H); return; }
@@ -1696,7 +1748,14 @@ async function viewAnalytics(c){
       <div class="card"><h3>🗄️ Хранилище по ящикам</h3><div class="table-wrap"><table class="tbl"><thead><tr><th>Ящик</th><th>Писем</th><th>Объём</th><th>Папок</th><th>Последний</th></tr></thead><tbody>${rows}</tbody></table></div></div>
       <div class="card"><h3>📊 Писем по ящикам</h3><div class="an-chart" id="accBars"></div></div></div>`);
     c.appendChild(stCard);
-    reg(()=>chartHBars($('#accBars',stCard), d.accounts.map(a=>({label:a.name,value:a.messages})), {colorByIndex:true, height:Math.max(90,d.accounts.length*32), labelChars:20}));
+    // Только первые 20 ящиков: на 500 холст вырастал до 16 000 CSS-пикселей
+    // (с учётом devicePixelRatio — за предел canvas в Safari, график просто
+    // не рисовался). Полный список всё равно есть в разделе «Почтовые ящики».
+    const accTop=[...d.accounts].sort((a,b)=>(b.messages||0)-(a.messages||0)).slice(0,20);
+    reg(()=>chartHBars($('#accBars',stCard), accTop.map(a=>({label:a.name,value:a.messages})), {colorByIndex:true, height:Math.max(90,accTop.length*32), labelChars:20}));
+    if(d.accounts.length>accTop.length){
+      stCard.appendChild(h(`<div class="muted small">Показаны 20 самых крупных ящиков из ${fmtNum(d.accounts.length)}.</div>`));
+    }
   }
 
   // Расписания и аудит

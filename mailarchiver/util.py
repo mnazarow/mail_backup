@@ -9,6 +9,7 @@ import re
 import tempfile
 import time
 import unicodedata
+from email.header import decode_header
 from datetime import datetime, timezone
 from functools import wraps
 from typing import Callable, Iterable, Optional, TypeVar
@@ -50,6 +51,50 @@ def human_duration(seconds: float) -> str:
     if seconds and not days:
         parts.append(f"{seconds} с")
     return " ".join(parts) if parts else "0 с"
+
+
+#: Кодировки, которыми пробуем читать 8-битный заголовок без RFC2047.
+#: utf-8 первым: он сам себя отсеивает на некорректных последовательностях,
+#: а cp1251 «читается» почти из любых байтов и молча даёт кракозябры.
+HEADER_FALLBACK_ENCODINGS = ("utf-8", "cp1251")
+
+
+def decode_mime_header(value) -> str:
+    """Расшифровать заголовок письма (Subject, From, To…).
+
+    Почему не ``str(make_header(decode_header(value)))``: на заголовке с
+    8-битной кириллицей БЕЗ RFC2047-кодирования (а так шлёт масса программ)
+    парсер помечает часть как ``unknown-8bit``, и ``make_header`` декодирует её
+    как ASCII — тема письма превращается в «????????». Байты при этом целы,
+    поэтому разбираем куски сами и подбираем кодировку.
+    """
+    if not value:
+        return ""
+    try:
+        parts = decode_header(value)
+    except Exception:  # noqa: BLE001 — заголовок может быть каким угодно
+        return str(value)
+    out = []
+    for chunk, charset in parts:
+        if isinstance(chunk, str):
+            # 8-битные байты пролезли сюда через surrogateescape — вернём их.
+            chunk = chunk.encode("utf-8", "surrogateescape")
+        name = (charset or "").lower()
+        if name in ("", "unknown-8bit", "unknown", "x-unknown", "8bit", "us-ascii"):
+            for candidate in HEADER_FALLBACK_ENCODINGS:
+                try:
+                    out.append(chunk.decode(candidate))
+                    break
+                except (UnicodeDecodeError, LookupError):
+                    continue
+            else:
+                out.append(chunk.decode("utf-8", "replace"))
+        else:
+            try:
+                out.append(chunk.decode(name, "replace"))
+            except LookupError:
+                out.append(chunk.decode("utf-8", "replace"))
+    return "".join(out)
 
 
 def human_size(num_bytes: float) -> str:
