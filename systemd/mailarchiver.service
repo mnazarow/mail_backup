@@ -15,6 +15,18 @@ Restart=on-failure
 RestartSec=5
 TimeoutStopSec=30
 
+# Лимиты ресурсов. MemoryMax не даёт одному тяжёлому заданию (крупный экспорт,
+# аналитика на большом архиве) утянуть за собой всю машину: служба будет
+# перезапущена, остальные сервисы выживут.
+# НЕ правьте этот файл: он перезаписывается при каждом обновлении. Свои
+# значения задавайте в дополнении:  sudo systemctl edit mailarchiver
+#   [Service]
+#   MemoryMax=8G
+MemoryMax=4G
+MemoryHigh=3G
+LimitNOFILE=8192
+TasksMax=512
+
 # Усиление безопасности (systemd sandbox)
 NoNewPrivileges=true
 ProtectSystem=full
@@ -23,6 +35,20 @@ PrivateTmp=true
 ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
+PrivateDevices=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+LockPersonality=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RemoveIPC=true
+# Сервису нужны только сеть (IMAP/HTTP) и unix-сокеты
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# Файлы данных (письма, БД, экспорты) — только владельцу службы
+UMask=0077
 ReadWritePaths=@DATADIR@
 
 [Install]

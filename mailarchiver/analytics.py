@@ -24,12 +24,13 @@
 """
 from __future__ import annotations
 
-import json
 import os
 import re
 import threading
 import time
+from array import array
 from collections import Counter, defaultdict
+from functools import lru_cache
 from datetime import datetime, timedelta, timezone
 from email.utils import getaddresses, parseaddr
 from typing import Callable, Dict, List, Optional
@@ -115,6 +116,70 @@ def _domain_of(addr: str) -> str:
 def _email_of(addr: str) -> str:
     _, email_addr = parseaddr(addr or "")
     return (email_addr or addr or "").lower().strip()
+
+
+
+#: Простой вид заголовка From: «Имя <user@host>» или просто «user@host».
+#: Покрывает подавляющее большинство реальных писем и разбирается в сотню раз
+#: быстрее, чем email.utils.parseaddr (машина состояний с посимвольным разбором).
+_SIMPLE_FROM_RE = re.compile(
+    r"""^\s*(?:(?P<name>[^"<>,;:\\]*?)\s*)?<?\s*(?P<addr>[^\s"<>,;:\\()\[\]]+@[^\s"<>,;:\\()\[\]]+)\s*>?\s*$"""
+)
+
+
+@lru_cache(maxsize=50000)
+def _addr_parts(frm: str):
+    """Разобрать заголовок From ОДИН раз → (email, отображаемое имя, домен).
+
+    Раньше на каждое письмо ``parseaddr`` вызывался трижды (_email_of,
+    parseaddr для имени, _domain_of): на 200 000 писем это 600 000 вызовов и
+    46 из 54 секунд расчёта. Теперь вызов один, к нему добавлены быстрый разбор
+    типового вида заголовка и кэш (в реальном архиве адреса повторяются
+    тысячами писем, и почти все вызовы попадают в кэш).
+    """
+    value = frm or ""
+    m = _SIMPLE_FROM_RE.match(value)
+    if m:
+        em = m.group("addr").lower()
+        name = (m.group("name") or "").strip()
+    else:
+        name, addr = parseaddr(value)
+        em = (addr or value).lower().strip()
+        name = name or ""
+    dom = em.rsplit("@", 1)[1].strip(">").strip() if "@" in em else ""
+    return em, name, dom
+
+
+#: Кэш готовой аналитики писем: ключ → (метка времени, число писем, результат).
+#: Расчёт обходит весь индекс, поэтому каждое открытие вкладки считало всё
+#: заново — на большом архиве это минуты работы и сотни мегабайт памяти.
+_MAIL_CACHE: Dict = {}
+_MAIL_CACHE_TTL_S = 300.0
+_mail_cache_lock = threading.Lock()
+
+
+def _mail_cache_get(key, count: int):
+    with _mail_cache_lock:
+        item = _MAIL_CACHE.get(key)
+    if not item:
+        return None
+    ts, cached_count, value = item
+    if cached_count != count or (time.time() - ts) > _MAIL_CACHE_TTL_S:
+        return None
+    return value
+
+
+def _mail_cache_put(key, count: int, value) -> None:
+    with _mail_cache_lock:
+        if len(_MAIL_CACHE) > 64:
+            _MAIL_CACHE.clear()
+        _MAIL_CACHE[key] = (time.time(), count, value)
+
+
+def invalidate_mail_analytics_cache() -> None:
+    """Сбросить кэш аналитики (после бэкапа, восстановления, очистки)."""
+    with _mail_cache_lock:
+        _MAIL_CACHE.clear()
 
 
 def _top(counter: Counter, n: int) -> List[Dict]:
@@ -384,10 +449,21 @@ def system_analytics(svc, account_id: Optional[int] = None, *, days: int = 90) -
 # ===========================================================================
 #  АНАЛИТИКА ПИСЕМ (по метаданным индекса)
 # ===========================================================================
-def mail_analytics(svc, account_id: Optional[int] = None) -> Dict:
+def mail_analytics(svc, account_id: Optional[int] = None, use_cache: bool = True) -> Dict:
     db = svc.db
-    rows = db.index_rows_for_analytics(account_id)
-    total = len(rows)
+    # Индекс обходим ПОТОКОМ: прежняя выборка списком занимала ~140 МБ на
+    # 200 000 писем, и это до всех накопителей внутри цикла.
+    expected = db.count_messages(account_id)
+    if use_cache:
+        cached = _mail_cache_get(("mail", account_id), expected)
+        if cached is not None:
+            return cached
+    rows = db.iter_index_rows_for_analytics(account_id)
+    total = 0
+    try:
+        local_tz = svc.local_tz()
+    except Exception:  # noqa: BLE001
+        local_tz = timezone.utc
 
     senders: Counter = Counter()
     sender_names: Dict[str, str] = {}
@@ -404,10 +480,16 @@ def mail_analytics(svc, account_id: Optional[int] = None) -> Dict:
     total_bytes = 0
     seen = flagged = answered = draft = with_attach = 0
     reply_cnt = forward_cnt = empty_subject = 0
-    sizes: List[int] = []
-    dates: List[datetime] = []
+    # Массив вместо списка: нужен только для медианы, а array("q") хранит
+    # 8 байт на число вместо ~36 у списка Python-объектов.
+    sizes = array("q")
+    # Для дат достаточно минимума и максимума — список из сотен тысяч
+    # datetime держать незачем.
+    dmin_dt: Optional[datetime] = None
+    dmax_dt: Optional[datetime] = None
 
     for r in rows:
+        total += 1
         size = r["size"] or 0
         total_bytes += size
         sizes.append(size)
@@ -432,21 +514,25 @@ def mail_analytics(svc, account_id: Optional[int] = None) -> Dict:
         fld = r["folder"] or "—"
         by_folder_cnt[fld] += 1
         by_folder_bytes[fld] += size
-        # отправитель / домен
+        # отправитель / домен — один разбор адреса на письмо (с кэшем)
         frm = r["from_addr"] or ""
-        em = _email_of(frm)
+        em, name, dom = _addr_parts(frm)
         if em:
             senders[em] += 1
-            name, _addr = parseaddr(frm)
             if name and em not in sender_names:
                 sender_names[em] = name
-        dom = _domain_of(frm)
         if dom:
             domains[dom] += 1
         # дата → год/месяц/день недели/час/тепловая карта
         dt = _parse_dt(r["internaldate"])
         if dt:
-            dates.append(dt)
+            # Часы, дни недели и месяцы — по часам ПОЛЬЗОВАТЕЛЯ: в UTC рабочий
+            # день 9–17 по Москве выглядел как 06–14.
+            dt = dt.astimezone(local_tz)
+            if dmin_dt is None or dt < dmin_dt:
+                dmin_dt = dt
+            if dmax_dt is None or dt > dmax_dt:
+                dmax_dt = dt
             by_year[dt.strftime("%Y")] += 1
             by_month[dt.strftime("%Y-%m")] += 1
             wd = dt.weekday()
@@ -474,6 +560,11 @@ def mail_analytics(svc, account_id: Optional[int] = None) -> Dict:
         keys = sorted(by_month.keys())
         y0, m0 = int(keys[0][:4]), int(keys[0][5:7])
         y1, m1 = int(keys[-1][:4]), int(keys[-1][5:7])
+        # Не больше 400 ПОСЛЕДНИХ месяцев: одно письмо с датой 1970 года раньше
+        # обрезало график на 2003 году, и свежих месяцев не было видно вовсе.
+        if (y1 * 12 + m1) - (y0 * 12 + m0) >= 400:
+            start = y1 * 12 + (m1 - 1) - 399
+            y0, m0 = start // 12, start % 12 + 1
         y, m = y0, m0
         guard = 0
         while (y, m) <= (y1, m1) and guard < 400:
@@ -485,11 +576,12 @@ def mail_analytics(svc, account_id: Optional[int] = None) -> Dict:
                 y += 1
             guard += 1
 
-    sizes.sort()
-    median = sizes[len(sizes) // 2] if sizes else 0
-    dmin = min(dates).isoformat() if dates else None
-    dmax = max(dates).isoformat() if dates else None
-    span_days = ((max(dates) - min(dates)).days + 1) if dates else 0
+    sorted_sizes = sorted(sizes)
+    median = sorted_sizes[len(sorted_sizes) // 2] if sorted_sizes else 0
+    del sorted_sizes
+    dmin = dmin_dt.isoformat() if dmin_dt else None
+    dmax = dmax_dt.isoformat() if dmax_dt else None
+    span_days = ((dmax_dt - dmin_dt).days + 1) if (dmin_dt and dmax_dt) else 0
     avg_per_day = round(total / span_days, 1) if span_days else 0
 
     largest = [{"subject": r["subject"] or "(без темы)", "from": r["from_addr"] or "",
@@ -497,7 +589,7 @@ def mail_analytics(svc, account_id: Optional[int] = None) -> Dict:
                 "date": r["internaldate"]}
                for r in db.largest_messages(account_id, limit=10)]
 
-    return {
+    result = {
         "scope": {"account_id": account_id},
         "overview": {
             "messages": total, "bytes": total_bytes, "bytes_h": human_size(total_bytes),
@@ -536,6 +628,10 @@ def mail_analytics(svc, account_id: Optional[int] = None) -> Dict:
                          {"label": "Без вложений", "value": total - with_attach}],
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
+    # Кладём в кэш ВСЕГДА (use_cache управляет только чтением): иначе принудительное
+    # обновление оставляло кэш пустым и следующий же запрос считал всё заново.
+    _mail_cache_put(("mail", account_id), total, result)
+    return result
 
 
 # ===========================================================================
@@ -578,7 +674,7 @@ def deep_scan(svc, account_id: Optional[int] = None,
               cancel_cb: Optional[Callable] = None,
               event_cb: Optional[Callable] = None) -> Dict:
     """Тяжёлый разбор писем: типы вложений, домены получателей, тело, язык, слова."""
-    from .mailview import parse_message
+    from .mailview import summarize_source
 
     db = svc.db
     # Обходим индекс ПОСТРАНИЧНО. Единым запросом с limit=1_000_000 брать нельзя:
@@ -589,17 +685,17 @@ def deep_scan(svc, account_id: Optional[int] = None,
     total = sum(db.count_messages(aid) for aid in account_ids)
 
     def _iter_rows():
+        # По первичному ключу, а не «дата + OFFSET»: OFFSET на сотнях тысяч
+        # писем квадратичен и сбивается, если параллельно идёт бэкап.
         for aid in account_ids:
-            offset = 0
+            last_id = 0
             while True:
-                page = db.list_messages(aid, limit=_SCAN_PAGE_SIZE, offset=offset)
+                page = db.messages_after_id(aid, last_id, limit=_SCAN_PAGE_SIZE)
                 if not page:
                     break
                 for row in page:
                     yield row
-                if len(page) < _SCAN_PAGE_SIZE:
-                    break
-                offset += _SCAN_PAGE_SIZE
+                last_id = int(page[-1]["id"])
 
     ext_counter: Counter = Counter()
     ctype_counter: Counter = Counter()
@@ -620,8 +716,13 @@ def deep_scan(svc, account_id: Optional[int] = None,
             from .errors import JobCancelled
             raise JobCancelled("Глубокий анализ отменён пользователем.")
         try:
-            raw = svc.store.read_message(row["account_id"], row["stored_path"])
-            parsed = parse_message(raw)
+            # Через источник, а не байты: крупные письма (свыше 25 МБ) раньше
+            # разбирались только по заголовкам, и их вложения — самые тяжёлые в
+            # архиве — выпадали из статистики. Потоковый разбор даёт полный
+            # список вложений без загрузки письма в память.
+            aid, stored = row["account_id"], row["stored_path"]
+            size = svc.store.message_size(aid, stored)
+            parsed = summarize_source(lambda: svc.store.open_message(aid, stored), size)
         except Exception:  # noqa: BLE001
             errors += 1
             continue

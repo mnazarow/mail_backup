@@ -24,11 +24,12 @@ FROM python:3.12-slim
 
 LABEL org.opencontainers.image.title="MailArchiver" \
       org.opencontainers.image.description="Резервное копирование почтовых ящиков по IMAP с веб-интерфейсом" \
-      org.opencontainers.image.version="1.1.0"
+      org.opencontainers.image.version="1.4.0"
 
-# readpst нужен только для импорта .pst; ca-certificates — для TLS/OAuth2
+# readpst нужен только для импорта .pst; ca-certificates — для TLS/OAuth2;
+# rsync и ssh — для копии архива на другой сервер по SSH
 RUN apt-get update \
- && apt-get install -y --no-install-recommends pst-utils ca-certificates curl \
+ && apt-get install -y --no-install-recommends pst-utils ca-certificates curl rsync openssh-client \
  && rm -rf /var/lib/apt/lists/*
 
 # непривилегированный пользователь

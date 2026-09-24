@@ -8,27 +8,52 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    image: mailarchiver:1.1.0
+    image: mailarchiver:1.4.0
     container_name: mailarchiver
     restart: unless-stopped
     ports:
-      - "8493:8493"           # веб-интерфейс (host:container)
+      # Только петлевой интерфейс: у сервиса нет TLS, а интерфейс даёт полный
+      # доступ ко всем архивам почты. Наружу публикуйте через reverse proxy
+      # с HTTPS (и тогда укажите server.behind_proxy + server.trusted_proxies).
+      - "127.0.0.1:8493:8493"
     volumes:
       - mailarchiver-data:/data   # БД, локальные копии писем, экспорты
-      # Чтобы забирать экспортированные файлы напрямую, можно смонтировать хост-каталог:
+      # Чтобы забирать экспортированные файлы напрямую, можно смонтировать хост-каталог.
+      # Создайте его ЗАРАНЕЕ и отдайте пользователю контейнера (uid 10001) — иначе
+      # Docker создаст его от root, и выгрузки не запишутся:
+      #   mkdir -p exports && sudo chown 10001:10001 exports
       # - ./exports:/data/exports
     environment:
       MA_HOST: "0.0.0.0"
       MA_PORT: "8493"
-      # Автосоздание администратора при первом запуске (можно убрать после старта):
-      MA_ADMIN_USER: "admin"
-      MA_ADMIN_PASSWORD: "СменитеЭтотПароль123"
       TZ: "Europe/Moscow"
+      # Автосоздание администратора при первом запуске — НЕОБЯЗАТЕЛЬНО.
+      # Пароль в этом файле НЕ ЗАДАН намеренно: он попал бы в репозиторий.
+      # Задайте его одним из двух способов:
+      #   1) файл-секрет (предпочтительно). Файл монтируется как есть, поэтому
+      #      читать его должен пользователь контейнера (uid 10001):
+      #        echo -n 'ваш-пароль' > ./admin_password.txt
+      #        sudo chown 10001 ./admin_password.txt && chmod 400 ./admin_password.txt
+      #      и раскомментируйте MA_ADMIN_USER + MA_ADMIN_PASSWORD_FILE и блок secrets ниже;
+      #   2) переменная окружения из .env (не коммитьте его):
+      #        MA_ADMIN_USER + MA_ADMIN_PASSWORD
+      # Без пароля администратор не создаётся — заведите его первым входом
+      # в интерфейс (мастер первичной настройки) или командой:
+      #   docker compose exec mailarchiver mailarchiver create-admin -u admin
+      # MA_ADMIN_USER: "admin"
+      # MA_ADMIN_PASSWORD_FILE: "/run/secrets/ma_admin_password"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8493/health"]
       interval: 30s
       timeout: 5s
       retries: 3
+
+    # secrets:
+    #   - ma_admin_password
+
+# secrets:
+#   ma_admin_password:
+#     file: ./admin_password.txt
 
 volumes:
   mailarchiver-data:

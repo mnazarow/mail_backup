@@ -4,6 +4,7 @@ import io
 import pytest
 
 from mailarchiver.employees import parse_employee_file, sync_employees
+from mailarchiver.errors import ValidationError
 from mailarchiver.models import Account
 
 CSV_COMMA = (
@@ -157,6 +158,7 @@ def test_sync_creates_disabled_accounts(services):
 
 def test_sync_links_existing_account(services):
     """Если ящик с таким логином уже заведён — привязываем его, а не создаём новый."""
+    services.set_rt("employees", "account_host", "imap.example.ru")
     account_id = services.db.create_account(
         Account(name="Почта Иванова", host="imap.example.ru", username="ivanov@example.ru", enabled=True))
     rows, _ = parse_employee_file(CSV_COMMA.encode("utf-8"), "e.csv")
@@ -216,6 +218,8 @@ def test_employees_require_auth(client):
 
 def test_employees_crud_api(client):
     _login(client)
+    # без сервера в шаблоне ящик не заводится — задаём его
+    client.put("/api/settings", json={"values": {"employees.account_host": "imap.example.ru"}})
     empty = client.get("/api/employees").json()
     assert empty["employees"] == [] and empty["total"] == 0
     assert empty["counts"] == {"active": 0, "archived": 0, "with_account": 0, "without_account": 0}
@@ -396,3 +400,75 @@ def test_scheduler_registers_employees_sync(services):
         assert services.scheduler._sched.get_job(job_id) is None
     finally:
         services.scheduler.stop()
+
+
+def test_sync_without_host_links_but_does_not_create(services):
+    """Сервер в шаблоне не задан: существующие ящики привязываются, новые не заводятся."""
+    account_id = services.db.create_account(
+        Account(name="Почта Иванова", host="imap.example.ru", username="ivanov@example.ru", enabled=True))
+    rows, _ = parse_employee_file(CSV_COMMA.encode("utf-8"), "e.csv")
+    result = sync_employees(services, rows, create_accounts=True)
+    assert result["accounts_linked"] == 1 and result["accounts_created"] == 0
+    assert result["warnings"] and "IMAP-сервер" in result["warnings"][0]
+    assert services.db.get_employee_by_email("ivanov@example.ru")["account_id"] == account_id
+
+
+def test_deleted_account_is_not_recreated(services):
+    """Ящик, удалённый администратором, ночная синхронизация не пересоздаёт."""
+    services.set_rt("employees", "account_host", "imap.example.ru")
+    rows, _ = parse_employee_file(CSV_COMMA.encode("utf-8"), "e.csv")
+    first = sync_employees(services, rows, create_accounts=True)
+    assert first["accounts_created"] == 2
+    emp = services.db.get_employee_by_email("petrova@example.ru")
+    services.db.delete_account(emp["account_id"])
+    again = sync_employees(services, rows, create_accounts=True)
+    assert again["accounts_created"] == 0
+    assert services.db.get_employee_by_email("petrova@example.ru")["account_id"] is None
+
+
+def test_parallel_sync_is_refused_for_upload(services):
+    from mailarchiver import employees as emp_mod
+    rows, _ = parse_employee_file(CSV_COMMA.encode("utf-8"), "e.csv")
+    with emp_mod._SYNC_LOCK:
+        with pytest.raises(ValidationError):
+            sync_employees(services, rows, create_accounts=False, wait=False)
+
+
+def test_email_column_found_by_content_and_free_header():
+    """«Электронная почта» и колонка адресов без узнаваемого заголовка распознаются,
+    а «Адрес» (почтовый) не перекрывает настоящую почту."""
+    data = ("ФИО;Адрес;Электронная почта сотрудника\n"
+            "Иванов Иван;г. Челябинск, ул. Ленина 1;ivanov@example.ru\n"
+            "Петрова Анна;г. Москва;petrova@example.ru\n").encode("utf-8")
+    rows, _ = parse_employee_file(data, "e.csv")
+    assert [r["email"] for r in rows] == ["ivanov@example.ru", "petrova@example.ru"]
+    data = ("ФИО;Контакт\nИванов Иван;ivanov@example.ru\nПетрова Анна;petrova@example.ru\n").encode("utf-8")
+    rows, _ = parse_employee_file(data, "e.csv")
+    assert rows[0]["email"] == "ivanov@example.ru"
+
+
+def test_whole_column_is_checked_for_dismissed():
+    """«нет» только в конце длинного списка — колонка «работает» всё равно распознаётся."""
+    lines = ["ФИО;E-mail;"] + [f"Сотрудник {i};u{i}@example.ru;да" for i in range(100)] \
+        + ["Уволенный;gone@example.ru;нет"]
+    rows, _ = parse_employee_file("\n".join(lines).encode("utf-8"), "e.csv")
+    assert [r["email"] for r in rows if r["inactive"]] == ["gone@example.ru"]
+
+
+def test_email_is_filled_into_card_found_by_name(services):
+    """Карточка без почты (колонку раньше не распознали) дозаполняется, а не дублируется."""
+    first = ("ФИО;Должность\nИванов Иван;Менеджер\n").encode("utf-8")
+    rows, _ = parse_employee_file(first, "e.csv")
+    sync_employees(services, rows, create_accounts=False)
+    second = ("ФИО;E-mail\nИванов Иван;ivanov@example.ru\n").encode("utf-8")
+    rows, _ = parse_employee_file(second, "e.csv")
+    result = sync_employees(services, rows, create_accounts=False)
+    assert result["created"] == 0 and services.db.count_employees() == 1
+    assert services.db.get_employee_by_email("ivanov@example.ru") is not None
+
+
+def test_header_row_below_report_title():
+    data = ("Список сотрудников на 01.09.2026;;\nФИО;E-mail;Отдел\nИванов Иван;ivanov@example.ru;Продажи\n"
+            ).encode("utf-8")
+    rows, _ = parse_employee_file(data, "e.csv")
+    assert rows[0]["full_name"] == "Иванов Иван" and rows[0]["department"] == "Продажи"

@@ -21,6 +21,7 @@ from ..errors import (
     ImapConnectionError,
     ImapProtocolError,
     ImapTimeoutError,
+    MailArchiverError,
 )
 from ..logging_setup import get_logger
 from ..models import Account, AuthType, Security
@@ -28,13 +29,33 @@ from .oauth import refresh_access_token
 
 log = get_logger("imap")
 
+# imaplib отвергает строки ответа длиннее _MAXLINE (1 МБ). Ответ `* SEARCH 1 2 3 …`
+# приходит ОДНОЙ строкой, и на папке примерно от 125–160 тысяч писем он
+# длиннее: раньше это роняло копирование всего ящика («got more than 1000000
+# bytes»). Поднимаем предел; сам поиск на больших папках к тому же идёт
+# диапазонами UID (см. ImapConnection.search_uids).
+_MAXLINE_WANTED = 256 * 1024 * 1024
+if getattr(imaplib, "_MAXLINE", 0) < _MAXLINE_WANTED:
+    imaplib._MAXLINE = _MAXLINE_WANTED  # noqa: SLF001
+
+#: Папки больше этого числа писем ищутся диапазонами UID, а не одним SEARCH ALL.
+SEARCH_RANGE_THRESHOLD = 100_000
+#: На сколько диапазонов делить пространство UID (не меньше 100 000 UID в диапазоне).
+SEARCH_RANGE_PARTS = 50
+
+#: Коды ответа LOGIN, означающие временный отказ (RFC 5530): стоит повторить позже.
+_TEMPORARY_LOGIN_CODES = ("[unavailable]", "[inuse]", "[limit]", "[serverbug]", "[contactadmin]")
+
 # Целевой СУММАРНЫЙ объём одной порции FETCH (байты). Порция набирается по
 # размеру писем, а не по их количеству: батч из 200 писем с вложениями по
 # 20-30 МБ забирал бы в память несколько гигабайт за один запрос (OOM).
 FETCH_CHUNK_TARGET_BYTES = 64 * 1024 * 1024
 # Сколько UID спрашивать за один запрос размеров: ответ на (RFC822.SIZE)
-# крошечный, поэтому порция здесь заметно крупнее порции загрузки.
-SIZE_PROBE_BATCH_SIZE = 2000
+# крошечный, поэтому порция здесь заметно крупнее порции загрузки. Но не
+# больше 1000: IMAPClient перечисляет номера через запятую, и строка команды
+# на 1000 семизначных UID — около 8 КБ (столько советует не превышать RFC 7162;
+# часть серверов длинные команды отвергает).
+SIZE_PROBE_BATCH_SIZE = 1000
 # Во что оценивать письмо, размер которого сервер не сообщил. Нужно только
 # для набора порции: без оценки такие письма считались бы «нулевыми» и порция
 # опять набиралась бы одним лишь количеством.
@@ -60,7 +81,7 @@ SELECT_RETRY_DELAY_S = 1.5
 # Общая формулировка библиотеки вокруг ответа сервера: imapclient формирует
 # сообщение как "<команда> failed: <ответ сервера>". Разворачиваем её, чтобы
 # в лог попали именно слова сервера.
-_LIB_WRAPPER_RE = re.compile(r"^\s*[A-Za-z]+ (?:failed|command error):\s*(?P<reply>.+)$", re.S)
+_LIB_WRAPPER_RE = re.compile(r"^\s*(?:[a-z_]+ failed|[A-Z]+ command error):\s*(?P<reply>.+)$", re.S)
 
 # Untagged-строки, в которых серверы объясняют отказ.
 _SERVER_NOTICE_KEYS = ("NO", "BAD", "ALERT", "BYE")
@@ -72,6 +93,11 @@ class ConnectOptions:
     socket_timeout_s: int = 120
     verify_ssl: bool = True
     fetch_batch_size: int = 200
+    #: вызывается, когда сервер OAuth2 выдал новый refresh-токен: (ящик, токен)
+    on_refresh_token: Optional[Callable] = None
+    #: вход администратора почты в чужой ящик (ящики с auth_type=master):
+    #: {"host", "user", "password", "mode": sasl_plain|separator, "separator"}
+    master: Optional[dict] = None
 
 
 @dataclass
@@ -98,6 +124,14 @@ def _map_exception(exc: BaseException) -> Exception:
         return ImapAuthError("Аутентификация IMAP не удалась (неверные логин/пароль или требуется пароль приложения).",
                              hint="Для Gmail/Mail.ru/Яндекс включите доступ по IMAP и используйте пароль приложения, либо OAuth2.",
                              cause=exc)
+    if isinstance(exc, imaplib.IMAP4.abort):
+        # Сервер закрыл соединение (EOF, «* BYE», сброс). imaplib сообщает это
+        # подклассом IMAP4.error, и раньше обрыв превращался в «ошибку
+        # протокола» — то есть в отказ КОНКРЕТНОЙ папки: исправные папки
+        # копили неудачи, а повтор задания не срабатывал.
+        return ImapConnectionError(f"Соединение с IMAP-сервером прервано: {_server_reply(exc) or exc}",
+                                   hint="Сервер закрыл сеанс. Если это повторяется, проверьте нагрузку "
+                                        "и лимиты сеансов на почтовом сервере.", cause=exc)
     if isinstance(exc, imaplib.IMAP4.error):
         text = str(exc).lower()
         if "auth" in text or "login" in text or "credential" in text:
@@ -119,11 +153,28 @@ def _is_already_exists_error(exc: BaseException) -> bool:
     return any(marker in text for marker in _ALREADY_EXISTS_MARKERS)
 
 
+_BYTES_REPR_RE = re.compile(r"""^b(['"])(?P<body>.*)\1$""", re.S)
+
+
 def _as_text(value) -> str:
-    """Привести кусок ответа сервера (bytes/str/что угодно) к строке."""
+    """Привести кусок ответа сервера (bytes/str/что угодно) к строке.
+
+    IMAPClient кладёт в текст ошибки входа ``str(bytes)`` — «b'[ALERT] …'»;
+    такую обёртку снимаем, чтобы администратор видел слова сервера как есть.
+    """
     if isinstance(value, (bytes, bytearray)):
         return bytes(value).decode("utf-8", "replace")
-    return str(value)
+    text = str(value)
+    match = _BYTES_REPR_RE.match(text.strip())
+    if match:
+        body = match.group("body")
+        try:
+            import ast
+            decoded = ast.literal_eval("b" + match.group(1) + body + match.group(1))
+            return decoded.decode("utf-8", "replace")
+        except (ValueError, SyntaxError):
+            return body
+    return text
 
 
 def _server_reply(exc: BaseException) -> str:
@@ -170,18 +221,77 @@ def _server_notices(client) -> str:
     return "; ".join(out)
 
 
-def _header_message_id(raw_header) -> str:
-    """Достать значение Message-ID из куска заголовков, отданного сервером."""
+def header_value(raw_header, name: str) -> str:
+    """Значение заголовка из блока заголовков, со склейкой свёрнутых строк.
+
+    ``Message-ID:\r\n <id@host>`` — законная запись (RFC 5322 «folding»):
+    раньше в таком случае значение получалось пустым, и проверка дублей при
+    восстановлении для таких писем не работала.
+    """
     if not raw_header:
         return ""
-    if isinstance(raw_header, bytes):
-        text = raw_header.decode("latin-1", "ignore")
+    if isinstance(raw_header, (bytes, bytearray)):
+        text = bytes(raw_header).decode("latin-1", "ignore")
     else:
         text = str(raw_header)
-    for line in text.splitlines():
-        if line.lower().startswith("message-id:"):
-            return line.split(":", 1)[1].strip()
+    want = name.lower() + ":"
+    lines = text.replace("\r\n", "\n").split("\n")
+    for i, line in enumerate(lines):
+        if not line.strip():
+            break                      # конец блока заголовков
+        if line.lower().startswith(want):
+            value = line.split(":", 1)[1]
+            j = i + 1
+            while j < len(lines) and lines[j][:1] in (" ", "\t"):
+                value += " " + lines[j].strip()
+                j += 1
+            return value.strip()
     return ""
+
+
+def _header_message_id(raw_header) -> str:
+    """Достать значение Message-ID из куска заголовков, отданного сервером."""
+    return header_value(raw_header, "Message-ID")
+
+
+def uid_set(uids) -> str:
+    """Свернуть список UID в компактный набор IMAP: [1,2,3,5,7,8] → «1:3,5,7:8».
+
+    Для SEARCH: там IMAPClient передаёт набор как есть, а перечисление номеров
+    через запятую занимало бы килобайты одной строкой. (В FETCH так нельзя:
+    IMAPClient сверяет ответ со списком номеров и строку-набор не понимает.)
+    """
+    ordered = sorted(set(int(u) for u in uids))
+    parts: List[str] = []
+    i = 0
+    while i < len(ordered):
+        start = end = ordered[i]
+        while i + 1 < len(ordered) and ordered[i + 1] == end + 1:
+            i += 1
+            end = ordered[i]
+        parts.append(str(start) if start == end else f"{start}:{end}")
+        i += 1
+    return ",".join(parts)
+
+
+def folder_matches(name: str, patterns, delimiter: str) -> bool:
+    """Подходит ли папка под шаблоны include/exclude.
+
+    Шаблон «Архив» задаёт и саму папку, и всё, что вложено в неё («Архив/2020»).
+    Регистр не важен. Одна и та же функция используется копированием и
+    диагностикой папок — иначе диагностика показывала бы «потерянными» папки,
+    которые копирование намеренно пропускает.
+    """
+    delimiter = delimiter or "/"
+    low = name.lower()
+    for p in patterns or ():
+        p = str(p or "").strip()
+        if not p:
+            continue
+        pl = p.lower()
+        if low == pl or low.startswith(pl + delimiter.lower()):
+            return True
+    return False
 
 
 def _plan_size_chunks(uids: List[int], sizes: Dict[int, int], max_count: int,
@@ -214,6 +324,8 @@ class ImapConnection:
         self.opt = options or ConnectOptions()
         self.client: Optional[IMAPClient] = None
         self._delimiter: str = "/"
+        #: имена папок, которые сервер прислал в неверной кодировке (пропущены)
+        self.bad_folder_names: List[str] = []
 
     # -- контекстный менеджер -----------------------------------------------
     def __enter__(self) -> "ImapConnection":
@@ -257,12 +369,25 @@ class ImapConnection:
             # Запоминаем клиента СРАЗУ после конструктора: если STARTTLS (или
             # логин) упадёт, close() всё равно закроет уже открытый сокет.
             self.client = client
+            # Даты — с часовым поясом. По умолчанию IMAPClient переводит их в
+            # «наивное» местное время текущего смещения, а .timestamp() потом
+            # применяет правила пояса НА ДАТУ ПИСЬМА: письма из периода с другим
+            # смещением (летнее время, Москва 2011–2014) сдвигались на час.
+            try:
+                client.normalise_times = False
+            except Exception:  # noqa: BLE001
+                pass
             if acc.security == Security.STARTTLS:
                 client.starttls(self._ssl_context())
             self._login()
             log.info("Подключение к ящику «%s» (%s:%s) установлено", acc.name, acc.host, acc.port)
         except (LoginError, ImapAuthError):
             self.close()
+            raise
+        except MailArchiverError:
+            # уже понятная ошибка (временный отказ входа, сбой сервера токенов
+            # OAuth2) — пробрасываем как есть, не превращая в «неожиданную»
+            self.close(force=True)
             raise
         except Exception as exc:  # noqa: BLE001
             # ошибка уровня сети/TLS — сокет наверняка непригоден, рвём сразу
@@ -274,19 +399,84 @@ class ImapConnection:
         assert self.client is not None
         try:
             if acc.auth_type == AuthType.OAUTH2:
-                access, _exp = refresh_access_token(
+                access, _exp, new_refresh = refresh_access_token(
                     acc.oauth_token_url, acc.oauth_client_id, acc.oauth_client_secret,
                     acc.oauth_refresh_token, timeout=self.opt.connect_timeout_s,
+                    with_refresh=True,
                 )
+                if new_refresh and new_refresh != acc.oauth_refresh_token:
+                    # Microsoft 365 выдаёт новый refresh-токен при каждом обновлении,
+                    # а старый со временем истекает: без сохранения копирование через
+                    # несколько месяцев переставало бы входить в ящик.
+                    acc.oauth_refresh_token = new_refresh
+                    if self.opt.on_refresh_token is not None:
+                        try:
+                            self.opt.on_refresh_token(acc, new_refresh)
+                        except Exception as cb_exc:  # noqa: BLE001
+                            log.warning("Не удалось сохранить новый refresh-токен ящика «%s»: %s",
+                                        acc.name, cb_exc)
                 self.client.oauth2_login(acc.username, access)
+            elif acc.auth_type == AuthType.MASTER:
+                self._master_login()
             else:
                 self.client.login(acc.username, acc.password)
         except LoginError as exc:
+            if acc.auth_type == AuthType.MASTER:
+                reply = _server_reply(exc)
+                text = "Вход через учётную запись администратора почты отклонён сервером."
+                if reply:
+                    text += f" Ответ сервера: «{reply}»."
+                raise ImapAuthError(
+                    text,
+                    hint="Проверьте логин и пароль администратора почты и способ входа («Настройки → Вход "
+                         "через администратора почты»). Сервер должен разрешать администратору вход в чужие "
+                         "ящики (Dovecot master users, SASL PLAIN с authzid в Cyrus и Zimbra). Axigen такой вход "
+                         "не документирует — проверьте кнопкой «Проверить вход администратора».",
+                    cause=exc,
+                ) from exc
+            reply = _server_reply(exc)
+            low = reply.lower()
+            if any(code in low for code in _TEMPORARY_LOGIN_CODES):
+                # Временный отказ («слишком много сеансов», сервер перегружен)
+                # — не повод проваливать ночное задание без повтора.
+                raise ImapConnectionError(
+                    f"Сервер временно не пускает в ящик: {reply}",
+                    hint="Это временный отказ сервера (лимит сеансов, перегрузка); задание повторится.",
+                    cause=exc,
+                ) from exc
+            text = "Не удалось войти в почтовый ящик: сервер отклонил учётные данные."
+            if reply:
+                text += f" Ответ сервера: «{reply}»."
             raise ImapAuthError(
-                "Не удалось войти в почтовый ящик: сервер отклонил учётные данные.",
-                hint="Проверьте логин/пароль. Возможно, нужен «пароль приложения» или включение IMAP в настройках почты.",
+                text,
+                hint="Проверьте логин/пароль. Возможно, нужен «пароль приложения» или включение IMAP в настройках почты. "
+                     "Если в ответе сервера сказано, что учётная запись отключена или пароль устарел, — это "
+                     "решается на почтовом сервере.",
                 cause=exc,
             ) from exc
+
+    def _master_login(self) -> None:
+        """Войти в ящик учётной записью администратора почты."""
+        acc = self.account
+        master = self.opt.master or {}
+        if not master.get("user") or not master.get("password"):
+            raise ImapAuthError(
+                f"Ящик «{acc.name}» копируется входом администратора почты, а этот вход не настроен.",
+                hint="Заполните «Настройки → Вход через администратора почты» или задайте ящику пароль.")
+        allowed = str(master.get("host") or "").strip().lower()
+        if not allowed or allowed != (acc.host or "").strip().lower():
+            # Пароль администратора почты отправляется ТОЛЬКО на её собственный сервер:
+            # ящик с опечаткой (или злонамеренно изменённым) адресом его не получит.
+            raise ImapAuthError(
+                f"Вход администратора разрешён только для сервера «{master.get('host') or '—'}», "
+                f"а у ящика «{acc.name}» указан «{acc.host}».",
+                hint="Исправьте сервер ящика или адрес сервера в настройках входа администратора.")
+        if str(master.get("mode") or "sasl_plain") == "separator":
+            sep = str(master.get("separator") or "*")
+            self.client.login(f"{acc.username}{sep}{master['user']}", master["password"])
+        else:
+            self.client.plain_login(master["user"], master["password"],
+                                    authorization_identity=acc.username)
 
     _CLOSE_TIMEOUT_S = 5
 
@@ -335,6 +525,12 @@ class ImapConnection:
     def list_folders(self) -> List[FolderInfo]:
         try:
             raw = self.client.list_folders()
+        except UnicodeError:
+            # Сервер прислал имя в неверной кодировке IMAP UTF-7 (например «R&D»
+            # без экранирования «&»). IMAPClient декодирует список целиком, и
+            # одно такое имя роняло копирование ВСЕГО ящика. Берём список без
+            # декодирования и разбираем имена по одному.
+            raw = self._list_folders_tolerant()
         except Exception as exc:  # noqa: BLE001
             raise _map_exception(exc) from exc
         result: List[FolderInfo] = []
@@ -348,6 +544,35 @@ class ImapConnection:
             result.append(FolderInfo(name=_as_text(name), delimiter=deli or "/",
                                      flags=flag_list, selectable=selectable))
         return result
+
+    def _list_folders_tolerant(self):
+        """LIST без общего декодирования: плохие имена помечаются, а не роняют всё."""
+        from imapclient import imap_utf7
+        client = self.client
+        prev = getattr(client, "folder_encode", True)
+        try:
+            client.folder_encode = False
+            raw = client.list_folders()
+        except Exception as exc:  # noqa: BLE001
+            raise _map_exception(exc) from exc
+        finally:
+            try:
+                client.folder_encode = prev
+            except Exception:  # noqa: BLE001
+                pass
+        out = []
+        for flags, delimiter, name in raw:
+            name_bytes = name if isinstance(name, (bytes, bytearray)) else str(name).encode("utf-8", "replace")
+            try:
+                decoded = imap_utf7.decode(bytes(name_bytes))
+            except Exception:  # noqa: BLE001
+                shown = bytes(name_bytes).decode("utf-8", "replace")
+                log.error("Сервер вернул папку с именем в неверной кодировке IMAP UTF-7: %r — "
+                          "папка пропущена (её нельзя открыть по имени).", shown)
+                self.bad_folder_names.append(shown)
+                continue
+            out.append((flags, delimiter, decoded))
+        return out
 
     @property
     def delimiter(self) -> str:
@@ -376,6 +601,11 @@ class ImapConnection:
             try:
                 info = self.client.select_folder(folder, readonly=readonly)
             except Exception as exc:  # noqa: BLE001
+                mapped = _map_exception(exc)
+                if isinstance(mapped, (ImapConnectionError, ImapTimeoutError)):
+                    # Связь потеряна — это не беда папки: повторять SELECT и
+                    # собирать диагностику по мёртвому соединению бессмысленно.
+                    raise mapped from exc
                 if attempt >= attempts:
                     fallback_error = None
                     if readonly:
@@ -521,6 +751,10 @@ class ImapConnection:
         try:
             info = self.client.select_folder(folder, readonly=True)
         except Exception as exc:  # noqa: BLE001
+            mapped = _map_exception(exc)
+            if isinstance(mapped, (ImapConnectionError, ImapTimeoutError)):
+                # связь потеряна — дальше каждая папка «не открывалась» бы
+                raise mapped from exc
             return None, (_server_reply(exc) or str(exc))
         return {
             "uidvalidity": int(info.get(b"UIDVALIDITY", 0) or 0),
@@ -643,6 +877,54 @@ class ImapConnection:
         except Exception as exc:  # noqa: BLE001
             raise _map_exception(exc) from exc
 
+    def search_uids(self, info: Optional[Dict[str, int]] = None) -> List[int]:
+        """Все UID открытой папки.
+
+        На больших папках (по данным SELECT) — несколькими запросами по
+        диапазонам UID: ответ на один «SEARCH ALL» у папки в сотни тысяч писем
+        занимает мегабайты одной строкой.
+        """
+        exists = int((info or {}).get("exists") or 0)
+        uidnext = int((info or {}).get("uidnext") or 0)
+        if exists <= SEARCH_RANGE_THRESHOLD or uidnext <= 1:
+            return self.search_all_uids()
+        step = max(100_000, -(-uidnext // SEARCH_RANGE_PARTS))
+        found: List[int] = []
+        lo = 1
+        while lo < uidnext:
+            hi = min(uidnext - 1, lo + step - 1)
+            try:
+                found.extend(self.client.search(["UID", f"{lo}:{hi}"]))
+            except Exception as exc:  # noqa: BLE001
+                raise _map_exception(exc) from exc
+            lo = hi + 1
+        # письма, пришедшие после SELECT (UID ≥ UIDNEXT на момент открытия)
+        try:
+            found.extend(u for u in self.client.search(["UID", f"{uidnext}:*"]) if u >= uidnext)
+        except Exception as exc:  # noqa: BLE001
+            raise _map_exception(exc) from exc
+        return sorted(set(int(u) for u in found))
+
+    def uids_present(self, uids: List[int]) -> Optional[Set[int]]:
+        """Какие из этих UID ещё есть в открытой папке (None — проверить не удалось).
+
+        Нужно, чтобы отличить письмо, удалённое на сервере во время копирования
+        (это нормально), от письма, которое сервер просто не отдаёт (это потеря).
+        """
+        if not uids:
+            return set()
+        found: Set[int] = set()
+        try:
+            for start in range(0, len(uids), 500):
+                part = uids[start:start + 500]
+                found.update(int(u) for u in self.client.search(["UID", uid_set(part)]))
+        except Exception as exc:  # noqa: BLE001
+            mapped = _map_exception(exc)
+            if isinstance(mapped, (ImapConnectionError, ImapTimeoutError)):
+                raise mapped from exc
+            return None
+        return found & set(int(u) for u in uids)
+
     def search_since(self, date) -> List[int]:
         try:
             return list(self.client.search(["SINCE", date]))
@@ -718,13 +1000,30 @@ class ImapConnection:
                 yield from self._fetch_chunk(chunk)
 
     def _fetch_chunk(self, chunk: List[int]) -> Iterator[dict]:
-        """Скачать одну готовую порцию UID и отдать письма по одному."""
+        """Скачать одну готовую порцию UID и отдать письма по одному.
+
+        Если сервер отказал в выдаче порции (одно письмо повреждено на сервере,
+        письмо удалено во время FETCH — ``NO [EXPUNGEISSUED]``), порция делится
+        пополам и так до одного письма: раньше один отказ бросал всю папку, и
+        письма после «битого» не копировались больше никогда. Для письма,
+        которое сервер не отдаёт и поодиночке, возвращается запись с ключом
+        ``error`` — вызывающий учтёт её как ошибку конкретного письма.
+        """
         if not chunk:
             return
         try:
             data = self.client.fetch(chunk, [b"BODY.PEEK[]", b"FLAGS", b"INTERNALDATE", b"RFC822.SIZE"])
         except Exception as exc:  # noqa: BLE001
-            raise _map_exception(exc) from exc
+            mapped = _map_exception(exc)
+            if isinstance(mapped, (ImapConnectionError, ImapTimeoutError)):
+                raise mapped from exc
+            if len(chunk) > 1:
+                half = len(chunk) // 2
+                yield from self._fetch_chunk(chunk[:half])
+                yield from self._fetch_chunk(chunk[half:])
+                return
+            yield {"uid": chunk[0], "error": _server_reply(exc) or mapped.message}
+            return
         missing: List[int] = []
         for uid in chunk:
             # pop, а не get: отданное письмо сразу перестаёт удерживаться
@@ -738,8 +1037,13 @@ class ImapConnection:
                 missing.append(uid)
                 continue
             internaldate = item.get(b"INTERNALDATE")
-            epoch = internaldate.timestamp() if internaldate else None
-            flags = [f.decode() if isinstance(f, bytes) else str(f) for f in (item.get(b"FLAGS") or ())]
+            try:
+                epoch = internaldate.timestamp() if internaldate else None
+            except (OverflowError, OSError, ValueError):
+                epoch = None
+            # Флаги — атомы ASCII, но серверы присылают и ключевые слова в
+            # cp1251: строгое .decode() роняло весь прогон (UnicodeDecodeError).
+            flags = [f.decode("latin-1") if isinstance(f, bytes) else str(f) for f in (item.get(b"FLAGS") or ())]
             yield {
                 "uid": uid,
                 "raw": raw,
@@ -749,11 +1053,15 @@ class ImapConnection:
             }
         if missing:
             # Молча терять письма нельзя: сервер мог их удалить между SEARCH и
-            # FETCH, но так же выглядит и сбой выдачи — пишем в лог.
+            # FETCH, но так же выглядит и сбой выдачи. Раньше это попадало
+            # только в лог службы; теперь вызывающий получает отметку по
+            # каждому такому письму и показывает их в журнале задания.
             shown = ", ".join(str(u) for u in missing[:20])
             tail = f" и ещё {len(missing) - 20}" if len(missing) > 20 else ""
             log.warning("FETCH не вернул %d из %d писем (пропущены): UID %s%s",
                         len(missing), len(chunk), shown, tail)
+            for uid in missing:
+                yield {"uid": uid, "missing": True}
 
     # -- запись (для восстановления) ----------------------------------------
     def ensure_folder(self, folder: str) -> None:
@@ -844,6 +1152,75 @@ class ImapConnection:
             raise _map_exception(exc) from exc
 
 
+#: Сколько раз подряд можно переподключаться, если между обрывами не удалось
+#: продвинуться ни на одно письмо или папку (сервер лежит — ждать бесполезно).
+MAX_RECONNECTS_WITHOUT_PROGRESS = 3
+#: Пауза перед переподключением, с (модульная — её подменяют тесты).
+RECONNECT_DELAY_S = 5.0
+
+
+class ReconnectingSession:
+    """IMAP-соединение одного прогона с переподключением после обрыва.
+
+    Раньше обрыв связи на любой папке валил весь прогон (или, хуже, считался
+    отказом ЭТОЙ папки — и исправные папки копили «неудачи»). Теперь движок
+    переподключается и продолжает. Предел — несколько обрывов ПОДРЯД без
+    продвижения: если между ними не сохранено ни одного письма и не пройдено
+    ни одной папки, сервер, видимо, лежит, и лучше отдать задание очереди на
+    повтор позже.
+    """
+
+    def __init__(self, account: Account, options: ConnectOptions,
+                 emit: Callable[[str, str], None], check_cancel: Callable[[], None]) -> None:
+        self.account = account
+        self.options = options
+        self.emit = emit
+        self.check_cancel = check_cancel
+        self.conn: Optional["ImapConnection"] = None
+        self.reconnects = 0
+        self._fails_in_row = 0
+
+    def open(self) -> "ImapConnection":
+        conn = ImapConnection(self.account, self.options)
+        conn.connect()
+        self.conn = conn
+        return conn
+
+    def progressed(self) -> None:
+        """Продвинулись (сохранено письмо, пройдена папка) — счётчик обрывов с нуля."""
+        self._fails_in_row = 0
+
+    def reconnect(self, exc) -> "ImapConnection":
+        """Переподключиться после обрыва или бросить ``exc``, если предел исчерпан."""
+        self._fails_in_row += 1
+        self.close(force=True)
+        if self._fails_in_row > MAX_RECONNECTS_WITHOUT_PROGRESS:
+            raise exc
+        self.reconnects += 1
+        text = getattr(exc, "message", None) or str(exc)
+        self.emit("WARNING", f"Связь с сервером прервалась: {text} Переподключение "
+                             f"(попытка {self._fails_in_row} из {MAX_RECONNECTS_WITHOUT_PROGRESS})…")
+        # Пауза — по кусочкам, чтобы кнопка «Отмена» срабатывала и здесь.
+        deadline = time.time() + max(0.0, float(RECONNECT_DELAY_S))
+        while time.time() < deadline:
+            self.check_cancel()
+            time.sleep(min(0.5, max(0.0, deadline - time.time())))
+        return self.open()
+
+    def reset(self) -> "ImapConnection":
+        """Открыть соединение заново без счёта обрывов (после сбоя разбора ответа)."""
+        self.close(force=True)
+        return self.open()
+
+    def close(self, *, force: bool = False) -> None:
+        conn, self.conn = self.conn, None
+        if conn is not None:
+            try:
+                conn.close(force=force)
+            except Exception:  # noqa: BLE001
+                pass
+
+
 def probe_account(account: Account, options: Optional[ConnectOptions] = None) -> dict:
     """
     Проверить подключение к ящику. Возвращает структуру для интерфейса:
@@ -855,7 +1232,7 @@ def probe_account(account: Account, options: Optional[ConnectOptions] = None) ->
     Никогда не бросает исключение — всё упаковывается в результат.
     """
     result = {"ok": False, "error": None, "hint": None, "capabilities": [], "folders": [],
-              "duplicate_folders": []}
+              "duplicate_folders": [], "kind": ""}
     try:
         with ImapConnection(account, options) as conn:
             result["capabilities"] = conn.capabilities()
@@ -886,7 +1263,7 @@ def probe_account(account: Account, options: Optional[ConnectOptions] = None) ->
                             ", ".join(result["duplicate_folders"]))
             result["ok"] = True
     except Exception as exc:  # noqa: BLE001
-        from ..errors import MailArchiverError
+        result["kind"] = login_failure_kind(exc)
         if isinstance(exc, MailArchiverError):
             result["error"] = exc.message
             result["hint"] = exc.hint
@@ -895,8 +1272,32 @@ def probe_account(account: Account, options: Optional[ConnectOptions] = None) ->
     return result
 
 
+def login_failure_kind(exc: BaseException) -> str:
+    """Чем кончилась попытка входа: auth_error (сервер отверг логин/пароль) или conn_error."""
+    if isinstance(exc, (ImapAuthError, LoginError)):
+        return "auth_error"
+    return "conn_error"
+
+
+def check_login(account: Account, options: Optional[ConnectOptions] = None) -> tuple:
+    """Только войти в ящик и выйти — проверка пароля. ``(статус, текст ошибки)``.
+
+    Статусы: ok | auth_error | conn_error. Папки не запрашиваются: на сотнях
+    ящиков важна скорость, и лишние команды серверу ни к чему.
+    """
+    conn = ImapConnection(account, options)
+    try:
+        conn.connect()
+    except Exception as exc:  # noqa: BLE001
+        text = exc.message if isinstance(exc, MailArchiverError) else str(exc)
+        return login_failure_kind(exc), text
+    conn.close()
+    return "ok", ""
+
+
 def diagnose_folders(account: Account, options: Optional[ConnectOptions] = None,
-                     max_folders: int = 500) -> dict:
+                     max_folders: int = 500, *, global_include: Optional[List[str]] = None,
+                     global_exclude: Optional[List[str]] = None) -> dict:
     """Проверить КАЖДУЮ папку ящика и сказать по каждой, что с ней.
 
     Отвечает на вопрос «почему копия неполная», не заставляя администратора
@@ -905,38 +1306,50 @@ def diagnose_folders(account: Account, options: Optional[ConnectOptions] = None,
     каждую папку идёт запрос к серверу (EXAMINE, при отказе — STATUS), поэтому
     вызывается только по кнопке, а не при обычной проверке подключения.
 
+    Правила те же, что у копирования: те же списки «Копировать только» и
+    «Пропускать» (ящика и общие), папка-контейнер — только если сервер сам
+    пометил её \\Noselect или по STATUS в ней 0 писем.
+
     Вердикты (поле ``verdict``):
       * ``ok`` — папка открылась, письма доступны;
-      * ``container`` — не открывается, но есть вложенные папки: своих писем
-        не хранит, содержимое копируется через вложенные;
+      * ``container`` — не открывается, писем в ней 0, есть вложенные папки:
+        содержимое копируется через вложенные;
       * ``noselect`` — сервер сам пометил папку как неоткрываемую;
       * ``empty_broken`` — не открывается, по STATUS писем 0: терять нечего;
-      * ``broken`` — не открывается, письма недоступны: ЭТО потеря;
-      * ``excluded`` — папка исключена настройками ящика и не копируется.
+      * ``broken`` — не открывается, а письма в ней есть (или сервер не
+        говорит, сколько их): ЭТО потеря;
+      * ``excluded`` — папка исключена настройками и не копируется.
 
     Исключения наружу не пробрасываются — всё упаковано в результат.
     """
     result: dict = {"ok": False, "error": None, "hint": None, "folders": [],
                     "counts": {"ok": 0, "container": 0, "noselect": 0, "empty_broken": 0,
                                "broken": 0, "excluded": 0},
-                    "broken_folders": [], "messages_lost": 0, "checked": 0, "truncated": False}
-    exclude = [str(x).strip().lower() for x in (account.folder_exclude or []) if str(x).strip()]
-    include = [str(x).strip().lower() for x in (account.folder_include or []) if str(x).strip()]
+                    "broken_folders": [], "messages_lost": 0, "checked": 0, "truncated": False,
+                    "bad_names": []}
+    include = [str(x).strip() for x in list(account.folder_include or []) + list(global_include or [])
+               if str(x).strip()]
+    exclude = [str(x).strip() for x in list(account.folder_exclude or []) + list(global_exclude or [])
+               if str(x).strip()]
     try:
         with ImapConnection(account, options) as conn:
             infos = conn.list_folders()
+            result["bad_names"] = list(conn.bad_folder_names)
             all_names = [fi.name for fi in infos]
             result["truncated"] = len(infos) > max_folders
+            seen: Set[str] = set()
             for fi in infos[:max_folders]:
+                if fi.name in seen:        # сервер повторил папку в LIST
+                    continue
+                seen.add(fi.name)
                 row = {"name": fi.name, "flags": list(fi.flags), "children": 0,
                        "messages": None, "verdict": "", "detail": ""}
-                low = fi.name.lower()
-                if include and low not in include:
+                if include and not folder_matches(fi.name, include, fi.delimiter):
                     row["verdict"] = "excluded"
                     row["detail"] = "не входит в список «Копировать только папки»"
-                elif low in exclude:
+                elif exclude and folder_matches(fi.name, exclude, fi.delimiter):
                     row["verdict"] = "excluded"
-                    row["detail"] = "папка в списке «Пропускать папки»"
+                    row["detail"] = "папка в списке «Пропускать папки» (или вложена в такую)"
                 elif not fi.selectable:
                     row["verdict"] = "noselect"
                     row["detail"] = "сервер пометил папку как неоткрываемую (контейнер)"
@@ -952,24 +1365,39 @@ def diagnose_folders(account: Account, options: Optional[ConnectOptions] = None,
                                     if n != fi.name and n.startswith(fi.name + (fi.delimiter or "/"))]
                         row["children"] = len(children)
                         status = conn.folder_status(fi.name)
-                        row["messages"] = status["messages"] if status else None
-                        if children:
+                        msgs = status["messages"] if status is not None else None
+                        row["messages"] = msgs
+                        if msgs == 0 and children:
                             row["verdict"] = "container"
-                            row["detail"] = (f"не открывается, но содержит вложенные папки "
+                            row["detail"] = (f"не открывается, писем в ней 0, есть вложенные папки "
                                              f"({len(children)}): своих писем не хранит")
-                        elif status is not None and status["messages"] == 0:
+                        elif msgs == 0:
                             row["verdict"] = "empty_broken"
                             row["detail"] = f"не открывается ({error}), но писем в ней 0 — терять нечего"
                         else:
                             row["verdict"] = "broken"
-                            row["detail"] = (f"не открывается ({error}); "
-                                             + (f"по STATUS писем {status['messages']}"
-                                                if status else "STATUS тоже не отвечает"))
+                            if msgs is None:
+                                row["detail"] = (f"не открывается ({error}); STATUS тоже не отвечает — "
+                                                 f"сколько в ней писем, неизвестно")
+                                if children:
+                                    row["detail"] += (f"; у папки есть вложенные ({len(children)}) — "
+                                                      f"возможно, это контейнер, но проверить нельзя")
+                            else:
+                                row["detail"] = f"не открывается ({error}); по STATUS писем {msgs}"
+                                if children:
+                                    row["detail"] += (f"; вложенные папки ({len(children)}) копируются, "
+                                                      f"а письма самой папки — нет")
+                                result["messages_lost"] += int(msgs)
                             result["broken_folders"].append(fi.name)
-                            if status:
-                                result["messages_lost"] += int(status["messages"])
                 result["counts"][row["verdict"]] = result["counts"].get(row["verdict"], 0) + 1
                 result["folders"].append(row)
+            for bad in result["bad_names"]:
+                result["folders"].append({"name": bad, "flags": [], "children": 0, "messages": None,
+                                          "verdict": "broken",
+                                          "detail": "имя папки прислано в неверной кодировке IMAP UTF-7 — "
+                                                    "открыть её по имени нельзя; переименуйте папку на сервере"})
+                result["counts"]["broken"] += 1
+                result["broken_folders"].append(bad)
             result["ok"] = True
     except Exception as exc:  # noqa: BLE001
         from ..errors import MailArchiverError

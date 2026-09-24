@@ -15,6 +15,7 @@ def _seed_index(svc, aid, folder, uid, subject, from_addr, size, iso, flags="", 
 
 def test_mail_analytics_metadata(services):
     svc = services
+    svc.set_rt("scheduler", "timezone", "UTC")     # часы ниже — по UTC
     aid = svc.db.create_account(models.Account(name="A", host="h", port=993, username="u", password="p"))
     # 4 письма: 2 понедельника (2024-01-01 = Пн), разные отправители/домены/размеры
     _seed_index(svc, aid, "INBOX", 1, "Отчёт за январь", "Иван <ivan@aa.ru>", 5000,
@@ -126,3 +127,28 @@ def test_analytics_endpoints_admin_only(client):
     assert r.status_code == 200 and r.json()["ok"] is True
     d = client.get(f"/api/analytics/mail/deep?account_id={aid}")
     assert d.status_code == 200 and "available" in d.json()
+
+
+def test_mail_analytics_uses_local_time(services):
+    """Часы и дни недели — по часовому поясу пользователя, а не по UTC."""
+    svc = services
+    svc.set_rt("scheduler", "timezone", "Europe/Moscow")
+    aid = svc.db.create_account(models.Account(name="TZ", host="h", port=993, username="u", password="p"))
+    # 14.09.2026 22:30 UTC = 15.09.2026 01:30 МСК (вторник)
+    _seed_index(svc, aid, "INBOX", 1, "Ночное", "Иван <ivan@aa.ru>", 100,
+                "2026-09-14T22:30:00+00:00", "", 0)
+    ma = A.mail_analytics(svc, account_id=aid, use_cache=False)
+    hours = {h["label"]: h["value"] for h in ma["by_hour"]}
+    assert hours["01"] == 1 and hours["22"] == 0
+    wd = {w["label"]: w["value"] for w in ma["by_weekday"]}
+    assert wd["Вт"] == 1 and wd["Пн"] == 0
+
+
+def test_daily_series_has_no_gaps(services):
+    """В ряду «Активность» дни без заданий — нули, а не пропуски."""
+    svc = services
+    aid = svc.db.create_account(models.Account(name="D", host="h", port=993, username="u", password="p"))
+    svc.db.bump_daily_stats(aid, messages=5, jobs=1)
+    series = svc.db.daily_series(days=7)
+    assert len(series) == 7
+    assert series[0]["messages"] == 5 and all(r["messages"] == 0 for r in series[1:])

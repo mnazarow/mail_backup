@@ -270,3 +270,61 @@ def test_preview_account_template(services):
     preview = preview_account_template(services)
     assert preview["name"] == "Иванов — Менеджер"
     assert preview["username"] == "ivanov@example.ru"
+
+
+class _RawHandler(BaseHTTPRequestHandler):
+    """Сервер «с дефектами»: обрывает ответ, отвечает не по HTTP, шлёт на ftp://."""
+
+    mode = "truncated"
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):                    # noqa: N802
+        body = CSV.encode("utf-8")
+        if self.mode == "truncated":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/csv")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body[:-3])          # последние байты не дошли
+            self.wfile.flush()
+            self.close_connection = True
+        elif self.mode == "ftp":
+            self.send_response(302)
+            self.send_header("Location", "ftp://example.com/employees.csv")
+            self.end_headers()
+
+
+def _raw_server(mode):
+    _RawHandler.mode = mode
+    server = HTTPServer(("127.0.0.1", 0), _RawHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+def test_truncated_download_is_refused():
+    server = _raw_server("truncated")
+    try:
+        with pytest.raises(ValidationError) as err:
+            fetch_employee_source(f"http://127.0.0.1:{server.server_port}/e.csv", timeout_s=5)
+        assert "не целиком" in str(err.value)
+    finally:
+        server.shutdown()
+
+
+def test_redirect_to_other_scheme_is_refused():
+    server = _raw_server("ftp")
+    try:
+        with pytest.raises(ValidationError):
+            fetch_employee_source(f"http://127.0.0.1:{server.server_port}/e.csv", timeout_s=5)
+    finally:
+        server.shutdown()
+
+
+def test_redact_url_hides_more_secrets():
+    from mailarchiver.employees import redact_url
+    out = redact_url("https://u:p@hr.example.ru/export/3f9c2a7b1e4d5f60a8b9c0d1e2f3a4b5/list.csv"
+                     "?ticket=abc&sid=42&format=csv#access_token=zzz")
+    assert "p@" not in out and "abc" not in out and "sid=42" not in out and "zzz" not in out
+    assert "3f9c2a7b1e4d5f60a8b9c0d1e2f3a4b5" not in out and "format=csv" in out

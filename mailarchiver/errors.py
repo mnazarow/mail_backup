@@ -120,6 +120,13 @@ class RestoreError(MailArchiverError):
     code = "restore_error"
 
 
+# --- Копия архива вне сервера ------------------------------------------------
+class ReplicaError(MailArchiverError):
+    """Сбой копии вне сервера (сетевая папка, rsync по SSH, S3)."""
+
+    code = "replica_error"
+
+
 # --- Очередь и задания -----------------------------------------------------
 class JobError(MailArchiverError):
     code = "job_error"

@@ -61,11 +61,61 @@ def test_retention_endpoint(client):
         "username": "u@example.com", "password": "secret", "security": "ssl", "auth_type": "password",
     }).json()["id"]
     r = client.post(f"/api/accounts/{aid}/retention", json={"days": 3, "run_now": False})
-    assert r.status_code == 200 and r.json()["days"] == 3
+    assert r.status_code == 200 and r.json()["days"] == 3 and r.json()["sweep_cron"]
     assert client.get(f"/api/accounts/{aid}").json()["retention_days"] == 3
-    # автосоздание расписания ежедневной очистки
-    sch = client.get("/api/schedules").json()
-    assert any(s["job_type"] == "retention" and s["account_id"] == aid for s in sch)
+    # отдельное расписание не нужно: ежедневная очистка обходит все ящики
+    assert client.post(f"/api/accounts/{aid}/retention", json={"days": -5}).status_code == 400
+
+
+def test_legacy_retention_schedules_removed_once(services):
+    """Расписания очистки, которые до 1.3.0 заводились ящикам автоматически,
+    убираются при обновлении один раз; прочие расписания не трогаются."""
+    from mailarchiver.models import JobType, ScheduleKind
+    db = services.db
+    a1 = db.create_account(models.Account(name="A", host="h", port=993, username="a", password="p",
+                                          retention_days=3))
+    a2 = db.create_account(models.Account(name="B", host="h", port=993, username="b", password="p"))
+    legacy = db.create_schedule(a1, ScheduleKind.CRON, JobType.RETENTION, cron_expr="30 3 * * *")
+    legacy_off = db.create_schedule(a2, ScheduleKind.CRON, JobType.RETENTION, cron_expr="30 3 * * *",
+                                    enabled=False)
+    custom = db.create_schedule(a2, ScheduleKind.CRON, JobType.RETENTION, cron_expr="0 5 * * 0")
+    backup = db.create_schedule(a1, ScheduleKind.CRON, JobType.BACKUP, cron_expr="30 3 * * *")
+    # база «прежней версии»: отметки о выполненной чистке ещё нет
+    db.execute("DELETE FROM meta WHERE key=?", (db._LEGACY_RETENTION_MARK,))
+    db.init_schema()
+    left = {row["id"] for row in db.list_schedules()}
+    assert legacy not in left and legacy_off not in left
+    assert {custom, backup} <= left
+    assert any(row["action"] == "schedules_cleanup" for row in db.list_audit())
+    # повторный запуск службы не трогает расписание, созданное вручную позже
+    again = db.create_schedule(a1, ScheduleKind.CRON, JobType.RETENTION, cron_expr="30 3 * * *")
+    db.init_schema()
+    assert again in {row["id"] for row in db.list_schedules()}
+
+
+def test_longer_retention_forgets_retired_uids(client):
+    """Срок хранения увеличили — вычищенные по старому сроку письма снова скачаются."""
+    _login(client)
+    svc = client.app.state.services
+    aid = client.post("/api/accounts", json={
+        "name": "Box", "host": "imap.example.com", "port": 993,
+        "username": "u@example.com", "password": "secret"}).json()["id"]
+    client.post(f"/api/accounts/{aid}/retention", json={"days": 3, "run_now": False})
+    svc.db.execute("INSERT INTO retired_uids(account_id, folder, uidvalidity, uid, retired_at) "
+                   "VALUES(?,?,?,?,?)", (aid, "INBOX", 1, 5, "2026-01-01"))
+    client.post(f"/api/accounts/{aid}/retention", json={"days": 1, "run_now": False})
+    assert svc.db.count_retired(aid) == 1, "срок сократили — «надгробия» остаются"
+    client.post(f"/api/accounts/{aid}/retention", json={"days": 0, "run_now": False})
+    assert svc.db.count_retired(aid) == 0
+    # то же через форму ящика
+    client.post(f"/api/accounts/{aid}/retention", json={"days": 3, "run_now": False})
+    svc.db.execute("INSERT INTO retired_uids(account_id, folder, uidvalidity, uid, retired_at) "
+                   "VALUES(?,?,?,?,?)", (aid, "INBOX", 1, 6, "2026-01-01"))
+    acc = client.get(f"/api/accounts/{aid}").json()
+    body = {k: acc[k] for k in ("name", "host", "port", "username", "security", "auth_type")}
+    body.update(password="", retention_days=30)
+    assert client.put(f"/api/accounts/{aid}", json=body).status_code == 200
+    assert svc.db.count_retired(aid) == 0
 
 
 def test_mail_viewer_endpoints(client):
@@ -153,10 +203,62 @@ def test_rebuild_missing_drops_index_rows_without_files(services, tmp_path):
         def progress(self, *_a, **_k):
             pass
 
+        def is_cancelled(self):
+            return False
+
     lost = _rebuild_missing(_Ctx(), acc)
     assert lost == 2                                   # пустой и пропавший
     assert services.db.count_messages(acc_id) == 1     # целое письмо осталось
     assert any("потерянных файлов: 2" in m for _lvl, m in events)
+
+
+def test_rebuild_missing_refuses_on_unmounted_storage(services):
+    """Каталога ящика нет или пропала бОльшая часть файлов — индекс не трогаем.
+
+    Так выглядит несмонтированный диск, а не потеря писем: раньше из индекса
+    удалялось всё, и записи о письмах, уже удалённых на сервере, пропадали.
+    """
+    import shutil
+    from mailarchiver.errors import ValidationError
+    from mailarchiver.models import Account
+    from mailarchiver.queue.jobs import _rebuild_missing
+
+    acc_id = services.db.create_account(Account(name="Диск", host="h", username="u", password="p"))
+    acc = services.db.get_account(acc_id)
+    acc_dir = services.store.account_dir(acc_id)
+    os.makedirs(os.path.join(acc_dir, "INBOX", "cur"), exist_ok=True)
+    for uid in range(1, 31):
+        rel = os.path.join("INBOX", "cur", f"{uid}.eml")
+        if uid <= 5:
+            with open(os.path.join(acc_dir, rel), "wb") as fh:
+                fh.write(b"From: a@b\r\n\r\nx")
+        services.db.add_message_index(acc_id, "INBOX", 1000, uid, f"<{uid}@x>", 10,
+                                      "2026-09-01T00:00:00+00:00", "", rel, "sha")
+
+    class _Ctx:
+        db = services.db
+
+        def __init__(self):
+            self.services = services
+
+        def event(self, *_a):
+            pass
+
+        def progress(self, *_a, **_k):
+            pass
+
+        def is_cancelled(self):
+            return False
+
+    import pytest
+    with pytest.raises(ValidationError, match="больше половины"):
+        _rebuild_missing(_Ctx(), acc)
+    assert services.db.count_messages(acc_id) == 30        # индекс цел
+
+    shutil.rmtree(acc_dir)
+    with pytest.raises(ValidationError, match="не найден"):
+        _rebuild_missing(_Ctx(), acc)
+    assert services.db.count_messages(acc_id) == 30
 
 
 def test_rebuild_full_wipes_index_and_files(services):
@@ -218,17 +320,90 @@ def test_native_pst_reports_ansi_limit():
     from mailarchiver.errors import PstEngineError
     from mailarchiver.export.pst_native import ANSI_PST_LIMIT_BYTES, PstWriter
 
-    writer = PstWriter()
+    import tempfile
+
     assert ANSI_PST_LIMIT_BYTES < 2 * 1024 ** 3
-    # подсовываем узел, который заведомо переполняет файл
-    writer.nodes.append(type("N", (), {"nid": 1, "parent_nid": 0, "bid": 0,
-                                       "data": b"x" * 64})())
-    writer._buf = bytearray(512)
-    original = writer._block_bytes
-    writer._block_bytes = lambda data, bid, ib: b"x" * (ANSI_PST_LIMIT_BYTES + 1)
-    try:
-        with pytest.raises(PstEngineError) as err:
-            writer.build()
-        assert "ANSI" in str(err.value)
-    finally:
-        writer._block_bytes = original
+    with tempfile.TemporaryDirectory() as tmp:
+        writer = PstWriter()
+        writer.open(os.path.join(tmp, "big.pst"))
+        try:
+            # подменяем сборку блока: «узел» сразу переполняет файл
+            writer._block_bytes = lambda data, bid, ib: b"x" * (ANSI_PST_LIMIT_BYTES + 1)
+            with pytest.raises(PstEngineError) as err:
+                writer.add_node(1, 0, b"x" * 64)
+            assert "ANSI" in str(err.value)
+        finally:
+            writer.close()
+
+
+# ---------------------------------------------------------------------------
+#  Карантин прежней копии ящика
+# ---------------------------------------------------------------------------
+def test_quarantine_keeps_files_and_recreates_dir(services):
+    from mailarchiver.models import Account
+
+    acc_id = services.db.create_account(Account(name="Я", host="h", username="u", password="p"))
+    rel, _sha, _size = services.store.store_message(acc_id, "INBOX", "/", 1,
+                                                    "From: a@b\r\n\r\nтело".encode("utf-8"))
+    quarantine, files, freed = services.store.quarantine_account_files(acc_id)
+
+    assert files == 1 and freed > 0
+    assert os.path.isdir(quarantine) and os.path.isfile(os.path.join(quarantine, rel))
+    assert os.path.isdir(services.store.account_dir(acc_id))       # каталог создан заново
+    assert not os.path.exists(os.path.join(services.store.account_dir(acc_id), rel))
+
+    listed = services.store.list_quarantines(acc_id)
+    assert [p for p, _f, _b in listed] == [quarantine]
+
+
+def test_quarantine_name_never_collides(services):
+    """Два пересоздания в одну секунду раньше падали с «Directory not empty»."""
+    from mailarchiver.models import Account
+
+    acc_id = services.db.create_account(Account(name="Я2", host="h", username="u", password="p"))
+    paths = []
+    for _ in range(3):
+        services.store.store_message(acc_id, "INBOX", "/", 1, b"From: a@b\r\n\r\nx")
+        path, files, _bytes = services.store.quarantine_account_files(acc_id)
+        assert files == 1
+        paths.append(path)
+    assert len(set(paths)) == 3
+    assert len(services.store.list_quarantines(acc_id)) == 3
+
+
+def test_drop_quarantine_refuses_foreign_paths(services, tmp_path):
+    from mailarchiver.errors import StorageError
+    from mailarchiver.models import Account
+
+    acc_id = services.db.create_account(Account(name="Я3", host="h", username="u", password="p"))
+    services.store.store_message(acc_id, "INBOX", "/", 1, b"From: a@b\r\n\r\nx")
+    path, _f, _b = services.store.quarantine_account_files(acc_id)
+
+    outsider = tmp_path / "чужой"
+    outsider.mkdir()
+    with pytest.raises(StorageError):
+        services.store.drop_quarantine(str(outsider))
+    assert outsider.exists()
+
+    services.store.drop_quarantine(path)
+    assert not os.path.exists(path)
+
+
+def test_batch_index_normalizes_like_single_insert(services):
+    """Через пачку не должны проходить нерезаные строки и has_attach=None."""
+    from mailarchiver.models import Account
+
+    acc_id = services.db.create_account(Account(name="Я4", host="h", username="u", password="p"))
+    inserted = services.db.add_message_index_batch([
+        (acc_id, "INBOX", 1000, 1, "<1@x>", 10, "2026-09-01T00:00:00+00:00", "",
+         "cur/1.eml", "sha", "т" * 900, "a" * 600, None),
+    ])
+    assert inserted == 1
+    row = services.db.list_messages(acc_id)[0]
+    assert len(row["subject"]) == 500 and len(row["from_addr"]) == 300
+    assert row["has_attach"] == 0
+    # повторная пачка тех же писем ничего не добавляет
+    assert services.db.add_message_index_batch([
+        (acc_id, "INBOX", 1000, 1, "<1@x>", 10, "2026-09-01T00:00:00+00:00", "",
+         "cur/1.eml", "sha", "тема", "a@b", 1),
+    ]) == 0

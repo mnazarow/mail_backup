@@ -106,3 +106,46 @@ def test_storage_compressed(cfg):
     rel, digest, size = store.store_message(1, "INBOX", "/", 1, raw)
     assert rel.endswith(".gz")
     assert store.read_message(1, rel) == raw  # прозрачная распаковка
+
+
+def test_config_file_errors_are_reported(tmp_path, monkeypatch):
+    """Опечатки в config.yaml видны: неизвестный параметр — предупреждение,
+    неверный тип и часовой пояс — ошибка, отсутствующий файл — ошибка."""
+    from mailarchiver.config import load_config
+    from mailarchiver.errors import ConfigError
+    monkeypatch.setenv("MAILARCHIVER_DATA", str(tmp_path / "d"))
+    with pytest.raises(ConfigError):
+        load_config(str(tmp_path / "нет-такого.yaml"))
+    cfg_path = tmp_path / "c.yaml"
+    cfg_path.write_text("backup:\n  max_concurent_jobs: 3\nsecurity:\n  lockout_minutes: '20'\n", encoding="utf-8")
+    cfg = load_config(str(cfg_path))
+    assert any("max_concurent_jobs" in w for w in cfg.warnings)
+    assert cfg.security["lockout_minutes"] == 20           # строка «20» приведена к числу
+    cfg_path.write_text("backup:\n  retry_attempts: много\n", encoding="utf-8")
+    with pytest.raises(ConfigError):
+        load_config(str(cfg_path))
+    cfg_path.write_text("scheduler:\n  timezone: Mars/Olympus\n", encoding="utf-8")
+    with pytest.raises(ConfigError):
+        load_config(str(cfg_path))
+    # Строка вместо числа — понятная ошибка с именем параметра, а не «invalid literal for int()».
+    cfg_path.write_text("backup:\n  max_concurrent_jobs: abc\n", encoding="utf-8")
+    with pytest.raises(ConfigError) as err:
+        load_config(str(cfg_path))
+    assert "backup.max_concurrent_jobs" in str(err.value)
+    # Допустимые значения в «другом виде» принимаются: порт в кавычках, формат с заглавной.
+    cfg_path.write_text('server:\n  port: "8500"\nexport:\n  pst_format: Unicode\n', encoding="utf-8")
+    cfg = load_config(str(cfg_path))
+    assert cfg.server["port"] == 8500 and cfg.export["pst_format"] == "unicode"
+
+
+def test_ensure_dir_keeps_existing_permissions(tmp_path):
+    import os
+    from mailarchiver.util import ensure_dir
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    os.chmod(shared, 0o1777)
+    ensure_dir(str(shared), 0o700)
+    assert oct(os.stat(shared).st_mode & 0o7777) == "0o1777"
+    fresh = tmp_path / "fresh"
+    ensure_dir(str(fresh), 0o700)
+    assert oct(os.stat(fresh).st_mode & 0o777) == "0o700"

@@ -58,7 +58,38 @@ def test_native_pst_readpst_roundtrip(tmp_path):
     resolve_engine("native").export(iter(_items(n)), pst, total_hint=n)
     outdir = str(tmp_path / "extracted")
     os.makedirs(outdir)
-    proc = subprocess.run(["readpst", "-e", "-o", outdir, pst], capture_output=True, text=True, timeout=60)
+    proc = subprocess.run(["readpst", "-j", "0", "-e", "-o", outdir, pst], capture_output=True, text=True, timeout=60)
     assert proc.returncode == 0, f"readpst failed: {proc.stdout} {proc.stderr}"
     eml = [f for _r, _d, fs in os.walk(outdir) for f in fs if f.endswith(".eml")]
     assert len(eml) == n, f"ожидалось {n} писем, извлечено {len(eml)}"
+
+
+def test_native_pst_splits_instead_of_failing(tmp_path, monkeypatch):
+    """Крупный .pst делится на части (предел ANSI 2 ГБ), каждая открывается readpst."""
+    import random
+    import shutil
+    import subprocess
+    from mailarchiver.export import pst_native
+    from mailarchiver.export.base import MailItem
+    monkeypatch.setattr(pst_native, "MIN_SPLIT_BYTES", 256 * 1024)
+    random.seed(1)
+    items = []
+    for i in range(300):
+        body = " ".join(random.choice(["архив", "письмо", "договор", "отчёт"]) for _ in range(1500))
+        raw = (f"Subject: n{i}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{body}\r\n").encode()
+        items.append(MailItem(folder=["INBOX", "Отправленные"][i % 2], raw=raw, flags=["\\Seen"], size=len(raw)))
+    engine = pst_native.NativePstEngine() if hasattr(pst_native, "NativePstEngine") else \
+        [c for c in vars(pst_native).values() if isinstance(c, type) and getattr(c, "name", "") == "native"][0]()
+    out = str(tmp_path / "box.pst")
+    res = engine.export(iter(items), out, options={"pst_split_size_mb": 1, "tmp_dir": str(tmp_path)})
+    assert res.count == 300 and len(res.parts) >= 2
+    assert all(os.path.getsize(p) <= 1024 * 1024 for p in res.parts)
+    assert os.path.basename(res.parts[0]) == "box_part1.pst" and not os.path.exists(out)
+    if shutil.which("readpst"):
+        total = 0
+        for part in res.parts:
+            d = tmp_path / ("x" + os.path.basename(part))
+            d.mkdir()
+            assert subprocess.run(["readpst", "-j", "0", "-e", "-o", str(d), part], capture_output=True).returncode == 0
+            total += sum(1 for _r, _d, fs in os.walk(d) for f in fs if f.endswith(".eml"))
+        assert total == 300

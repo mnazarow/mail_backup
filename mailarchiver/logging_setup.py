@@ -26,11 +26,19 @@ class MemoryLogHandler(logging.Handler):
     def __init__(self, capacity: int = _MEMORY_CAPACITY) -> None:
         super().__init__()
         self.buffer: Deque[Dict] = deque(maxlen=capacity)
+        # Сквозной номер записи: интерфейс дописывает только новые строки, а не
+        # перерисовывает весь журнал (иначе выделение текста сбрасывалось каждые
+        # полторы секунды и скопировать строку было невозможно).
+        self._seq = 0
 
     def emit(self, record: logging.LogRecord) -> None:
+        # emit вызывается под блокировкой обработчика (Handler.handle), поэтому
+        # счётчик увеличивается без гонок.
         try:
+            self._seq += 1
             self.buffer.append(
                 {
+                    "seq": self._seq,
                     "ts": record.created,
                     "level": record.levelname,
                     "logger": record.name,
@@ -107,6 +115,23 @@ def setup_logging(log_dir: str, level: str = "INFO", to_stdout: bool = True) -> 
 
     _CONFIGURED = True
     logging.getLogger("mailarchiver").info("Логирование инициализировано, уровень=%s", level)
+
+
+def set_level(level: str) -> None:
+    """Сменить уровень журнала на лету — и у корневого логгера, и у ОБРАБОТЧИКОВ.
+
+    Раньше менялся только уровень логгера «mailarchiver», а обработчики (файл,
+    stdout, буфер для раздела «Логи») оставались на уровне из config.yaml:
+    выбор DEBUG в «Настройках» ничего не добавлял в журнал.
+    """
+    numeric = getattr(logging, str(level or "INFO").upper(), None)
+    if not isinstance(numeric, int):
+        return
+    root = logging.getLogger()
+    root.setLevel(numeric)
+    logging.getLogger("mailarchiver").setLevel(numeric)
+    for handler in root.handlers:
+        handler.setLevel(numeric)
 
 
 def get_logger(name: str) -> logging.Logger:

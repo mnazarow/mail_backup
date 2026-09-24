@@ -1,7 +1,4 @@
 """Общие фикстуры для тестов MailArchiver."""
-import os
-import tempfile
-
 import pytest
 
 
@@ -29,11 +26,16 @@ def services(cfg):
     return svc
 
 
+#: Заголовок, который интерфейс шлёт на каждый запрос к API (см. web/proxy.py:
+#: запросы, меняющие состояние, без Origin/Referer принимаются только с ним).
+API_HEADERS = {"X-Requested-With": "fetch"}
+
+
 @pytest.fixture()
 def client(data_dir):
     """TestClient с полным жизненным циклом (очередь и планировщик стартуют)."""
     from fastapi.testclient import TestClient
     from mailarchiver.web.app import create_app
     app = create_app()
-    with TestClient(app) as c:
+    with TestClient(app, headers=API_HEADERS) as c:
         yield c

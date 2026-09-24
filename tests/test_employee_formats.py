@@ -276,3 +276,75 @@ def test_url_is_redacted_in_logs_and_answers():
     assert redact_url("https://hr/export?token=SECRET&id=5") == "https://hr/export?token=***&id=5"
     assert redact_url("https://user:pass@hr/x.csv") == "https://***@hr/x.csv"
     assert redact_url("http://hr/plain.csv") == "http://hr/plain.csv"
+
+
+def test_password_file_excel_types_are_not_applied():
+    """TRUE, даты и дроби, в которые Excel превратил пароли, не ставятся молча."""
+    import datetime as dt
+    rows, problems = parse_password_file(_xlsx([
+        ("email", "пароль"),
+        ("a@x.ru", True),
+        ("b@x.ru", dt.datetime(2024, 5, 12)),
+        ("c@x.ru", 1.5),
+        ("d@x.ru", 12345678),
+        ("e@x.ru", "Нормальный Пароль"),
+    ]), "p.xlsx")
+    assert {r["email"]: r["password"] for r in rows} == {"d@x.ru": "12345678", "e@x.ru": "Нормальный Пароль"}
+    assert {p["row"] for p in problems} == {2, 3, 4}
+
+
+def test_password_file_three_columns_without_header_refused():
+    with pytest.raises(ValidationError):
+        parse_password_file(_xlsx([("ivanov@x.ru", "Иванов Иван", "Pass1"),
+                                   ("petrova@x.ru", "Петрова Анна", "Pass2")]), "p.xlsx")
+
+
+def test_password_file_login_column_with_header():
+    rows, problems = parse_password_file(_xlsx([("логин", "пароль"), ("ivanov", "Pass1")]), "p.xlsx")
+    assert rows == [{"row": 2, "email": "ivanov", "password": "Pass1"}] and not problems
+
+
+def test_spreadsheetml_prefixed_tags_merge_and_escaped_html():
+    xml = """<?xml version="1.0"?><?mso-application progid="Excel.Sheet"?>
+<ss:Workbook xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet"><ss:Worksheet><ss:Table>
+<ss:Row><ss:Cell ss:MergeAcross="1"><ss:Data ss:Type="String">ФИО</ss:Data></ss:Cell>
+<ss:Cell><ss:Data ss:Type="String">E-mail</ss:Data></ss:Cell><ss:Cell><ss:Data ss:Type="String">Отдел</ss:Data></ss:Cell></ss:Row>
+<ss:Row><ss:Cell><ss:Data ss:Type="String" xmlns="http://www.w3.org/TR/REC-html40"><B>Иванов</B> Иван</ss:Data></ss:Cell>
+<ss:Cell/><ss:Cell><ss:Data ss:Type="String">ivanov@x.ru</ss:Data></ss:Cell>
+<ss:Cell><ss:Data ss:Type="String">&lt;span&gt;Склад &lt;2 кат.&gt;&lt;/span&gt;</ss:Data></ss:Cell></ss:Row>
+</ss:Table></ss:Worksheet></ss:Workbook>"""
+    rows, _ = parse_employee_file(xml.encode("utf-8"), "x.xml")
+    assert rows[0]["full_name"] == "Иванов Иван"
+    assert rows[0]["email"] == "ivanov@x.ru"
+    assert rows[0]["department"] == "Склад <2 кат.>"
+
+
+def test_truncated_spreadsheetml_is_refused():
+    xml = SPREADSHEET_ML.split("</Table>")[0][:-40]
+    with pytest.raises(ValidationError) as err:
+        parse_employee_file(xml.encode("utf-8"), "x.xml")
+    assert "обрезана" in str(err.value)
+
+
+def test_broken_row_is_parsed_in_linear_time():
+    import time as _t
+    row = "<Row>" + "<Cell><Data>x" * 20000 + "</Row>"
+    xml = f"<?mso-application progid=\"Excel.Sheet\"?><Workbook><Table><Row><Cell><Data>ФИО</Data></Cell></Row>{row}</Table></Workbook>"
+    started = _t.monotonic()
+    try:
+        parse_employee_file(xml.encode("utf-8"), "x.xml")
+    except ValidationError:
+        pass
+    assert _t.monotonic() - started < 5
+
+
+def test_csv_delimiter_prefers_consistent_semicolon():
+    data = "Фамилия, имя;E-mail\nИванов, Иван;ivanov@x.ru\nПетрова, Анна;petrova@x.ru\n".encode("utf-8")
+    rows, _ = parse_employee_file(data, "e.csv")
+    assert rows[0]["email"] == "ivanov@x.ru"
+
+
+def test_utf16_csv():
+    data = "ФИО\tE-mail\r\nИванов Иван\tivanov@x.ru\r\n".encode("utf-16")
+    rows, _ = parse_employee_file(data, "e.csv")
+    assert rows[0]["full_name"] == "Иванов Иван" and rows[0]["email"] == "ivanov@x.ru"

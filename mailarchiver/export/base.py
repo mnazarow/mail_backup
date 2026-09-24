@@ -34,6 +34,9 @@ class ExportResult:
     engine: str = ""
     fmt: str = ""
     warning: str = ""              # напр. про экспериментальность или eval-режим
+    #: если результат разбит на несколько файлов (например .pst по частям) —
+    #: их пути; обработчик задания упакует их в один архив
+    parts: List[str] = field(default_factory=list)
 
 
 class ExportEngine:
@@ -56,16 +59,54 @@ class ExportEngine:
         raise NotImplementedError
 
 
-def zip_directory(dir_path: str, zip_path: str, *, arc_root: Optional[str] = None) -> int:
+def _zip_entries(entries, zip_path: str, cancel_cb: Optional[CancelCB] = None) -> int:
+    """Записать архив атомарно: во временный ``*.part``, затем переименовать.
+
+    Недописанный архив (кончилось место, отмена) не остаётся лежать в каталоге
+    выгрузок под «настоящим» именем — ``*.part`` убирается здесь же, а если
+    процесс убит — при следующем запуске службы.
+    """
+    part = zip_path + ".part"
+    try:
+        with zipfile.ZipFile(part, "w", zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as zf:
+            for full, arcname in entries:
+                if cancel_cb and cancel_cb():
+                    from ..errors import JobCancelled
+                    raise JobCancelled("Экспорт отменён пользователем.")
+                zf.write(full, arcname)
+        os.replace(part, zip_path)
+    except BaseException:
+        try:
+            os.unlink(part)
+        except OSError:
+            pass
+        raise
+    return os.path.getsize(zip_path)
+
+
+def zip_files(paths: List[str], zip_path: str, *, arc_root: str = "",
+              cancel_cb: Optional[CancelCB] = None) -> int:
+    """Упаковать список файлов в zip (плоско, в каталог arc_root). Размер архива."""
+    entries = []
+    for full in paths:
+        name = os.path.basename(full)
+        entries.append((full, os.path.join(arc_root, name) if arc_root else name))
+    return _zip_entries(entries, zip_path, cancel_cb)
+
+
+def zip_directory(dir_path: str, zip_path: str, *, arc_root: Optional[str] = None,
+                  cancel_cb: Optional[CancelCB] = None) -> int:
     """Упаковать каталог в zip. Возвращает размер архива в байтах."""
     root = arc_root or os.path.basename(dir_path.rstrip("/"))
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+
+    def entries():
         for base, _dirs, files in os.walk(dir_path):
-            for fn in files:
+            for fn in sorted(files):
                 full = os.path.join(base, fn)
                 rel = os.path.relpath(full, dir_path)
-                zf.write(full, os.path.join(root, rel))
-    return os.path.getsize(zip_path)
+                yield full, os.path.join(root, rel)
+
+    return _zip_entries(entries(), zip_path, cancel_cb)
 
 
 def folder_to_fs(folder: str) -> str:

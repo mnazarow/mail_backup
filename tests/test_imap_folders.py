@@ -74,14 +74,48 @@ class FakeIMAP:
                 b"UIDNEXT": 9999, b"UIDVALIDITY": self.uidvalidity}
 
     def search(self, criteria):
-        return sorted(self.messages.get(self.current, {}))
+        uids = sorted(self.messages.get(self.current, {}))
+        if isinstance(criteria, (list, tuple)) and criteria and criteria[0] == "UID":
+            wanted = set(self._expand(criteria[1].replace("*", str(max(uids or [0])))))
+            uids = [u for u in uids if u in wanted]
+        return [u for u in uids if u not in getattr(self, "gone", set())]
+
+    @staticmethod
+    def _expand(uids):
+        """Набор UID как его шлёт клиент: список или строка вида «1:3,5»."""
+        if isinstance(uids, (list, tuple, set)):
+            return [int(u) for u in uids]
+        out = []
+        for part in str(uids).split(","):
+            if ":" in part:
+                lo, hi = part.split(":")
+                out.extend(range(int(lo), int(hi) + 1))
+            elif part:
+                out.append(int(part))
+        return out
 
     def fetch(self, uids, fields):
         msgs = self.messages.get(self.current, {})
         out = {}
-        for uid in uids:
+        wanted = self._expand(uids)
+        if b"BODY.PEEK[]" in fields:
+            broken = set(wanted) & getattr(self, "fetch_fail", set())
+            if broken:
+                raise IMAPClientError(f"fetch failed: Message {min(broken)} is corrupt")
+            vanish = set(wanted) & getattr(self, "vanish_on_fetch", set())
+            if vanish:
+                # письма удалены на сервере прямо во время копирования
+                self.gone = getattr(self, "gone", set()) | vanish
+                self.not_returned = getattr(self, "not_returned", set()) | vanish
+            if getattr(self, "drop_on_fetch", 0):
+                self.drop_on_fetch -= 1
+                import imaplib
+                raise imaplib.IMAP4.abort("socket error: EOF")
+        for uid in wanted:
             raw = msgs.get(uid)
             if raw is None:
+                continue
+            if b"BODY.PEEK[]" in fields and uid in getattr(self, "not_returned", set()):
                 continue
             if b"BODY.PEEK[]" in fields:
                 out[uid] = {b"BODY[]": raw, b"FLAGS": (b"\\Seen",),
@@ -162,6 +196,7 @@ def _patch_connection(monkeypatch, fake):
     monkeypatch.setattr(backup_mod, "ImapConnection", _Conn)
     monkeypatch.setattr(client_mod, "ImapConnection", _Conn)
     monkeypatch.setattr(client_mod, "SELECT_RETRY_DELAY_S", 0)  # тесты не спят
+    monkeypatch.setattr(client_mod, "RECONNECT_DELAY_S", 0)
     return _Conn
 
 
@@ -505,10 +540,10 @@ def test_select_error_detects_name_mismatch(monkeypatch):
 
 
 def test_unopenable_folder_with_children_is_a_container(monkeypatch):
-    """Папка не открывается, но у неё есть вложенные — это контейнер.
+    """Папка не открывается, писем в ней 0, у неё есть вложенные — это контейнер.
 
     Некоторые серверы забывают пометить такую папку флагом \\Noselect. Своих
-    писем она не хранит, вложенные копируются отдельно — значит копия полная.
+    писем она не хранит (STATUS: 0), вложенные копируются отдельно — копия полная.
     """
     fake = FakeIMAP(
         folders=[
@@ -517,6 +552,7 @@ def test_unopenable_folder_with_children_is_a_container(monkeypatch):
         ],
         messages=_messages("Отправленные/2022"),
         select_errors={"Отправленные": [_axigen_refusal()] * 3},
+        status_messages={"Отправленные": 0},
     )
     res, db, store, events = _run_backup(monkeypatch, fake)
 
@@ -527,6 +563,49 @@ def test_unopenable_folder_with_children_is_a_container(monkeypatch):
     assert "вложенные папки" in note
     final = [m for _lvl, m in events if m.startswith("Бэкап завершён")][-1]
     assert "КОПИЯ НЕПОЛНАЯ" not in final
+
+
+def test_folder_with_children_and_own_messages_is_a_loss(monkeypatch):
+    """Вложенные папки не делают папку «контейнером», если в ней самой есть письма.
+
+    В IMAP папка может одновременно хранить письма и содержать подпапки. Раньше
+    такие письма молча объявлялись «папкой-контейнером» при статусе «Успешно».
+    """
+    fake = FakeIMAP(
+        folders=[
+            ((b"\\HasChildren",), b"/", "Отправленные"),
+            ((b"\\HasNoChildren",), b"/", "Отправленные/2022"),
+        ],
+        messages=_messages("Отправленные/2022"),
+        select_errors={"Отправленные": [_axigen_refusal()] * 3},
+        status_messages={"Отправленные": 50},
+    )
+    res, db, store, events = _run_backup(monkeypatch, fake)
+
+    assert res.container_folders == []
+    assert res.skipped_folders == ["Отправленные"] and res.errors == 1
+    assert res.status_label == "partial"
+    skip = [m for lvl, m in events if m.startswith("Пропуск папки")][0]
+    assert "писем в ней по данным сервера: 50" in skip
+    final = [m for _lvl, m in events if m.startswith("Бэкап завершён")][-1]
+    assert "КОПИЯ НЕПОЛНАЯ" in final
+
+
+def test_folder_with_children_and_unknown_status_is_not_silent(monkeypatch):
+    """STATUS не отвечает, вложенные есть — это не «потерь нет»."""
+    fake = FakeIMAP(
+        folders=[
+            ((b"\\HasChildren",), b"/", "Отправленные"),
+            ((b"\\HasNoChildren",), b"/", "Отправленные/2022"),
+        ],
+        messages=_messages("Отправленные/2022"),
+        select_errors={"Отправленные": [_axigen_refusal()] * 3},
+    )
+    res, db, store, events = _run_backup(monkeypatch, fake)
+
+    assert res.container_folders == [] and res.skipped_folders == ["Отправленные"]
+    skip = [m for lvl, m in events if m.startswith("Пропуск папки")][0]
+    assert "возможно, это контейнер, но проверить нельзя" in skip
 
 
 # ---------------------------------------------------------------------------
@@ -547,7 +626,7 @@ def test_diagnose_folders_sorts_folders_by_verdict(monkeypatch):
             "Отправленные": [_axigen_refusal()],        # контейнер без \Noselect
             "Отправленные/s2022_000": [_axigen_refusal()],
         },
-        status_messages={"Отправленные/s2022_000": 12},
+        status_messages={"Отправленные/s2022_000": 12, "Отправленные": 0},
     )
     _patch_connection(monkeypatch, fake)
     acc = models.Account(id=1, name="Ящик", host="h", username="u", password="p",
@@ -684,3 +763,123 @@ def test_skip_message_fits_the_event_limit(monkeypatch):
         assert "прогон подряд" in message           # счётчик виден, а не обрезан
     # объяснение выводится один раз на весь прогон, а не для каждой папки
     assert len([m for lvl, m in events if m.startswith("Подробности по папкам")]) == 1
+
+
+# ---------------------------------------------------------------------------
+#  (ж) обрывы связи, битые письма, место на диске
+# ---------------------------------------------------------------------------
+def test_connection_drop_while_planning_reconnects_and_continues(monkeypatch):
+    """Обрыв связи — не отказ папки: переподключение и работа дальше."""
+    import imaplib
+    fake = FakeIMAP(
+        folders=[((b"\\HasNoChildren",), b"/", "INBOX"),
+                 ((b"\\HasNoChildren",), b"/", "Архив")],
+        messages=_messages("INBOX", "Архив"),
+        select_errors={"Архив": [imaplib.IMAP4.abort("socket error: EOF")]},
+    )
+    res, db, store, events = _run_backup(monkeypatch, fake)
+
+    assert res.errors == 0 and res.skipped_folders == []
+    assert res.messages_new == 4 and res.status_label == "success"
+    assert res.reconnects == 1
+    assert db.problems == {}          # исправная папка НЕ копит «неудачи»
+    assert any("Переподключение" in m for _lvl, m in events)
+
+
+def test_connection_drop_while_fetching_resumes_the_folder(monkeypatch):
+    fake = FakeIMAP(folders=[((b"\\HasNoChildren",), b"/", "INBOX")],
+                    messages={"INBOX": {i: RAW for i in range(1, 6)}})
+    fake.drop_on_fetch = 1
+    res, db, store, events = _run_backup(monkeypatch, fake)
+
+    assert res.messages_new == 5 and res.errors == 0 and res.reconnects == 1
+    assert len(db.indexed) == 5 and len(store.stored) == 5
+
+
+def test_one_broken_message_does_not_block_the_folder(monkeypatch):
+    """Сервер не отдаёт одно письмо — остальные копируются, ошибка видна."""
+    fake = FakeIMAP(folders=[((b"\\HasNoChildren",), b"/", "INBOX")],
+                    messages={"INBOX": {i: RAW for i in range(1, 11)}})
+    fake.fetch_fail = {4}
+    res, db, store, events = _run_backup(monkeypatch, fake)
+
+    assert res.messages_new == 9 and res.messages_failed == 1
+    assert res.errors == 1 and res.status_label == "partial"
+    assert sorted(uid for _f, uid in store.stored) == [1, 2, 3, 5, 6, 7, 8, 9, 10]
+    assert any("UID 4" in m and "отказался" in m for _lvl, m in events)
+
+
+def test_message_not_returned_by_fetch_is_classified(monkeypatch):
+    """Письмо не пришло в FETCH: удалено на сервере — не ошибка; лежит в папке — ошибка."""
+    fake = FakeIMAP(folders=[((b"\\HasNoChildren",), b"/", "INBOX")],
+                    messages={"INBOX": {i: RAW for i in range(1, 6)}})
+    fake.not_returned = {4}               # UID 4 сервер не отдаёт, хотя оно в папке
+    fake.vanish_on_fetch = {2}            # UID 2 удалили во время копирования
+    res, db, store, events = _run_backup(monkeypatch, fake)
+
+    assert res.messages_new == 3
+    assert res.messages_vanished == 1 and res.messages_failed == 1
+    assert res.errors == 1
+    assert any("UID 4" in m for _lvl, m in events)
+
+
+def test_disk_full_aborts_the_run_and_keeps_the_index(monkeypatch):
+    """Место кончилось — прогон прерывается сразу, уже скачанное — в индексе."""
+    import pytest
+    from mailarchiver.errors import DiskSpaceError
+
+    fake = FakeIMAP(folders=[((b"\\HasNoChildren",), b"/", "INBOX")],
+                    messages={"INBOX": {i: RAW for i in range(1, 11)}})
+    _patch_connection(monkeypatch, fake)
+    db = FakeDB()
+
+    class _Store(FakeStore):
+        def store_message(self, account_id, folder, delimiter, uid, raw, flags=(), internaldate=None):
+            if len(self.stored) >= 3:
+                raise DiskSpaceError("Недостаточно места на диске")
+            return super().store_message(account_id, folder, delimiter, uid, raw, flags, internaldate)
+
+    store = _Store()
+    engine = backup_mod.BackupEngine(db, store, client_mod.ConnectOptions())
+    acc = models.Account(id=1, name="Ящик", host="h", username="u", password="p")
+    with pytest.raises(DiskSpaceError):
+        engine.run(acc)
+    assert len(db.indexed) == 3           # записи индекса не потеряны (flush в finally)
+
+
+def test_header_meta_uses_only_the_header_block():
+    """Тема/отправитель и Message-ID — из блока заголовков, в том числе свёрнутый
+    Message-ID после 13 КБ служебных заголовков (Exchange Online, ARC, DKIM)."""
+    filler = b"".join(b"X-Filler-%d: " % i + b"a" * 120 + b"\r\n" for i in range(110))
+    raw = (b"From: =?utf-8?b?0JjQstCw0L0=?= <ivan@example.com>\r\n" + filler +
+           b"Subject: =?utf-8?b?0J/RgNC40LLQtdGC?=\r\nMessage-ID:\r\n <id-1@example.com>\r\n"
+           b"Content-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\n\r\nbody\r\n--x--\r\n")
+    assert len(filler) > 8192
+    subject, from_addr, has_attach = backup_mod.BackupEngine._extract_meta(raw)
+    assert subject == "Привет" and from_addr == "ivan@example.com" and has_attach == 1
+    assert backup_mod.BackupEngine._extract_message_id(raw) == "<id-1@example.com>"
+
+
+def test_uid_set_compacts_ranges():
+    assert client_mod.uid_set([1, 2, 3, 5, 7, 8]) == "1:3,5,7:8"
+    assert client_mod.uid_set([9]) == "9" and client_mod.uid_set([]) == ""
+
+
+def test_diagnose_uses_the_same_exclusions_as_backup(monkeypatch):
+    """Папка, вложенная в исключённую (или исключённая глобально), — не «потеря»."""
+    fake = FakeIMAP(
+        folders=[((b"\\HasNoChildren",), b"/", "INBOX"),
+                 ((b"\\HasChildren",), b"/", "Архив"),
+                 ((b"\\HasNoChildren",), b"/", "Архив/2020"),
+                 ((b"\\HasNoChildren",), b"/", "Спам")],
+        messages=_messages("INBOX"),
+        select_errors={"Архив/2020": [_axigen_refusal()]},
+        status_messages={"Архив/2020": 40},
+    )
+    _patch_connection(monkeypatch, fake)
+    acc = models.Account(id=1, name="Ящик", host="h", username="u", password="p",
+                         folder_exclude=["Архив"])
+    d = client_mod.diagnose_folders(acc, global_exclude=["спам"])
+    verdicts = {f["name"]: f["verdict"] for f in d["folders"]}
+    assert verdicts == {"INBOX": "ok", "Архив": "excluded", "Архив/2020": "excluded", "Спам": "excluded"}
+    assert d["broken_folders"] == [] and d["messages_lost"] == 0

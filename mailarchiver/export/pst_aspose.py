@@ -119,9 +119,13 @@ class AsposePstExportEngine(ExportEngine):
                 if cancel_cb and cancel_cb():
                     break
                 folder = get_folder(item.folder)
-                tmp_eml = os.path.join(tmp_dir, f"aspose_{os.getpid()}_{result.count}.eml")
+                # Уникальное имя на каждое письмо: параллельные экспорты в одном
+                # процессе (потоки очереди) получали одинаковое имя вида
+                # aspose_<pid>_<N>.eml — и в PST одного сотрудника попадали
+                # письма другого.
+                fd, tmp_eml = tempfile.mkstemp(prefix="aspose_", suffix=".eml", dir=tmp_dir)
                 try:
-                    with open(tmp_eml, "wb") as fh:
+                    with os.fdopen(fd, "wb") as fh:
                         fh.write(item.raw)
                     mapi = self._load_mapi(MapiMessage, tmp_eml)
                     folder.add_message(mapi)

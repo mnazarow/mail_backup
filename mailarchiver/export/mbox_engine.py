@@ -15,7 +15,8 @@ import email.utils
 import os
 import re
 import time
-from typing import Dict, Iterable, Optional, TextIO
+from collections import OrderedDict
+from typing import Iterable, Optional
 
 from ..errors import ExportError
 from ..util import ensure_dir
@@ -23,6 +24,33 @@ from .base import (CancelCB, ExportEngine, ExportResult, MailItem, ProgressCB, f
                    safe_export_path)
 
 _FROM_RE = re.compile(rb"^(>*From )", re.MULTILINE)
+
+
+#: Сколько mbox-файлов держим открытыми одновременно.
+MAX_OPEN_MBOX_FILES = 64
+
+
+def _status_headers(flags) -> bytes:
+    """Флаги IMAP → заголовки mbox ``Status``/``X-Status``.
+
+    Status: R — прочитано, O — «старое» (не новое в ящике).
+    X-Status: A — отвечено, F — помечено, D — удалено, T — черновик.
+    """
+    names = {str(f).lstrip("\\").lower() for f in (flags or [])}
+    status = ("R" if "seen" in names else "") + "O"
+    x = ""
+    if "answered" in names:
+        x += "A"
+    if "flagged" in names:
+        x += "F"
+    if "deleted" in names:
+        x += "D"
+    if "draft" in names:
+        x += "T"
+    out = f"Status: {status}\n"
+    if x:
+        out += f"X-Status: {x}\n"
+    return out.encode("ascii", "replace")
 
 
 class MboxExportEngine(ExportEngine):
@@ -34,14 +62,30 @@ class MboxExportEngine(ExportEngine):
                cancel_cb: Optional[CancelCB] = None, total_hint: int = 0) -> ExportResult:
         ensure_dir(out_path, 0o700)
         result = ExportResult(path=out_path, is_dir=True, engine=self.name, fmt=self.fmt)
-        handles: Dict[str, "os.PathLike"] = {}
-        open_files: Dict[str, object] = {}
+        # OrderedDict: вытесняем ДАВНО не использованный файл, а не первый
+        # открытый. Письма приходят вперемешку по дате, и при FIFO кэш
+        # вырождался — на 100 папок было 5000 открытий вместо 100.
+        open_files: "OrderedDict[str, object]" = OrderedDict()
         try:
             for item in items:
                 if cancel_cb and cancel_cb():
                     break
                 rel = folder_to_fs(item.folder) + ".mbox"
                 fh = open_files.get(rel)
+                if fh is not None:
+                    open_files.move_to_end(rel)
+                if fh is None and len(open_files) >= MAX_OPEN_MBOX_FILES:
+                    # На ящике с сотнями папок держать по дескриптору на каждую
+                    # — верный путь упереться в лимит открытых файлов. Закрываем
+                    # самый давний: файлы открываются в режиме дозаписи.
+                    old_rel, old_fh = next(iter(open_files.items()))
+                    try:
+                        old_fh.flush()
+                        old_fh.close()
+                    except (OSError, ValueError) as exc:
+                        result.errors += 1
+                        result.error_details.append(f"{old_rel}: {exc}")
+                    open_files.pop(old_rel, None)
                 if fh is None:
                     try:
                         # защита «в глубину»: путь обязан остаться внутри каталога экспорта
@@ -101,6 +145,11 @@ class MboxExportEngine(ExportEngine):
         header = f"From {sender} {date_str}\n".encode("utf-8", "replace")
         # mboxrd: экранируем строки, начинающиеся с (>*)From
         body = _FROM_RE.sub(rb">\1", item.raw)
+        status = _status_headers(item.flags)
+        if status:
+            # Status/X-Status — стандартный способ mbox хранить флаги письма.
+            # Без них «прочитано», «отвечено» и «помечено» терялись при экспорте.
+            body = status + body
         if not body.endswith(b"\n"):
             body += b"\n"
         return header + body + b"\n"

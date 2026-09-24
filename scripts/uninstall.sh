@@ -8,7 +8,10 @@
 #  Запуск:  sudo bash scripts/uninstall.sh            # удалить, данные оставить
 #           sudo bash scripts/uninstall.sh --purge    # удалить всё, включая данные
 # ============================================================================
-set -Eeuo pipefail
+# Без -e: удаление — «по возможности». Сбой одного шага (служба уже удалена,
+# каталога нет) не должен оставлять половину установки; ловушка ERR сообщает
+# о каждом сбое, и скрипт идёт дальше — как и обещает её текст.
+set -Euo pipefail
 
 APP_NAME="mailarchiver"
 APP_USER="${MA_USER:-mailarchiver}"
@@ -43,6 +46,10 @@ systemctl stop "$APP_NAME" 2>/dev/null || warn "Служба не запущен
 systemctl disable "$APP_NAME" 2>/dev/null || true
 if [ -f "$SERVICE_FILE" ]; then rm -f "$SERVICE_FILE"; systemctl daemon-reload 2>/dev/null || true; ok "Служба удалена."; fi
 
+if [ -f /usr/local/bin/mailarchiver ] && grep -q "MailArchiver CLI" /usr/local/bin/mailarchiver 2>/dev/null; then
+  rm -f /usr/local/bin/mailarchiver && ok "Команда mailarchiver удалена."
+fi
+
 if [ -d "$INSTALL_DIR" ]; then
   info "Удаляю файлы приложения ($INSTALL_DIR)…"
   rm -rf "$INSTALL_DIR"
@@ -54,7 +61,7 @@ if [ "$PURGE" != "1" ] && [ -t 0 ]; then
   echo ""
   warn "Удалить также ДАННЫЕ (локальные копии писем и БД) и конфигурацию?"
   echo "    Данные:       $DATA_DIR"
-  echo "    Конфигурация: $CONFIG_DIR"
+  echo "    Конфигурация: $CONFIG_DIR (там же обычно лежит ключ шифрования storage.key)"
   read -r -p "    Удалить безвозвратно? [y/N] " ans
   case "$ans" in y|Y|yes|да) PURGE=1 ;; esac
 fi

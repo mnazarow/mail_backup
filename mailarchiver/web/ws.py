@@ -18,7 +18,8 @@ from typing import Dict, List, Optional
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from ..logging_setup import get_logger, memory_handler
-from .api import serialize_job
+from .api import serialize_job, visible_author
+from .proxy import check_origin, host_is_trusted
 from . import auth as auth_mod
 
 log = get_logger("ws")
@@ -40,7 +41,14 @@ def _ws_user(websocket: WebSocket):
     данные.
     """
     services = websocket.app.state.services
-    return auth_mod.user_from_cookies(services, websocket.cookies)
+    # Перепроверка сессии открытым сокетом НЕ продлевает её: иначе открытая
+    # вкладка держала бы сессию живой вечно, и «Тайм-аут бездействия» не работал.
+    user = auth_mod.user_from_cookies(services, websocket.cookies, touch=False)
+    if user is not None and auth_mod.two_factor_required(services, user):
+        # администратор, которому 2FA обязательна, пока её не включил —
+        # как и в REST, до этого ему недоступно ничего, кроме её настройки
+        return None
+    return user
 
 
 class _LiveHub:
@@ -132,13 +140,32 @@ _hub = _LiveHub()
 
 @router.websocket("/ws")
 async def ws_live(websocket: WebSocket):
+    # Проверка источника ДО accept(): иначе страница чужого сайта открывала
+    # соединение с cookie пользователя и читала весь поток состояния.
+    services = websocket.app.state.services
+    try:
+        # как и у REST (SecurityHeadersMiddleware): значение из интерфейса тоже
+        # учитывается, а не только из config.yaml — иначе POST проходил, а
+        # WebSocket с тем же Origin получал отказ
+        public_url = str(services.rt("server", "public_url") or "")
+    except Exception:  # noqa: BLE001
+        public_url = ""
+    if not check_origin(websocket.scope, public_url):
+        await websocket.close(code=4403)
+        return
+    if not bool(services.rt("security", "auth_enabled")):
+        # без входа поток состояния открыт всем, кто дотянулся до порта —
+        # тогда хотя бы имя сервера должно быть «своим» (DNS rebinding)
+        host = websocket.headers.get("host", "")
+        if not host_is_trusted(host, public_url):
+            await websocket.close(code=4403)
+            return
     await websocket.accept()
     user = await asyncio.to_thread(_ws_user, websocket)
     if user is None:
         await websocket.send_text(json.dumps({"type": "error", "message": "unauthorized"}))
         await websocket.close(code=4401)
         return
-    services = websocket.app.state.services
     _hub.subscribe(services)
     tick = 0
     version = 0
@@ -169,11 +196,16 @@ def _collect_snapshot(services) -> dict:
     """Общий снимок состояния — считается один раз на всех подписчиков."""
     return {
         "type": "live",
-        "active_jobs": [serialize_job(j) for j in services.db.active_jobs()],
+        "active_jobs": [serialize_job(j, services.db.account_names()) for j in services.db.active_jobs()],
         "job_counts": services.db.count_jobs_by_status(),
         "scheduler_running": services.scheduler.running(),
         "logs": memory_handler.tail(limit=40),
     }
+
+
+def collect_live(services, user: dict) -> dict:
+    """Снимок для одного пользователя — для запасного REST-опроса (/api/live)."""
+    return _personal_snapshot(_collect_snapshot(services), user)
 
 
 def _personal_snapshot(snapshot: dict, user: dict) -> dict:
@@ -182,7 +214,13 @@ def _personal_snapshot(snapshot: dict, user: dict) -> dict:
     if user.get("role") == "mailbox":
         # как и в /api/state: пользователь-ящик видит только свои задания
         aid = user.get("account_id")
-        out["active_jobs"] = [j for j in snapshot.get("active_jobs", []) if j["account_id"] == aid]
+        own = [dict(j, created_by=visible_author(j.get("created_by", ""), user))
+               for j in snapshot.get("active_jobs", []) if j["account_id"] == aid]
+        out["active_jobs"] = own
+        # Счётчики очереди — тоже общесистемные данные: пользователь-ящик
+        # видит количество только своих активных заданий.
+        out["job_counts"] = {"running": sum(1 for j in own if j["status"] == "running"),
+                             "queued": sum(1 for j in own if j["status"] == "queued")}
     if user.get("role") != "admin":
         # Общий лог сервиса (имена и хосты чужих ящиков, ошибки чужих заданий)
         # отдаём только администратору — как и /api/logs.

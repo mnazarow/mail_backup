@@ -14,10 +14,12 @@
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 import threading
-from typing import Any, Dict, List, Optional, Sequence
+import time
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from . import models
 from .logging_setup import get_logger
@@ -31,16 +33,38 @@ log = get_logger("db")
 #: Настройки, значения которых хранятся в БД в зашифрованном виде
 #: (шифруются в :meth:`Database.set_setting`, расшифровываются в
 #: :meth:`Database.get_setting`).
-_ENCRYPTED_SETTINGS = {"notifications.smtp_password"}
+_ENCRYPTED_SETTINGS = {"notifications.smtp_password", "employees.source_url_password",
+                       "replica.s3_secret_key", "monitoring.metrics_token", "mailadmin.password"}
 
 
 #: Выборка сотрудника вместе с названием и состоянием привязанного ящика:
 #: интерфейсу нужны account_name/account_enabled, а отдельный запрос на строку
 #: превратил бы список в N+1 обращений к БД.
 _EMPLOYEE_SELECT = (
-    "SELECT e.*, a.name AS account_name, a.enabled AS account_enabled "
+    "SELECT e.*, a.name AS account_name, a.enabled AS account_enabled, a.hold_until AS account_hold_until "
     "FROM employees e LEFT JOIN accounts a ON a.id = e.account_id"
 )
+
+
+def _row_str(row, key: str) -> str:
+    """Значение колонки строкой ('' если колонки нет или там NULL)."""
+    try:
+        value = row[key]
+    except (IndexError, KeyError):
+        return ""
+    return "" if value is None else str(value)
+
+
+def _row_int(row, key: str) -> int:
+    """Значение колонки числом (0, если колонки нет или там NULL)."""
+    try:
+        value = row[key]
+    except (IndexError, KeyError):
+        return 0
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _ma_lower(value):
@@ -112,6 +136,18 @@ class Database:
         except sqlite3.Error as exc:  # pragma: no cover - крайне редкий случай
             log.warning("Не удалось откатить транзакцию: %s", exc)
 
+    @contextmanager
+    def transaction(self):
+        """Несколько операторов одной транзакцией: всё или ничего."""
+        conn = self.connect()
+        with self._write_lock:
+            try:
+                yield conn
+                conn.commit()
+            except BaseException:
+                self._safe_rollback(conn)
+                raise
+
     def query(self, sql: str, params: tuple = ()) -> List[sqlite3.Row]:
         return self.connect().execute(sql, params).fetchall()
 
@@ -140,6 +176,46 @@ class Database:
                 self._safe_rollback(conn)
                 raise
             self._migrate(conn)
+            # Полнотекстовый поиск (FTS5): таблица и триггер удаления. Без FTS5
+            # в сборке SQLite поиск работает по теме и отправителю.
+            from .search import ensure_schema as _ensure_search_schema
+            try:
+                self.fts_available = _ensure_search_schema(conn)
+                conn.commit()
+            except BaseException:
+                self._safe_rollback(conn)
+                raise
+            # Отпечатки вложений для отчёта «Одинаковые вложения» (таблица и триггер удаления).
+            from .dedup import ensure_schema as _ensure_dedup_schema
+            _ensure_dedup_schema(conn)
+        self._encrypt_plain_settings()
+
+    def _encrypt_plain_settings(self) -> None:
+        """Зашифровать секреты-настройки, сохранённые прежними версиями открытым текстом.
+
+        Пароль источника сотрудников (employees.source_url_password) до 1.3.0
+        лежал в БД как есть, хотя интерфейс и документация обещали шифрование.
+        Значение, похожее на токен Fernet, но не расшифровываемое, не трогаем:
+        это зашифрованный секрет при сменившемся ключе, а не открытый текст.
+        """
+        for key in _ENCRYPTED_SETTINGS:
+            row = self.query_one("SELECT value FROM settings WHERE key=?", (key,))
+            if row is None:
+                continue
+            try:
+                value = json.loads(row["value"])
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(value, str) or not value:
+                continue
+            try:
+                self.secret.decrypt(value)
+                continue                       # уже зашифровано
+            except Exception:  # noqa: BLE001
+                if value.startswith("gAAAAA"):
+                    continue
+            self.set_setting(key, value)
+            log.info("Настройка %s зашифрована в базе (была сохранена открытым текстом).", key)
 
     def _migrate(self, conn: sqlite3.Connection) -> None:
         """Безопасные миграции для БД, созданных прошлыми версиями (ADD COLUMN)."""
@@ -152,8 +228,47 @@ class Database:
             ("messages", "has_attach", "INTEGER DEFAULT 0"),
             ("sessions", "role", "TEXT DEFAULT 'admin'"),
             ("sessions", "account_id", "INTEGER"),
+            # двухфакторный вход (1.3.0)
+            ("users", "totp_enabled", "INTEGER NOT NULL DEFAULT 0"),
+            ("users", "totp_secret_enc", "TEXT DEFAULT ''"),
+            ("users", "totp_pending_enc", "TEXT DEFAULT ''"),
+            ("users", "totp_last_step", "INTEGER NOT NULL DEFAULT 0"),
+            ("users", "totp_recovery", "TEXT DEFAULT '[]'"),
+            # счётчик нечитаемых папок растёт раз в сутки (1.3.0)
+            ("folder_problems", "counted_at", "TEXT"),
+            # автор выгрузки хранится в ней самой: задания чистятся раньше (1.3.0)
+            ("exports", "created_by", "TEXT DEFAULT ''"),
+            # отложенный повтор хранится в БД, а не в таймере процесса (1.3.0)
+            ("jobs", "run_after", "TEXT"),
+            ("jobs", "restarts", "INTEGER DEFAULT 0"),
+            # итог последней проверки входа и даты резервных копий (1.3.0)
+            ("accounts", "login_status", "TEXT DEFAULT ''"),
+            ("accounts", "login_checked_at", "TEXT"),
+            ("accounts", "login_error", "TEXT DEFAULT ''"),
+            ("accounts", "first_backup_at", "TEXT"),
+            ("accounts", "last_backup_at", "TEXT"),
+            ("accounts", "last_backup_status", "TEXT DEFAULT ''"),
+            # вид попытки входа: пароль / код 2FA / проверка ящика по IMAP (1.3.0)
+            ("login_attempts", "kind", "TEXT DEFAULT ''"),
+            # у сотрудника уже был ящик: удалённый администратором ящик ночная
+            # синхронизация больше не пересоздаёт (1.3.0)
+            ("employees", "had_account", "INTEGER NOT NULL DEFAULT 0"),
+            # удержание архива и увольнение сотрудника (1.4.0)
+            ("accounts", "hold_until", "TEXT DEFAULT ''"),
+            ("accounts", "hold_reason", "TEXT DEFAULT ''"),
+            ("accounts", "dismissed_at", "TEXT"),
+            ("accounts", "auto_disabled", "INTEGER NOT NULL DEFAULT 0"),
+            ("employees", "dismissed_at", "TEXT"),
         ]
         changed = False
+        # Индекс (account_id, folder) полностью покрыт уникальным ключом
+        # (account_id, folder, uidvalidity, uid) и idx_messages_date — лишний
+        # индекс только замедлял запись писем.
+        try:
+            conn.execute("DROP INDEX IF EXISTS idx_messages_acc")
+            changed = True
+        except sqlite3.OperationalError as exc:
+            log.warning("Не удалось удалить лишний индекс idx_messages_acc: %s", exc)
         for table, col, decl in migrations:
             try:
                 if col not in cols(table):
@@ -170,6 +285,69 @@ class Database:
             except BaseException:
                 self._safe_rollback(conn)
                 raise
+        # Индекс по новой колонке — только после её появления в старой базе.
+        try:
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_login_attempts_kind ON login_attempts(kind, ts)")
+            conn.execute("UPDATE employees SET had_account=1 WHERE account_id IS NOT NULL AND had_account=0")
+            # поиск ящика по логину — на каждой строке синхронизации сотрудников
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_accounts_username ON accounts(username COLLATE NOCASE)")
+            conn.commit()
+        except sqlite3.Error as exc:
+            self._safe_rollback(conn)
+            log.warning("Не удалось создать индекс idx_login_attempts_kind: %s", exc)
+        # Даты резервных копий для базы прежней версии: первая — по самому
+        # раннему сохранённому письму, последняя — по истории прогонов.
+        try:
+            if conn.execute("SELECT 1 FROM accounts WHERE first_backup_at IS NULL LIMIT 1").fetchone():
+                conn.execute(
+                    "UPDATE accounts SET first_backup_at=(SELECT MIN(backed_up_at) FROM messages m "
+                    "WHERE m.account_id=accounts.id) WHERE first_backup_at IS NULL")
+                conn.execute(
+                    "UPDATE accounts SET last_backup_at=(SELECT MAX(finished_at) FROM runs r "
+                    "WHERE r.account_id=accounts.id AND r.type='backup' AND r.status IN ('success','partial')) "
+                    "WHERE last_backup_at IS NULL")
+                conn.commit()
+        except sqlite3.Error as exc:
+            self._safe_rollback(conn)
+            log.warning("Не удалось заполнить даты резервных копий ящиков: %s", exc)
+        self._drop_legacy_retention_schedules(conn)
+
+    #: Отметка в meta: устаревшие расписания очистки уже убраны (один раз).
+    _LEGACY_RETENTION_MARK = "legacy_retention_schedules_removed"
+
+    def _drop_legacy_retention_schedules(self, conn: sqlite3.Connection) -> None:
+        """Убрать расписания очистки, которые версии до 1.3.0 заводили сами.
+
+        При выборе срока хранения в меню ящика прежние версии создавали ящику
+        расписание «очистка, cron 30 3 * * *, без параметров». Теперь их работу
+        делает ежедневный обход (retention.cron), который ставит очистку только
+        ящикам, где есть что удалять, а старые расписания ставили её КАЖДОМУ
+        такому ящику каждую ночь — сотни пустых заданий в очереди и истории.
+        Выполняется один раз: расписание, созданное вручную позже, не трогаем.
+        """
+        try:
+            if conn.execute("SELECT 1 FROM meta WHERE key=?", (self._LEGACY_RETENTION_MARK,)).fetchone():
+                return
+            cur = conn.execute(
+                "DELETE FROM schedules WHERE job_type='retention' AND kind='cron' "
+                "AND TRIM(COALESCE(cron_expr, ''))='30 3 * * *' "
+                "AND TRIM(COALESCE(options, '')) IN ('', '{}')")
+            removed = max(0, cur.rowcount or 0)
+            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+                         (self._LEGACY_RETENTION_MARK, str(removed)))
+            if removed:
+                conn.execute(
+                    "INSERT INTO audit(ts, user, action, detail) VALUES(?,?,?,?)",
+                    (utcnow_iso(), "system", "schedules_cleanup",
+                     f"удалено устаревших расписаний очистки ящиков: {removed} — очистку по сроку "
+                     f"хранения теперь ставит ежедневный обход (retention.cron)"))
+            conn.commit()
+            if removed:
+                log.info("Удалено устаревших расписаний очистки ящиков: %d — их работу выполняет "
+                         "ежедневная очистка по срокам хранения (retention.cron).", removed)
+        except sqlite3.Error as exc:
+            self._safe_rollback(conn)
+            log.warning("Не удалось убрать устаревшие расписания очистки: %s", exc)
 
     # ======================================================================
     #  Пользователи и вход
@@ -210,49 +388,200 @@ class Database:
         return self.query_one("SELECT * FROM users WHERE id=?", (user_id,))
 
     def list_users(self) -> List[sqlite3.Row]:
-        return self.query("SELECT id, username, role, created_at, last_login, disabled FROM users ORDER BY id")
+        return self.query("SELECT id, username, role, created_at, last_login, disabled, totp_enabled "
+                          "FROM users ORDER BY id")
 
     def set_user_password(self, user_id: int, password_hash: str) -> None:
         self.execute("UPDATE users SET password_hash=? WHERE id=?", (password_hash, user_id))
+        # Смена пароля обязана завершать все открытые сеансы: иначе сценарий
+        # «нас взломали, меняю пароль» не работал — cookie злоумышленника
+        # жила до конца session_ttl_hours. Заодно отзываются выданные по
+        # старому паролю билеты второго шага входа.
+        self.delete_user_sessions(user_id)
+        self.drop_user_otp_challenges(user_id)
 
     def set_last_login(self, user_id: int) -> None:
         self.execute("UPDATE users SET last_login=? WHERE id=?", (utcnow_iso(), user_id))
 
     def set_user_disabled(self, user_id: int, disabled: bool) -> None:
         self.execute("UPDATE users SET disabled=? WHERE id=?", (1 if disabled else 0, user_id))
+        if disabled:
+            self.delete_user_sessions(user_id)
+            self.drop_user_otp_challenges(user_id)
 
     def delete_user(self, user_id: int) -> None:
+        self.delete_user_sessions(user_id)
+        self.drop_user_otp_challenges(user_id)
         self.execute("DELETE FROM users WHERE id=?", (user_id,))
 
-    def record_login_attempt(self, username: str, success: bool, ip: str = "") -> None:
-        self.execute(
-            "INSERT INTO login_attempts(username, ts, success, ip) VALUES(?,?,?,?)",
-            (username, utcnow_iso(), 1 if success else 0, ip),
-        )
+    # ---- двухфакторный вход (TOTP) ----------------------------------------
+    def totp_state(self, user_id: int) -> Optional[Dict[str, Any]]:
+        """Состояние 2FA пользователя: секреты расшифрованы (или пусты)."""
+        row = self.query_one(
+            "SELECT totp_enabled, totp_secret_enc, totp_pending_enc, totp_last_step, totp_recovery "
+            "FROM users WHERE id=?", (user_id,))
+        if row is None:
+            return None
+        broken = [False]
+        try:
+            recovery = json.loads(row["totp_recovery"] or "[]")
+        except (TypeError, ValueError):
+            recovery = []
+        return {
+            "enabled": bool(row["totp_enabled"]),
+            "secret": self._decrypt_opt(row["totp_secret_enc"], broken),
+            "pending": self._decrypt_opt(row["totp_pending_enc"], broken),
+            "last_step": int(row["totp_last_step"] or 0),
+            "recovery": recovery if isinstance(recovery, list) else [],
+            "secret_broken": broken[0],
+        }
 
-    def count_recent_failures(self, username: str, since_iso: str, ip: Optional[str] = None) -> int:
+    def set_totp_pending(self, user_id: int, secret_b32: str) -> None:
+        self.execute("UPDATE users SET totp_pending_enc=? WHERE id=?",
+                     (self.secret.encrypt(secret_b32) if secret_b32 else "", user_id))
+
+    def enable_totp(self, user_id: int, secret_b32: str, recovery_hashes: List[str], step: int) -> None:
+        self.execute(
+            "UPDATE users SET totp_enabled=1, totp_secret_enc=?, totp_pending_enc='', "
+            "totp_last_step=?, totp_recovery=? WHERE id=?",
+            (self.secret.encrypt(secret_b32), int(step), json.dumps(recovery_hashes), user_id))
+
+    def disable_totp(self, user_id: int) -> None:
+        self.execute(
+            "UPDATE users SET totp_enabled=0, totp_secret_enc='', totp_pending_enc='', "
+            "totp_last_step=0, totp_recovery='[]' WHERE id=?", (user_id,))
+        self.drop_user_otp_challenges(user_id)
+
+    def claim_totp_step(self, user_id: int, step: int) -> bool:
+        """Атомарно отметить шаг TOTP использованным.
+
+        ``False`` — этот (или более поздний) шаг уже использован: код
+        предъявлен повторно, например перехвачен. Проверка и запись — одним
+        оператором, поэтому два одновременных входа с одним кодом не проходят.
+        """
+        cur = self.execute("UPDATE users SET totp_last_step=? WHERE id=? AND totp_last_step < ?",
+                           (int(step), user_id, int(step)))
+        return bool(cur.rowcount)
+
+    def set_totp_recovery(self, user_id: int, recovery_hashes: List[str]) -> None:
+        self.execute("UPDATE users SET totp_recovery=? WHERE id=?", (json.dumps(recovery_hashes), user_id))
+
+    def consume_totp_recovery(self, user_id: int, used_hash: str) -> bool:
+        """Вычеркнуть использованный резервный код (атомарно)."""
+        conn = self.connect()
+        with self._write_lock:
+            try:
+                row = conn.execute("SELECT totp_recovery FROM users WHERE id=?", (user_id,)).fetchone()
+                items = json.loads((row[0] if row else "") or "[]")
+                if used_hash not in items:
+                    return False
+                items.remove(used_hash)
+                conn.execute("UPDATE users SET totp_recovery=? WHERE id=?", (json.dumps(items), user_id))
+                conn.commit()
+                return True
+            except BaseException:
+                self._safe_rollback(conn)
+                raise
+
+    def delete_mailbox_sessions(self, account_id: int) -> int:
+        """Завершить сеансы сотрудника, вошедшего по паролю этого ящика."""
+        cur = self.execute("DELETE FROM sessions WHERE role='mailbox' AND account_id=?", (int(account_id),))
+        return int(cur.rowcount or 0)
+
+    def delete_user_sessions(self, user_id: int) -> int:
+        """Завершить все сеансы пользователя веб-интерфейса.
+
+        Сеансы входа ПО ЯЩИКУ создаются с ``user_id = 0`` (у них нет записи в
+        таблице users), поэтому они исключены явно: иначе опечатка в id —
+        ``/api/users/0/disable`` — разом выкидывала бы из интерфейса всех, кто
+        вошёл по учётным данным своего ящика.
+        """
+        if not user_id or int(user_id) <= 0:
+            return 0
+        cur = self.execute("DELETE FROM sessions WHERE user_id=? AND role IS NOT 'mailbox'", (user_id,))
+        try:
+            return int(cur.rowcount or 0)
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def record_login_attempt(self, username: str, success: bool, ip: str = "", kind: str = "") -> int:
+        """Записать попытку входа; вернуть её id.
+
+        ``kind``: '' — пароль, 'otp' — код второго шага, 'imap' — проверка
+        пароля почтового ящика на IMAP-сервере.
+        """
+        cur = self.execute(
+            "INSERT INTO login_attempts(username, ts, success, ip, kind) VALUES(?,?,?,?,?)",
+            (username, utcnow_iso(), 1 if success else 0, ip, kind or ""),
+        )
+        return int(cur.lastrowid or 0)
+
+    def delete_login_attempt(self, attempt_id: int) -> None:
+        """Убрать записанную заранее «неудачу», если попытка оказалась успешной."""
+        if attempt_id:
+            self.execute("DELETE FROM login_attempts WHERE id=?", (int(attempt_id),))
+
+    def count_recent_failures(self, username: str, since_iso: str, ip: Optional[str] = None,
+                              kind: Optional[str] = None) -> int:
         """Неудачные попытки входа за период.
 
         ``ip`` задан → считаются только попытки с этого источника, то есть по
         ПАРЕ «имя пользователя + IP». Без него — по учётной записи целиком
         (прежнее поведение, используется для общесистемной защиты).
+        ``kind`` задан → только попытки этого вида (см. :meth:`record_login_attempt`).
         """
-        if ip is None:
-            return int(
-                self.scalar(
-                    "SELECT COUNT(*) FROM login_attempts WHERE username=? COLLATE NOCASE AND success=0 AND ts>=?",
-                    (username, since_iso),
-                )
-                or 0
-            )
-        return int(
-            self.scalar(
-                "SELECT COUNT(*) FROM login_attempts "
-                "WHERE username=? COLLATE NOCASE AND ip=? AND success=0 AND ts>=?",
-                (username, ip, since_iso),
-            )
-            or 0
-        )
+        sql = "SELECT COUNT(*) FROM login_attempts WHERE username=? COLLATE NOCASE AND success=0 AND ts>=?"
+        args: list = [username, since_iso]
+        if ip is not None:
+            sql += " AND ip=?"
+            args.append(ip)
+        if kind is not None:
+            sql += " AND kind=?"
+            args.append(kind)
+        return int(self.scalar(sql, tuple(args)) or 0)
+
+    def count_recent_failures_of_kind(self, kind: str, since_iso: str) -> int:
+        """Неудачные попытки одного вида по ВСЕМ учётным записям (например, все
+        проверки паролей ящиков на IMAP-сервере)."""
+        return int(self.scalar("SELECT COUNT(*) FROM login_attempts WHERE kind=? AND success=0 AND ts>=?",
+                               (kind, since_iso)) or 0)
+
+    # ---- билеты второго шага входа ----------------------------------------
+    def create_otp_challenge(self, nonce: str, user_id: int, expires: int, pw: str) -> None:
+        now = int(time.time())
+        with self.transaction() as conn:
+            conn.execute("DELETE FROM otp_challenges WHERE expires < ?", (now,))
+            conn.execute("INSERT INTO otp_challenges(nonce, user_id, expires, attempts, pw) VALUES(?,?,?,0,?)",
+                         (nonce, int(user_id), int(expires), pw or ""))
+
+    def take_otp_attempt(self, nonce: str, user_id: int, max_attempts: int) -> Optional[Tuple[str, int]]:
+        """Засчитать попытку ввода кода по билету — ДО проверки кода.
+
+        Возвращает ``(отпечаток пароля, с которым выдан билет; номер попытки)``
+        или None: билета нет (использован, истёк, выдан до обновления) либо
+        попытки по нему исчерпаны. Проверка и увеличение счётчика — одним
+        оператором, поэтому залп параллельных запросов не получит лишних попыток.
+        """
+        cur = self.execute(
+            "UPDATE otp_challenges SET attempts=attempts+1 "
+            "WHERE nonce=? AND user_id=? AND expires>=? AND attempts<?",
+            (nonce, int(user_id), int(time.time()), int(max_attempts)))
+        if not cur.rowcount:
+            return None
+        row = self.query_one("SELECT pw, attempts FROM otp_challenges WHERE nonce=?", (nonce,))
+        if row is None:
+            return None
+        return (row["pw"] or ""), int(row["attempts"] or 0)
+
+    def drop_otp_challenge(self, nonce: str) -> None:
+        self.execute("DELETE FROM otp_challenges WHERE nonce=?", (nonce,))
+
+    def drop_user_otp_challenges(self, user_id: int) -> None:
+        self.execute("DELETE FROM otp_challenges WHERE user_id=?", (int(user_id),))
+
+    def purge_expired_otp_challenges(self) -> int:
+        cur = self.execute("DELETE FROM otp_challenges WHERE expires < ?", (int(time.time()),))
+        return int(cur.rowcount or 0)
 
     def count_recent_failures_by_ip(self, ip: str, since_iso: str) -> int:
         """Неудачные попытки входа с одного источника по ВСЕМ именам пользователей.
@@ -277,6 +606,9 @@ class Database:
             self.execute("DELETE FROM login_attempts WHERE username=? COLLATE NOCASE", (username,))
             return
         self.execute("DELETE FROM login_attempts WHERE username=? COLLATE NOCASE AND ip=?", (username, ip))
+
+    def purge_older_login(self, older_than_iso: str) -> int:
+        return self.purge_old_login_attempts(older_than_iso)
 
     def purge_old_login_attempts(self, older_than_iso: str) -> int:
         """Удалить попытки входа старше указанной отметки времени (ISO-8601).
@@ -313,26 +645,98 @@ class Database:
     # ======================================================================
     #  Аккаунты (почтовые ящики)
     # ======================================================================
+    def _decrypt_opt(self, value, broken: List[bool]) -> str:
+        """Расшифровать секрет; при неподходящем ключе вернуть пустую строку.
+
+        Без этого потеря (или замена) secret.key убивала ВЕСЬ интерфейс:
+        _account_from_row поднимал AuthError, и /api/state, /api/accounts и
+        WebSocket отвечали 400 — до списка ящиков, где предлагается ввести
+        пароль заново, добраться было нельзя.
+        """
+        if not value:
+            return ""
+        try:
+            return self.secret.decrypt(value)
+        except Exception:  # noqa: BLE001
+            broken[0] = True
+            return ""
+
     def _account_from_row(self, row: sqlite3.Row) -> models.Account:
+        broken = [False]
+        password = self._decrypt_opt(row["password_enc"], broken)
+        oauth_secret = self._decrypt_opt(row["oauth_client_secret_enc"], broken)
+        oauth_refresh = self._decrypt_opt(row["oauth_refresh_token_enc"], broken)
+        if broken[0]:
+            log.warning("Ящик «%s» (id=%s): сохранённый пароль не расшифровывается текущим "
+                        "secret.key — введите пароль заново.", row["name"], row["id"])
         return models.Account(
             id=row["id"],
             name=row["name"],
             host=row["host"],
             port=row["port"],
             username=row["username"],
-            password=self.secret.decrypt(row["password_enc"]) if row["password_enc"] else "",
+            password=password,
             auth_type=row["auth_type"],
             security=row["security"],
             enabled=bool(row["enabled"]),
             folder_include=json.loads(row["folder_include"] or "[]"),
             folder_exclude=json.loads(row["folder_exclude"] or "[]"),
             oauth_client_id=row["oauth_client_id"] or "",
-            oauth_client_secret=self.secret.decrypt(row["oauth_client_secret_enc"]) if row["oauth_client_secret_enc"] else "",
-            oauth_refresh_token=self.secret.decrypt(row["oauth_refresh_token_enc"]) if row["oauth_refresh_token_enc"] else "",
+            oauth_client_secret=oauth_secret,
+            oauth_refresh_token=oauth_refresh,
             oauth_token_url=row["oauth_token_url"] or "",
             notes=row["notes"] or "",
             retention_days=row["retention_days"] if row["retention_days"] is not None else -1,
+            secret_broken=broken[0],
+            login_status=_row_str(row, "login_status"),
+            login_checked_at=_row_str(row, "login_checked_at"),
+            login_error=_row_str(row, "login_error"),
+            first_backup_at=_row_str(row, "first_backup_at"),
+            last_backup_at=_row_str(row, "last_backup_at"),
+            last_backup_status=_row_str(row, "last_backup_status"),
+            hold_until=_row_str(row, "hold_until"),
+            hold_reason=_row_str(row, "hold_reason"),
+            dismissed_at=_row_str(row, "dismissed_at"),
+            auto_disabled=bool(_row_int(row, "auto_disabled")),
         )
+
+    def set_account_hold(self, account_id: int, hold_until: str, reason: str = "manual") -> None:
+        """Удержание архива ящика: до даты (ГГГГ-ММ-ДД) очистка по сроку его не трогает."""
+        self.execute("UPDATE accounts SET hold_until=?, hold_reason=?, updated_at=? WHERE id=?",
+                     (hold_until or "", reason if hold_until else "", utcnow_iso(), account_id))
+
+    def mark_account_dismissed(self, account_id: int, dismissed_at: Optional[str]) -> None:
+        self.execute("UPDATE accounts SET dismissed_at=?, updated_at=? WHERE id=?",
+                     (dismissed_at, utcnow_iso(), account_id))
+
+    def set_account_auto_disabled(self, account_id: int, disabled: bool) -> None:
+        """Выключить копирование «из-за увольнения» (или вернуть его)."""
+        self.execute("UPDATE accounts SET enabled=?, auto_disabled=?, updated_at=? WHERE id=?",
+                     (0 if disabled else 1, 1 if disabled else 0, utcnow_iso(), account_id))
+
+    # ---- итог проверки входа и даты копий -------------------------------
+    def set_login_status(self, account_id: int, status: str, error: str = "") -> None:
+        """Запомнить, чем кончилась последняя попытка входа в ящик.
+
+        ``status``: ok | auth_error | conn_error | no_password | secret_broken.
+        Пишется проверкой паролей, кнопкой «Проверить» и каждым бэкапом —
+        по этому полю в разделе «Почтовые ящики» отбираются ящики с неверным
+        паролем.
+        """
+        self.execute("UPDATE accounts SET login_status=?, login_checked_at=?, login_error=? WHERE id=?",
+                     (status, utcnow_iso(), (error or "")[:500], account_id))
+
+    def note_backup_result(self, account_id: int, status: str) -> None:
+        """Итог копирования: дата последней удачной копии и первой копии ящика."""
+        now = utcnow_iso()
+        if status in (models.JobStatus.SUCCESS, models.JobStatus.PARTIAL):
+            self.execute(
+                "UPDATE accounts SET last_backup_at=?, last_backup_status=?, "
+                "first_backup_at=COALESCE(first_backup_at, (SELECT MIN(backed_up_at) FROM messages m "
+                "WHERE m.account_id=accounts.id), ?) WHERE id=?",
+                (now, status, now, account_id))
+        else:
+            self.execute("UPDATE accounts SET last_backup_status=? WHERE id=?", (status, account_id))
 
     def create_account(self, acc: models.Account) -> int:
         cur = self.execute(
@@ -388,6 +792,10 @@ class Database:
         row = self.query_one("SELECT * FROM accounts WHERE id=?", (account_id,))
         return self._account_from_row(row) if row else None
 
+    def account_names(self) -> Dict[int, str]:
+        """Имена ящиков по id — дёшево, без расшифровки секретов."""
+        return {int(r["id"]): r["name"] for r in self.query("SELECT id, name FROM accounts")}
+
     def get_account_by_username(self, username: str) -> Optional[models.Account]:
         row = self.query_one("SELECT * FROM accounts WHERE username=? COLLATE NOCASE ORDER BY id LIMIT 1", (username,))
         return self._account_from_row(row) if row else None
@@ -405,6 +813,12 @@ class Database:
     def set_account_retention(self, account_id: int, days: int) -> None:
         self.execute("UPDATE accounts SET retention_days=?, updated_at=? WHERE id=?", (days, utcnow_iso(), account_id))
 
+    def set_account_oauth_refresh(self, account_id: int, refresh_token: str) -> None:
+        """Сохранить новый refresh-токен OAuth2, выданный сервером при обновлении."""
+        self.execute("UPDATE accounts SET oauth_refresh_token_enc=?, updated_at=? WHERE id=?",
+                     (self.secret.encrypt(refresh_token) if refresh_token else "", utcnow_iso(),
+                      account_id))
+
     def delete_account(self, account_id: int) -> None:
         self.execute("DELETE FROM accounts WHERE id=?", (account_id,))
 
@@ -415,7 +829,7 @@ class Database:
     #: синхронизации. Белый список нужен, чтобы update_employee нельзя было
     #: заставить переписать служебные колонки (id, created_at и т.п.).
     EMPLOYEE_FIELDS = ("external_id", "full_name", "email", "position", "department",
-                       "phone", "status", "account_id", "notes", "source", "last_seen_at")
+                       "phone", "status", "account_id", "notes", "source", "last_seen_at", "dismissed_at")
 
     @staticmethod
     def _employee_filter(query: Optional[str], status: Optional[str]) -> tuple:
@@ -511,13 +925,19 @@ class Database:
         return int(self.scalar(f"SELECT COUNT(*) FROM employees e{where}", params) or 0)
 
     def employee_counts(self) -> Dict[str, int]:
-        """Сводка для шапки раздела: по статусам и по наличию ящика."""
+        """Сводка для шапки раздела: по статусам и — среди работающих — по наличию ящика.
+
+        «С ящиком» и «Без ящика» считаются только по работающим: плитки говорят
+        о том, чья почта копируется сейчас, а ящик уволенного уже выключен.
+        """
         row = self.query_one(
             """SELECT
                    COALESCE(SUM(CASE WHEN status='active'   THEN 1 ELSE 0 END), 0) AS active,
                    COALESCE(SUM(CASE WHEN status='archived' THEN 1 ELSE 0 END), 0) AS archived,
-                   COALESCE(SUM(CASE WHEN account_id IS NOT NULL THEN 1 ELSE 0 END), 0) AS with_account,
-                   COALESCE(SUM(CASE WHEN account_id IS NULL THEN 1 ELSE 0 END), 0) AS without_account
+                   COALESCE(SUM(CASE WHEN status='active' AND account_id IS NOT NULL THEN 1 ELSE 0 END), 0)
+                       AS with_account,
+                   COALESCE(SUM(CASE WHEN status='active' AND account_id IS NULL THEN 1 ELSE 0 END), 0)
+                       AS without_account
                FROM employees"""
         )
         return {
@@ -533,8 +953,16 @@ class Database:
         self.execute("DELETE FROM employees WHERE id=?", (employee_id,))
 
     def set_employee_account(self, employee_id: int, account_id: Optional[int]) -> None:
-        """Привязать сотрудника к ящику (None — отвязать)."""
-        self.execute("UPDATE employees SET account_id=?, updated_at=? WHERE id=?",
+        """Привязать сотрудника к ящику (None — отвязать).
+
+        Привязка отмечает «ящик у сотрудника был»: если его потом удалят или
+        отвяжут, синхронизация не заведёт ящик заново.
+        """
+        if account_id is None:
+            self.execute("UPDATE employees SET account_id=NULL, updated_at=? WHERE id=?",
+                         (utcnow_iso(), employee_id))
+            return
+        self.execute("UPDATE employees SET account_id=?, had_account=1, updated_at=? WHERE id=?",
                      (account_id, utcnow_iso(), employee_id))
 
     # ======================================================================
@@ -559,23 +987,36 @@ class Database:
         return self.query("SELECT * FROM folders WHERE account_id=? ORDER BY folder", (account_id,))
 
     # ---- папки, которые сервер не даёт открыть -------------------------
+    #: Счётчик «сколько прогонов подряд папка не открывается» растёт не чаще раза
+    #: в столько часов: повторы одного ночного задания (до 4 попыток при сбоях)
+    #: — это один и тот же прогон, а не четыре дня подряд.
+    FOLDER_PROBLEM_COUNT_HOURS = 20
+
     def record_folder_problem(self, account_id: int, folder: str, error: str = "") -> int:
         """Отметить, что папка снова не открылась, и вернуть число неудач ПОДРЯД.
 
         Счётчик нужен, чтобы отличать свежую поломку (о ней надо кричать) от
         папки, которая не открывается на сервере неделями: бесконечное «копия
         неполная» приучает не читать предупреждения, и настоящая пропажа писем
-        теряется среди них.
+        теряется среди них. Считаются СУТКИ, а не попытки: иначе три сетевых
+        сбоя за одну ночь превращали свежую поломку в «известную» к утру.
         """
-        now = utcnow_iso()
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat()
+        threshold = (now_dt - timedelta(hours=self.FOLDER_PROBLEM_COUNT_HOURS)).isoformat()
         self.execute(
-            """INSERT INTO folder_problems(account_id, folder, fails, first_failed, last_failed, last_error)
-               VALUES(?,?,1,?,?,?)
+            """INSERT INTO folder_problems(account_id, folder, fails, first_failed, last_failed,
+                                           last_error, counted_at)
+               VALUES(?,?,1,?,?,?,?)
                ON CONFLICT(account_id, folder) DO UPDATE SET
-                   fails=folder_problems.fails+1,
+                   fails=folder_problems.fails + (CASE WHEN folder_problems.counted_at IS NULL
+                                                        OR folder_problems.counted_at < ? THEN 1 ELSE 0 END),
+                   counted_at=(CASE WHEN folder_problems.counted_at IS NULL
+                                     OR folder_problems.counted_at < ? THEN excluded.counted_at
+                                    ELSE folder_problems.counted_at END),
                    last_failed=excluded.last_failed,
                    last_error=excluded.last_error""",
-            (account_id, folder, now, now, (error or "")[:1000]),
+            (account_id, folder, now, now, (error or "")[:1000], now, threshold, threshold),
         )
         row = self.query_one("SELECT fails FROM folder_problems WHERE account_id=? AND folder=?",
                              (account_id, folder))
@@ -610,6 +1051,47 @@ class Database:
              stored_path, sha256, subject[:500], from_addr[:300], 1 if has_attach else 0, utcnow_iso()),
         )
 
+    def add_message_index_batch(self, rows: Sequence[tuple]) -> int:
+        """Записать пачку писем в индекс ОДНОЙ транзакцией.
+
+        По письму на транзакцию SQLite держит общий на процесс замок записи:
+        ящик на 200 000 писем — это столько же отдельных коммитов, и воркеры
+        упираются в базу, а не в сеть. Кортеж — в порядке колонок
+        :meth:`add_message_index`.
+        """
+        if not rows:
+            return 0
+        now = utcnow_iso()
+        # Нормализуем так же, как одиночная вставка: иначе через пачку в базу
+        # попадали бы нерезаные subject/from_addr и has_attach=None, из-за
+        # которого письмо выпадало бы из фильтра «с вложениями».
+        payload = []
+        for row in rows:
+            row = list(row)
+            row[10] = (row[10] or "")[:500]
+            row[11] = (row[11] or "")[:300]
+            row[12] = 1 if row[12] else 0
+            payload.append((*row, now))
+        conn = self.connect()
+        with self._write_lock:
+            try:
+                cur = conn.executemany(
+                    """INSERT OR IGNORE INTO messages(
+                            account_id, folder, uidvalidity, uid, message_id, size, internaldate,
+                            flags, stored_path, sha256, subject, from_addr, has_attach, backed_up_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    payload,
+                )
+                inserted = int(cur.rowcount or 0)
+                conn.commit()
+            except BaseException:
+                # BaseException, а не Exception: при Ctrl+C или остановке службы
+                # незакрытая транзакция держала бы writer-lock, и вся база
+                # вставала бы с «database is locked».
+                self._safe_rollback(conn)
+                raise
+        return inserted
+
     def set_message_headers(self, pk: int, subject: str, from_addr: str, has_attach: int) -> None:
         self.execute("UPDATE messages SET subject=?, from_addr=?, has_attach=? WHERE id=?",
                      (subject[:500], from_addr[:300], 1 if has_attach else 0, pk))
@@ -628,11 +1110,73 @@ class Database:
         ) is not None
 
     def existing_uids(self, account_id: int, folder: str, uidvalidity: int) -> set:
+        """UID писем, которые копировать заново НЕ нужно.
+
+        Это и письма из индекса, и письма, вычищенные по сроку хранения
+        (``retired_uids``): без вторых ретеншн и бэкап работали бы друг против
+        друга — удалённое ночью по сроку следующей ночью скачивалось бы снова.
+        """
         rows = self.query(
-            "SELECT uid FROM messages WHERE account_id=? AND folder=? AND uidvalidity=?",
-            (account_id, folder, uidvalidity),
+            "SELECT uid FROM messages WHERE account_id=? AND folder=? AND uidvalidity=? "
+            "UNION SELECT uid FROM retired_uids WHERE account_id=? AND folder=? AND uidvalidity=?",
+            (account_id, folder, uidvalidity, account_id, folder, uidvalidity),
         )
         return {r["uid"] for r in rows}
+
+    # ---- письма, вычищенные по сроку хранения ---------------------------
+    def retire_message_indexes(self, ids: Sequence[int]) -> int:
+        """Убрать письма из индекса, запомнив их UID как «вычищенные по сроку».
+
+        Запись о UID остаётся, чтобы бэкап не скачал письмо снова, пока оно
+        лежит на сервере. Всё остальное (списки, экспорт, счётчики, аналитика)
+        вычищенных писем не видит — их просто нет в ``messages``.
+        """
+        ids = [int(i) for i in ids]
+        done = 0
+        now = utcnow_iso()
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            marks = ",".join("?" * len(chunk))
+            with self.transaction() as conn:
+                conn.execute(
+                    f"INSERT OR IGNORE INTO retired_uids(account_id, folder, uidvalidity, uid, retired_at) "
+                    f"SELECT account_id, folder, uidvalidity, uid, ? FROM messages WHERE id IN ({marks})",
+                    (now, *chunk))
+                cur = conn.execute(f"DELETE FROM messages WHERE id IN ({marks})", tuple(chunk))
+                done += int(cur.rowcount or 0)
+        return done
+
+    def prune_retired_uids(self, account_id: int, folder: str, uidvalidity: int, server_uids) -> int:
+        """Забыть вычищенные UID, которых на сервере больше нет.
+
+        В пределах одного UIDVALIDITY сервер номера не переиспользует, поэтому
+        такое письмо уже никогда не появится — помнить его незачем.
+        """
+        rows = self.query("SELECT uid FROM retired_uids WHERE account_id=? AND folder=? AND uidvalidity=?",
+                          (account_id, folder, uidvalidity))
+        if not rows:
+            return 0
+        present = set(int(u) for u in server_uids)
+        gone = [int(r["uid"]) for r in rows if int(r["uid"]) not in present]
+        for start in range(0, len(gone), 500):
+            chunk = gone[start:start + 500]
+            marks = ",".join("?" * len(chunk))
+            self.execute(f"DELETE FROM retired_uids WHERE account_id=? AND folder=? AND uidvalidity=? "
+                         f"AND uid IN ({marks})", (account_id, folder, uidvalidity, *chunk))
+        # UID прежних UIDVALIDITY этой папки тоже больше не нужны
+        self.execute("DELETE FROM retired_uids WHERE account_id=? AND folder=? AND uidvalidity<>?",
+                     (account_id, folder, uidvalidity))
+        return len(gone)
+
+    def count_retired(self, account_id: Optional[int] = None) -> int:
+        if account_id is None:
+            return int(self.scalar("SELECT COUNT(*) FROM retired_uids") or 0)
+        return int(self.scalar("SELECT COUNT(*) FROM retired_uids WHERE account_id=?", (account_id,)) or 0)
+
+    def clear_retired(self, account_id: int) -> int:
+        """Забыть вычищенные письма ящика (например, срок хранения увеличили)."""
+        cur = self.execute("DELETE FROM retired_uids WHERE account_id=?", (account_id,))
+        return int(cur.rowcount or 0)
 
     def hash_exists(self, account_id: int, sha256: str) -> Optional[str]:
         row = self.query_one(
@@ -672,6 +1216,51 @@ class Database:
             (account_id, limit, offset),
         )
 
+    def messages_after_id(self, account_id: int, after_id: int = 0, folder: Optional[str] = None,
+                          limit: int = 5000) -> List[sqlite3.Row]:
+        """Страница индекса по первичному ключу — устойчивый обход.
+
+        В отличие от :meth:`list_messages` (сортировка по дате + OFFSET) этот
+        обход не сбивается, когда во время прохода в индекс добавляются или
+        из него удаляются письма.
+        """
+        if folder:
+            return self.query(
+                "SELECT * FROM messages WHERE account_id=? AND folder=? AND id > ? "
+                "ORDER BY id LIMIT ?", (account_id, folder, after_id, limit))
+        return self.query(
+            "SELECT * FROM messages WHERE account_id=? AND id > ? ORDER BY id LIMIT ?",
+            (account_id, after_id, limit))
+
+    @staticmethod
+    def _export_filter(account_id: int, folder: Optional[str], since: Optional[str],
+                       until: Optional[str]):
+        conds, params = ["account_id=?"], [account_id]
+        if folder:
+            conds.append("folder=?")
+            params.append(folder)
+        if since or until:
+            # письма без даты в период не попадают: неизвестно, к какому он дню
+            conds.append("internaldate IS NOT NULL AND internaldate<>''")
+        if since:
+            conds.append("internaldate>=?")
+            params.append(since)
+        if until:
+            conds.append("internaldate<?")
+            params.append(until)
+        return " AND ".join(conds), params
+
+    def export_rows(self, account_id: int, folder: Optional[str], since: Optional[str],
+                    until: Optional[str], after_id: int, limit: int) -> List[sqlite3.Row]:
+        where, params = self._export_filter(account_id, folder, since, until)
+        return self.query(f"SELECT * FROM messages WHERE {where} AND id>? ORDER BY id LIMIT ?",
+                          (*params, after_id, limit))
+
+    def count_export_rows(self, account_id: int, folder: Optional[str], since: Optional[str],
+                          until: Optional[str]) -> int:
+        where, params = self._export_filter(account_id, folder, since, until)
+        return int(self.scalar(f"SELECT COUNT(*) FROM messages WHERE {where}", tuple(params)) or 0)
+
     def delete_message_index(self, message_id_pk: int) -> None:
         self.execute("DELETE FROM messages WHERE id=?", (message_id_pk,))
 
@@ -690,18 +1279,20 @@ class Database:
         Порциями — потому что у большого ящика сотни тысяч записей, и читать их
         одним списком в память при проверке файлов на диске не стоит.
         """
-        offset = 0
+        # Обход по id (а не OFFSET): на сотнях тысяч писем OFFSET квадратичен
+        # и сбивается, если во время прохода записи удаляются.
+        last_id = 0
         while True:
             rows = self.query(
-                "SELECT id, folder, stored_path FROM messages WHERE account_id=? "
-                "ORDER BY id LIMIT ? OFFSET ?",
-                (account_id, batch, offset),
+                "SELECT id, folder, stored_path FROM messages WHERE account_id=? AND id>? "
+                "ORDER BY id LIMIT ?",
+                (account_id, last_id, batch),
             )
             if not rows:
                 return
             for row in rows:
                 yield int(row["id"]), row["folder"], (row["stored_path"] or "")
-            offset += len(rows)
+            last_id = int(rows[-1]["id"])
 
     def delete_message_indexes(self, ids: Sequence[int]) -> int:
         """Удалить записи индекса по списку id. Возвращает число удалённых."""
@@ -791,26 +1382,43 @@ class Database:
                 self._safe_rollback(conn)
                 raise
 
-    def claim_next_job_filtered(self, worker_id: str, skip_accounts) -> Optional[sqlite3.Row]:
-        """Захватить следующее задание, пропуская аккаунты из skip_accounts."""
+    def claim_next_job_filtered(self, worker_id: str, skip_accounts=(), *, busy_accounts=(),
+                                local_types=(), skip_types=()) -> Optional[sqlite3.Row]:
+        """Захватить следующее задание очереди.
+
+        * ``skip_accounts`` — ящики, по которым не брать НИЧЕГО;
+        * ``busy_accounts`` + ``local_types`` — по этим ящикам уже идёт работа с
+          локальной копией: второе такое задание (бэкап, очистка, перешифровка,
+          экспорт…) не берём — иначе они работали бы с одними файлами наперегонки;
+        * ``skip_types`` — типы, которые сейчас брать нельзя (одиночные задания);
+        * задания с отложенным повтором (run_after в будущем) ждут своего времени.
+        """
+        conds = ["status=?", "(run_after IS NULL OR run_after<=?)"]
+        params: List[Any] = [models.JobStatus.QUEUED, utcnow_iso()]
         skip_accounts = list(skip_accounts or [])
+        if skip_accounts:
+            conds.append(f"(account_id IS NULL OR account_id NOT IN ({','.join('?' * len(skip_accounts))}))")
+            params += skip_accounts
+        busy_accounts = list(busy_accounts or [])
+        local_types = list(local_types or [])
+        if busy_accounts and local_types:
+            conds.append(f"NOT (account_id IN ({','.join('?' * len(busy_accounts))}) "
+                         f"AND type IN ({','.join('?' * len(local_types))}))")
+            params += busy_accounts + local_types
+        skip_types = list(skip_types or [])
+        if skip_types:
+            conds.append(f"type NOT IN ({','.join('?' * len(skip_types))})")
+            params += skip_types
+        sql = f"SELECT * FROM jobs WHERE {' AND '.join(conds)} ORDER BY priority ASC, id ASC LIMIT 1"
         with self._write_lock:
             conn = self.connect()
             try:
-                if skip_accounts:
-                    ph = ",".join("?" * len(skip_accounts))
-                    sql = (f"SELECT * FROM jobs WHERE status=? AND (account_id IS NULL OR account_id NOT IN ({ph})) "
-                           f"ORDER BY priority ASC, id ASC LIMIT 1")
-                    row = conn.execute(sql, (models.JobStatus.QUEUED, *skip_accounts)).fetchone()
-                else:
-                    row = conn.execute(
-                        "SELECT * FROM jobs WHERE status=? ORDER BY priority ASC, id ASC LIMIT 1",
-                        (models.JobStatus.QUEUED,),
-                    ).fetchone()
+                row = conn.execute(sql, tuple(params)).fetchone()
                 if row is None:
                     return None
                 conn.execute(
-                    "UPDATE jobs SET status=?, started_at=?, worker_id=?, attempts=attempts+1 WHERE id=?",
+                    "UPDATE jobs SET status=?, started_at=?, worker_id=?, attempts=attempts+1, run_after=NULL "
+                    "WHERE id=?",
                     (models.JobStatus.RUNNING, utcnow_iso(), worker_id, row["id"]),
                 )
                 conn.commit()
@@ -841,6 +1449,16 @@ class Database:
             (models.JobStatus.RUNNING, models.JobStatus.QUEUED),
         )
 
+    def count_waiting_jobs(self, exclude_types: Sequence[str] = ()) -> int:
+        """Сколько заданий ждут свободного воркера прямо сейчас (без отложенных повторов)."""
+        sql = "SELECT COUNT(*) FROM jobs WHERE status=? AND (run_after IS NULL OR run_after<=?)"
+        params: List[Any] = [models.JobStatus.QUEUED, utcnow_iso()]
+        exclude_types = list(exclude_types or [])
+        if exclude_types:
+            sql += f" AND type NOT IN ({','.join('?' * len(exclude_types))})"
+            params += exclude_types
+        return int(self.scalar(sql, tuple(params)) or 0)
+
     def count_jobs_by_status(self) -> Dict[str, int]:
         rows = self.query("SELECT status, COUNT(*) AS c FROM jobs GROUP BY status")
         return {r["status"]: r["c"] for r in rows}
@@ -859,19 +1477,29 @@ class Database:
             (status, utcnow_iso(), json.dumps(result or {}, ensure_ascii=False), error[:2000], utcnow_iso(), job_id),
         )
 
-    def requeue_job(self, job_id: int) -> None:
-        """Вернуть задание в очередь для повторной попытки.
+    def requeue_job(self, job_id: int, *, run_after: Optional[str] = None, refund_attempt: bool = False,
+                    reset_attempts: bool = False, clear_cancel: bool = False) -> None:
+        """Вернуть задание в очередь.
 
-        Флаг отмены снимаем обязательно: при нештатном перезапуске службы
-        задания остаются с проставленным cancel_requested, и после возврата в
-        очередь они мгновенно отменяли сами себя — ночное копирование тихо не
-        выполнялось.
+        * ``run_after`` — не раньше этого времени (отложенный повтор хранится в
+          БД: пока задание ждёт, оно в статусе «в очереди», и кнопка «Отмена»
+          на нём работает — раньше таймер повтора отмену не замечал);
+        * ``refund_attempt`` — попытка не засчитывается (прервано перезапуском);
+        * ``reset_attempts`` — ручной «Повторить»: снова все попытки;
+        * ``clear_cancel`` — снять флаг отмены (только по явному действию
+          пользователя: автоматический повтор флаг, выставленный пользователем,
+          больше не стирает).
         """
-        self.execute(
-            "UPDATE jobs SET status=?, worker_id=NULL, started_at=NULL, error='', "
-            "cancel_requested=0 WHERE id=?",
-            (models.JobStatus.QUEUED, job_id),
-        )
+        sets = ["status=?", "worker_id=NULL", "started_at=NULL", "run_after=?"]
+        params: List[Any] = [models.JobStatus.QUEUED, run_after]
+        if refund_attempt:
+            sets.append("attempts=MAX(0, attempts-1)")
+        if reset_attempts:
+            sets.append("attempts=0")
+            sets.append("error=''")
+        if clear_cancel:
+            sets.append("cancel_requested=0")
+        self.execute(f"UPDATE jobs SET {', '.join(sets)} WHERE id=?", (*params, job_id))
 
     def request_cancel(self, job_id: int) -> None:
         self.execute("UPDATE jobs SET cancel_requested=1 WHERE id=?", (job_id,))
@@ -880,15 +1508,33 @@ class Database:
         row = self.query_one("SELECT cancel_requested FROM jobs WHERE id=?", (job_id,))
         return bool(row and row["cancel_requested"])
 
+    #: Сколько раз подряд задание может прерываться перезапуском службы: если
+    #: больше — вероятно, оно само и роняет службу (например, нехваткой памяти).
+    MAX_JOB_RESTARTS = 3
+
     def reset_orphan_jobs(self) -> int:
-        """При старте: задания в статусе RUNNING считаем прерванными → в очередь или ошибка."""
-        rows = self.query("SELECT id, attempts, max_attempts FROM jobs WHERE status=?", (models.JobStatus.RUNNING,))
+        """При старте: задания в статусе RUNNING прерваны перезапуском — вернуть в очередь.
+
+        Попытка при этом не засчитывается: задание не провалилось, его прервали.
+        Раньше задание с одной попыткой (экспорт, очистка) после обновления
+        службы объявлялось проваленным.
+        """
+        rows = self.query("SELECT id, restarts, cancel_requested FROM jobs WHERE status=?",
+                          (models.JobStatus.RUNNING,))
         count = 0
         for r in rows:
-            if r["attempts"] < r["max_attempts"]:
-                self.requeue_job(r["id"])
+            restarts = int(r["restarts"] or 0) + 1
+            if r["cancel_requested"]:
+                self.finish_job(r["id"], models.JobStatus.CANCELLED, error="Отменено пользователем")
+            elif restarts > self.MAX_JOB_RESTARTS:
+                self.finish_job(r["id"], models.JobStatus.FAILED,
+                                error=f"Задание прерывалось перезапуском службы {restarts} раз подряд — "
+                                      f"возможно, оно само приводит к сбою службы (например, нехватка памяти).")
             else:
-                self.finish_job(r["id"], models.JobStatus.FAILED, error="Прервано при перезапуске сервиса")
+                self.execute("UPDATE jobs SET restarts=? WHERE id=?", (restarts, r["id"]))
+                self.requeue_job(r["id"], refund_attempt=True)
+                self.add_job_event(r["id"], "WARNING", "Задание было прервано перезапуском службы и "
+                                                       "продолжится (попытка не засчитана).")
             count += 1
         return count
 
@@ -925,6 +1571,58 @@ class Database:
             "SELECT * FROM job_events WHERE job_id=? ORDER BY id DESC LIMIT ?", (job_id, limit)
         )
 
+    # ---- служебная чистка (см. mailarchiver/maintenance.py) ---------------
+    def purge_jobs_by_age(self, ok_before_iso: str, failed_before_iso: str, keep_max: int = 100000) -> int:
+        """Удалить завершённые задания по возрасту: удачные — раньше, с ошибками — позже.
+
+        Раньше хранились последние 300 заданий: за ночь на 580 ящиков ошибки
+        первой половины ночи вместе с журналами исчезали до утра.
+        """
+        ids = [r["id"] for r in self.query(
+            "SELECT id FROM jobs WHERE status IN (?,?) AND COALESCE(finished_at, created_at) < ? "
+            "UNION SELECT id FROM jobs WHERE status IN (?,?) AND COALESCE(finished_at, created_at) < ?",
+            (models.JobStatus.SUCCESS, models.JobStatus.CANCELLED, ok_before_iso,
+             models.JobStatus.FAILED, models.JobStatus.PARTIAL, failed_before_iso))]
+        ids += [r["id"] for r in self.query(
+            "SELECT id FROM jobs WHERE status NOT IN (?,?) ORDER BY id DESC LIMIT -1 OFFSET ?",
+            (models.JobStatus.QUEUED, models.JobStatus.RUNNING, int(keep_max)))]
+        return self._delete_jobs(sorted(set(ids)))
+
+    def _delete_jobs(self, ids: Sequence[int]) -> int:
+        removed = 0
+        for batch in chunked(list(ids), 500):
+            ph = ",".join("?" * len(batch))
+            self.execute(f"DELETE FROM job_events WHERE job_id IN ({ph})", tuple(batch))
+            cur = self.execute(f"DELETE FROM jobs WHERE id IN ({ph})", tuple(batch))
+            removed += int(cur.rowcount or 0)
+        return removed
+
+    def purge_runs(self, keep_per_account: int) -> int:
+        """История прогонов: последние N на ящик и ничего — от удалённых ящиков."""
+        cur = self.execute(
+            "DELETE FROM runs WHERE account_id NOT IN (SELECT id FROM accounts) OR id IN ("
+            " SELECT id FROM (SELECT id, ROW_NUMBER() OVER (PARTITION BY account_id ORDER BY id DESC) AS rn"
+            " FROM runs) WHERE rn > ?)", (max(1, int(keep_per_account)),))
+        return int(cur.rowcount or 0)
+
+    def purge_older(self, table: str, column: str, before: str) -> int:
+        if table not in ("audit", "stats_daily", "restores", "login_attempts"):
+            raise ValueError(table)
+        cur = self.execute(f"DELETE FROM {table} WHERE {column} < ?", (before,))
+        return int(cur.rowcount or 0)
+
+    def exports_older_than(self, before_iso: str) -> List[sqlite3.Row]:
+        return self.query("SELECT * FROM exports WHERE created_at < ? AND status <> 'pending'", (before_iso,))
+
+    def fail_interrupted_artifacts(self) -> int:
+        """При старте: выгрузки и восстановления, оставшиеся «в работе», — прерваны."""
+        n = 0
+        for table in ("exports", "restores"):
+            cur = self.execute(f"UPDATE {table} SET status=?, error=? WHERE status='pending'",
+                               (models.JobStatus.FAILED, "Прервано перезапуском службы"))
+            n += int(cur.rowcount or 0)
+        return n
+
     def purge_old_jobs(self, keep: int) -> int:
         """Оставить последние keep завершённых заданий, остальные удалить."""
         rows = self.query(
@@ -949,11 +1647,22 @@ class Database:
     #  История прогонов (runs)
     # ======================================================================
     def start_run(self, account_id: int, run_type: str, job_id: Optional[int]) -> int:
-        cur = self.execute(
-            "INSERT INTO runs(account_id, type, job_id, status, started_at) VALUES(?,?,?,?,?)",
-            (account_id, run_type, job_id, models.JobStatus.RUNNING, utcnow_iso()),
-        )
-        return int(cur.lastrowid)
+        """Открыть запись прогона. Повторная попытка того же задания продолжает ЕГО
+        запись, а не заводит новую: одно ночное копирование с тремя повторами —
+        это один прогон, а не четыре."""
+        with self.transaction() as conn:
+            if job_id is not None:
+                row = conn.execute("SELECT id FROM runs WHERE job_id=? AND type=? AND account_id=? "
+                                   "ORDER BY id DESC LIMIT 1", (job_id, run_type, account_id)).fetchone()
+                if row is not None:
+                    conn.execute("UPDATE runs SET status=?, finished_at=NULL WHERE id=?",
+                                 (models.JobStatus.RUNNING, row["id"]))
+                    return int(row["id"])
+            cur = conn.execute(
+                "INSERT INTO runs(account_id, type, job_id, status, started_at) VALUES(?,?,?,?,?)",
+                (account_id, run_type, job_id, models.JobStatus.RUNNING, utcnow_iso()),
+            )
+            return int(cur.lastrowid)
 
     def finish_run(self, run_id: int, status: str, *, messages_new: int = 0, bytes_new: int = 0,
                    messages_total: int = 0, errors: int = 0, detail: str = "") -> None:
@@ -1024,10 +1733,13 @@ class Database:
     # ======================================================================
     #  Экспорты и восстановления (артефакты)
     # ======================================================================
-    def create_export(self, account_id: int, engine: str, fmt: str, path: str, params: Dict, job_id: Optional[int]) -> int:
+    def create_export(self, account_id: int, engine: str, fmt: str, path: str, params: Dict,
+                      job_id: Optional[int], created_by: str = "") -> int:
         cur = self.execute(
-            "INSERT INTO exports(account_id, engine, format, path, params, job_id, status, created_at) VALUES(?,?,?,?,?,?,?,?)",
-            (account_id, engine, fmt, path, json.dumps(params, ensure_ascii=False), job_id, "pending", utcnow_iso()),
+            "INSERT INTO exports(account_id, engine, format, path, params, job_id, status, created_at, created_by) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (account_id, engine, fmt, path, json.dumps(params, ensure_ascii=False), job_id, "pending",
+             utcnow_iso(), created_by or ""),
         )
         return int(cur.lastrowid)
 
@@ -1069,6 +1781,72 @@ class Database:
     # ======================================================================
     #  Настройки, статистика, аудит
     # ======================================================================
+    # ---- служебные отметки (таблица meta) ----------------------------------
+    def get_meta(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        row = self.query_one("SELECT value FROM meta WHERE key=?", (key,))
+        return row["value"] if row is not None else default
+
+    def set_meta(self, key: str, value: str) -> None:
+        self.execute("INSERT INTO meta(key, value) VALUES(?,?) "
+                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
+
+    # ---- копия вне сервера: что уже отправлено ------------------------------
+    def replica_clear(self) -> None:
+        self.execute("DELETE FROM replica_files")
+
+    def replica_count(self) -> int:
+        return int(self.scalar("SELECT COUNT(*) FROM replica_files") or 0)
+
+    def replica_count_prefix(self, prefix: str) -> int:
+        # Диапазон по первичному ключу вместо LIKE: LIKE не использует индекс
+        # и спотыкается о «_» и «%» в путях.
+        return int(self.scalar("SELECT COUNT(*) FROM replica_files WHERE path >= ? AND path < ?",
+                               (prefix, prefix + "\U0010ffff")) or 0)
+
+    def replica_groups(self) -> List[str]:
+        return [r[0] for r in self.query("SELECT DISTINCT grp FROM replica_files")]
+
+    def replica_state_group(self, grp: str) -> Dict[str, Tuple[int, int]]:
+        return {r["path"]: (int(r["size"]), int(r["mtime_ns"]))
+                for r in self.query("SELECT path, size, mtime_ns FROM replica_files WHERE grp=?", (grp,))}
+
+    def replica_upsert(self, rows) -> None:
+        """rows: (путь, группа, размер, mtime_ns)."""
+        now = utcnow_iso()
+        self.executemany(
+            "INSERT INTO replica_files(path, grp, size, mtime_ns, done_at) VALUES(?,?,?,?,?) "
+            "ON CONFLICT(path) DO UPDATE SET grp=excluded.grp, size=excluded.size, "
+            "mtime_ns=excluded.mtime_ns, done_at=excluded.done_at",
+            [(p, g, int(sz), int(mt), now) for p, g, sz, mt in rows])
+
+    def replica_replace_group(self, grp: str, rows) -> None:
+        """Заменить сведения о группе целиком (после полной сверки с копией)."""
+        now = utcnow_iso()
+        with self.transaction() as conn:
+            conn.execute("DELETE FROM replica_files WHERE grp=?", (grp,))
+            conn.executemany("INSERT OR REPLACE INTO replica_files(path, grp, size, mtime_ns, done_at) "
+                             "VALUES(?,?,?,?,?)",
+                             [(p, g, int(sz), int(mt), now) for p, g, sz, mt in rows])
+
+    def replica_delete(self, paths) -> None:
+        paths = list(paths)
+        for start in range(0, len(paths), 500):
+            chunk = paths[start:start + 500]
+            self.execute(f"DELETE FROM replica_files WHERE path IN ({','.join('?' * len(chunk))})",
+                         tuple(chunk))
+
+    def count_encrypted_messages(self) -> Dict[str, int]:
+        """Сколько писем в индексе хранится зашифрованными и открытыми."""
+        row = self.query_one(
+            "SELECT SUM(CASE WHEN stored_path LIKE '%.enc' THEN 1 ELSE 0 END) AS enc, COUNT(*) AS total "
+            "FROM messages")
+        enc = int((row["enc"] if row else 0) or 0)
+        total = int((row["total"] if row else 0) or 0)
+        return {"encrypted": enc, "plain": total - enc, "total": total}
+
+    def set_message_path(self, pk: int, stored_path: str) -> None:
+        self.execute("UPDATE messages SET stored_path=? WHERE id=?", (stored_path, pk))
+
     def get_setting(self, key: str, default: Any = None) -> Any:
         row = self.query_one("SELECT value FROM settings WHERE key=?", (key,))
         if row is None:
@@ -1096,6 +1874,39 @@ class Database:
             (key, json.dumps(stored, ensure_ascii=False)),
         )
 
+    def _encode_setting(self, key: str, value: Any) -> str:
+        stored: Any = value
+        if key in _ENCRYPTED_SETTINGS and isinstance(value, str) and value:
+            stored = self.secret.encrypt(value)
+        return json.dumps(stored, ensure_ascii=False)
+
+    def set_settings_many(self, values: Dict[str, Any]) -> None:
+        """Записать несколько настроек ОДНОЙ транзакцией: всё или ничего."""
+        with self.transaction() as conn:
+            for key, value in values.items():
+                conn.execute("INSERT INTO settings(key, value) VALUES(?,?) "
+                             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                             (key, self._encode_setting(key, value)))
+
+    def restore_settings(self, snapshot: Dict[str, Any]) -> None:
+        """Вернуть настройки к снимку: значение None — «переопределения не было»."""
+        with self.transaction() as conn:
+            for key, value in snapshot.items():
+                if value is None:
+                    conn.execute("DELETE FROM settings WHERE key=?", (key,))
+                else:
+                    conn.execute("INSERT INTO settings(key, value) VALUES(?,?) "
+                                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                                 (key, value))
+
+    def raw_settings(self, keys) -> Dict[str, Any]:
+        """Сырые (как в БД) значения настроек — для снимка перед изменением."""
+        out: Dict[str, Any] = {}
+        for key in keys:
+            row = self.query_one("SELECT value FROM settings WHERE key=?", (key,))
+            out[key] = row["value"] if row is not None else None
+        return out
+
     def all_settings(self) -> Dict[str, Any]:
         out = {}
         for r in self.query("SELECT key, value FROM settings"):
@@ -1105,8 +1916,22 @@ class Database:
                 out[r["key"]] = r["value"]
         return out
 
+    def local_day(self) -> str:
+        """Сегодняшняя дата по часам ПОЛЬЗОВАТЕЛЯ (Services подставляет свой часовой пояс).
+
+        По UTC ночной бэкап в 02:30 по Москве записывался в «Активность»
+        предыдущим днём.
+        """
+        provider = getattr(self, "day_provider", None)
+        if provider is not None:
+            try:
+                return str(provider())
+            except Exception:  # noqa: BLE001
+                pass
+        return utcnow_iso()[:10]
+
     def bump_daily_stats(self, account_id: int, *, messages: int = 0, bytes_: int = 0, jobs: int = 0, errors: int = 0) -> None:
-        day = utcnow_iso()[:10]
+        day = self.local_day()
         self.execute(
             """INSERT INTO stats_daily(day, account_id, messages, bytes, jobs, errors)
                VALUES(?,?,?,?,?,?)
@@ -1118,20 +1943,42 @@ class Database:
             (day, account_id, messages, bytes_, jobs, errors),
         )
 
-    def daily_series(self, days: int = 30, account_id: Optional[int] = None) -> List[sqlite3.Row]:
-        """Активность по дням; при заданном ящике — только его строки."""
-        where = " WHERE account_id=?" if account_id is not None else ""
-        params: tuple = (account_id, days) if account_id is not None else (days,)
-        return self.query(
+    def daily_series(self, days: int = 30, account_id: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Активность по дням — СПЛОШНОЙ ряд за последние ``days`` дней (новые первыми).
+
+        Раньше брались «последние N дней, в которых были данные»: дни простоя
+        (сервер лежал, бэкапов не было) просто выпадали из графика.
+        """
+        from datetime import date as _date
+        try:
+            today = _date.fromisoformat(self.local_day())
+        except ValueError:
+            today = datetime.now(timezone.utc).date()
+        start = today - timedelta(days=max(1, int(days)) - 1)
+        conds, params = ["day>=?"], [start.isoformat()]
+        if account_id is not None:
+            conds.append("account_id=?")
+            params.append(account_id)
+        rows = self.query(
             "SELECT day, SUM(messages) AS messages, SUM(bytes) AS bytes, SUM(jobs) AS jobs, "
-            f"SUM(errors) AS errors FROM stats_daily{where} GROUP BY day ORDER BY day DESC LIMIT ?",
-            params,
-        )
+            f"SUM(errors) AS errors FROM stats_daily WHERE {' AND '.join(conds)} GROUP BY day",
+            tuple(params))
+        by_day = {r["day"]: r for r in rows}
+        out: List[Dict[str, Any]] = []
+        for i in range(max(1, int(days))):
+            day = (today - timedelta(days=i)).isoformat()
+            r = by_day.get(day)
+            out.append({"day": day, "messages": int(r["messages"] or 0) if r else 0,
+                        "bytes": int(r["bytes"] or 0) if r else 0,
+                        "jobs": int(r["jobs"] or 0) if r else 0,
+                        "errors": int(r["errors"] or 0) if r else 0})
+        return out
 
     def add_audit(self, user: str, action: str, detail: str = "") -> None:
+        # Имя пользователя тоже обрезаем: при входе оно приходит от анонима.
         self.execute(
             "INSERT INTO audit(ts, user, action, detail) VALUES(?,?,?,?)",
-            (utcnow_iso(), user, action, detail[:1000]),
+            (utcnow_iso(), str(user or "")[:320], str(action or "")[:64], str(detail or "")[:1000]),
         )
 
     def list_audit(self, limit: int = 200) -> List[sqlite3.Row]:
@@ -1140,12 +1987,48 @@ class Database:
     # ======================================================================
     #  Агрегаты для раздела «Аналитика»
     # ======================================================================
+    ANALYTICS_COLS = "account_id, folder, size, internaldate, flags, has_attach, subject, from_addr"
+
     def index_rows_for_analytics(self, account_id: Optional[int] = None) -> List[sqlite3.Row]:
-        """Лёгкая выборка полей индекса писем для расчёта аналитики (без тел)."""
-        cols = "account_id, folder, size, internaldate, flags, has_attach, subject, from_addr"
+        """Лёгкая выборка полей индекса писем для расчёта аналитики (без тел).
+
+        Оставлена для совместимости; для больших архивов используйте
+        :meth:`iter_index_rows_for_analytics` — она не держит весь индекс в
+        памяти (200 000 строк списком — это около 140 МБ).
+        """
+        cols = self.ANALYTICS_COLS
         if account_id is None:
             return self.query(f"SELECT {cols} FROM messages")
         return self.query(f"SELECT {cols} FROM messages WHERE account_id=?", (account_id,))
+
+    def iter_index_rows_for_analytics(self, account_id: Optional[int] = None, batch: int = 5000):
+        """Итератор по тем же полям: читает порциями, ничего не материализует.
+
+        Каждая порция читается ОТДЕЛЬНЫМ коротким запросом по первичному ключу.
+        Держать один открытый курсор всё время расчёта нельзя: при
+        ``database.wal: false`` он блокирует запись, и идущий в это же время
+        бэкап (или запись сессии при входе) падает с «database is locked» —
+        а расчёт на большом архиве идёт минуты. Обход по ``id`` вместо OFFSET
+        ещё и устойчив к параллельным вставкам и удалениям.
+        """
+        cols = self.ANALYTICS_COLS
+        last_id = 0
+        while True:
+            if account_id is None:
+                chunk = self.query(
+                    f"SELECT id, {cols} FROM messages WHERE id > ? ORDER BY id LIMIT ?",
+                    (last_id, batch))
+            else:
+                chunk = self.query(
+                    f"SELECT id, {cols} FROM messages WHERE account_id=? AND id > ? ORDER BY id LIMIT ?",
+                    (account_id, last_id, batch))
+            if not chunk:
+                return
+            for row in chunk:
+                yield row
+            last_id = chunk[-1]["id"]
+            if len(chunk) < batch:
+                return
 
     def largest_messages(self, account_id: Optional[int] = None, limit: int = 10) -> List[sqlite3.Row]:
         base = "SELECT account_id, folder, subject, from_addr, size, internaldate FROM messages"
@@ -1272,13 +2155,18 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 
 CREATE TABLE IF NOT EXISTS users (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    username      TEXT UNIQUE NOT NULL,
-    password_hash TEXT NOT NULL,
-    role          TEXT NOT NULL DEFAULT 'admin',
-    created_at    TEXT,
-    last_login    TEXT,
-    disabled      INTEGER NOT NULL DEFAULT 0
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    username         TEXT UNIQUE NOT NULL,
+    password_hash    TEXT NOT NULL,
+    role             TEXT NOT NULL DEFAULT 'admin',
+    created_at       TEXT,
+    last_login       TEXT,
+    disabled         INTEGER NOT NULL DEFAULT 0,
+    totp_enabled     INTEGER NOT NULL DEFAULT 0,
+    totp_secret_enc  TEXT DEFAULT '',
+    totp_pending_enc TEXT DEFAULT '',
+    totp_last_step   INTEGER NOT NULL DEFAULT 0,
+    totp_recovery    TEXT DEFAULT '[]'
 );
 
 CREATE TABLE IF NOT EXISTS login_attempts (
@@ -1286,7 +2174,19 @@ CREATE TABLE IF NOT EXISTS login_attempts (
     username TEXT,
     ts       TEXT,
     success  INTEGER,
-    ip       TEXT
+    ip       TEXT,
+    -- '' — пароль; 'otp' — код второго шага; 'imap' — проверка пароля ящика
+    kind     TEXT DEFAULT ''
+);
+
+-- «Билеты» второго шага входа (2FA): одноразовые, с лимитом попыток и
+-- привязкой к паролю — смена пароля отзывает выданные билеты.
+CREATE TABLE IF NOT EXISTS otp_challenges (
+    nonce    TEXT PRIMARY KEY,
+    user_id  INTEGER NOT NULL,
+    expires  INTEGER NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    pw       TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_login_attempts ON login_attempts(username, ts);
 -- запросы по логину идут с COLLATE NOCASE — им нужен индекс с той же сортировкой,
@@ -1327,7 +2227,17 @@ CREATE TABLE IF NOT EXISTS accounts (
     notes                     TEXT DEFAULT '',
     retention_days            INTEGER DEFAULT -1,
     created_at                TEXT,
-    updated_at                TEXT
+    updated_at                TEXT,
+    login_status              TEXT DEFAULT '',   -- итог последней попытки входа
+    login_checked_at          TEXT,
+    login_error               TEXT DEFAULT '',
+    first_backup_at           TEXT,              -- первая удачная резервная копия
+    last_backup_at            TEXT,              -- последняя удачная резервная копия
+    last_backup_status        TEXT DEFAULT '',
+    hold_until                TEXT DEFAULT '',   -- удержание архива до даты (ГГГГ-ММ-ДД)
+    hold_reason               TEXT DEFAULT '',   -- dismissed | manual
+    dismissed_at              TEXT,              -- когда сотрудник уволен
+    auto_disabled             INTEGER NOT NULL DEFAULT 0  -- копирование выключено увольнением
 );
 
 -- Сотрудники организации. Ящик (accounts) необязателен: сотрудник может
@@ -1348,6 +2258,8 @@ CREATE TABLE IF NOT EXISTS employees (
     created_at   TEXT,
     updated_at   TEXT,
     last_seen_at TEXT,
+    had_account  INTEGER NOT NULL DEFAULT 0,
+    dismissed_at TEXT,
     FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE SET NULL
 );
 -- поиск сотрудника по почте идёт с COLLATE NOCASE — индексу нужна та же сортировка
@@ -1375,6 +2287,7 @@ CREATE TABLE IF NOT EXISTS folder_problems (
     first_failed  TEXT,                -- когда перестала открываться впервые
     last_failed   TEXT,                -- когда пробовали в последний раз
     last_error    TEXT,                -- ответ сервера (для интерфейса и поддержки)
+    counted_at    TEXT,                -- когда счётчик fails увеличивался в последний раз
     UNIQUE(account_id, folder),
     FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
 );
@@ -1398,10 +2311,25 @@ CREATE TABLE IF NOT EXISTS messages (
     UNIQUE(account_id, folder, uidvalidity, uid),
     FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
 );
-CREATE INDEX IF NOT EXISTS idx_messages_acc ON messages(account_id, folder);
 CREATE INDEX IF NOT EXISTS idx_messages_hash ON messages(account_id, sha256);
 -- под горячий ORDER BY internaldate DESC в списках писем
 CREATE INDEX IF NOT EXISTS idx_messages_date ON messages(account_id, folder, internaldate);
+-- список «все папки», ретеншн, фильтр дат экспорта — по ящику и дате
+CREATE INDEX IF NOT EXISTS idx_messages_acc_date ON messages(account_id, internaldate);
+-- счётчики и суммы размеров по ящику (дашборд), крупнейшие письма
+CREATE INDEX IF NOT EXISTS idx_messages_acc_size ON messages(account_id, size);
+
+-- Письма, вычищенные по сроку хранения: их UID помнятся, чтобы бэкап не
+-- скачивал их снова, пока они лежат на сервере.
+CREATE TABLE IF NOT EXISTS retired_uids (
+    account_id  INTEGER NOT NULL,
+    folder      TEXT NOT NULL,
+    uidvalidity INTEGER NOT NULL,
+    uid         INTEGER NOT NULL,
+    retired_at  TEXT,
+    PRIMARY KEY(account_id, folder, uidvalidity, uid),
+    FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS jobs (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1425,7 +2353,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     cancel_requested INTEGER DEFAULT 0,
     created_by       TEXT DEFAULT '',
     result           TEXT DEFAULT '{}',
-    error            TEXT DEFAULT ''
+    error            TEXT DEFAULT '',
+    run_after        TEXT,
+    restarts         INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, priority, id);
 
@@ -1480,7 +2410,8 @@ CREATE TABLE IF NOT EXISTS exports (
     job_id     INTEGER,
     status     TEXT DEFAULT 'pending',
     error      TEXT DEFAULT '',
-    created_at TEXT
+    created_at TEXT,
+    created_by TEXT DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS restores (
@@ -1509,6 +2440,17 @@ CREATE TABLE IF NOT EXISTS stats_daily (
     errors     INTEGER DEFAULT 0,
     PRIMARY KEY(day, account_id)
 );
+
+-- Копия вне сервера: какие файлы уже отправлены (путь в копии, размер и время
+-- изменения на момент отправки). По ней прогон отправляет только новое.
+CREATE TABLE IF NOT EXISTS replica_files (
+    path     TEXT PRIMARY KEY,
+    grp      TEXT NOT NULL,
+    size     INTEGER NOT NULL,
+    mtime_ns INTEGER NOT NULL,
+    done_at  TEXT
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_replica_grp ON replica_files(grp);
 
 CREATE TABLE IF NOT EXISTS audit (
     id     INTEGER PRIMARY KEY AUTOINCREMENT,

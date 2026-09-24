@@ -18,9 +18,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from mailarchiver.web.i18n import (  # noqa: E402
-    PARAM_HELP, SETTINGS_SECTIONS, ACCOUNT_HELP, EXPORT_HELP, RESTORE_HELP, SCHEDULE_HELP,
+    PARAM_HELP, SETTINGS_SECTIONS, ACCOUNT_HELP,
 )
-from mailarchiver.version import __version__  # noqa: E402
 
 
 def esc(s):
@@ -107,7 +106,9 @@ def params_html():
 
 def gen_html():
     from doc_template import TEMPLATE  # локальный модуль рядом
-    html = TEMPLATE.replace("%%VERSION%%", __version__).replace("%%PARAMS%%", params_html())
+    # Номер версии в HTML не пишем: страница документации доступна без входа,
+    # а точная версия подсказывает, какие уязвимости искать (как и /health).
+    html = TEMPLATE.replace("%%VERSION%%", "").replace("%%PARAMS%%", params_html())
     out = os.path.join(ROOT, "mailarchiver", "web", "static", "docs", "index.html")
     os.makedirs(os.path.dirname(out), exist_ok=True)
     with open(out, "w", encoding="utf-8") as f:

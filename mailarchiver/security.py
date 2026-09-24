@@ -14,7 +14,6 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
-import os
 import secrets
 from typing import Optional
 
@@ -94,12 +93,16 @@ def sign_value(value: str, app_secret: bytes) -> str:
 
 
 def unsign_value(signed: str, app_secret: bytes) -> Optional[str]:
+    if not isinstance(signed, str) or not signed:
+        return None
     try:
         value, mac = signed.rsplit(".", 1)
     except ValueError:
         return None
-    expected = hmac.new(app_secret, value.encode("utf-8"), hashlib.sha256).hexdigest()
-    if hmac.compare_digest(mac, expected):
+    expected = hmac.new(app_secret, value.encode("utf-8", "surrogatepass"), hashlib.sha256).hexdigest()
+    # Сравниваем байты: hmac.compare_digest на строке с не-ASCII символами
+    # падает TypeError, и cookie с кириллицей давала ответ 500.
+    if hmac.compare_digest(mac.encode("utf-8", "surrogatepass"), expected.encode("ascii")):
         return value
     return None
 

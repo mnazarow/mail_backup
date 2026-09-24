@@ -2,64 +2,87 @@
 #  MailArchiver — файл конфигурации
 #  Скопируйте в /etc/mailarchiver/config.yaml (или config/config.yaml)
 #  и отредактируйте под себя. Все параметры имеют разумные значения по
-#  умолчанию — можно менять только нужное. Подробности по каждому параметру:
-#  docs/ru/05-parameters-reference.md
+#  умолчанию — можно менять только нужное (лишние строки можно удалить).
+#  Подробности по каждому параметру: docs/ru/05-parameters-reference.md
+#
+#  Проверка файла:  sudo -u mailarchiver /opt/mailarchiver/venv/bin/mailarchiver check-config
+#  Опечатка в имени параметра выводится предупреждением, неверное значение — ошибкой.
+#  Большинство параметров можно менять и в веб-интерфейсе («Настройки»);
+#  значение из интерфейса важнее значения из этого файла.
 # ============================================================================
 
-server:
-  host: "127.0.0.1"     # 0.0.0.0 — слушать на всех интерфейсах (за reverse proxy)
+server:                  # задаётся ТОЛЬКО здесь; после изменения — перезапуск службы
+  host: "127.0.0.1"      # 0.0.0.0 — слушать на всех интерфейсах (за reverse proxy)
   port: 8493
-  public_url: ""         # напр. "https://mail-backup.example.ru"
+  public_url: ""         # внешний адрес интерфейса, напр. "https://mail-backup.example.ru"
   behind_proxy: false    # true, если стоите за nginx/traefik с TLS
+  # Кому верить в заголовке X-Forwarded-For. Настоящим адресом клиента считается
+  # первый СПРАВА хоп, которого нет в этом списке (левую часть цепочки дописывает
+  # сам клиент). Без списка защита от подбора пароля обходится подстановкой
+  # заголовка. Отдельные адреса и сети через запятую; «*» отключает проверку.
+  trusted_proxies: "127.0.0.1, ::1"
 
 security:
   auth_enabled: true
   session_ttl_hours: 12
   session_idle_minutes: 60
   min_password_length: 8
-  max_login_attempts: 5
+  max_login_attempts: 5  # от этого числа считаются и остальные пределы (см. справочник)
   lockout_minutes: 15
   secure_cookie: false   # true при работе только по HTTPS
+  require_2fa: false     # true — администраторы обязаны включить вход с кодом из приложения
+  mailbox_login: true    # вход сотрудников по email и паролю своего ящика
+  imap_ssl_verify: true  # проверять TLS-сертификат IMAP-сервера
 
 paths:
   data_dir: ""           # пусто = /var/lib/mailarchiver (или ./data при запуске из исходников)
 
 storage:
-  layout: "maildir"
   compress: false        # true — сжимать письма gzip (экономия места)
+  fsync: true
   min_free_space_mb: 500
   verify_after_write: true
+  # Шифрование локальной копии (AES-256-GCM). Файл ключа храните ОТДЕЛЬНО от
+  # каталога данных и обязательно сделайте его копию: без ключа письма не прочитать.
+  # Создать ключ:  mailarchiver storage-key --generate /etc/mailarchiver/storage.key
+  encrypt: false
+  encryption_key_file: ""   # абсолютный путь, напр. "/etc/mailarchiver/storage.key"
 
 backup:
-  max_concurrent_jobs: 2
-  per_account_concurrency: 1
+  max_concurrent_jobs: 2     # 1–16; с одним ящиком одновременно работает одно задание
   fetch_batch_size: 200
   connect_timeout_s: 30
   socket_timeout_s: 120
-  retry_attempts: 4
+  retry_attempts: 4          # всего попыток: первый запуск и до трёх повторов
   download_flags: true
   skip_larger_than_mb: 0
+  unreadable_folder_grace_runs: 3
+  folder_include: []     # напр. ["INBOX", "Отправленные"] — пусто = все папки
   folder_exclude: []     # напр. ["[Gmail]/Корзина", "Спам"]
 
 retention:
-  enabled: false
+  enabled: false         # общая очистка по сроку keep_days (свой срок ящика действует всегда)
   keep_days: 0           # 0 = хранить вечно
+  cron: "30 4 * * *"     # когда запускать ежедневную очистку
   keep_last_runs: 30
-  delete_removed_from_server: false
 
 export:
-  default_engine: "auto"   # auto|aspose|native|mbox|eml|msg
+  default_engine: "auto"   # auto|aspose|native|mbox|eml
   pst_format: "unicode"    # unicode (Outlook 2003+) | ansi (Outlook 97–2002)
-  outlook_target: "2016+"
   pst_split_size_mb: 0
+  keep_days: 30            # удалять готовые выгрузки старше N дней (0 — не удалять)
   aspose_license_path: ""
+  tmp_dir: ""              # каталог временных файлов (пусто = <data_dir>/tmp)
 
 scheduler:
   enabled: true
   timezone: "Europe/Moscow"
+  misfire_grace_time_s: 3600
+  coalesce: true
 
 logging:
-  level: "INFO"
+  level: "INFO"          # DEBUG | INFO | WARNING | ERROR
+  to_stdout: true        # задаётся только здесь
 
 notifications:
   enabled: false
@@ -67,8 +90,86 @@ notifications:
   smtp_port: 587
   smtp_security: "starttls"
   smtp_user: ""
-  smtp_password: ""
+  smtp_password: ""      # лучше задать в интерфейсе: там он хранится зашифрованным
   mail_from: ""
   mail_to: []
   on_failure: true
   on_success: false
+  summary_enabled: true  # еженедельная сводка администраторам (если уведомления включены)
+  summary_cron: "0 8 * * 1"
+
+employees:
+  sync_enabled: false        # синхронизировать справочник сотрудников по расписанию
+  source_type: "file"        # file (файл на сервере) | url (адрес выгрузки)
+  source_file: ""            # путь к CSV/XLSX/XML на сервере
+  source_url: ""             # https://… (при source_type: url)
+  source_url_user: ""
+  source_url_password: ""    # лучше задать в интерфейсе: там он хранится зашифрованным
+  source_url_verify_ssl: true
+  source_url_timeout_s: 60   # за это время выгрузка должна скачаться целиком
+  source_url_format: "auto"  # auto | csv | xlsx
+  cron: "0 5 * * *"
+  create_accounts: true      # заводить ящики новым сотрудникам (нужен account_host)
+  account_host: ""           # IMAP-сервер создаваемых ящиков, напр. "mx.example.ru"
+  account_port: 993
+  account_security: "ssl"    # ssl | starttls | plain
+  account_name_template: "{full_name}"
+  account_username_template: "{email}"
+  account_notes_template: "Создан автоматически для сотрудника."
+  account_enabled: false
+  account_folder_include: []
+  account_folder_exclude: []
+  account_retention_days: -1 # -1 = как в общих настройках, 0 = вечно, N = дней
+  account_schedule_enabled: false
+  account_schedule_cron: "0 2 * * *"
+  account_use_master: false  # новые ящики — вход через администратора почты (см. mailadmin)
+  dismiss_from_file: true    # отмечать уволенных по колонкам «Работает»/«Уволен»/«Дата увольнения»
+  dismiss_missing_days: 0    # уволен, если нет в выгрузке N дней (0 — не считать)
+  dismissed_action: "final_backup_disable"   # final_backup_disable | keep
+  dismissed_keep_years: 5    # сколько лет удерживать архив уволенного (0 — бессрочно)
+
+replica:                     # копия архива вне сервера (docs/ru/13-replica.md)
+  enabled: false
+  target: "dir"              # dir (сетевая папка/диск) | rsync (сервер по SSH) | s3
+  cron: "0 6 * * *"          # в это же время — ежедневный снимок базы
+  include_db: true           # класть в копию снимки базы
+  db_snapshot_keep: 3        # сколько снимков базы хранить (0 — не делать)
+  mirror_deletions: true     # удалять в копии удалённое из архива
+  max_delete_percent: 50     # защита от массового удаления
+  parallel: 4
+  verify_every_days: 7       # полная сверка копии с архивом
+  timeout_s: 120
+  dir_path: ""               # /mnt/backup/mailarchiver
+  rsync_dest: ""             # backup@backup.example.ru:/srv/mailarchiver
+  ssh_port: 22
+  ssh_key_file: ""           # пусто — ключ службы <каталог данных>/replica_ssh_key
+  bwlimit_kbps: 0
+  s3_endpoint: ""            # https://storage.yandexcloud.net
+  s3_region: "ru-central1"
+  s3_bucket: ""
+  s3_prefix: "mailarchiver/"
+  s3_access_key: ""
+  s3_secret_key: ""          # лучше задать в интерфейсе: там он хранится зашифрованным
+  s3_path_style: true
+  s3_storage_class: ""       # пусто — стандартный; для «холодной» копии, напр. COLD
+  s3_verify_ssl: true
+
+monitoring:                  # метрики /metrics для Prometheus и Zabbix (docs/ru/14-monitoring.md)
+  metrics_enabled: false
+  metrics_token: ""          # Bearer-токен, не короче 16 символов; лучше задать в интерфейсе
+  metrics_allowed_ips: ["127.0.0.1", "::1"]   # откуда можно без токена
+  per_account_metrics: true
+
+search:                      # поиск по письмам (docs/ru/15-search.md)
+  enabled: true
+  index_bodies: true         # искать и по тексту писем
+  index_bodies_encrypted: false   # индексировать текст при шифровании копии (не рекомендуется)
+  body_max_kb: 16
+
+mailadmin:                   # вход в ящики через администратора почты (docs/ru/16-mailadmin.md)
+  enabled: false
+  host: ""                   # IMAP-сервер, для которого действует вход администратора
+  user: ""
+  password: ""               # лучше задать в интерфейсе: там он хранится зашифрованным
+  mode: "sasl_plain"         # sasl_plain | separator
+  separator: "*"

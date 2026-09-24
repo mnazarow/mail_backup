@@ -210,6 +210,10 @@ def test_folder_problem_history_is_stored(client):
     acc_id = _make_account(client, "История папок")
     svc = client.app.state.services
     assert svc.db.record_folder_problem(acc_id, "Отправленные/s2022", "failed EXAMINE") == 1
+    # повтор того же ночного задания — это тот же прогон, счётчик не растёт
+    assert svc.db.record_folder_problem(acc_id, "Отправленные/s2022", "failed EXAMINE") == 1
+    # на следующие сутки — растёт
+    svc.db.execute("UPDATE folder_problems SET counted_at='2000-01-01T00:00:00+00:00'")
     assert svc.db.record_folder_problem(acc_id, "Отправленные/s2022", "failed EXAMINE") == 2
     row = svc.db.get_folder_problem(acc_id, "Отправленные/s2022")
     assert row["fails"] == 2 and row["first_failed"] and "EXAMINE" in row["last_error"]

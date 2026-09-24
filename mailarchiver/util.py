@@ -10,7 +10,7 @@ import tempfile
 import time
 import unicodedata
 from email.header import decode_header
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from functools import wraps
 from typing import Callable, Iterable, Optional, TypeVar
 
@@ -114,7 +114,14 @@ def human_size(num_bytes: float) -> str:
 # ---------------------------------------------------------------------------
 
 def ensure_dir(path: str, mode: int = 0o700) -> str:
-    """Создать директорию (со всеми родителями), если её нет."""
+    """Создать директорию (со всеми родителями), если её нет.
+
+    Права выставляются только только что созданному каталогу. Раньше они
+    менялись и у существующего: ``check-config`` от root с ``export.tmp_dir:
+    /tmp`` превращал общий /tmp (1777) в 0700 — и система переставала работать.
+    """
+    if os.path.isdir(path):
+        return path
     os.makedirs(path, exist_ok=True)
     try:
         os.chmod(path, mode)
@@ -202,7 +209,27 @@ def sanitize_folder_component(name: str) -> str:
     stripped = name.strip(". ")
     if not stripped or set(stripped) <= {"."}:
         return "_" if name else "INBOX"
-    return stripped
+    return _limit_component(stripped)
+
+
+#: Предел длины одного имени в файловой системе (ext4, xfs, btrfs — 255 БАЙТ).
+_MAX_COMPONENT_BYTES = 255
+
+
+def _limit_component(name: str) -> str:
+    """Слишком длинное имя уровня папки укоротить, сохранив уникальность.
+
+    Кириллица в UTF-8 занимает 2 байта на букву: папка из ~130 русских букв
+    уже не помещается в 255 байт, и раньше запись любого её письма падала с
+    «File name too long» (а заодно всё, что шло после этой папки). Имена до
+    предела не меняются — у уже сохранённых папок путь прежний.
+    """
+    raw = name.encode("utf-8")
+    if len(raw) <= _MAX_COMPONENT_BYTES:
+        return name
+    digest = hashlib.sha1(raw).hexdigest()[:10]
+    cut = raw[:200].decode("utf-8", "ignore").rstrip(". ")
+    return f"{cut}~{digest}"
 
 
 def sha256_hex(data: bytes) -> str:
@@ -293,3 +320,21 @@ def parse_bool(value, default: bool = False) -> bool:
     if value is None:
         return default
     return str(value).strip().lower() in {"1", "true", "yes", "on", "да", "y"}
+
+
+def parse_day(value) -> date:
+    """Дата из строки «ГГГГ-ММ-ДД» или «ДД.ММ.ГГГГ». Иначе ValidationError.
+
+    Раньше формат не проверялся, и строки сравнивались как есть: период
+    «01.01.2020–31.12.2020» выгружал письма 2026 года.
+    """
+    from datetime import datetime as _dt
+    from .errors import ValidationError
+    text = str(value or "").strip()
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y"):
+        try:
+            return _dt.strptime(text[:10], fmt).date()
+        except ValueError:
+            continue
+    raise ValidationError(f"Не удалось разобрать дату «{text}».",
+                          hint="Укажите дату в виде ГГГГ-ММ-ДД (например 2026-09-15) или ДД.ММ.ГГГГ.")
