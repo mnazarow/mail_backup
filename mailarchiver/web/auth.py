@@ -14,6 +14,11 @@ from fastapi import HTTPException, Request, Response
 
 from ..errors import AuthError
 from ..logging_setup import get_logger
+# Роли (подробно — :mod:`mailarchiver.roles`). Администратор — всё. Оператор
+# следит за копированием и запускает его, но не читает письма, не меняет
+# настроек и ничего не удаляет. Пользователь-ящик (сотрудник, вошедший по
+# паролю своего ящика) видит только свой ящик.
+from ..roles import ROLE_ADMIN, ROLE_MAILBOX, ROLE_OPERATOR, STAFF_ROLES
 from .proxy import client_ip
 from ..security import (
     check_password_policy,
@@ -25,6 +30,30 @@ from ..security import (
 )
 
 COOKIE_NAME = "ma_session"
+
+#: Точки API, открытые любому вошедшему (``require_user``), которые нужны оператору.
+#: Остальные такие точки — письма, выгрузки, восстановление, правка ящиков и
+#: расписаний — оператору закрыты. Список разрешающий: точка, добавленная позже,
+#: оператору по умолчанию НЕ доступна.
+OPERATOR_ROUTES = frozenset({
+    ("GET", "/api/accounts"),
+    ("GET", "/api/accounts/{account_id}"),
+    ("POST", "/api/accounts/{account_id}/backup"),          # «с нуля» — только администратору
+    ("POST", "/api/accounts/{account_id}/folders/diagnose"),
+    ("GET", "/api/accounts/{account_id}/runs"),
+    ("POST", "/api/accounts/{account_id}/test"),
+    ("POST", "/api/accounts/{account_id}/verify"),
+    ("GET", "/api/help"),
+    ("GET", "/api/jobs"),
+    ("GET", "/api/jobs/{job_id}"),
+    ("GET", "/api/jobs/{job_id}/events"),
+    ("POST", "/api/jobs/{job_id}/cancel"),                   # только задания копирования и проверок
+    ("POST", "/api/jobs/{job_id}/retry"),
+    ("GET", "/api/live"),
+    ("GET", "/api/state"),
+    ("GET", "/api/stats"),
+    ("GET", "/api/schedules"),
+})
 
 log = get_logger("auth")
 
@@ -164,7 +193,7 @@ _ENROLL_PATHS = ("/api/me", "/api/logout", "/api/help", "/api/needs-setup")
 
 def two_factor_required(services, user: dict) -> bool:
     """Обязан ли этот пользователь включить 2FA прежде чем работать."""
-    if not user or user.get("role") != "admin" or user.get("anonymous_auth_disabled"):
+    if not user or user.get("role") not in STAFF_ROLES or user.get("anonymous_auth_disabled"):
         return False
     if user.get("totp_enabled"):
         return False
@@ -174,7 +203,8 @@ def two_factor_required(services, user: dict) -> bool:
         return False
 
 
-def require_user(request: Request) -> dict:
+def _authenticated(request: Request) -> dict:
+    """Вошедший пользователь (401 — нет) с проверкой обязательного 2FA."""
     user = current_user(request)
     if user is None:
         raise HTTPException(status_code=401, detail="Требуется вход")
@@ -188,11 +218,50 @@ def require_user(request: Request) -> dict:
     return user
 
 
+def _route_key(request: Request) -> Tuple[str, str]:
+    route = request.scope.get("route")
+    return request.method.upper(), getattr(route, "path", None) or request.url.path
+
+
+def require_login(request: Request) -> dict:
+    """Любой вошедший, роль не важна — для точек «о себе» (свой двухфакторный вход)."""
+    return _authenticated(request)
+
+
+def require_user(request: Request) -> dict:
+    """Любой вошедший: администратор, оператор (только :data:`OPERATOR_ROUTES`) или
+    пользователь-ящик (точка сама ограничивает его своим ящиком).
+
+    Разрешающий список ролей: незнакомая роль (база из другой версии, правка
+    вручную) не получает прав администратора по умолчанию.
+    """
+    user = _authenticated(request)
+    role = user.get("role")
+    if role == ROLE_OPERATOR:
+        if _route_key(request) not in OPERATOR_ROUTES:
+            raise HTTPException(status_code=403, detail="Оператору это недоступно: нужна роль администратора")
+    elif role not in (ROLE_ADMIN, ROLE_MAILBOX):
+        raise HTTPException(status_code=403, detail="Неизвестная роль пользователя — обратитесь к администратору")
+    return user
+
+
 def require_admin(request: Request) -> dict:
-    user = require_user(request)
-    if user.get("role") != "admin":
+    user = _authenticated(request)
+    if user.get("role") != ROLE_ADMIN:
         raise HTTPException(status_code=403, detail="Требуются права администратора")
     return user
+
+
+def require_staff(request: Request) -> dict:
+    """Администратор или оператор (точки для наблюдения и запуска копирования)."""
+    user = _authenticated(request)
+    if user.get("role") not in STAFF_ROLES:
+        raise HTTPException(status_code=403, detail="Требуются права администратора или оператора")
+    return user
+
+
+def is_admin(user: Optional[dict]) -> bool:
+    return bool(user) and user.get("role") == ROLE_ADMIN
 
 
 def create_session(services, response: Response, user_id: int, request: Request,
@@ -433,7 +502,7 @@ SECURITY_AUDIT_ACTIONS = (
     "login", "login_failed", "login_password_ok", "login_2fa", "login_2fa_failed", "login_2fa_locked",
     "login_mailbox", "login_mailbox_limited", "login_busy", "2fa_enabled", "2fa_disabled", "2fa_reset",
     "2fa_code_failed", "2fa_disable_bad_password", "2fa_recovery_regenerated", "user_password",
-    "user_logout_all", "user_disable", "user_create", "user_delete", "create_admin",
+    "user_logout_all", "user_disable", "user_create", "user_delete", "user_role", "create_admin",
     "account_logout_sessions", "security_unblock", "search")
 
 

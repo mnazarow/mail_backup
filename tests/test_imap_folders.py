@@ -140,12 +140,14 @@ class FakeDB:
         self.problems = {}
 
     # -- история папок, которые не открываются ------------------------------
-    def record_folder_problem(self, account_id, folder, error=""):
+    def record_folder_problem(self, account_id, folder, error="", delimiter=""):
         row = self.problems.setdefault((account_id, folder),
                                        {"fails": 0, "first_failed": "2026-09-01T00:00:00+00:00",
-                                        "last_error": ""})
+                                        "last_error": "", "delimiter": ""})
         row["fails"] += 1
         row["last_error"] = error
+        if delimiter:
+            row["delimiter"] = delimiter
         return row["fails"]
 
     def clear_folder_problem(self, account_id, folder):
@@ -883,3 +885,17 @@ def test_diagnose_uses_the_same_exclusions_as_backup(monkeypatch):
     verdicts = {f["name"]: f["verdict"] for f in d["folders"]}
     assert verdicts == {"INBOX": "ok", "Архив": "excluded", "Архив/2020": "excluded", "Спам": "excluded"}
     assert d["broken_folders"] == [] and d["messages_lost"] == 0
+
+
+def test_unreadable_folder_remembers_server_delimiter(monkeypatch):
+    """Разделитель папок сервера запоминается вместе с нечитаемой папкой (для сравнения прежней копии)."""
+    bad = "Архив.2019"
+    fake = FakeIMAP(
+        folders=[((b"\\HasNoChildren",), b".", "INBOX"),
+                 ((b"\\HasNoChildren",), b".", bad)],
+        messages=_messages("INBOX"),
+        select_errors={bad: [_axigen_refusal()] * 6},
+    )
+    engine, acc, db, _store = _engine_and_account(monkeypatch, fake)
+    engine.run(acc, event_cb=lambda lvl, m: None)
+    assert db.problems[(acc.id, bad)]["delimiter"] == "."

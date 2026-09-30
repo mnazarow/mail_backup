@@ -112,6 +112,8 @@ def test_weekly_summary_text(services):
     assert "Неверный пароль" in body and "bad@x" in body
     assert "Нет удачной копии дольше 72 ч" in body and "Давно" in body
     assert "Копия вне сервера не настроена" in body
+    assert "прогонов 1, удачных 0, с ошибкой 1;" in body          # запятые между словами на месте
+    assert "Архив: писем 3, объём" in body
     assert "Выключен" not in body
     for acc_id in ids.values():
         services.db.execute("DELETE FROM accounts WHERE id=?", (acc_id,))
@@ -146,3 +148,43 @@ def test_replica_alert_on_dashboard(client):
     assert "48 ч" in client.get("/api/state").json()["replica_alert"]
     svc.db.set_meta("replica_last_ok", _iso(1))
     assert client.get("/api/state").json()["replica_alert"] == ""
+
+
+def test_quarantines_in_metrics_and_summary(services):
+    """Прежние копии (карантин после «с нуля») видны в метриках и в еженедельной сводке."""
+    import os
+    import time as _time
+    from mailarchiver import quarantine as qmod
+    ids = _seed(services)
+    root = services.cfg.mail_root
+    old_stamp = _time.strftime("%Y%m%d_%H%M%S", _time.localtime(_time.time() - 45 * 86400))
+    fresh_stamp = _time.strftime("%Y%m%d_%H%M%S", _time.localtime(_time.time() - 3600))
+    checked = os.path.join(root, f"account_{ids['ok']}_old_{old_stamp}")
+    unchecked = os.path.join(root, f"account_{ids['stale']}_old_{fresh_stamp}")
+    for path in (checked, unchecked):
+        os.makedirs(os.path.join(path, "INBOX", "cur"))
+    services.db.set_meta(qmod.meta_key(checked), json.dumps({
+        "path": checked, "files": 10, "disk_bytes": 5 * 1024 * 1024, "identical": 7, "unique": 3,
+        "unique_bytes": 30000, "new_copy_complete": True}))
+    reset_cache()
+    text = render_prometheus(services)
+    assert 'mailarchiver_quarantines{state="total"} 2' in text
+    assert 'mailarchiver_quarantines{state="unchecked"} 1' in text
+    assert 'mailarchiver_quarantines{state="with_unique"} 1' in text
+    assert "mailarchiver_quarantine_unique_messages 3" in text
+    assert f"mailarchiver_quarantine_bytes {5 * 1024 * 1024}" in text
+    age = [line for line in text.splitlines() if line.startswith("mailarchiver_quarantine_oldest_age_seconds ")]
+    assert age and float(age[0].split()[1]) > 44 * 86400
+    assert f'mailarchiver_account_quarantines{{account_id="{ids["ok"]}"' in text
+    samples = [line for line in text.splitlines() if line and not line.startswith("#")]
+    assert all(_SAMPLE.match(line) for line in samples)
+    subject, body = weekly_summary(services)
+    assert "Прежние копии после копирования «с нуля»: 2 у 2 ящиков" in body
+    assert "ещё не сравнивались: 1" in body
+    assert "Писем только в прежних копиях (в архиве их нет): 3" in body and "Бухгалтерия" in body
+    assert "Самой старой прежней копии 45 дн." in body or "Самой старой прежней копии 44 дн." in body
+    # письма вернули — сводка больше не тревожится из-за карантина
+    services.db.set_meta(qmod.meta_key(checked), json.dumps({"path": checked, "disk_bytes": 1, "unique": 0}))
+    reset_cache()
+    _subject, body = weekly_summary(services)
+    assert "Писем только в прежних копиях" not in body

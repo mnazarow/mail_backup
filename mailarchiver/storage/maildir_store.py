@@ -30,11 +30,12 @@ from __future__ import annotations
 import gzip
 import io
 import os
+import re
 import shutil
 import socket
 import time
 import zlib
-from typing import Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 from ..errors import DiskSpaceError, StorageError
 from ..util import ensure_dir, disk_free_bytes, sha256_hex, sanitize_folder_component
@@ -564,34 +565,93 @@ class MaildirStore:
             ensure_dir(acc_dir, 0o700)
         return quarantine, count, total
 
+    def quarantine_counts(self) -> Dict[int, int]:
+        """Сколько прежних копий у каждого ящика: ``{номер ящика: число каталогов}``.
+
+        Одно чтение каталога с почтой — без обхода самих копий (для списка ящиков).
+        """
+        out: Dict[int, int] = {}
+        try:
+            names = os.listdir(self.mail_root)
+        except OSError:
+            return out
+        for name in names:
+            m = re.match(r"^account_(\d+)_old_", name)
+            if m:
+                out[int(m.group(1))] = out.get(int(m.group(1)), 0) + 1
+        return out
+
+    def quarantine_paths(self, account_id: int) -> List[str]:
+        """Каталоги прежних копий ящика, свежие первыми, — без обхода их файлов.
+
+        Для проверок «есть ли такая прежняя копия»: полный обход с подсчётом
+        размера (:meth:`list_quarantines`) на копии в сотни тысяч файлов занимает
+        минуты, а групповое действие делало бы его по каждому ящику.
+        """
+        acc_dir = self.account_dir(account_id)
+        prefix = os.path.basename(acc_dir) + "_old_"
+        parent = os.path.dirname(acc_dir)
+        try:
+            names = sorted(os.listdir(parent), reverse=True)
+        except OSError:
+            return []
+        return [os.path.join(parent, name) for name in names
+                if name.startswith(prefix) and os.path.isdir(os.path.join(parent, name))]
+
+    @staticmethod
+    def quarantine_created_at(path: str) -> Optional[float]:
+        """Когда сделана прежняя копия (время копии «с нуля») — по имени каталога."""
+        m = re.search(r"_old_(\d{8}_\d{6})", os.path.basename(os.path.normpath(path)))
+        if not m:
+            return None
+        try:
+            return time.mktime(time.strptime(m.group(1), "%Y%m%d_%H%M%S"))
+        except (ValueError, OverflowError):
+            return None
+
+    @staticmethod
+    def quarantine_usage(path: str) -> Tuple[int, int]:
+        """Файлов и байт в каталоге прежней копии (полный обход — небыстро)."""
+        count = total = 0
+        for root, _dirs, files in os.walk(path):
+            for fn in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, fn))
+                    count += 1
+                except OSError:
+                    pass
+        return count, total
+
     def list_quarantines(self, account_id: int) -> List[Tuple[str, int, int]]:
         """Карантинные копии ящика: ``(путь, файлов, байт)``, свежие первыми.
 
         Нужны интерфейсу: после пересоздания копии на диске остаётся полная
         прежняя версия, и без такого списка она лежала бы там вечно незаметно.
         """
-        acc_dir = self.account_dir(account_id)
-        prefix = os.path.basename(acc_dir) + "_old_"
-        parent = os.path.dirname(acc_dir)
-        out: List[Tuple[str, int, int]] = []
-        try:
-            names = sorted(os.listdir(parent), reverse=True)
-        except OSError:
-            return out
-        for name in names:
-            if not name.startswith(prefix):
-                continue
-            path = os.path.join(parent, name)
-            count = total = 0
-            for root, _dirs, files in os.walk(path):
-                for fn in files:
-                    try:
-                        total += os.path.getsize(os.path.join(root, fn))
-                        count += 1
-                    except OSError:
-                        pass
-            out.append((path, count, total))
-        return out
+        return [(path, *self.quarantine_usage(path)) for path in self.quarantine_paths(account_id)]
+
+    def _quarantine_file(self, path: str) -> str:
+        """Путь к файлу письма ПРЕЖНЕЙ копии — только внутри каталога с почтой и
+        только в каталоге вида ``account_N_old_…`` (страховка от подмены пути)."""
+        target = os.path.realpath(path)
+        root = os.path.realpath(self.mail_root)
+        rel = os.path.relpath(target, root)
+        top = rel.split(os.sep, 1)[0]
+        if rel.startswith("..") or os.path.isabs(rel) or "_old_" not in top or not os.path.isfile(target):
+            raise StorageError("Файл не относится к прежней копии ящика.",
+                               hint="Обновите список прежних копий.")
+        return target
+
+    def open_quarantine_file(self, path: str):
+        """Открыть письмо прежней копии как поток (распаковка и расшифровка — на лету)."""
+        return self._open_raw_file(self._quarantine_file(path))
+
+    def read_quarantine_file(self, path: str) -> bytes:
+        return self._read_raw_file(self._quarantine_file(path))
+
+    def hash_quarantine_file(self, path: str) -> Tuple[str, int]:
+        """SHA-256 и размер содержимого письма прежней копии (потоком)."""
+        return self._stream_digest(self._quarantine_file(path))
 
     def drop_quarantine(self, path: str) -> None:
         """Удалить карантинную копию (только внутри каталога с почтой)."""

@@ -36,6 +36,7 @@ from email.utils import getaddresses, parseaddr
 from typing import Callable, Dict, List, Optional
 
 from .models import JobStatus, JobType
+from .roles import ROLE_LABELS
 from .util import human_size
 
 # --- Русскоязычные подписи ---------------------------------------------------
@@ -439,7 +440,8 @@ def system_analytics(svc, account_id: Optional[int] = None, *, days: int = 90) -
                                   for k, v in sched_by_type.most_common()],
                       "upcoming": upcoming[:8]},
         "activity": activity,
-        "security": {"users_by_role": [{"label": k, "value": v} for k, v in users_roles.items()],
+        "security": {"users_by_role": [{"label": ROLE_LABELS.get(k, k), "key": k, "value": v}
+                                       for k, v in users_roles.items()],
                      "active_sessions": active_sessions, "login_failures_24h": login_failures_24h},
         "audit_top": audit_actions,
         "generated_at": datetime.now(timezone.utc).isoformat(),

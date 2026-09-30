@@ -8,9 +8,9 @@ Zabbix: элемент «HTTP-агент» + предобработка «Promet
 
 Сводка (``notifications.summary_cron``, по умолчанию по понедельникам в 8:00)
 приходит письмом: что с ящиками (неверные пароли, давно не копировались,
-ошибки), сколько скопировано за неделю, место на диске и прогноз, копия вне
-сервера, события безопасности. Ящики «требуют внимания» по тем же правилам,
-что и на дашборде.
+ошибки), сколько скопировано за неделю, место на диске и прогноз, прежние
+копии после копирования «с нуля», копия вне сервера, события безопасности.
+Ящики «требуют внимания» по тем же правилам, что и на дашборде.
 """
 from __future__ import annotations
 
@@ -110,6 +110,17 @@ def account_problems(svc) -> Dict:
     return _cached("accounts", HEAVY_TTL_S, compute)
 
 
+def quarantines(svc) -> Dict:
+    """Прежние копии ящиков (карантин после «с нуля»): число, размер, письма «только здесь»."""
+    from .quarantine import overview
+    try:
+        return _cached("quarantines", HEAVY_TTL_S, lambda: overview(svc))
+    except Exception as exc:  # noqa: BLE001 — метрики и сводка не должны падать из-за карантина
+        log.warning("Не удалось собрать сведения о прежних копиях: %s", exc)
+        return {"count": 0, "accounts": 0, "checked": 0, "unchecked": 0, "bytes": 0, "with_unique": 0,
+                "unique": 0, "unique_bytes": 0, "oldest_created_at": None, "items": []}
+
+
 def collect(svc) -> Dict:
     """Всё состояние для метрик и сводки."""
     acc = account_problems(svc)
@@ -135,7 +146,7 @@ def collect(svc) -> Dict:
     from .replica import snapshots
     rep = replica_runner.status(svc)
     snaps = snapshots.list_snapshots(svc.cfg)
-    return {"accounts": acc, **state,
+    return {"accounts": acc, **state, "quarantines": quarantines(svc),
             "encryption": {"active": bool(svc.store.encrypt), "blocked": bool(svc.store.encryption_blocked)},
             "scheduler_running": bool(svc.scheduler.running()),
             "replica": rep, "snapshot": snaps[0] if snaps else None}
@@ -221,6 +232,16 @@ def render_prometheus(svc, *, per_account: bool = True) -> str:
     out.metric("mailarchiver_oldest_backup_age_seconds",
                "Сколько секунд назад была последняя удачная копия у самого «отстающего» включённого ящика",
                "gauge", [({}, oldest)])
+    q = data["quarantines"]
+    out.metric("mailarchiver_quarantines", "Прежние копии ящиков после копирования «с нуля»", "gauge", [
+        ({"state": "total"}, q["count"]), ({"state": "unchecked"}, q["unchecked"]),
+        ({"state": "with_unique"}, q["with_unique"])])
+    out.metric("mailarchiver_quarantine_bytes", "Объём сравненных прежних копий на диске, байт", "gauge",
+               [({}, q["bytes"])])
+    out.metric("mailarchiver_quarantine_unique_messages",
+               "Писем, которые есть только в прежних копиях (нет в архиве)", "gauge", [({}, q["unique"])])
+    out.metric("mailarchiver_quarantine_oldest_age_seconds", "Возраст самой старой прежней копии, секунд", "gauge",
+               [({}, max(0.0, time.time() - q["oldest_created_at"]))] if q["oldest_created_at"] else [])
     if per_account:
         rows = acc["accounts"]
 
@@ -236,12 +257,22 @@ def render_prometheus(svc, *, per_account: bool = True) -> str:
                    [(labels(i), i["messages"]) for i in rows])
         out.metric("mailarchiver_account_bytes", "Объём писем ящика в архиве, байт", "gauge",
                    [(labels(i), i["bytes"]) for i in rows])
+        per_q: Dict[int, int] = {}
+        for item in q["items"]:
+            per_q[item["account_id"]] = per_q.get(item["account_id"], 0) + 1
+        out.metric("mailarchiver_account_quarantines", "Прежних копий у ящика", "gauge",
+                   [(labels(i), per_q[i["id"]]) for i in rows if i["id"] in per_q])
     return out.text()
 
 
 # ---------------------------------------------------------------------------
 #  Еженедельная сводка
 # ---------------------------------------------------------------------------
+def _num(value) -> str:
+    """Число с разрядами через пробел: 12 345."""
+    return f"{int(value or 0):,}".replace(",", " ")
+
+
 def _names(items: List[Dict], limit: int = 20) -> str:
     shown = [f"{i['name']} ({i['username']})" if i.get("username") and i["username"] != i["name"] else i["name"]
              for i in items[:limit]]
@@ -249,9 +280,15 @@ def _names(items: List[Dict], limit: int = 20) -> str:
     return "; ".join(shown) + (f" и ещё {more}" if more > 0 else "")
 
 
-def weekly_summary(svc, days: int = 7) -> Tuple[str, str]:
-    """Тема и текст письма-сводки за последние ``days`` дней."""
-    reset_cache()
+def weekly_summary(svc, days: int = 7, *, fresh: bool = True, security: bool = True) -> Tuple[str, str]:
+    """Тема и текст письма-сводки за последние ``days`` дней.
+
+    ``fresh=False`` — взять состояние ящиков из кэша (до 5 минут): предпросмотр в
+    интерфейсе не должен пересчитывать весь архив на каждое нажатие.
+    ``security=False`` — без строки о неудачных входах (предпросмотр оператора).
+    """
+    if fresh:
+        reset_cache()
     data = collect(svc)
     acc = data["accounts"]
     tz = svc.local_tz()
@@ -277,9 +314,12 @@ def weekly_summary(svc, days: int = 7) -> Tuple[str, str]:
     lines = [f"MailArchiver {__version__}: сводка за {period}", ""]
     lines.append(f"Ящиков: {acc['total']} (копируются: {acc['enabled']}).")
     if runs is not None:
-        lines.append(f"Копирование за неделю: прогонов {runs['n']}, удачных {runs['ok']}, с ошибкой {runs['bad']}; "
-                     f"новых писем {int(runs['msgs']):,} ({human_size(int(runs['bytes']))}).".replace(",", " "))
-    lines.append(f"Архив: писем {acc['messages']:,}, объём {human_size(acc['bytes'])}.".replace(",", " "))
+        # разряды отделяем пробелом только в самих числах: прежний .replace(",", " ")
+        # по всей строке съедал и запятые между словами («прогонов 1  удачных 0»)
+        lines.append(f"Копирование за неделю: прогонов {_num(runs['n'])}, удачных {_num(runs['ok'])}, "
+                     f"с ошибкой {_num(runs['bad'])}; новых писем {_num(runs['msgs'])} "
+                     f"({human_size(int(runs['bytes']))}).")
+    lines.append(f"Архив: писем {_num(acc['messages'])}, объём {human_size(acc['bytes'])}.")
     disk = data["disk"]
     if disk["total"]:
         text = f"Диск с письмами: свободно {human_size(disk['free'])} из {human_size(disk['total'])}"
@@ -306,6 +346,9 @@ def weekly_summary(svc, days: int = 7) -> Tuple[str, str]:
         lines.append("")
     if acc["nopassword"]:
         lines.append(f"Включены, но без пароля — {len(acc['nopassword'])}: {_names(acc['nopassword'], 10)}")
+    q_lines, q_problem = _quarantine_lines(data["quarantines"], tz, now)
+    lines.extend(q_lines)
+    problems += q_problem
     if failed_jobs:
         lines.append(f"Заданий с ошибкой за неделю: {failed_jobs} (подробно — «Очередь и задания»).")
     if rep["enabled"]:
@@ -331,7 +374,7 @@ def weekly_summary(svc, days: int = 7) -> Tuple[str, str]:
     if data["encryption"]["blocked"]:
         problems += 1
         lines.append("⛔ Шифрование включено, а ключа нет — новые письма не сохраняются!")
-    if sec is not None and (sec["pw"] or sec["otp"] or sec["imap"]):
+    if security and sec is not None and (sec["pw"] or sec["otp"] or sec["imap"]):
         lines.append(f"Безопасность за неделю: неудачных входов {sec['pw']}, неверных кодов 2FA {sec['otp']}, "
                      f"неудачных проверок паролей ящиков {sec['imap']}.")
     lines.append("")
@@ -343,6 +386,42 @@ def weekly_summary(svc, days: int = 7) -> Tuple[str, str]:
     subject = (f"MailArchiver: сводка за неделю — требуют внимания: {total_problems}" if total_problems
                else "MailArchiver: сводка за неделю — всё в порядке")
     return subject, "\n".join(lines) + "\n"
+
+
+#: Прежняя копия старше стольких дней упоминается в сводке отдельно: она
+#: занимает место, а письма «только в ней» не видны ни в поиске, ни в выгрузке.
+QUARANTINE_OLD_DAYS = 30
+
+
+def _quarantine_lines(q: Dict, tz, now: datetime) -> Tuple[List[str], int]:
+    """Строки сводки о прежних копиях и число «требующих внимания» (0 или 1)."""
+    if not q.get("count"):
+        return [], 0
+    lines = []
+    n_acc = q["accounts"]
+    text = (f"Прежние копии после копирования «с нуля»: {q['count']} у {n_acc} "
+            f"{'ящика' if n_acc % 10 == 1 and n_acc % 100 != 11 else 'ящиков'}")
+    if q["checked"]:
+        text += f", сравнено {q['checked']} (на диске {human_size(q['bytes'])})"
+    if q["unchecked"]:
+        text += f", ещё не сравнивались: {q['unchecked']}"
+    lines.append(text + ".")
+    problem = 0
+    if q["unique"]:
+        problem = 1
+        owners = sorted({i["account"] for i in q["items"] if i["unique"]})
+        shown = "; ".join(owners[:10]) + (f" и ещё {len(owners) - 10}" if len(owners) > 10 else "")
+        lines.append(f"⚠ Писем только в прежних копиях (в архиве их нет): {_num(q['unique'])} "
+                     f"({human_size(q['unique_bytes'])}) — {shown}. Верните их кнопкой «🛟 Вернуть» "
+                     f"(меню ящика → «Прежние копии»), прежде чем удалять копии.")
+    oldest = q.get("oldest_created_at")
+    if oldest:
+        age_days = int((now.timestamp() - oldest) // 86400)
+        if age_days >= QUARANTINE_OLD_DAYS:
+            lines.append(f"Самой старой прежней копии {age_days} дн. (от "
+                         f"{datetime.fromtimestamp(oldest, tz):%d.%m.%Y}): если письма из неё не нужны, "
+                         f"её можно удалить и освободить место.")
+    return lines, problem
 
 
 def _daily_growth(svc, days: int) -> float:

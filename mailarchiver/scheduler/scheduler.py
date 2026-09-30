@@ -23,9 +23,9 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
+from ..cronutil import crontab_trigger
 from ..errors import ValidationError
 from ..logging_setup import get_logger
 from ..models import AuthType, JobType, ScheduleKind, account_has_credentials
@@ -130,7 +130,7 @@ class SchedulerService:
             log.error("Некорректное cron-выражение %s: «%s» (нужно 5 полей).", what, expr)
             return None
         try:
-            return CronTrigger.from_crontab(expr, timezone=self._timezone())
+            return crontab_trigger(expr, timezone=self._timezone())
         except Exception as exc:  # noqa: BLE001
             log.error("Не удалось разобрать cron %s «%s»: %s", what, expr, exc)
             return None
@@ -300,7 +300,11 @@ class SchedulerService:
             if len(parts) != 5:
                 raise ValidationError(f"Некорректное cron-выражение: «{expr}» (нужно 5 полей).",
                                       hint="Пример: «0 3 * * *» — каждый день в 03:00.")
-            return CronTrigger.from_crontab(expr, timezone=tz)
+            try:
+                return crontab_trigger(expr, timezone=tz)
+            except ValueError as exc:
+                raise ValidationError(f"Некорректное cron-выражение: «{expr}» ({exc}).",
+                                      hint="Пример: «0 3 * * *» — каждый день в 03:00.") from exc
         if kind == ScheduleKind.INTERVAL:
             secs = int(row["interval_seconds"] or 0)
             if secs < 60:
@@ -368,7 +372,19 @@ class SchedulerService:
                                 "в очереди или выполняется.", schedule_id, job_type)
                     svc.db.set_schedule_runtimes(schedule_id, last_run=now)
                     return
-            max_attempts = int(svc.rt("backup", "retry_attempts") or 1) if job_type == JobType.BACKUP else 1
+            elif job_type == JobType.BACKUP_ALL:
+                # Проход по всем ящикам по очереди может идти дольше интервала
+                # между запусками: второй такой же проход не ставим, прежний
+                # просто продолжает работу. Проход по ВЫБРАННЫМ ящикам (групповое
+                # действие) общему не мешает: он встанет в очередь следом.
+                from ..queue.jobs import is_global_pass
+                if any(is_global_pass(job) for job in svc.db.active_jobs()):
+                    log.warning("Расписание #%s пропущено: копирование всех ящиков по очереди ещё идёт "
+                                "или стоит в очереди.", schedule_id)
+                    svc.db.set_schedule_runtimes(schedule_id, last_run=now)
+                    return
+            max_attempts = (int(svc.rt("backup", "retry_attempts") or 1)
+                            if job_type in (JobType.BACKUP, JobType.BACKUP_ALL) else 1)
             try:
                 priority = int(options.get("priority", 5))
             except (TypeError, ValueError):

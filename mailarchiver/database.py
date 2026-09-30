@@ -236,6 +236,8 @@ class Database:
             ("users", "totp_recovery", "TEXT DEFAULT '[]'"),
             # счётчик нечитаемых папок растёт раз в сутки (1.3.0)
             ("folder_problems", "counted_at", "TEXT"),
+            # разделитель папок сервера у нечитаемой папки (1.7.0)
+            ("folder_problems", "delimiter", "TEXT DEFAULT ''"),
             # автор выгрузки хранится в ней самой: задания чистятся раньше (1.3.0)
             ("exports", "created_by", "TEXT DEFAULT ''"),
             # отложенный повтор хранится в БД, а не в таймере процесса (1.3.0)
@@ -311,6 +313,66 @@ class Database:
             self._safe_rollback(conn)
             log.warning("Не удалось заполнить даты резервных копий ящиков: %s", exc)
         self._drop_legacy_retention_schedules(conn)
+        self._schedules_allow_global(conn)
+
+    def schedules_allow_global(self) -> bool:
+        """Разрешены ли расписания без ящика (прошла ли миграция 1.5.0)."""
+        try:
+            info = self.query("PRAGMA table_info(schedules)")
+        except sqlite3.Error:
+            return False
+        return not any(row[1] == "account_id" and int(row[3]) for row in info)
+
+    #: Столбцы таблицы schedules — для её пересборки (порядок как в схеме).
+    _SCHEDULE_COLUMNS = ("id", "account_id", "kind", "job_type", "cron_expr", "interval_seconds",
+                         "enabled", "options", "last_run", "next_run", "created_at")
+
+    def _schedules_allow_global(self, conn: sqlite3.Connection) -> None:
+        """Разрешить расписания без ящика (1.5.0): «копировать все ящики по очереди».
+
+        До 1.5.0 schedules.account_id был NOT NULL. SQLite не умеет снимать это
+        ограничение ALTER-ом, поэтому таблица пересобирается по стандартной схеме:
+        новая таблица → копия строк → замена старой. Всё в одной транзакции при
+        выключенной проверке внешних ключей (иначе DROP TABLE тронул бы
+        ссылки); при любой ошибке — откат, прежняя таблица остаётся как была.
+        """
+        try:
+            info = conn.execute("PRAGMA table_info(schedules)").fetchall()
+        except sqlite3.Error as exc:
+            log.warning("Не удалось прочитать структуру таблицы расписаний: %s", exc)
+            return
+        notnull = {row[1]: int(row[3]) for row in info}
+        if not notnull.get("account_id"):
+            return
+        present = [c for c in self._SCHEDULE_COLUMNS if c in notnull]
+        cols = ", ".join(present)
+        create = _SCHEMA_SQL[_SCHEMA_SQL.index("CREATE TABLE IF NOT EXISTS schedules"):]
+        create = create[:create.index(");") + 2].replace(
+            "CREATE TABLE IF NOT EXISTS schedules", "CREATE TABLE schedules_v15", 1)
+        try:
+            conn.commit()
+            conn.execute("PRAGMA foreign_keys=OFF")
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute("DROP TABLE IF EXISTS schedules_v15")
+                conn.execute(create)
+                conn.execute(f"INSERT INTO schedules_v15({cols}) SELECT {cols} FROM schedules")
+                conn.execute("DROP TABLE schedules")
+                conn.execute("ALTER TABLE schedules_v15 RENAME TO schedules")
+                bad = conn.execute("PRAGMA foreign_key_check(schedules)").fetchall()
+                if bad:
+                    # расписания ящиков, которых уже нет: раньше их удалял каскад
+                    conn.execute("DELETE FROM schedules WHERE account_id IS NOT NULL AND account_id NOT IN "
+                                 "(SELECT id FROM accounts)")
+                conn.commit()
+                log.info("Таблица расписаний обновлена: разрешены общие расписания на все ящики.")
+            except BaseException:
+                self._safe_rollback(conn)
+                raise
+            finally:
+                conn.execute("PRAGMA foreign_keys=ON")
+        except sqlite3.Error as exc:
+            log.error("Не удалось обновить таблицу расписаний (общие расписания недоступны): %s", exc)
 
     #: Отметка в meta: устаревшие расписания очистки уже убраны (один раз).
     _LEGACY_RETENTION_MARK = "legacy_retention_schedules_removed"
@@ -403,16 +465,41 @@ class Database:
     def set_last_login(self, user_id: int) -> None:
         self.execute("UPDATE users SET last_login=? WHERE id=?", (utcnow_iso(), user_id))
 
-    def set_user_disabled(self, user_id: int, disabled: bool) -> None:
-        self.execute("UPDATE users SET disabled=? WHERE id=?", (1 if disabled else 0, user_id))
+    #: Условие «после изменения пользователя ? останется включённый администратор»:
+    #: он сам не включённый администратор — или есть другой. Проверка и изменение
+    #: идут ОДНИМ оператором SQL: два администратора, одновременно понижающие
+    #: (отключающие, удаляющие) друг друга, не оставят систему без администратора.
+    _KEEPS_ADMIN = ("(role<>'admin' OR disabled<>0 OR EXISTS(SELECT 1 FROM users AS other "
+                    "WHERE other.role='admin' AND other.disabled=0 AND other.id<>users.id))")
+
+    def set_user_role(self, user_id: int, role: str) -> bool:
+        """Сменить роль. False — это последний включённый администратор (не меняем)."""
+        if role == "admin":
+            cur = self.execute("UPDATE users SET role=? WHERE id=?", (role, user_id))
+        else:
+            cur = self.execute(f"UPDATE users SET role=? WHERE id=? AND {self._KEEPS_ADMIN}", (role, user_id))
+        return bool(cur.rowcount)
+
+    def set_user_disabled(self, user_id: int, disabled: bool) -> bool:
+        """Отключить или включить. False — отключался последний включённый администратор."""
         if disabled:
+            cur = self.execute(f"UPDATE users SET disabled=1 WHERE id=? AND {self._KEEPS_ADMIN}", (user_id,))
+            if not cur.rowcount:
+                return False
             self.delete_user_sessions(user_id)
             self.drop_user_otp_challenges(user_id)
+            return True
+        cur = self.execute("UPDATE users SET disabled=0 WHERE id=?", (user_id,))
+        return bool(cur.rowcount)
 
-    def delete_user(self, user_id: int) -> None:
+    def delete_user(self, user_id: int) -> bool:
+        """Удалить пользователя. False — это последний включённый администратор (не удаляем)."""
+        cur = self.execute(f"DELETE FROM users WHERE id=? AND {self._KEEPS_ADMIN}", (user_id,))
+        if not cur.rowcount:
+            return False
         self.delete_user_sessions(user_id)
         self.drop_user_otp_challenges(user_id)
-        self.execute("DELETE FROM users WHERE id=?", (user_id,))
+        return True
 
     # ---- двухфакторный вход (TOTP) ----------------------------------------
     def totp_state(self, user_id: int) -> Optional[Dict[str, Any]]:
@@ -992,7 +1079,7 @@ class Database:
     #: — это один и тот же прогон, а не четыре дня подряд.
     FOLDER_PROBLEM_COUNT_HOURS = 20
 
-    def record_folder_problem(self, account_id: int, folder: str, error: str = "") -> int:
+    def record_folder_problem(self, account_id: int, folder: str, error: str = "", delimiter: str = "") -> int:
         """Отметить, что папка снова не открылась, и вернуть число неудач ПОДРЯД.
 
         Счётчик нужен, чтобы отличать свежую поломку (о ней надо кричать) от
@@ -1006,8 +1093,8 @@ class Database:
         threshold = (now_dt - timedelta(hours=self.FOLDER_PROBLEM_COUNT_HOURS)).isoformat()
         self.execute(
             """INSERT INTO folder_problems(account_id, folder, fails, first_failed, last_failed,
-                                           last_error, counted_at)
-               VALUES(?,?,1,?,?,?,?)
+                                           last_error, counted_at, delimiter)
+               VALUES(?,?,1,?,?,?,?,?)
                ON CONFLICT(account_id, folder) DO UPDATE SET
                    fails=folder_problems.fails + (CASE WHEN folder_problems.counted_at IS NULL
                                                         OR folder_problems.counted_at < ? THEN 1 ELSE 0 END),
@@ -1015,8 +1102,10 @@ class Database:
                                      OR folder_problems.counted_at < ? THEN excluded.counted_at
                                     ELSE folder_problems.counted_at END),
                    last_failed=excluded.last_failed,
-                   last_error=excluded.last_error""",
-            (account_id, folder, now, now, (error or "")[:1000], now, threshold, threshold),
+                   last_error=excluded.last_error,
+                   delimiter=(CASE WHEN COALESCE(excluded.delimiter, '')<>'' THEN excluded.delimiter
+                                   ELSE folder_problems.delimiter END)""",
+            (account_id, folder, now, now, (error or "")[:1000], now, (delimiter or "")[:4], threshold, threshold),
         )
         row = self.query_one("SELECT fails FROM folder_problems WHERE account_id=? AND folder=?",
                              (account_id, folder))
@@ -1123,6 +1212,80 @@ class Database:
         )
         return {r["uid"] for r in rows}
 
+    # ---- смена UIDVALIDITY: перепривязка уже скачанных писем --------------
+    def rekey_candidates(self, account_id: int, folder: str, uidvalidity: int) -> List[sqlite3.Row]:
+        """Письма папки, скачанные под ПРЕЖНИМ UIDVALIDITY (с Message-ID) — кандидаты
+        на перепривязку к новым UID вместо повторного скачивания."""
+        return self.query(
+            "SELECT id, uid, message_id, size, internaldate, stored_path FROM messages WHERE account_id=? "
+            "AND folder=? AND uidvalidity<>? AND uidvalidity>=0 AND COALESCE(message_id, '')<>'' "
+            "ORDER BY internaldate, uid",
+            (account_id, folder, uidvalidity))
+
+    def rekey_messages(self, uidvalidity: int, pairs: Sequence[Tuple[int, int]]) -> List[Tuple[int, int]]:
+        """Перепривязать записи индекса ``(id, новый_uid)`` к новому UIDVALIDITY.
+
+        Одной транзакцией: либо папка перепривязана целиком, либо не тронута. Файл
+        письма и его путь не меняются — меняется только адрес письма на сервере.
+        Возвращает пары, которые действительно перепривязаны (запись с таким
+        адресом уже могла существовать — такую пару пропускаем).
+        """
+        done: List[Tuple[int, int]] = []
+        if not pairs:
+            return done
+        with self.transaction() as conn:
+            for msg_id, uid in pairs:
+                cur = conn.execute("UPDATE OR IGNORE messages SET uidvalidity=?, uid=? WHERE id=?",
+                                   (int(uidvalidity), int(uid), int(msg_id)))
+                if int(cur.rowcount or 0) == 1:
+                    done.append((int(msg_id), int(uid)))
+        return done
+
+    # ---- прежние копии: сравнение и возврат писем -------------------------
+    def iter_message_digests(self, account_id: int, batch: int = 5000):
+        """Message-ID, SHA-256, путь к файлу, тема, отправитель и дата писем текущей
+        копии ящика (для сравнения с прежней копией) — порциями, без всей выборки
+        в памяти сразу."""
+        last = 0
+        while True:
+            rows = self.query(
+                "SELECT id, COALESCE(message_id, '') AS message_id, COALESCE(sha256, '') AS sha256, "
+                "COALESCE(stored_path, '') AS stored_path, COALESCE(subject, '') AS subject, "
+                "COALESCE(from_addr, '') AS from_addr, COALESCE(internaldate, '') AS internaldate "
+                "FROM messages WHERE account_id=? AND id>? ORDER BY id LIMIT ?", (account_id, last, int(batch)))
+            if not rows:
+                return
+            yield from rows
+            last = int(rows[-1]["id"])
+
+    def last_successful_backup_at(self, account_id: int) -> str:
+        """Когда последний раз копирование ящика прошло без ошибок (ISO, UTC; '' — ни разу)."""
+        return str(self.scalar("SELECT MAX(finished_at) FROM runs WHERE account_id=? AND type='backup' "
+                               "AND status='success'", (account_id,)) or "")
+
+    def note_complete_backup(self, account_id: int) -> None:
+        """Копирование ящика прочитало ВСЕ его папки (ошибки отдельных писем не в счёт)."""
+        self.set_meta(f"backup_complete_at:{int(account_id)}", utcnow_iso())
+
+    def complete_backup_at(self, account_id: int) -> str:
+        """Когда последний раз копирование ящика было полным (ISO, UTC; '' — ни разу):
+        все папки прочитаны — или прогон вообще прошёл без ошибок (до 1.6.0 отметки не было)."""
+        marks = [str(self.get_meta(f"backup_complete_at:{int(account_id)}") or ""),
+                 self.last_successful_backup_at(account_id)]
+        return max(marks)
+
+    def folder_disk_paths(self, account_id: int) -> List[sqlite3.Row]:
+        """По одному пути файла на папку: по нему видно, в каком каталоге лежит папка."""
+        return self.query("SELECT folder, MIN(stored_path) AS stored_path FROM messages "
+                          "WHERE account_id=? AND COALESCE(stored_path, '')<>'' GROUP BY folder", (account_id,))
+
+    def max_uid(self, account_id: int, folder: str, uidvalidity: int) -> int:
+        return int(self.scalar("SELECT MAX(uid) FROM messages WHERE account_id=? AND folder=? AND uidvalidity=?",
+                               (account_id, folder, uidvalidity)) or 0)
+
+    def delete_meta(self, key: str) -> None:
+        self.execute("DELETE FROM meta WHERE key=?", (key,))
+
     # ---- письма, вычищенные по сроку хранения ---------------------------
     def retire_message_indexes(self, ids: Sequence[int]) -> int:
         """Убрать письма из индекса, запомнив их UID как «вычищенные по сроку».
@@ -1145,6 +1308,18 @@ class Database:
                 cur = conn.execute(f"DELETE FROM messages WHERE id IN ({marks})", tuple(chunk))
                 done += int(cur.rowcount or 0)
         return done
+
+    def retire_uids(self, account_id: int, folder: str, uidvalidity: int, uids: Sequence[int]) -> int:
+        """Запомнить UID писем сервера, которые не скачиваются: они старше срока
+        хранения ящика. Как и вычищенные очисткой, при следующих прогонах они не
+        проверяются заново; если срок хранения увеличат, список забывается
+        (:meth:`clear_retired`) и письма скачаются."""
+        now = utcnow_iso()
+        rows = [(account_id, folder, int(uidvalidity), int(u), now) for u in uids]
+        with self.transaction() as conn:
+            conn.executemany("INSERT OR IGNORE INTO retired_uids(account_id, folder, uidvalidity, uid, retired_at) "
+                             "VALUES(?,?,?,?,?)", rows)
+        return len(rows)
 
     def prune_retired_uids(self, account_id: int, folder: str, uidvalidity: int, server_uids) -> int:
         """Забыть вычищенные UID, которых на сервере больше нет.
@@ -1402,8 +1577,11 @@ class Database:
         busy_accounts = list(busy_accounts or [])
         local_types = list(local_types or [])
         if busy_accounts and local_types:
-            conds.append(f"NOT (account_id IN ({','.join('?' * len(busy_accounts))}) "
-                         f"AND type IN ({','.join('?' * len(local_types))}))")
+            # «account_id IS NULL OR …»: для задания без ящика NOT(NULL AND …) даёт
+            # NULL, и такое задание (общий анализ писем) не бралось бы никогда,
+            # пока занят хоть один ящик.
+            conds.append(f"(account_id IS NULL OR NOT (account_id IN ({','.join('?' * len(busy_accounts))}) "
+                         f"AND type IN ({','.join('?' * len(local_types))})))")
             params += busy_accounts + local_types
         skip_types = list(skip_types or [])
         if skip_types:
@@ -1497,6 +1675,8 @@ class Database:
         if reset_attempts:
             sets.append("attempts=0")
             sets.append("error=''")
+            # ручной повтор: время окончания прошлой попытки больше не про это задание
+            sets.append("finished_at=NULL")
         if clear_cancel:
             sets.append("cancel_requested=0")
         self.execute(f"UPDATE jobs SET {', '.join(sets)} WHERE id=?", (*params, job_id))
@@ -1981,6 +2161,61 @@ class Database:
             (utcnow_iso(), str(user or "")[:320], str(action or "")[:64], str(detail or "")[:1000]),
         )
 
+    # ======================================================================
+    #  Групповые действия
+    # ======================================================================
+    #: Сколько последних групповых операций хранить.
+    BULK_OPS_KEEP = 300
+
+    def create_bulk_op(self, user: str, action: str, label: str, params: Dict[str, Any], total: int) -> int:
+        cur = self.execute(
+            "INSERT INTO bulk_ops(created_at, user, action, label, params, total) VALUES(?,?,?,?,?,?)",
+            (utcnow_iso(), user, action, label, json.dumps(params or {}, ensure_ascii=False), int(total)))
+        op_id = int(cur.lastrowid)
+        # старые операции чистим сразу: их немного, отдельного обслуживания не нужно
+        self.execute("DELETE FROM bulk_ops WHERE id <= ?", (op_id - self.BULK_OPS_KEEP,))
+        return op_id
+
+    def finish_bulk_op(self, op_id: int, *, ok: int, skipped: int, failed: int, jobs: int,
+                       summary: str, results: Sequence[Dict[str, Any]]) -> None:
+        self.execute(
+            "UPDATE bulk_ops SET finished_at=?, ok=?, skipped=?, failed=?, jobs=?, summary=?, results=? "
+            "WHERE id=?",
+            (utcnow_iso(), int(ok), int(skipped), int(failed), int(jobs), summary[:2000],
+             json.dumps(list(results), ensure_ascii=False), op_id))
+
+    def list_bulk_ops(self, limit: int = 50) -> List[sqlite3.Row]:
+        return self.query(
+            "SELECT id, created_at, finished_at, user, action, label, params, total, ok, skipped, failed, "
+            "jobs, summary FROM bulk_ops ORDER BY id DESC LIMIT ?", (int(limit),))
+
+    def get_bulk_op(self, op_id: int) -> Optional[sqlite3.Row]:
+        return self.query_one("SELECT * FROM bulk_ops WHERE id=?", (op_id,))
+
+    def job_statuses(self, job_ids: Sequence[int]) -> Dict[int, str]:
+        """Статусы заданий по списку id (для хода групповой операции)."""
+        out: Dict[int, str] = {}
+        ids = [int(i) for i in job_ids if i]
+        for start in range(0, len(ids), 500):
+            part = ids[start:start + 500]
+            for row in self.query(f"SELECT id, status FROM jobs WHERE id IN ({','.join('?' * len(part))})",
+                                  tuple(part)):
+                out[int(row["id"])] = row["status"]
+        return out
+
+    def employees_by_account(self) -> Dict[int, sqlite3.Row]:
+        """Карточка сотрудника каждого ящика (для шаблонов имён и выгрузки списка)."""
+        return {int(r["account_id"]): r for r in self.query(
+            "SELECT account_id, full_name, email, position, department, phone, status, dismissed_at "
+            "FROM employees WHERE account_id IS NOT NULL ORDER BY id")}
+
+    def schedules_by_account(self) -> Dict[int, List[sqlite3.Row]]:
+        """Расписания каждого ящика (общие расписания без ящика сюда не входят)."""
+        out: Dict[int, List[sqlite3.Row]] = {}
+        for r in self.query("SELECT * FROM schedules WHERE account_id IS NOT NULL ORDER BY id"):
+            out.setdefault(int(r["account_id"]), []).append(r)
+        return out
+
     def list_audit(self, limit: int = 200) -> List[sqlite3.Row]:
         return self.query("SELECT * FROM audit ORDER BY id DESC LIMIT ?", (limit,))
 
@@ -2288,6 +2523,7 @@ CREATE TABLE IF NOT EXISTS folder_problems (
     last_failed   TEXT,                -- когда пробовали в последний раз
     last_error    TEXT,                -- ответ сервера (для интерфейса и поддержки)
     counted_at    TEXT,                -- когда счётчик fails увеличивался в последний раз
+    delimiter     TEXT DEFAULT '',     -- разделитель папок сервера («» — неизвестен)
     UNIQUE(account_id, folder),
     FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
 );
@@ -2384,9 +2620,11 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 CREATE INDEX IF NOT EXISTS idx_runs_acc ON runs(account_id, id);
 
+-- account_id пуст — расписание на все включённые ящики сразу (например,
+-- копирование всех ящиков по очереди, job_type = backup_all).
 CREATE TABLE IF NOT EXISTS schedules (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
-    account_id       INTEGER NOT NULL,
+    account_id       INTEGER,
     kind             TEXT NOT NULL DEFAULT 'cron',
     job_type         TEXT NOT NULL DEFAULT 'backup',
     cron_expr        TEXT DEFAULT '',
@@ -2458,5 +2696,24 @@ CREATE TABLE IF NOT EXISTS audit (
     user   TEXT,
     action TEXT,
     detail TEXT
+);
+
+-- Групповые действия над ящиками: что, кем и над какими ящиками сделано,
+-- с итогом по каждому ящику (results — JSON-список, см. mailarchiver/bulk.py).
+CREATE TABLE IF NOT EXISTS bulk_ops (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT,
+    finished_at TEXT,
+    user       TEXT,
+    action     TEXT,
+    label      TEXT,
+    params     TEXT DEFAULT '{}',
+    total      INTEGER DEFAULT 0,
+    ok         INTEGER DEFAULT 0,
+    skipped    INTEGER DEFAULT 0,
+    failed     INTEGER DEFAULT 0,
+    jobs       INTEGER DEFAULT 0,
+    summary    TEXT DEFAULT '',
+    results    TEXT DEFAULT '[]'
 );
 """

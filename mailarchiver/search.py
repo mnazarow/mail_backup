@@ -202,17 +202,41 @@ def reset_index(db) -> None:
                      "value=CAST(COALESCE(value, '0') AS INTEGER) + 1", (_META_GEN,))
 
 
+def _body_cap(svc) -> int:
+    try:
+        cap_kb = int(svc.rt("search", "body_max_kb") or 16)
+    except (TypeError, ValueError):
+        cap_kb = 16
+    return max(1, cap_kb) * 1024
+
+
+def _row_fields(svc, row, with_body: bool, body_cap: int) -> Tuple[Dict[str, str], str]:
+    """Поля индекса для письма ``row`` и текст ошибки ('' — файл прочитан).
+
+    Файл не читается (его нет, нет ключа, письмо битое) — письмо попадает в
+    индекс по теме и отправителю из индекса писем: лучше так, чем никак.
+    """
+    fields = {"subject": normalize(row["subject"] or ""), "addrs": normalize(row["from_addr"] or ""),
+              "attach": "", "body": ""}
+    if not (row["stored_path"] or ""):
+        return fields, ""
+    try:
+        full = extract(lambda r=row: svc.store.open_message(r["account_id"], r["stored_path"]),
+                       with_body=with_body, body_cap_chars=body_cap)
+    except Exception as exc:  # noqa: BLE001 - нет файла, нет ключа, битое письмо
+        return fields, str(getattr(exc, "message", None) or exc)
+    if not full["subject"]:
+        full["subject"] = fields["subject"]
+    return full, ""
+
+
 def index_pending(svc, *, progress=None, cancelled=None, event=None, max_seconds: Optional[float] = None) -> Dict:
     """Проиндексировать письма, появившиеся после последнего прохода."""
     db = svc.db
     if not fts_available(db):
         return {"indexed": 0, "errors": 0, "pending": 0, "available": False}
     with_body = bodies_enabled(svc)
-    try:
-        cap_kb = int(svc.rt("search", "body_max_kb") or 16)
-    except (TypeError, ValueError):
-        cap_kb = 16
-    body_cap = max(1, cap_kb) * 1024
+    body_cap = _body_cap(svc)
     total_pending = pending_count(db)
     done = errors = 0
     started = time.time()
@@ -229,20 +253,11 @@ def index_pending(svc, *, progress=None, cancelled=None, event=None, max_seconds
             break
         batch: List[Tuple] = []
         for row in rows:
-            fields = {"subject": normalize(row["subject"] or ""), "addrs": normalize(row["from_addr"] or ""),
-                      "attach": "", "body": ""}
-            rel = row["stored_path"] or ""
-            if rel:
-                try:
-                    fields = extract(lambda r=row: svc.store.open_message(r["account_id"], r["stored_path"]),
-                                     with_body=with_body, body_cap_chars=body_cap)
-                    if not fields["subject"]:
-                        fields["subject"] = normalize(row["subject"] or "")
-                except Exception as exc:  # noqa: BLE001 - нет файла, нет ключа, битое письмо
-                    errors += 1
-                    if errors <= 20 and event is not None:
-                        event("WARNING", f"Письмо #{row['id']} проиндексировано только по теме и отправителю: "
-                                         f"{getattr(exc, 'message', None) or exc}")
+            fields, error = _row_fields(svc, row, with_body, body_cap)
+            if error:
+                errors += 1
+                if errors <= 20 and event is not None:
+                    event("WARNING", f"Письмо #{row['id']} проиндексировано только по теме и отправителю: {error}")
             batch.append((row["id"], fields["subject"], fields["addrs"], fields["attach"], fields["body"]))
             last = int(row["id"])
         with db.transaction() as conn:
@@ -258,6 +273,89 @@ def index_pending(svc, *, progress=None, cancelled=None, event=None, max_seconds
             progress(done, max(total_pending, done), f"Проиндексировано писем: {done} из {total_pending}")
     return {"indexed": done, "errors": errors, "pending": pending_count(db), "available": True,
             "bodies": with_body}
+
+
+def reindex_accounts(svc, account_ids: Iterable[int], *, progress=None, cancelled=None, event=None,
+                     on_account=None) -> Dict:
+    """Проиндексировать заново письма выбранных ящиков; остальной индекс не трогается.
+
+    Нужно, когда записи ящика в индексе устарели или неполны: текст писем
+    начали индексировать уже после первого прохода, файлы не читались (не было
+    ключа шифрования), поиск не находит письма конкретного ящика. Перестраивать
+    ради этого индекс всего архива — часы работы.
+
+    Переиндексируются письма, которые общий проход уже прошёл (номер не больше
+    его отметки); более новые он проиндексирует сам. ``on_account(id, итог)``
+    вызывается после каждого ящика. Индекс перестроили целиком во время работы —
+    остановка (``stopped="reset"``): записывать старые порции поверх нового
+    индекса нельзя, а новый индекс и так прочитает все письма.
+    """
+    db = svc.db
+    ids = [int(i) for i in account_ids]
+    if not fts_available(db):
+        return {"available": False, "indexed": 0, "errors": 0, "total": 0, "accounts": {}, "stopped": ""}
+    with_body = bodies_enabled(svc)
+    body_cap = _body_cap(svc)
+    gen = db.get_meta(_META_GEN) or "0"
+    watermark = int(db.get_meta(_META_WATERMARK) or 0)
+    total = 0
+    for start in range(0, len(ids), 500):
+        chunk = ids[start:start + 500]
+        marks = ",".join("?" * len(chunk))
+        total += int(db.scalar(f"SELECT COUNT(*) FROM messages WHERE account_id IN ({marks}) AND id <= ?",
+                               (*chunk, watermark)) or 0)
+    done = errors = 0
+    per: Dict[int, Dict[str, int]] = {}
+    stopped = ""
+    for account_id in ids:
+        stat = per.setdefault(account_id, {"indexed": 0, "errors": 0})
+        last = 0
+        while not stopped:
+            if cancelled is not None and cancelled():
+                stopped = "cancelled"
+                break
+            rows = db.query("SELECT id, account_id, stored_path, subject, from_addr FROM messages "
+                            "WHERE account_id=? AND id > ? AND id <= ? ORDER BY id LIMIT ?",
+                            (account_id, last, watermark, BATCH))
+            if not rows:
+                break
+            batch: List[Tuple] = []
+            failed_ids: List[int] = []
+            for row in rows:
+                fields, error = _row_fields(svc, row, with_body, body_cap)
+                if error:
+                    stat["errors"] += 1
+                    errors += 1
+                    failed_ids.append(int(row["id"]))
+                    if errors <= 20 and event is not None:
+                        event("WARNING", f"Письмо #{row['id']} не перечитано (в индексе остаётся прежняя запись): "
+                                         f"{error}")
+                batch.append((row["id"], fields["subject"], fields["addrs"], fields["attach"], fields["body"]))
+                last = int(row["id"])
+            with db.transaction() as conn:
+                now_gen = conn.execute("SELECT value FROM meta WHERE key=?", (_META_GEN,)).fetchone()
+                if (now_gen[0] if now_gen else "0") != gen:
+                    stopped = "reset"
+                    break
+                if failed_ids:
+                    # Файл не прочитался (нет ключа, сбой диска) — прежнюю, полную
+                    # запись индекса не заменяем записью «только тема и отправитель».
+                    marks = ",".join("?" * len(failed_ids))
+                    have = {int(r[0]) for r in conn.execute(
+                        f"SELECT rowid FROM {FTS_TABLE} WHERE rowid IN ({marks})", tuple(failed_ids))}
+                    batch = [b for b in batch if int(b[0]) not in have]
+                conn.executemany(f"INSERT OR REPLACE INTO {FTS_TABLE}(rowid, subject, addrs, attach, body) "
+                                 f"VALUES(?,?,?,?,?)", batch)
+            stat["indexed"] += len(batch)
+            done += len(batch)
+            if progress is not None:
+                progress(done, max(total, done), f"Переиндексировано писем: {done} из {total}")
+        if stopped:
+            break
+        if on_account is not None:
+            on_account(account_id, dict(stat))
+    return {"available": True, "indexed": done, "errors": errors, "total": total, "accounts": per,
+            "stopped": stopped, "bodies": with_body}
 
 
 # ---------------------------------------------------------------------------

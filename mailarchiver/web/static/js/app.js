@@ -323,27 +323,44 @@ function showRecoveryCodes(codes, reloadAfter){
 // ===================================================================
 //  Оболочка приложения
 // ===================================================================
+// Кто видит раздел: a — администратор, o — оператор, m — сотрудник (вход по ящику).
+// Оператор следит за копированием и запускает его, но не читает письма, не
+// меняет настроек и ничего не удаляет — это же проверяет и сервер.
 const NAV = [
-  {id:'dashboard', icon:'📊', title:'Дашборд', mb:true},
-  {id:'analytics', icon:'📈', title:'Аналитика', admin:true},
-  {id:'mailanalytics', icon:'🔎', title:'Аналитика писем', admin:true},
-  {id:'mail', icon:'📧', title:'Почта', mb:true},
-  {id:'accounts', icon:'📬', title:'Почтовые ящики'},
-  {id:'employees', icon:'🧑‍💼', title:'Сотрудники', admin:true},
-  {id:'jobs', icon:'⚙️', title:'Очередь и задания', mb:true},
-  {id:'exports', icon:'📤', title:'Экспорт (PST)', mb:true},
-  {id:'schedules', icon:'⏰', title:'Расписания'},
+  {id:'dashboard', icon:'📊', title:'Дашборд', roles:'aom'},
+  {id:'analytics', icon:'📈', title:'Аналитика', roles:'ao'},
+  {id:'mailanalytics', icon:'🔎', title:'Аналитика писем', roles:'a'},
+  {id:'mail', icon:'📧', title:'Почта', roles:'am'},
+  {id:'accounts', icon:'📬', title:'Почтовые ящики', roles:'ao'},
+  {id:'employees', icon:'🧑‍💼', title:'Сотрудники', roles:'a'},
+  {id:'jobs', icon:'⚙️', title:'Очередь и задания', roles:'aom'},
+  {id:'exports', icon:'📤', title:'Экспорт (PST)', roles:'am'},
+  {id:'schedules', icon:'⏰', title:'Расписания', roles:'ao'},
   {sep:true},
-  {id:'logs', icon:'📋', title:'Логи'},
-  {id:'settings', icon:'🔧', title:'Настройки'},
-  {id:'users', icon:'👥', title:'Пользователи', admin:true},
-  {id:'security', icon:'🔐', title:'Безопасность', admin:true},
-  {id:'audit', icon:'🛡️', title:'Аудит', admin:true},
+  {id:'logs', icon:'📋', title:'Логи', roles:'ao'},
+  {id:'settings', icon:'🔧', title:'Настройки', roles:'a'},
+  {id:'users', icon:'👥', title:'Пользователи', roles:'a'},
+  {id:'security', icon:'🔐', title:'Безопасность', roles:'a'},
+  {id:'audit', icon:'🛡️', title:'Аудит', roles:'a'},
 ];
-function isMailbox(){ return State.user && State.user.role === 'mailbox'; }
+const ROLE_LABELS = {admin:'администратор', operator:'оператор', mailbox:'вход по ящику'};
+function isMailbox(){ return !!State.user && State.user.role === 'mailbox'; }
+function isAdmin(){ return !!State.user && State.user.role === 'admin'; }
+function isOperator(){ return !!State.user && State.user.role === 'operator'; }
+/** Администратор или оператор — учётная запись архива, а не вход по ящику. */
+function isStaff(){ return isAdmin() || isOperator(); }
+function roleCode(){ return isAdmin()?'a':(isMailbox()?'m':'o'); }
+function navAllowed(item){ return !item.sep && item.roles.includes(roleCode()); }
 /** Сотрудник (вход по ящику) может отменять и повторять только свои задания:
- *  копирование по расписанию запускает не он, и снимать его ему нельзя. */
-function canTouchJob(j){ return !isMailbox() || (j && j.created_by === State.user.username); }
+ *  копирование по расписанию запускает не он, и снимать его ему нельзя.
+ *  Оператор — только копирование и проверки (не «с нуля», не выгрузки). */
+function canTouchJob(j){
+  if(isMailbox()) return !!j && j.created_by === State.user.username;
+  if(isOperator()) return !!j && !!j.operator_can_manage;
+  return true;
+}
+/** Сообщение там, где оператору нужно обратиться к администратору. */
+const ADMIN_ONLY_HINT = 'Доступно администратору';
 
 // Клик и Enter по значку «?» открывают подсказку: на тач-экране навести
 // курсор невозможно, а помощь по параметрам нужна именно там.
@@ -391,7 +408,7 @@ async function startApp(){
     <aside class="sidebar">
       <div class="brand"><div class="logo">📥</div><div><div class="name">MailArchiver</div><div class="ver">${State.user.version?'v'+esc(State.user.version):''}</div></div></div>
       <nav class="nav" id="nav"></nav>
-      <div class="sidebar-foot"><a href="#" id="profileLink" title="Профиль и двухфакторный вход">${State.user.totp_enabled?'🔐 ':''}${esc(State.user.username)}</a><a href="#" id="logout" title="Выход">Выход ⎋</a></div>
+      <div class="sidebar-foot"><a href="#" id="profileLink" title="Профиль и двухфакторный вход${isOperator()?' · роль: оператор':''}">${State.user.totp_enabled?'🔐 ':''}${esc(State.user.username)}${isOperator()?' <span class="tag">оператор</span>':''}</a><a href="#" id="logout" title="Выход">Выход ⎋</a></div>
     </aside>
     <div class="nav-backdrop" id="navBack"></div>
     <main class="main">
@@ -410,8 +427,7 @@ async function startApp(){
   const nav=$('#nav');
   NAV.forEach(item=>{
     if(item.sep){ if(!isMailbox()) nav.appendChild(h('<div class="sep"></div>')); return; }
-    if(item.admin && State.user.role!=='admin') return;
-    if(isMailbox() && !item.mb) return;
+    if(!navAllowed(item)) return;
     const a=h(`<a href="#/${item.id}" data-view="${item.id}"><span class="ic">${item.icon}</span><span>${esc(item.title)}</span></a>`);
     a.onclick=(e)=>{ e.preventDefault(); location.hash='#/'+item.id; };
     nav.appendChild(a);
@@ -448,8 +464,8 @@ function setActiveNav(view){
 
 function route(){
   let view=(location.hash.replace('#/','').split('?')[0]||(isMailbox()?'mail':'dashboard'));
-  // mailbox-пользователю доступны только его разделы
-  const allowed = NAV.filter(n=>!n.sep && (!n.admin||State.user.role==='admin') && (!isMailbox()||n.mb)).map(n=>n.id);
+  // сотруднику и оператору доступны только их разделы
+  const allowed = NAV.filter(navAllowed).map(n=>n.id);
   if(!allowed.includes(view)) view = isMailbox()?'mail':'dashboard';
   State.view=view; setActiveNav(view); State.redraw=null;
   const content=$('#content');
@@ -562,14 +578,14 @@ async function viewDashboard(c){
       <div class="muted small" style="margin-top:6px">Пока ключ недоступен, новые письма не сохраняются, чтобы не лечь
         на диск открытым текстом. Верните файл ключа (параметр «Файл ключа» в разделе «Настройки → Хранилище»)
         и перезапустите службу — либо осознанно выключите шифрование.</div>
-      ${State.user.role==='admin'?'<a class="btn small" href="#/settings" style="margin-top:10px">Открыть настройки</a>':''}</div>`));
+      ${isAdmin()?'<a class="btn small" href="#/settings" style="margin-top:10px">Открыть настройки</a>':''}</div>`));
   }
   // Копия вне сервера включена, но давно не обновлялась или завершилась ошибкой.
   if(s.replica_alert){
     c.appendChild(h(`<div class="card" style="margin-bottom:16px;border-color:var(--warn)">
       <div class="section-title"><h3>🛰️ Копия вне сервера</h3></div>
       <div>${esc(s.replica_alert)}</div>
-      <a class="btn small" href="#/settings" style="margin-top:10px">Открыть настройки копии</a></div>`));
+      ${isAdmin()?'<a class="btn small" href="#/settings" style="margin-top:10px">Открыть настройки копии</a>':'<div class="muted small" style="margin-top:6px">Сообщите администратору.</div>'}</div>`));
   }
   // Плашка «требуют внимания»: без неё ящик, который давно не копируется или
   // остался без пароля, ничем себя не выдаёт — и это обнаруживается тогда,
@@ -583,7 +599,7 @@ async function viewDashboard(c){
 
   const grid=h(`<div class="grid cols-2">
     <div class="card"><div class="section-title"><h3>📈 Активность</h3><span class="muted small">новые письма за 30 дней</span></div><div class="an-chart" id="chartBox"></div></div>
-    <div class="card"><div class="section-title"><h3>📬 ${isMailbox()?'Мой ящик':'Ящики'}</h3>${isMailbox()?'':`<span class="tag">${s.totals.accounts}</span><div class="spacer"></div><button class="btn sm primary" id="addAcc">+ Добавить</button>`}</div><div id="accList"></div></div>
+    <div class="card"><div class="section-title"><h3>📬 ${isMailbox()?'Мой ящик':'Ящики'}</h3>${isMailbox()?'':`<span class="tag">${s.totals.accounts}</span><div class="spacer"></div>${isAdmin()?'<button class="btn sm primary" id="addAcc">+ Добавить</button>':''}`}</div><div id="accList"></div></div>
   </div>`);
   c.appendChild(grid);
   const addAcc=$('#addAcc', grid); if(addAcc) addAcc.onclick=()=>accountModal();
@@ -927,7 +943,7 @@ async function employeeAccountTemplateModal(){
     <div class="kv"><b>Копировать папки</b><div class="spacer"></div>${list(p.folder_include)}</div>
     <div class="kv"><b>Пропускать папки</b><div class="spacer"></div>${list(p.folder_exclude)}</div>
     <div class="kv"><b>Срок хранения</b><div class="spacer"></div>${esc(keep)}</div>
-    <div class="kv"><b>Расписание копирования</b><div class="spacer"></div>${p.schedule_enabled?`<span class="tag ok">${esc(p.schedule_cron||'')}</span>`:'<span class="tag">не создаётся</span>'}</div>
+    <div class="kv"><b>Расписание копирования</b><div class="spacer"></div>${p.sequence_covers?'<span class="tag ok" title="В «Расписаниях» включено копирование всех ящиков по очереди — новый ящик попадёт в него">общее: все ящики по очереди</span>':(p.schedule_enabled?`<span class="tag ok">${esc(p.schedule_cron||'')}</span>`:'<span class="tag">не создаётся</span>')}</div>
     <div class="kv"><b>Заметка</b><div class="spacer"></div>${esc(p.notes||'—')}</div>
     <div class="hint" style="margin-top:12px">Пароль шаблон не задаёт: копирование начнётся только после того,
       как администратор впишет пароль в карточке ящика.</div>
@@ -963,26 +979,45 @@ async function backupNow(id, name){
   }catch(e){ toastErr(e); }
 }
 
-/** Поставить в очередь копирование сразу всех включённых ящиков. */
-async function backupAllNow(){
+/** Поставить в очередь копирование сразу всех включённых ящиков — параллельно или по очереди. */
+function backupAllNow(){
   const accs=State.accounts||[];
   const enabled=accs.filter(a=>a.enabled).length;
   const off=accs.length-enabled;
   if(!enabled) return toast('Нет включённых ящиков','Включите хотя бы один ящик, чтобы запустить копирование','warn');
-  const ok=await confirmDlg('Сделать резервную копию всех ящиков?',
-    `В очередь будет поставлено копирование для ${enabled} ${plural(enabled,'ящика','ящиков','ящиков')}.`
-    + (off?` Выключенные ящики (${off}) пропускаются.`:'')
-    + ' Ящики, по которым копирование уже идёт, повторно запущены не будут.',
-    {okText:'Запустить', okClass:'primary'});
-  if(!ok) return;
-  try{
-    const r=await api('/accounts/backup-all',{method:'POST'});
-    const st=(r.started||[]).length, sk=(r.skipped||[]).length;
-    if(st) toast('Резервное копирование запущено',
-                 `Ящиков в очереди: ${st}` + (sk?`, пропущено (уже копируются): ${sk}`:''));
-    else toast('Новых заданий нет','Все включённые ящики уже копируются','warn');
-    location.hash='#/jobs';
-  }catch(e){ toastErr(e); }
+  const m=modal('Сделать резервную копию всех ящиков?', `
+    <p style="margin-top:0">Копирование будет запущено для <b>${fmtNum(enabled)}</b> ${plural(enabled,'включённого ящика','включённых ящиков','включённых ящиков')}.${off?` Выключенные (${fmtNum(off)}) пропускаются.`:''}</p>
+    <label class="radio-card"><input type="radio" name="bkm" value="parallel" checked>
+      <span><b>Параллельно</b> — по заданию на ящик; одновременно идёт столько копирований, сколько задано
+      в «Одновременных заданий». Быстрее всего.</span></label>
+    <label class="radio-card"><input type="radio" name="bkm" value="seq">
+      <span><b>По очереди, ящик за ящиком</b> — одно задание копирует ящики строго по одному, начиная с тех,
+      что копировались давнее всего. Бережнее к почтовому серверу.</span></label>
+    <div class="form-row" id="bkPause" style="display:none;margin-top:10px"><label>Пауза между ящиками, секунд</label>
+      <input type="number" id="bkPauseIn" min="0" max="3600" value="0"></div>
+    <div class="hint">Ящики, по которым копирование уже идёт, повторно запущены не будут. Регулярное копирование
+      всех ящиков по очереди в заданное время настраивается в разделе «Расписания».</div>`,
+    {footer:'<button class="btn ghost" data-c>Отмена</button><button class="btn primary" data-go>Запустить</button>'});
+  const seq=()=>(m.body.querySelector('input[name=bkm]:checked')||{}).value==='seq';
+  m.body.querySelectorAll('input[name=bkm]').forEach(r=>r.onchange=()=>{ m.body.querySelector('#bkPause').style.display=seq()?'':'none'; });
+  m.foot.querySelector('[data-c]').onclick=()=>m.close();
+  m.foot.querySelector('[data-go]').onclick=async()=>{
+    const body = seq() ? {sequential:true, pause_seconds:parseInt(m.body.querySelector('#bkPauseIn').value||'0',10)||0} : {};
+    try{
+      const r=await api('/accounts/backup-all',{method:'POST',body});
+      m.close();
+      if(r.sequential){
+        toast(r.already?'Копирование по очереди уже идёт':'Копирование по очереди запущено',
+              r.already?`Задание №${r.job_id}`:`Ящиков: ${fmtNum(r.total_enabled||0)} — по одному, задание №${r.job_id}`);
+      }else{
+        const st=(r.started||[]).length, sk=(r.skipped||[]).length;
+        if(st) toast('Резервное копирование запущено',
+                     `Ящиков в очереди: ${st}` + (sk?`, пропущено (уже копируются): ${sk}`:''));
+        else toast('Новых заданий нет','Все включённые ящики уже копируются','warn');
+      }
+      location.hash='#/jobs';
+    }catch(e){ toastErr(e); }
+  };
 }
 
 /** Массовая загрузка паролей ящиков из файла «адрес — пароль». */
@@ -1039,7 +1074,7 @@ function passwordImportReport(r){
 
 //: Состояние отбора в разделе «Почтовые ящики». Живёт между перерисовками,
 //: поэтому после правки ящика список остаётся отфильтрованным так же.
-const Acc = { query:'', filter:'', shown:100 };
+const Acc = { query:'', filter:'', shown:100, sel:new Set() };
 //: По сколько строк дорисовывать в списке ящиков: после синхронизации
 //: сотрудников их бывают сотни, и рисовать всё сразу незачем.
 const ACC_PAGE = 100;
@@ -1053,8 +1088,9 @@ function accNoBackup(a){ return !a.last_backup_at && !a.messages; }
 function accStale(a){ return a.enabled && !accNoBackup(a) && hoursSince(a.last_backup_at)>ACC_STALE_HOURS; }
 function accFailed(a){ return !!(a.last_run ? a.last_run.status==='failed' : a.last_backup_status==='failed'); }
 
-function accountMatches(a){
-  const f=Acc.filter;
+function accountMatches(a){ return accountMatchesBy(a, Acc.filter, Acc.query); }
+/** Подходит ли ящик под отбор f и строку поиска query (для списка и групповых действий). */
+function accountMatchesBy(a, f, query){
   if(f==='enabled' && !a.enabled) return false;
   if(f==='disabled' && a.enabled) return false;
   if(f==='nopassword' && a.has_password) return false;
@@ -1068,7 +1104,8 @@ function accountMatches(a){
   if(f==='dismissed' && !a.dismissed_at) return false;
   if(f==='hold' && !a.on_hold) return false;
   if(f==='holdexpired' && !a.hold_expired) return false;
-  const q=(Acc.query||'').trim().toLowerCase();
+  if(f==='quarantine' && !a.quarantines) return false;
+  const q=(query||'').trim().toLowerCase();
   if(!q) return true;
   return [a.name, a.username, a.host].some(v=>String(v||'').toLowerCase().includes(q));
 }
@@ -1089,112 +1126,177 @@ function loginCell(a){
 }
 
 /** Даты резервных копий ящика — для колонки «Резервные копии». */
-function backupCell(a){
+function fmtDay(iso){ if(!iso) return '—'; try{ return new Date(iso).toLocaleDateString('ru-RU',{day:'2-digit',month:'2-digit',year:'numeric'}); }catch(e){ return iso; } }
+/** Колонка «Резервные копии»: последняя копия — строкой, первая (только дата), число писем и объём — второй;
+ *  extra (ссылка «история») дописывается в конец, чтобы строка ящика не вырастала ещё на одну. */
+function backupCell(a, extra=''){
   if(accNoBackup(a)){
     const lr=a.last_run;
     const tail = lr && lr.status==='failed' ? `<div class="small" style="color:var(--danger)">попытка ${esc(fmtDate(lr.finished_at||lr.started_at))} не удалась</div>` : '';
-    return `<span class="tag warn">копий нет</span>${tail}`;
+    return `<span class="tag warn">копий нет</span>${extra?` <span class="small">${extra}</span>`:''}${tail}`;
   }
   const st=a.last_backup_status||'';
   const stale = accStale(a) ? ` <span class="tag warn" title="Удачной копии не было больше ${ACC_STALE_HOURS} ч">давно</span>` : '';
   const lr=a.last_run;
   const failedLater = lr && lr.status==='failed' && (!a.last_backup_at || (lr.started_at||'')>a.last_backup_at)
     ? `<div class="small" style="color:var(--danger)" title="${esc(lr.detail||'')}">последняя попытка ${esc(fmtDate(lr.finished_at||lr.started_at))} — ошибка</div>` : '';
-  return `<div class="small">последняя: <b>${esc(fmtDate(a.last_backup_at))}</b>${st==='partial'?' <span class="badge partial">частично</span>':''}${stale}</div>
-    <div class="small muted">первая: ${esc(fmtDate(a.first_backup_at))} · писем ${fmtNum(a.messages)} (${esc(a.bytes_h||'')})</div>${failedLater}`;
+  return `<div class="small"><span class="nowrap">последняя: <b>${esc(fmtDate(a.last_backup_at))}</b></span>${st==='partial'?' <span class="badge partial">частично</span>':''}${stale}</div>
+    <div class="small muted"><span class="nowrap">первая: ${esc(fmtDay(a.first_backup_at))}</span> · <span class="nowrap">писем ${fmtNum(a.messages)} (${esc(a.bytes_h||'')})</span>${extra?' · '+extra:''}</div>${failedLater}`;
 }
 
 async function viewAccounts(c){
   const accs=await api('/accounts'); State.accounts=accs;
   c.innerHTML='';
-  const isAdmin=State.user&&State.user.role==='admin';
+  // Администратор — всё; оператор — копирование, проверки и групповые действия
+  // копирования (без добавления, выключения и удаления ящиков).
+  const admin=isAdmin(), staff=isStaff();
+  const tab = staff && /[?&]bulk\b/.test(location.hash) ? 'bulk' : 'list';
   const enabledCnt=accs.filter(a=>a.enabled).length;
   const disabledCnt=accs.length-enabledCnt;
   const noPwCnt=accs.filter(a=>!a.has_password).length;
+  // выбор ящиков живёт между перерисовками, но ящики, которых уже нет, из него уходят
+  const known=new Set(accs.map(a=>a.id));
+  Acc.sel.forEach(id=>{ if(!known.has(id)) Acc.sel.delete(id); });
   const head=h(`<div class="section-title"><h2 style="margin:0">Почтовые ящики</h2>
     <span class="tag" title="Всего ящиков в системе">всего: ${accs.length}${disabledCnt?` · выключено: ${disabledCnt}`:''}</span>
     <div class="spacer"></div>
-    ${isAdmin?`<button class="btn" id="pwCheck" title="Войти в каждый ящик и сразу выйти — найти ящики с неверным паролем">🔐 Проверить пароли</button>
-    <button class="btn" id="pwImport" title="Массово проставить пароли ящикам из файла «адрес — пароль»">🔑 Загрузить пароли</button>
-    <button class="btn" id="bkAll" ${enabledCnt?'':'disabled'} title="Поставить в очередь резервное копирование всех включённых ящиков">💾 Копия всех ящиков сейчас</button>
-    <button class="btn primary" id="add">+ Добавить ящик</button>`:''}</div>`);
+    ${admin?'<button class="btn" id="addMany" title="Завести много ящиков сразу из списка адресов">+ Списком</button><button class="btn primary" id="add">+ Добавить ящик</button>':''}</div>`);
   c.appendChild(head);
-  if(isAdmin){
-    $('#add',c).onclick=()=>accountModal();
-    $('#bkAll',c).onclick=()=>backupAllNow();
-    $('#pwImport',c).onclick=()=>passwordImportModal();
-    $('#pwCheck',c).onclick=()=>checkLoginsModal(accs);
+  if(staff){
+    // Вкладки и действия сразу со всеми ящиками — одной строкой.
+    const tabs=h(`<div class="tabs" role="tablist">
+      <a href="#/accounts" class="${tab==='list'?'active':''}" role="tab">📬 Список ящиков</a>
+      <a href="#/accounts?bulk" class="${tab==='bulk'?'active':''}" role="tab">🧰 Групповые действия${Acc.sel.size?` <span class="count">${fmtNum(Acc.sel.size)}</span>`:''}</a>
+      <div class="spacer"></div>
+      <div class="tab-actions">
+        <button class="btn sm" id="pwCheck" title="Войти в каждый ящик и сразу выйти — найти ящики с неверным паролем">🔐 Проверить пароли</button>
+        ${admin?'<button class="btn sm" id="pwImport" title="Массово проставить пароли ящикам из файла «адрес — пароль»">🔑 Загрузить пароли</button>':''}
+        <button class="btn sm" id="bkAll" ${enabledCnt?'':'disabled'} title="Поставить в очередь резервное копирование всех включённых ящиков — параллельно или по очереди">💾 Копия всех сейчас</button>
+        ${admin?`<button class="btn sm danger" id="bkZero" ${enabledCnt?'':'disabled'} title="Копия всех ящиков с нуля: прежние копии всех включённых ящиков уходят в карантин, письма скачиваются заново">🧨 Копия всех с нуля</button>`:''}
+      </div></div>`);
+    c.appendChild(tabs);
+    const on=(sel, fn)=>{ const el=$(sel,c); if(el) el.onclick=fn; };
+    on('#add', ()=>accountModal());
+    on('#addMany', ()=>bulkCreateModal());
+    on('#bkAll', ()=>backupAllNow());
+    on('#bkZero', ()=>rebuildAllModal());
+    on('#pwImport', ()=>passwordImportModal());
+    on('#pwCheck', ()=>checkLoginsModal(accs));
   }
+  if(tab==='bulk') return viewBulk(c, accs);
   const progress=h('<div id="pwProgress" style="display:none" class="hint"></div>');
   c.appendChild(progress);
   if(State.checkLoginsJob) watchCheckLogins(State.checkLoginsJob);
-  if(!accs.length){ c.appendChild(h('<div class="card"><div class="empty"><div class="big">📭</div>Пока нет ни одного ящика.<br>Нажмите «Добавить ящик», чтобы начать.</div></div>')); return; }
+  if(!accs.length){ c.appendChild(h(`<div class="card"><div class="empty"><div class="big">📭</div>Пока нет ни одного ящика.<br>${admin?'Нажмите «Добавить ящик», чтобы начать.':'Ящики заводит администратор.'}</div></div>`)); return; }
 
   // Отбор: ящиков бывает несколько сотен (их заводит синхронизация сотрудников),
   // и найти среди них выключенные, оставшиеся без пароля или без копий глазами нереально.
-  const cnt=(fn)=>accs.filter(fn).length;
-  const opts=[['','Все ящики'+` (${accs.length})`],
-              ['enabled','Только включённые'+` (${enabledCnt})`],
-              ['disabled','Только выключенные'+` (${disabledCnt})`],
-              ['ready','Готовые к копированию'+` (${cnt(a=>a.enabled&&a.has_password)})`],
-              ['badpw','С неправильным паролем'+` (${cnt(accBadPassword)})`],
-              ['nopassword','Без пароля'+` (${noPwCnt})`],
-              ['connerr','Нет связи при проверке входа'+` (${cnt(a=>a.login_status==='conn_error')})`],
-              ['unchecked','Пароль не проверялся'+` (${cnt(a=>!a.login_status&&a.has_password)})`],
-              ['nobackup','Без резервных копий'+` (${cnt(accNoBackup)})`],
-              ['stale',`Копия старше ${ACC_STALE_HOURS} ч`+` (${cnt(accStale)})`],
-              ['failed','Последняя копия с ошибкой'+` (${cnt(accFailed)})`],
-              ['dismissed','Уволенные сотрудники'+` (${cnt(a=>!!a.dismissed_at)})`],
-              ['hold','Архив удерживается'+` (${cnt(a=>a.on_hold)})`],
-              ['holdexpired','Удержание истекло'+` (${cnt(a=>a.hold_expired)})`]];
+  const opts=accFilterOptions(accs);
   const bar=h(`<div class="an-toolbar">
     <input type="text" id="accQ" placeholder="Поиск по названию, логину, серверу…" style="flex:0 1 320px;min-width:200px" value="${esc(Acc.query)}">
     <select id="accF">${opts.map(([v,t])=>`<option value="${v}" ${v===Acc.filter?'selected':''}>${esc(t)}</option>`).join('')}</select>
     <button class="btn small ghost" id="accReset" ${(Acc.query||Acc.filter)?'':'style="display:none"'}>Сбросить</button>
     <div class="spacer"></div><span class="muted small" id="accCount"></span></div>`);
   c.appendChild(bar);
+  // Панель выбранных ящиков: частые действия — сразу, остальное — в «Групповых действиях».
+  const selBar=h(`<div class="sel-bar" id="selBar" style="display:none"></div>`);
+  if(staff) c.appendChild(selBar);
 
-  const wrap=h('<div class="card table-wrap"><table class="tbl"><thead><tr><th>Название и сервер</th><th>Логин</th><th>Вход</th><th>Резервные копии</th><th>Статус</th><th></th></tr></thead><tbody></tbody></table></div>');
+  const wrap=h(`<div class="card table-wrap"><table class="tbl acc-tbl"><thead><tr>
+    ${staff?'<th class="chk"><input type="checkbox" id="selAll" aria-label="Выбрать все ящики по отбору" title="Выбрать все ящики по отбору"></th>':''}
+    <th>Название и сервер</th><th>Логин</th><th>Вход</th><th>Резервные копии</th><th>Статус</th><th></th></tr></thead><tbody></tbody></table></div>`);
   const tb=wrap.querySelector('tbody');
+  const cols=staff?7:6;
+  let lastClicked=null;
+  const renderSel=()=>{
+    if(!staff) return;
+    const shown=accs.filter(accountMatches);
+    const inShown=shown.filter(a=>Acc.sel.has(a.id)).length;
+    const all=$('#selAll',wrap);
+    if(all){ all.checked=shown.length>0 && inShown===shown.length; all.indeterminate=inShown>0 && inShown<shown.length; }
+    const n=Acc.sel.size;
+    const tabCount=$('.tabs .count', c);
+    if(tabCount) tabCount.textContent=fmtNum(n);
+    else if(n){ const t=$$('.tabs a',c)[1]; if(t) t.insertAdjacentHTML('beforeend',` <span class="count">${fmtNum(n)}</span>`); }
+    if(!n){ selBar.style.display='none'; return; }
+    selBar.style.display='';
+    const hidden=n-inShown;
+    selBar.innerHTML=`<b>Выбрано: ${fmtNum(n)}</b>
+      ${hidden>0?`<span class="muted small" title="Отмеченные ящики, которые сейчас скрыты отбором">(скрыто отбором: ${fmtNum(hidden)})</span>`:''}
+      ${inShown<shown.length?`<button class="btn sm ghost" data-s="all" title="Отметить все ящики, попавшие под отбор">Выбрать все (${fmtNum(shown.length)})</button>`:''}
+      <button class="btn sm ghost" data-s="none">Снять выбор</button>
+      <div class="spacer"></div>
+      <button class="btn sm" data-q="backup" title="Поставить копирование выбранных ящиков в очередь (параллельно)">💾 Копия</button>
+      <button class="btn sm" data-q="backup_sequence" title="Одно задание: выбранные ящики копируются строго по одному">🔁 По очереди</button>
+      ${admin?`<button class="btn sm" data-q="enable" title="Включить копирование выбранных ящиков">▶️ Включить</button>
+      <button class="btn sm" data-q="disable" title="Выключить копирование выбранных ящиков">⏸️ Выключить</button>`:''}
+      <button class="btn sm" data-q="export_list" title="Список выбранных ящиков в Excel">📊 Excel</button>
+      <button class="btn sm primary" data-q="more" title="Все групповые действия с выбранными ящиками">🧰 Ещё действия…</button>`;
+    selBar.querySelectorAll('[data-s]').forEach(b=>b.onclick=()=>{
+      if(b.dataset.s==='all') shown.forEach(a=>Acc.sel.add(a.id)); else Acc.sel.clear();
+      render();
+    });
+    selBar.querySelectorAll('[data-q]').forEach(b=>b.onclick=()=>{
+      const q=b.dataset.q, ids=[...Acc.sel];
+      if(q==='more'){ Bulk.source='selected'; location.hash='#/accounts?bulk'; return; }
+      if(q==='export_list') return exportAccountList(ids);
+      bulkDialog(q, ids);
+    });
+  };
   const render=()=>{
     tb.innerHTML='';
     const shown=accs.filter(accountMatches);
     $('#accCount',bar).textContent=`показано ${Math.min(shown.length, Acc.shown)} из ${shown.length}`
       + (shown.length!==accs.length?` (всего ${accs.length})`:'');
     $('#accReset',bar).style.display=(Acc.query||Acc.filter)?'':'none';
+    renderSel();
     if(!shown.length){
-      tb.appendChild(h('<tr><td colspan="6" class="empty">Под отбор не попал ни один ящик</td></tr>'));
+      tb.appendChild(h(`<tr><td colspan="${cols}" class="empty">Под отбор не попал ни один ящик</td></tr>`));
       return;
     }
     const page=shown.slice(0, Acc.shown);
-    page.forEach(a=>{
+    page.forEach((a, i)=>{
       // «Копируется» — только если копирование действительно может пройти:
       // включённый ящик без пароля или с отвергнутым паролем не копируется.
       const state = !a.enabled ? '<span class="tag">выключен</span>'
         : (!a.has_password || a.secret_broken) ? '<span class="tag warn" title="Ящик включён, но без пароля копирование не пойдёт">не копируется</span>'
         : a.login_status==='auth_error' ? '<span class="tag err" title="Сервер отверг пароль — исправьте его">не копируется</span>'
         : '<span class="tag ok">копируется</span>';
-      const hold = holdTags(a);
-      const tr=h(`<tr>
+      const hold = holdTags(a) + (a.quarantines ? ` <span class="tag" title="Прежние копии после копирования «с нуля»${admin?' (меню ⋯ → «Прежние копии»)':' — разбирает администратор'}: ${a.quarantines}">🧺 прежние копии</span>` : '');
+      const tr=h(`<tr class="${Acc.sel.has(a.id)?'selected':''}">
+        ${staff?`<td class="chk"><input type="checkbox" data-sel ${Acc.sel.has(a.id)?'checked':''} aria-label="Выбрать ящик ${esc(a.name)}"></td>`:''}
         <td><strong>${esc(a.name)}</strong><div class="small muted nowrap">${esc(a.host)}:${a.port} · ${esc(a.security)}${a.auth_type==='oauth2'?' · OAuth2':(a.auth_type==='master'?' · через администратора':'')}</div></td>
-        <td class="small">${esc(a.username)}</td>
+        <td class="small login">${esc(a.username).replace('@','<wbr>@')}</td>
         <td>${loginCell(a)}</td>
-        <td>${backupCell(a)} <a href="javascript:void(0)" class="small" data-runs>история</a></td>
+        <td class="bk">${backupCell(a, '<a href="javascript:void(0)" data-runs>история</a>')}</td>
         <td>${state}${hold?'<div style="margin-top:4px">'+hold+'</div>':''}</td>
         <td style="text-align:right;white-space:nowrap">
-          <button class="btn sm" data-test>Проверить</button>
-          <button class="btn sm primary" data-bk ${a.enabled?'':'disabled'} title="${a.enabled?'Сделать резервную копию этого ящика сейчас':'Ящик выключен — включите его, чтобы делать копии'}">💾 Копия сейчас</button>
+          <button class="btn sm" data-test title="Проверить подключение к ящику"><span class="ic-only">🔌</span><span class="lbl">Проверить</span></button>
+          <button class="btn sm primary" data-bk ${a.enabled?'':'disabled'} title="${a.enabled?'Сделать резервную копию этого ящика сейчас':'Ящик выключен — включите его, чтобы делать копии'}">💾<span class="lbl"> Копия сейчас</span></button>
           <button class="btn sm" data-menu>⋯</button>
         </td></tr>`);
       tr.querySelector('[data-test]').onclick=()=>testAccount(a.id);
       tr.querySelector('[data-bk]').onclick=()=>backupNow(a.id, a.name);
       tr.querySelector('[data-menu]').onclick=()=>accountMenu(a);
       tr.querySelector('[data-runs]').onclick=()=>runsModal(a);
+      const cb=tr.querySelector('[data-sel]');
+      if(cb) cb.onclick=(e)=>{
+        // Shift+щелчок отмечает диапазон — как в проводнике и почтовых клиентах.
+        if(e.shiftKey && lastClicked!==null){
+          const from=Math.min(lastClicked, i), to=Math.max(lastClicked, i);
+          page.slice(from, to+1).forEach(x=>{ if(cb.checked) Acc.sel.add(x.id); else Acc.sel.delete(x.id); });
+          lastClicked=i; render(); return;
+        }
+        lastClicked=i;
+        if(cb.checked) Acc.sel.add(a.id); else Acc.sel.delete(a.id);
+        tr.classList.toggle('selected', cb.checked);
+        renderSel();
+      };
       tb.appendChild(tr);
     });
     if(shown.length>page.length){
       const rest=shown.length-page.length;
-      const more=h(`<tr><td colspan="6" style="text-align:center">
+      const more=h(`<tr><td colspan="${cols}" style="text-align:center">
         <button class="btn small" id="accMore">Показать ещё ${Math.min(ACC_PAGE, rest)} из ${fmtNum(rest)}</button></td></tr>`);
       more.querySelector('#accMore').onclick=()=>{ Acc.shown+=ACC_PAGE; render(); };
       tb.appendChild(more);
@@ -1209,8 +1311,36 @@ async function viewAccounts(c){
   };
   $('#accF',bar).onchange=e=>{ Acc.filter=e.target.value; Acc.shown=ACC_PAGE; render(); };
   $('#accReset',bar).onclick=()=>{ Acc.query=''; Acc.filter=''; Acc.shown=ACC_PAGE; $('#accQ',bar).value=''; $('#accF',bar).value=''; render(); };
+  const selAll=$('#selAll',wrap);
+  if(selAll) selAll.onclick=()=>{
+    const shown=accs.filter(accountMatches);
+    const allIn=shown.length && shown.every(a=>Acc.sel.has(a.id));
+    shown.forEach(a=>{ if(allIn) Acc.sel.delete(a.id); else Acc.sel.add(a.id); });
+    render();
+  };
   c.appendChild(wrap);
   render();
+}
+
+/** Варианты отбора ящиков (с количеством) — общие для списка и групповых действий. */
+function accFilterOptions(accs){
+  const cnt=(fn)=>accs.filter(fn).length;
+  const enabledCnt=cnt(a=>a.enabled);
+  return [['','Все ящики'+` (${accs.length})`],
+          ['enabled','Только включённые'+` (${enabledCnt})`],
+          ['disabled','Только выключенные'+` (${accs.length-enabledCnt})`],
+          ['ready','Готовые к копированию'+` (${cnt(a=>a.enabled&&a.has_password)})`],
+          ['badpw','С неправильным паролем'+` (${cnt(accBadPassword)})`],
+          ['nopassword','Без пароля'+` (${cnt(a=>!a.has_password)})`],
+          ['connerr','Нет связи при проверке входа'+` (${cnt(a=>a.login_status==='conn_error')})`],
+          ['unchecked','Пароль не проверялся'+` (${cnt(a=>!a.login_status&&a.has_password)})`],
+          ['nobackup','Без резервных копий'+` (${cnt(accNoBackup)})`],
+          ['stale',`Копия старше ${ACC_STALE_HOURS} ч`+` (${cnt(accStale)})`],
+          ['failed','Последняя копия с ошибкой'+` (${cnt(accFailed)})`],
+          ['dismissed','Уволенные сотрудники'+` (${cnt(a=>!!a.dismissed_at)})`],
+          ['hold','Архив удерживается'+` (${cnt(a=>a.on_hold)})`],
+          ['holdexpired','Удержание истекло'+` (${cnt(a=>a.hold_expired)})`],
+          ['quarantine','Есть прежние копии (после «с нуля»)'+` (${cnt(a=>a.quarantines)})`]];
 }
 
 /** «Проверить пароли»: войти в ящики и сразу выйти, итог — в колонке «Вход». */
@@ -1299,30 +1429,91 @@ async function runsModal(a){
 }
 
 /** Карантинные копии: что осталось на диске после пересоздания «с нуля». */
-async function quarantineModal(a){
+async function quarantineModal(a, changed=false){
   let d;
   try{ d=await api(`/accounts/${a.id}/quarantines`); }catch(e){ return toastErr(e); }
   const list=d.quarantines||[];
-  const rows=list.map(q=>`<tr><td class="mono small">${esc(q.name)}</td>
-    <td class="small">${fmtNum(q.files)}</td><td class="small">${esc(q.bytes_h)}</td>
-    <td style="text-align:right"><button class="btn danger sm" data-del="${esc(q.path)}">Удалить</button></td></tr>`).join('');
+  const job=d.job;
+  // «account_9_old_20260921_031500» → «21.09.2026 03:15» — когда сделана копия «с нуля»
+  const qWhen=(name)=>{ const st=/_old_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})/.exec(name||'');
+    return st?`${st[3]}.${st[2]}.${st[1]} ${st[4]}:${st[5]}`:''; };
+  const cmpCell=(q)=>{
+    const c=q.check;
+    if(!c) return '<span class="tag warn" title="Неизвестно, есть ли в прежней копии письма, которых нет в новой">не сравнивалась</span>';
+    const blocked=c.unique_unreadable||0;
+    return `<div class="small">есть в новой: <b>${fmtNum(c.identical)}</b>${c.other_version?` · <span title="Тот же Message-ID, тема, отправитель и дата, но другие байты: сервер пересобрал заголовки того же письма">другой вариант: ${fmtNum(c.other_version)}</span>`:''}${c.outside_retention?` · <span title="Есть только здесь, но старше срока хранения ящика (${fmtNum(c.retention_days||0)} дн.) — ночная очистка удалила бы их из архива и так">старше срока хранения: ${fmtNum(c.outside_retention)}</span>`:''}</div>
+      <div style="margin:3px 0">${c.unique?`<span class="tag warn" title="Этих писем нет в новой копии: удалены на сервере, лежат в исключённых или неоткрывающихся папках либо больше лимита размера">только здесь: ${fmtNum(c.unique)} · ${esc(c.unique_bytes_h||'')}</span>`
+        :'<span class="tag ok">всё есть в новой копии</span>'}${c.unreadable?` <span class="tag err" title="Файлы не прочитались (нет ключа шифрования или файл повреждён)">не прочитано: ${fmtNum(c.unreadable)}</span>`:''}</div>
+      ${blocked?`<div class="small muted">из папок, которые сейчас не открываются на сервере: ${fmtNum(blocked)} — вернутся, когда папки снова начнут копироваться</div>`:''}
+      ${c.unique&&!c.new_copy_complete?'<div class="small muted">новая копия после «с нуля» ещё не прочитала все папки — вернуть письма можно после полного копирования</div>':''}
+      <div class="small muted">сравнено ${esc(fmtDate(c.checked_at))}${c.rescued?` · возвращено в архив: ${fmtNum(c.rescued)}`:''}</div>`;
+  };
+  const rows=list.map(q=>{
+    const c=q.check;
+    const canRescue=c&&c.unique>(c.unique_unreadable||0);
+    const rescueBlock=!job&&canRescue&&!c.new_copy_complete
+      ? ' disabled title="После копии «с нуля» копирование ещё не прочитало все папки ящика — иначе письма непрочитанных папок попали бы в архив дважды"' : '';
+    const when=qWhen(q.name);
+    return `<tr><td>${when?`<div class="nowrap"><b>${esc(when)}</b></div>`:''}<div class="mono small muted q-name">${esc(q.name)}</div></td>
+    <td class="small nowrap">${esc(q.bytes_h)}<div class="muted">файлов: ${fmtNum(q.files)}</div></td><td class="q-cmp">${cmpCell(q)}</td>
+    <td><div class="q-acts">
+      <button class="btn sm" data-cmp="${esc(q.path)}" ${job?'disabled':''} title="Сравнить с новой копией: какие письма есть только здесь (фоновое задание, ничего не меняет)">🔍 Сравнить</button>
+      ${canRescue?`<button class="btn sm" data-rescue="${esc(q.path)}" data-n="${fmtNum(c.unique-(c.unique_unreadable||0))}" ${job?'disabled':''}${rescueBlock} title="Вернуть в архив ящика письма, которых нет в новой копии">🛟 Вернуть ${fmtNum(c.unique-(c.unique_unreadable||0))}</button>`:''}
+      <button class="btn danger sm" data-del="${esc(q.path)}" ${a.on_hold?'disabled title="Архив удерживается — прежние копии не удаляются"':(job?'disabled title="Идёт задание с прежними копиями — дождитесь его окончания"':'')}>Удалить</button></div></td></tr>`;
+  }).join('');
+  // Письма «только здесь» — списком, чтобы было видно, что именно потеряется при удалении.
+  const samples=list.filter(q=>q.check&&q.check.unique&&(q.check.samples||[]).length).map(q=>{
+    const c=q.check, sm=c.samples||[];
+    const when=qWhen(q.name);
+    return `<details class="q-samples"><summary>Письма только в прежней копии ${when?`от ${esc(when)}`:`«${esc(q.name)}»`} — ${fmtNum(c.unique)}${c.unique>sm.length?` (показаны первые ${sm.length})`:''}</summary>
+      <div class="table-wrap"><table class="tbl"><thead><tr><th>Дата</th><th>Папка</th><th>От кого</th><th>Тема</th></tr></thead><tbody>
+      ${sm.map(x=>`<tr><td class="small nowrap">${esc(fmtDate(x.date))}</td><td class="small">${esc(x.folder)}</td><td class="small">${esc(x.from)}</td><td class="small">${esc(x.subject||'(без темы)')}</td></tr>`).join('')}
+      </tbody></table></div></details>`;
+  }).join('');
+  let reopening=false;
+  const JOBWHAT={quarantine_rescue:'возврат писем в архив', quarantine_check:'сравнение с новой копией', cleanup:'удаление прежней копии'};
+  const banner = job ? `<div class="hint" style="margin-bottom:12px">⏳ ${job.status==='queued'?'В очереди':'Идёт'} ${JOBWHAT[job.type]||'задание'} —
+      <a href="javascript:void(0)" data-jobinfo="${job.id}">задание №${job.id}</a>. Итог появится здесь.</div>` : '';
   const m=modal(`Прежние копии: ${a.name}`, list.length ? `
-    <p class="muted">При пересоздании копии «с нуля» прежние письма не удаляются, а переносятся
-      в карантин — на случай, если что-то пойдёт не так. Когда новая копия проверена, карантин
-      можно удалить и освободить место.</p>
-    <div class="table-wrap"><table class="tbl">
-      <thead><tr><th>Каталог</th><th>Файлов</th><th>Размер</th><th></th></tr></thead>
-      <tbody>${rows}</tbody></table></div>`
+    <p class="muted" style="margin-top:0">При пересоздании копии «с нуля» прежние письма не удаляются, а переносятся
+      в карантин. Письма, которых на сервере уже нет, остаются только здесь. <b>🔍 Сравнить</b> покажет, есть ли такие;
+      <b>🛟 Вернуть</b> запишет их в архив ящика (в те же папки) — после этого карантин можно удалить без потерь.</p>
+    ${banner}
+    <div class="table-wrap"><table class="tbl q-tbl">
+      <thead><tr><th>Прежняя копия</th><th>Размер</th><th>Сравнение с новой копией</th><th></th></tr></thead>
+      <tbody>${rows}</tbody></table></div>${samples}`
     : '<div class="empty">Карантинных копий нет — на диске только актуальная копия.</div>',
-    {wide:true});
+    // после сравнения, возврата или удаления список ящиков (отметка «прежние копии», счётчики) устарел
+    {wide:true, onClose:()=>{ if(changed && !reopening && State.view==='accounts') route(); }});
+  const reopen=()=>{ reopening=true; m.close(); quarantineModal(a, true); };
+  const ji=m.body.querySelector('[data-jobinfo]'); if(ji) ji.onclick=()=>jobDetails(parseInt(ji.dataset.jobinfo,10));
+  const start=async(path, rescue)=>{
+    try{
+      const r=await api(`/accounts/${a.id}/quarantines/check`,{method:'POST',body:{path, rescue}});
+      toast(r.already?'Задание уже идёт':(rescue?'Возврат писем запущен':'Сравнение запущено'), `Задание №${r.job_id}. Итог появится в «Прежних копиях».`);
+      reopen();
+    }catch(e){ toastErr(e); }
+  };
+  m.body.querySelectorAll('[data-cmp]').forEach(b=>b.onclick=()=>start(b.dataset.cmp, false));
+  m.body.querySelectorAll('[data-rescue]').forEach(b=>b.onclick=async()=>{
+    const ok=await confirmDlg('Вернуть письма в архив?',
+      `Писем, которых нет в новой копии: ${b.dataset.n}. Они будут записаны в архив ящика — в те же папки — и станут видны в просмотре, поиске и выгрузке. Письма старше срока хранения ящика не возвращаются (их удалила бы ночная очистка).`,
+      {okText:'Вернуть', okClass:'primary'});
+    if(ok) start(b.dataset.rescue, true);
+  });
   m.body.querySelectorAll('[data-del]').forEach(b=>b.onclick=async()=>{
-    const ok=await confirmDlg('Удалить карантинную копию?',
-      'Каталог с прежними письмами будет удалён безвозвратно. Убедитесь, что новая копия в порядке.',
-      {okText:'Удалить', okClass:'danger'});
+    const q=list.find(x=>x.path===b.dataset.del)||{};
+    const c=q.check;
+    const warn = !c ? 'Прежняя копия НЕ сравнивалась с новой: неизвестно, есть ли в ней письма, которых нет в новой копии. Надёжнее сначала нажать «Сравнить». '
+      : !q.safe ? `${q.unsafe_reason?q.unsafe_reason.charAt(0).toUpperCase()+q.unsafe_reason.slice(1):'Есть письма, которых нет в новой копии'}. Эти письма будут потеряны. `
+      : '';
+    const ok=await confirmDlg(q.safe?'Удалить карантинную копию?':'Удалить прежнюю копию с потерей писем?',
+      warn+'Каталог с прежними письмами будет удалён безвозвратно (фоновым заданием).',
+      {okText:q.safe?'Удалить':'Удалить с потерей писем', okClass:'danger'});
     if(!ok) return;
     try{
-      await api(`/accounts/${a.id}/quarantines/delete`,{method:'POST',body:{path:b.dataset.del}});
-      toast('Карантинная копия удалена'); m.close(); quarantineModal(a);
+      const r=await api(`/accounts/${a.id}/quarantines/delete`,{method:'POST',body:{path:b.dataset.del, force:!q.safe}});
+      toast('Удаление поставлено в очередь', `Задание №${r.job_id}.`); reopen();
     }catch(e){ toastErr(e); }
   });
 }
@@ -1338,24 +1529,26 @@ function rebuildModal(a){
         <span class="muted small">Сверяет индекс с файлами на диске: если файл письма пропал
         (сбой диска, оборванный прогон, чужая уборка), письмо скачивается заново.
         <b>Ничего не удаляется</b> — это безопасный режим.</span></span></label>
-    <label class="form-row check" style="align-items:flex-start;gap:10px;margin-top:10px">
+    ${isAdmin()?`<label class="form-row check" style="align-items:flex-start;gap:10px;margin-top:10px">
       <input type="radio" name="rb" value="full" style="margin-top:4px">
       <span><b>Полностью с нуля</b><br>
-        <span class="muted small">Стирает локальную копию ящика — и файлы писем, и записи индекса —
-        и скачивает всё с сервера заново.</span></span></label>
-    <div class="hint" style="margin-top:12px;border-left:3px solid var(--danger)">
-      <b>Режим «с нуля» необратим.</b> Письма, которых уже нет на почтовом сервере, есть только
-      в этой копии — после стирания их не вернуть. Выбирайте его, только если архив испорчен
-      и нужен именно чистый лист.</div>`,
+        <span class="muted small">Прежняя копия ящика уходит в карантин («Прежние копии»), индекс
+        очищается, и всё скачивается с сервера заново.</span></span></label>
+    <div class="hint" style="margin-top:12px;border-color:var(--danger)">
+      <b>Осторожно с режимом «с нуля».</b> Письма, которых уже нет на почтовом сервере, останутся только
+      в карантине: в просмотре, поиске и экспорте их не будет, а после удаления карантина их не вернуть.
+      Выбирайте его, только если архив испорчен и нужен именно чистый лист.
+      ${a.on_hold?'<br><b>Архив этого ящика удерживается — «с нуля» его не пересоздать, пока действует удержание.</b>':''}</div>`
+      :'<div class="muted small" style="margin-top:10px">Копию «с нуля» запускает администратор.</div>'}`,
     {wide:true, footer:'<button class="btn ghost" data-c>Отмена</button><button class="btn primary" data-go>Запустить</button>'});
   m.foot.querySelector('[data-c]').onclick=()=>m.close();
   m.foot.querySelector('[data-go]').onclick=async()=>{
     const mode=(m.body.querySelector('input[name=rb]:checked')||{}).value||'missing';
     if(mode==='full'){
-      const ok=await confirmDlg('Стереть локальную копию и скачать заново?',
-        `Все скачанные письма ящика «${a.name}» будут удалены с диска, а затем заново скачаны с сервера. `+
-        `Письма, которых на сервере уже нет, будут потеряны безвозвратно. Продолжить?`,
-        {okText:'Да, стереть и скачать заново', okClass:'danger'});
+      const ok=await confirmDlg('Скопировать ящик заново с нуля?',
+        `Прежняя копия ящика «${a.name}» уйдёт в карантин, а письма будут заново скачаны с сервера. `+
+        `Письма, которых на сервере уже нет, останутся только в карантине. Продолжить?`,
+        {okText:'Да, скопировать с нуля', okClass:'danger'});
       if(!ok) return;
     }
     try{
@@ -1412,7 +1605,7 @@ async function folderDiagnoseModal(a){
         <b>⚠️ Папки, которые сервер не даёт прочитать (${d.broken_folders.length})</b>
         <div class="muted small" style="margin:6px 0">Чинить их нужно на почтовом сервере. Если это
           невозможно — исключите их, чтобы задание перестало помечаться неполным.</div>
-        <button class="btn small" id="diagExclude">🚫 Больше не копировать эти папки</button>
+        ${isAdmin()?'<button class="btn small" id="diagExclude">🚫 Больше не копировать эти папки</button>':'<div class="muted small">Исключить папки может администратор.</div>'}
       </div>`:''}`;
   const ex=$('#diagExclude', m.el);
   if(ex) ex.onclick=async()=>{
@@ -1425,6 +1618,29 @@ async function folderDiagnoseModal(a){
 }
 
 function accountMenu(a){
+  // Оператору — только копирование и проверки: письма, настройки ящика,
+  // выгрузки и удаление доступны администратору.
+  if(isOperator()){
+    const m=modal(`Ящик: ${a.name}`, `<div class="btn-row" style="flex-direction:column;align-items:stretch;gap:10px">
+      <button class="btn primary" data-a="backup" ${a.enabled?'':'disabled title="Ящик выключен — включает его администратор"'}>💾 Сделать резервную копию сейчас</button>
+      <button class="btn" data-a="test">🔌 Проверить подключение</button>
+      <button class="btn" data-a="verify">🔍 Проверить целостность копии</button>
+      <button class="btn" data-a="folders">🗂️ Проверить папки на сервере</button>
+      <button class="btn" data-a="rebuild" ${a.enabled?'':'disabled title="Ящик выключен"'}>🩹 Докачать потерянные письма</button>
+      <button class="btn" data-a="runs">📜 История копирования</button>
+      <div class="muted small">Просмотр писем, настройки ящика, выгрузка и удаление — у администратора.</div>
+    </div>`);
+    m.body.querySelectorAll('[data-a]').forEach(b=>b.onclick=async()=>{
+      const act=b.dataset.a; m.close();
+      if(act==='backup') backupNow(a.id, a.name);
+      else if(act==='test') testAccount(a.id);
+      else if(act==='folders') folderDiagnoseModal(a);
+      else if(act==='rebuild') rebuildModal(a);
+      else if(act==='runs') runsModal(a);
+      else if(act==='verify'){ try{await api(`/accounts/${a.id}/verify`,{method:'POST'}); toast('Запущено','Проверка целостности в очереди'); location.hash='#/jobs';}catch(e){toastErr(e);} }
+    });
+    return;
+  }
   const m=modal(`Ящик: ${a.name}`, `<div class="btn-row" style="flex-direction:column;align-items:stretch;gap:10px">
     <button class="btn primary" data-a="backup" ${a.enabled?'':'disabled title="Ящик выключен — включите его, чтобы делать копии"'}>💾 Сделать резервную копию сейчас</button>
     <button class="btn" data-a="mail">📧 Просмотр писем</button>
@@ -1436,10 +1652,10 @@ function accountMenu(a){
     <button class="btn" data-a="verify">🔍 Проверить целостность копии</button>
     <button class="btn" data-a="folders">🗂️ Проверить папки на сервере</button>
     <button class="btn" data-a="rebuild" ${a.enabled?'':'disabled title="Ящик выключен"'}>🔄 Скопировать заново</button>
-    <button class="btn" data-a="quarantine">🧺 Прежние копии (карантин)</button>
+    <button class="btn" data-a="quarantine">🧺 Прежние копии (карантин)${a.quarantines?` — ${a.quarantines}`:''}</button>
     <button class="btn" data-a="logout" title="Сотрудник, вошедший в интерфейс по паролю этого ящика, будет разлогинен">🚪 Завершить сеансы сотрудника</button>
     <button class="btn" data-a="hold" title="Пока действует удержание, письма ящика не удаляются по сроку хранения">🔒 Удержание архива${a.on_hold?' (до '+esc(holdDate(a.hold_until))+')':''}</button>
-    <button class="btn danger" data-a="del">🗑️ Удалить ящик</button>
+    <button class="btn danger" data-a="del" ${a.on_hold?'disabled title="Архив удерживается — удалить ящик нельзя"':''}>🗑️ Удалить ящик</button>
     <button class="btn danger" data-a="purge" ${a.on_hold?'disabled title="Архив удерживается — удалить нельзя"':''}>🧹 Удалить ящик вместе с архивом писем</button>
   </div>`);
   m.body.querySelectorAll('[data-a]').forEach(b=>b.onclick=async()=>{
@@ -1460,6 +1676,513 @@ function accountMenu(a){
     else if(act==='verify'){ try{await api(`/accounts/${a.id}/verify`,{method:'POST'}); toast('Запущено','Проверка целостности в очереди'); location.hash='#/jobs';}catch(e){toastErr(e);} }
     else if(act==='del'){ if(await confirmDlg('Удалить ящик?', `Ящик «${a.name}» и его настройки будут удалены. Локальные копии писем на диске останутся.${a.on_hold?' Архив ящика удерживается до '+holdDate(a.hold_until)+' — файлы писем не трогаются.':''} Продолжить?`)){ try{await api(`/accounts/${a.id}`,{method:'DELETE'}); toast('Удалено'); route();}catch(e){toastErr(e);} } }
   });
+}
+
+// ===================================================================
+//  Групповые действия с ящиками
+// ===================================================================
+//: Состояние раздела «Групповые действия» (живёт между перерисовками).
+const Bulk = { source:'selected', filter:'', query:'', list:'', action:null, params:{}, showTargets:false };
+
+/** Описание действий с сервера (один раз за сеанс). */
+async function bulkMeta(key){
+  if(!State.bulkActions) State.bulkActions=await api('/accounts/bulk/actions');
+  if(!key) return State.bulkActions;
+  return State.bulkActions.actions.find(a=>a.key===key) || {key, label:key, params:[], desc:'', danger:0};
+}
+
+/** Разбор списка адресов: ящик ищется по логину, затем по названию. */
+function bulkParseList(text, accs){
+  const byLogin=new Map(), byName=new Map();
+  accs.forEach(a=>{ byLogin.set(String(a.username||'').toLowerCase(), a); byName.set(String(a.name||'').toLowerCase(), a); });
+  const found=[], missing=[], seen=new Set();
+  const tokens=[];
+  String(text||'').split(/[\n,;\t]+/).forEach(raw=>{
+    const t=raw.trim(); if(!t) return;
+    const inAngle=t.match(/<([^<>\s]+@[^<>\s]+)>/g);
+    if(inAngle) inAngle.forEach(x=>tokens.push(x.slice(1,-1)));          // «Иванов Иван <ivanov@…>»
+    else if(t.includes('@') && /\s/.test(t)) t.split(/\s+/).filter(x=>x.includes('@')).forEach(x=>tokens.push(x));  // «Иванов Иван ivanov@…», несколько адресов
+    else tokens.push(t);                                                  // адрес или название ящика
+  });
+  tokens.map(s=>s.trim()).filter(Boolean).forEach(item=>{
+    const key=item.toLowerCase();
+    const a=byLogin.get(key)||byName.get(key);
+    if(!a){ if(!missing.includes(item)) missing.push(item); return; }
+    if(!seen.has(a.id)){ seen.add(a.id); found.push(a); }
+  });
+  return {found, missing};
+}
+
+/** Ящики, над которыми будет выполнено действие, по выбранному источнику. */
+function bulkTargets(accs){
+  switch(Bulk.source){
+    case 'all': return accs.slice();
+    case 'enabled': return accs.filter(a=>a.enabled);
+    case 'filter': return accs.filter(a=>accountMatchesBy(a, Bulk.filter, Bulk.query));
+    case 'list': return bulkParseList(Bulk.list, accs).found;
+    default: return accs.filter(a=>Acc.sel.has(a.id));
+  }
+}
+
+async function viewBulk(c, accs){
+  let meta;
+  State.bulkActions=null;     // список ящиков-образцов и умолчания могли измениться
+  try{ meta=await bulkMeta(); }catch(e){ c.appendChild(h(`<div class="card"><div class="empty">${esc(e.message)}</div></div>`)); return; }
+  const opts=accFilterOptions(accs);
+  const targetsCard=h(`<div class="card bulk-card"><h3>1. Какие ящики</h3>
+    <div class="bulk-sources">
+      <label class="radio"><input type="radio" name="bsrc" value="selected"> Отмеченные в списке — <b>${fmtNum(Acc.sel.size)}</b>
+        ${Acc.sel.size?'':'<span class="muted small">(отметьте ящики флажками на вкладке «Список ящиков»)</span>'}</label>
+      <label class="radio"><input type="radio" name="bsrc" value="enabled"> Все включённые — <b>${fmtNum(accs.filter(a=>a.enabled).length)}</b></label>
+      <label class="radio"><input type="radio" name="bsrc" value="all"> Все ящики — <b>${fmtNum(accs.length)}</b></label>
+      <label class="radio"><input type="radio" name="bsrc" value="filter"> По отбору:</label>
+      <div class="bulk-sub" data-sub="filter">
+        <select id="bF">${opts.map(([v,t])=>`<option value="${v}" ${v===Bulk.filter?'selected':''}>${esc(t)}</option>`).join('')}</select>
+        <input type="text" id="bQ" placeholder="и поиск по названию, логину, серверу…" value="${esc(Bulk.query)}">
+      </div>
+      <label class="radio"><input type="radio" name="bsrc" value="list"> По списку адресов (вставьте из Excel или письма):</label>
+      <div class="bulk-sub" data-sub="list">
+        <textarea id="bL" rows="4" placeholder="ivanov@company.ru&#10;petrova@company.ru">${esc(Bulk.list)}</textarea>
+        <div class="small muted" id="bLinfo"></div>
+      </div>
+    </div>
+    <div class="bulk-total"><span id="bTotal"></span> <a href="javascript:void(0)" id="bShow" class="small"></a>
+      <span class="spacer"></span>
+      <button class="btn sm" id="bExport" title="Выгрузить список этих ящиков в Excel">📊 Список в Excel</button></div>
+    <div id="bList" class="bulk-list" style="display:none"></div></div>`);
+  c.appendChild(targetsCard);
+
+  const actionsCard=h(`<div class="card bulk-card"><h3>2. Что сделать</h3><div class="bulk-groups"></div></div>`);
+  const groupsBox=actionsCard.querySelector('.bulk-groups');
+  meta.groups.forEach(g=>{
+    const items=meta.actions.filter(a=>a.group===g.key);
+    if(!items.length && g.key!=='manage') return;
+    const box=h(`<div class="bulk-group"><div class="bg-title">${esc(g.label)}</div><div class="bulk-tiles"></div></div>`);
+    const tiles=box.querySelector('.bulk-tiles');
+    items.forEach(a=>{
+      const t=h(`<button class="bulk-tile ${a.danger>=2?'danger':(a.danger===1?'warn':'')}" data-act="${esc(a.key)}" title="${esc(a.desc)}">
+        <span class="ic">${a.icon}</span><span>${esc(a.label)}</span></button>`);
+      tiles.appendChild(t);
+    });
+    if(g.key==='manage'){
+      if(isAdmin()){
+        tiles.appendChild(h(`<button class="bulk-tile" data-client="create" title="Завести много ящиков сразу из списка адресов"><span class="ic">➕</span><span>Добавить ящики списком</span></button>`));
+        tiles.appendChild(h(`<button class="bulk-tile" data-client="passwords" title="Массово проставить пароли из файла «адрес — пароль»"><span class="ic">🔑</span><span>Загрузить пароли из файла</span></button>`));
+      }
+      tiles.appendChild(h(`<button class="bulk-tile" data-client="excel" title="Выгрузить список ящиков из пункта 1 в Excel"><span class="ic">📊</span><span>Список ящиков в Excel</span></button>`));
+    }
+    groupsBox.appendChild(box);
+  });
+  if(isOperator()) actionsCard.appendChild(h('<div class="muted small" style="margin-top:8px">Оператору доступны копирование и проверки. Остальные групповые действия — у администратора.</div>'));
+  c.appendChild(actionsCard);
+
+  const paramsCard=h(`<div class="card bulk-card" id="bParams" style="display:none"></div>`);
+  c.appendChild(paramsCard);
+  const histCard=h(`<div class="card bulk-card"><div class="section-title" style="margin-bottom:8px"><h3 style="margin:0">История групповых действий</h3><div class="spacer"></div><button class="btn sm ghost" id="bHistR">↻ Обновить</button></div><div id="bHist"><div class="empty"><span class="spinner"></span></div></div></div>`);
+  c.appendChild(histCard);
+
+  const radios=$$('input[name=bsrc]', targetsCard);
+  const updateTargets=()=>{
+    radios.forEach(r=>{ r.checked=(r.value===Bulk.source); });
+    $$('[data-sub]', targetsCard).forEach(el=>el.classList.toggle('on', el.dataset.sub===Bulk.source));
+    const list=bulkTargets(accs);
+    $('#bTotal',targetsCard).innerHTML=`Будет обработано: <b>${fmtNum(list.length)}</b> ${plural(list.length,'ящик','ящика','ящиков')}`;
+    if(Bulk.source==='list'){
+      const r=bulkParseList(Bulk.list, accs);
+      $('#bLinfo',targetsCard).innerHTML = Bulk.list.trim()
+        ? `Найдено: <b>${r.found.length}</b>` + (r.missing.length?` · не найдено: <b style="color:var(--danger)">${r.missing.length}</b> — ${esc(r.missing.slice(0,12).join(', '))}${r.missing.length>12?' …':''}`:'')
+        : 'По одному адресу (логину) или названию ящика в строке; подойдут и через запятую.';
+    }
+    const show=$('#bShow',targetsCard);
+    show.textContent = list.length ? (Bulk.showTargets?'скрыть список':'показать список') : '';
+    const box=$('#bList',targetsCard);
+    box.style.display = Bulk.showTargets && list.length ? '' : 'none';
+    if(Bulk.showTargets && list.length){
+      const max=300;
+      box.innerHTML=`<table class="tbl"><tbody>${list.slice(0,max).map(a=>`<tr><td>${esc(a.name)}</td><td class="small muted">${esc(a.username)}</td><td>${a.enabled?'<span class="tag ok">включён</span>':'<span class="tag">выключен</span>'}</td></tr>`).join('')}</tbody></table>`
+        + (list.length>max?`<div class="muted small" style="padding:6px 10px">… и ещё ${fmtNum(list.length-max)}</div>`:'');
+    }
+    const go=$('#bGo', paramsCard); if(go) go.disabled=!list.length;
+  };
+  radios.forEach(r=>r.onchange=()=>{ Bulk.source=r.value; updateTargets(); });
+  $('#bF',targetsCard).onchange=e=>{ Bulk.filter=e.target.value; Bulk.source='filter'; updateTargets(); };
+  let qT=null;
+  $('#bQ',targetsCard).oninput=e=>{ Bulk.query=e.target.value; Bulk.source='filter'; clearTimeout(qT); qT=setTimeout(updateTargets,200); };
+  let lT=null;
+  $('#bL',targetsCard).oninput=e=>{ Bulk.list=e.target.value; Bulk.source='list'; clearTimeout(lT); lT=setTimeout(updateTargets,250); };
+  $('#bShow',targetsCard).onclick=()=>{ Bulk.showTargets=!Bulk.showTargets; updateTargets(); };
+  $('#bExport',targetsCard).onclick=()=>{ const ids=bulkTargets(accs).map(a=>a.id); if(!ids.length) return toast('Не выбрано ни одного ящика','','warn'); exportAccountList(ids); };
+
+  const selectAction=(key)=>{
+    Bulk.action=key;
+    $$('.bulk-tile', actionsCard).forEach(t=>t.classList.toggle('active', t.dataset.act===key));
+    const a=meta.actions.find(x=>x.key===key);
+    if(!a){ paramsCard.style.display='none'; return; }
+    const saved=(Bulk.params[key]||{});
+    const tabParams=a.params.filter(p=>!p.on_warning);
+    paramsCard.style.display='';
+    paramsCard.innerHTML=`<h3>3. ${a.icon} ${esc(a.label)}</h3>
+      <p class="muted" style="margin-top:-4px">${esc(a.desc)}</p>
+      ${a.note?`<div class="hint" style="margin-bottom:12px">💡 ${esc(a.note)}</div>`:''}
+      ${tabParams.length?`<div class="bulk-form" data-form>${bulkFormHtml(tabParams, saved)}</div>`:''}
+      <div class="btn-row" style="margin-top:6px">
+        <button class="btn ${a.danger>=2?'danger':'primary'}" id="bGo">Проверить и запустить…</button>
+        <span class="muted small" style="align-self:center">Сначала покажем, что будет сделано с каждым ящиком, — без изменений.</span></div>`;
+    const form=paramsCard.querySelector('[data-form]');
+    if(form) bulkFormWire(form, tabParams);
+    $('#bGo',paramsCard).onclick=async()=>{
+      const values=form?bulkFormRead(form, tabParams):{};
+      Bulk.params[key]=values;
+      const ids=bulkTargets(accs).map(x=>x.id);
+      if(!ids.length) return toast('Не выбрано ни одного ящика','Укажите ящики в пункте 1','warn');
+      const done=await bulkDialog(key, ids, values, {onDone:()=>{ Bulk.action=null; }});
+      if(done) loadBulkHistory($('#bHist',histCard));
+    };
+    updateTargets();
+    paramsCard.scrollIntoView({behavior:'smooth', block:'nearest'});
+  };
+  $$('.bulk-tile', actionsCard).forEach(t=>t.onclick=()=>{
+    if(t.dataset.client==='passwords') return passwordImportModal();
+    if(t.dataset.client==='create') return bulkCreateModal();
+    if(t.dataset.client==='excel'){ const ids=bulkTargets(accs).map(a=>a.id); return ids.length?exportAccountList(ids):toast('Не выбрано ни одного ящика','Укажите ящики в пункте 1','warn'); }
+    selectAction(t.dataset.act);
+  });
+  $('#bHistR',histCard).onclick=()=>loadBulkHistory($('#bHist',histCard));
+  updateTargets();
+  if(Bulk.action) selectAction(Bulk.action);
+  loadBulkHistory($('#bHist',histCard));
+}
+
+// ---------- Форма параметров действия (по описанию с сервера) ----------
+function bulkFormHtml(params, values){
+  return params.map(p=>{
+    const v = (values && p.key in values) ? values[p.key] : p.default;
+    const help = p.help?`<div class="hint">${esc(p.help)}</div>`:'';
+    const warnOnly = p.on_warning ? ' data-onwarn style="display:none"' : '';
+    const attrs=`data-p="${esc(p.key)}"`;
+    let input;
+    switch(p.kind){
+      case 'bool':
+        return `<div class="form-row check" data-row="${esc(p.key)}"${warnOnly}><span class="switch"><input type="checkbox" ${attrs} ${v?'checked':''}><span class="track"></span></span><label>${esc(p.label)}</label>${help}</div>`;
+      case 'select':
+        input=`<select ${attrs}>${p.options.map(o=>`<option value="${esc(o.value)}" ${String(o.value)===String(v)?'selected':''}>${esc(o.label)}</option>`).join('')}</select>`; break;
+      case 'int':
+        input=`<input type="number" ${attrs} value="${v==null?'':esc(v)}" ${p.min!=null?`min="${p.min}"`:''} ${p.max!=null?`max="${p.max}"`:''} placeholder="${esc(p.placeholder||'')}">`; break;
+      case 'textarea':
+        input=`<textarea ${attrs} rows="3" placeholder="${esc(p.placeholder||'')}">${esc(v||'')}</textarea>`; break;
+      case 'date': input=`<input type="date" ${attrs} value="${esc(v||'')}">`; break;
+      case 'time': input=`<input type="time" ${attrs} value="${esc(v||'')}">`; break;
+      default: input=`<input type="text" ${attrs} value="${esc(v==null?'':v)}" placeholder="${esc(p.placeholder||'')}">`;
+    }
+    return `<div class="form-row" data-row="${esc(p.key)}"${warnOnly}><label>${esc(p.label)}</label>${input}${help}</div>`;
+  }).join('');
+}
+function bulkFormRead(root, params){
+  const out={};
+  params.forEach(p=>{
+    const el=root.querySelector(`[data-p="${p.key}"]`); if(!el) return;
+    if(p.kind==='bool') out[p.key]=el.checked;
+    else if(p.kind==='int') out[p.key]=el.value===''?null:parseInt(el.value,10);
+    else out[p.key]=el.value;
+  });
+  return out;
+}
+/** Показывать поля, зависящие от других (show_if). */
+function bulkFormWire(root, params){
+  const apply=()=>{
+    const vals=bulkFormRead(root, params);
+    params.forEach(p=>{
+      if(!p.show_if) return;
+      const row=root.querySelector(`[data-row="${p.key}"]`); if(!row) return;
+      const ok=Object.entries(p.show_if).every(([k,list])=>list.some(x=>String(x)===String(vals[k])));
+      row.style.display=ok?'':'none';
+    });
+  };
+  root.addEventListener('change', apply);
+  apply();
+}
+
+// ---------- Проверка, подтверждение и запуск ----------
+const BULK_STATUS = {ok:['ok','будет сделано','сделано'], skip:['','пропуск','пропуск'], fail:['err','ошибка','ошибка']};
+
+/** Итог по ящикам: плитки, причины пропусков, таблица с отбором. */
+function bulkResultHtml(r, preview){
+  const c=r.counts||{};
+  const reasons=Object.entries(r.reasons||{}).sort((a,b)=>b[1]-a[1]);
+  const disk=(r.extra&&r.extra.disk)||null;
+  return `<div class="an-kpis" style="margin:4px 0 12px">
+      <div class="kpi accent"><div class="k-label">${preview?'✅ Будет обработано':'✅ Выполнено'}</div><div class="k-value">${fmtNum(c.ok||0)}</div><div class="k-sub">из ${fmtNum(r.total)}</div></div>
+      <div class="kpi"><div class="k-label">⏭️ Пропущено</div><div class="k-value">${fmtNum(c.skip||0)}</div><div class="k-sub">${(c.skip||0)?'причины ниже':'нет'}</div></div>
+      <div class="kpi"><div class="k-label">⚠️ Ошибок</div><div class="k-value">${fmtNum(c.fail||0)}</div><div class="k-sub">${(c.fail||0)?'см. таблицу':'нет'}</div></div>
+      ${disk?`<div class="kpi"><div class="k-label">💽 Место</div><div class="k-value" style="font-size:1.05rem">${esc(disk.need_h)}</div><div class="k-sub">нужно · свободно ${esc(disk.free_h)}</div></div>`:''}
+      ${(r.jobs&&r.jobs.length)?`<div class="kpi"><div class="k-label">⚙️ Заданий</div><div class="k-value">${fmtNum(r.jobs.length)}</div><div class="k-sub">в очереди</div></div>`:''}
+    </div>
+    ${(r.warnings||[]).map(w=>`<div class="hint warnbox">⚠️ ${esc(w)}</div>`).join('')}
+    ${reasons.length?`<div class="bulk-reasons"><b>Почему пропущены:</b> ${reasons.map(([t,n])=>`<span class="tag">${esc(t)} — ${fmtNum(n)}</span>`).join(' ')}</div>`:''}
+    <div class="bulk-chips" data-chips>
+      <button class="chip active" data-f="">Все (${fmtNum(r.results.length)})</button>
+      <button class="chip" data-f="ok">${preview?'Будут обработаны':'Выполнены'} (${fmtNum(c.ok||0)})</button>
+      <button class="chip" data-f="skip">Пропущены (${fmtNum(c.skip||0)})</button>
+      ${(c.fail||0)?`<button class="chip" data-f="fail">Ошибки (${fmtNum(c.fail)})</button>`:''}
+    </div>
+    <div class="table-wrap bulk-results"><table class="tbl"><thead><tr><th>Ящик</th><th>Итог</th><th>Подробности</th></tr></thead><tbody data-rows></tbody></table></div>`;
+}
+function bulkWireResults(root, r, preview){
+  const rows=root.querySelector('[data-rows]');
+  const draw=(f)=>{
+    const list=r.results.filter(x=>!f||x.status===f);
+    const max=500;
+    rows.innerHTML=list.slice(0,max).map(x=>{
+      const [cls,pv,done]=BULK_STATUS[x.status]||['',x.status,x.status];
+      const js=x.job_status?` <span class="badge ${esc(x.job_status)}">${esc(STATUS_LBL[x.job_status]||x.job_status)}</span>`:'';
+      return `<tr><td><b>${esc(x.name)}</b><div class="small muted">${esc(x.username||'')}</div></td>
+        <td><span class="tag ${cls}">${esc(preview?pv:done)}</span>${js}</td>
+        <td class="small">${esc(x.detail||'')}${x.job_id?` <a href="javascript:void(0)" class="small" data-job="${x.job_id}">задание №${x.job_id}</a>`:''}</td></tr>`;
+    }).join('') + (list.length>max?`<tr><td colspan="3" class="muted small">… показаны первые ${max} из ${fmtNum(list.length)}</td></tr>`:'')
+      + (list.length?'':'<tr><td colspan="3" class="empty">Нет строк</td></tr>');
+    rows.querySelectorAll('[data-job]').forEach(a=>a.onclick=()=>jobDetails(parseInt(a.dataset.job,10)));
+  };
+  root.querySelectorAll('[data-chips] .chip').forEach(b=>b.onclick=()=>{
+    root.querySelectorAll('[data-chips] .chip').forEach(x=>x.classList.toggle('active', x===b));
+    draw(b.dataset.f);
+  });
+  draw('');
+}
+
+/** Окно групповой операции: проверка → подтверждение → запуск → итог.
+ *  Возвращает промис, который разрешается true, если операция выполнена. */
+function bulkDialog(actionKey, ids, params={}, opts={}){
+  return new Promise(async resolve=>{
+    let meta;
+    try{ meta=await bulkMeta(actionKey); }catch(e){ toastErr(e); return resolve(false); }
+    // Параметры, которых не передали, настраиваются прямо в окне.
+    const inline=(meta.params||[]).filter(p=>!(p.key in params));
+    let finished=false;
+    const m=modal(opts.title||`${meta.icon||''} ${meta.label}`, `
+      ${opts.intro||`<p class="muted" style="margin-top:0">${esc(meta.desc||'')}</p>`}
+      ${meta.note&&!opts.intro?`<div class="hint" style="margin-bottom:12px">💡 ${esc(meta.note)}</div>`:''}
+      ${inline.length?`<div class="bulk-form boxed" data-form>${bulkFormHtml(inline, opts.values||{})}</div>`:''}
+      <div data-preview><div class="empty"><span class="spinner"></span> Проверяем ${fmtNum(ids.length)} ${plural(ids.length,'ящик','ящика','ящиков')}…</div></div>
+      <div data-confirm></div>`,
+      {wide:true, onClose:()=>resolve(finished),
+       footer:`<button class="btn ghost" data-c>Отмена</button><button class="btn primary" data-go disabled>Выполнить</button>`});
+    const form=m.body.querySelector('[data-form]');
+    if(form) bulkFormWire(form, inline);
+    // Поля «только при предупреждении» (например, «запустить, даже если места мало»)
+    // показываются, лишь когда проверка о чём-то предупредила.
+    const syncForm=(warnings)=>{
+      if(!form) return;
+      form.querySelectorAll('[data-onwarn]').forEach(row=>{ row.style.display=(warnings||[]).length?'':'none'; });
+      form.style.display=[...form.querySelectorAll('[data-row]')].some(row=>row.style.display!=='none')?'':'none';
+    };
+    syncForm([]);
+    const go=m.foot.querySelector('[data-go]');
+    const current=()=>Object.assign({}, params, form?bulkFormRead(form, inline):{});
+    let pv=null, seq=0;
+    const box=m.body.querySelector('[data-preview]');
+    const conf=m.body.querySelector('[data-confirm]');
+    const refresh=async()=>{
+      const my=++seq;
+      go.disabled=true;
+      try{ pv=await api('/accounts/bulk',{method:'POST',body:{action:actionKey, ids, params:current(), preview:true}}); }
+      catch(e){ if(my!==seq) return; box.innerHTML=`<div class="hint warnbox">⚠️ ${esc(e.message)}${e.data&&e.data.hint?'<br><span class="small">'+esc(e.data.hint)+'</span>':''}</div>`; conf.innerHTML=''; return; }
+      if(my!==seq) return;
+      syncForm(pv.warnings);
+      box.innerHTML=bulkResultHtml(pv, true);
+      bulkWireResults(box, pv, true);
+      const n=(pv.counts&&pv.counts.ok)||0;
+      go.className='btn '+(pv.danger>=2?'danger':(pv.danger===1?'danger':'primary'));
+      go.textContent=n?`Выполнить для ${fmtNum(n)} ${plural(n,'ящика','ящиков','ящиков')}`:'Нечего выполнять';
+      if(pv.danger>=2 && n){
+        conf.innerHTML=`<div class="form-row confirm-row"><label>Это действие трудно или невозможно отменить. Для подтверждения введите число ящиков: <b>${fmtNum(n)}</b></label>
+          <input type="text" id="bConfirm" inputmode="numeric" autocomplete="off" placeholder="${n}"></div>`;
+        const inp=conf.querySelector('#bConfirm');
+        const check=()=>{ go.disabled=inp.value.replace(/\s/g,'')!==String(n); };
+        inp.oninput=check; check();
+      }else{ conf.innerHTML=''; go.disabled=!n; }
+    };
+    if(form){
+      let t=null;
+      form.addEventListener('change', ()=>{ clearTimeout(t); t=setTimeout(refresh, 250); });
+      form.addEventListener('input', (e)=>{ if(e.target.type==='checkbox') return; clearTimeout(t); t=setTimeout(refresh, 700); });
+    }
+    m.foot.querySelector('[data-c]').onclick=()=>m.close();
+    go.onclick=async()=>{
+      if(go.disabled||!pv) return;
+      const confirmValue=(conf.querySelector('#bConfirm')||{}).value||'';
+      go.disabled=true; go.innerHTML='<span class="spinner"></span> Выполняется…';
+      let r;
+      try{ r=await api('/accounts/bulk',{method:'POST',body:{action:actionKey, ids, params:current(), preview:false, confirm:confirmValue.replace(/\s/g,'')}}); }
+      catch(e){ toastErr(e); go.disabled=false; go.textContent='Выполнить'; return; }
+      finished=true;
+      if(opts.onDone) try{ opts.onDone(r); }catch(_){}
+      if(form) form.remove();
+      conf.innerHTML='';
+      box.innerHTML=`<div class="hint okbox">✅ ${esc(r.summary)}${r.op_id?` Операция №${r.op_id} — в истории групповых действий.`:''}</div>`+bulkResultHtml(r, false);
+      bulkWireResults(box, r, false);
+      m.foot.innerHTML=`${(r.jobs&&r.jobs.length)?'<button class="btn" data-jobs>⚙️ Открыть очередь заданий</button>':''}<button class="btn primary" data-close>Готово</button>`;
+      const jb=m.foot.querySelector('[data-jobs]'); if(jb) jb.onclick=()=>{ m.close(); location.hash='#/jobs'; };
+      m.foot.querySelector('[data-close]').onclick=()=>{ m.close(); if(State.view==='accounts') route(); };
+      toast('Готово', r.summary, (r.counts.fail?'warn':'success'), 7000);
+    };
+    refresh();
+  });
+}
+
+// ---------- История групповых действий ----------
+async function loadBulkHistory(box){
+  if(!box) return;
+  let d;
+  try{ d=await api('/accounts/bulk/history?limit=30',{bg:true}); }catch(e){ box.innerHTML=`<div class="empty">${esc(e.message)}</div>`; return; }
+  const items=d.items||[];
+  if(!items.length){ box.innerHTML='<div class="empty">Групповых действий ещё не было.</div>'; return; }
+  box.innerHTML=`<div class="table-wrap"><table class="tbl"><thead><tr><th>№</th><th>Когда</th><th>Кто</th><th>Действие</th><th>Ящиков</th><th>Итог</th><th></th></tr></thead><tbody>${items.map(o=>`<tr>
+      <td class="muted nowrap">${o.id}</td><td class="small nowrap">${esc(fmtDate(o.created_at))}</td><td class="small">${esc(o.user)}</td>
+      <td>${esc(o.label)}</td><td class="small">${fmtNum(o.total)}</td>
+      <td class="small"><span class="tag ok">выполнено ${fmtNum(o.ok)}</span>${o.skipped?` <span class="tag">пропущено ${fmtNum(o.skipped)}</span>`:''}${o.failed?` <span class="tag err">ошибок ${fmtNum(o.failed)}</span>`:''}${o.jobs?` <span class="tag">заданий ${fmtNum(o.jobs)}</span>`:''}</td>
+      <td style="text-align:right"><button class="btn sm" data-op="${o.id}">Подробнее</button></td></tr>`).join('')}</tbody></table></div>`;
+  box.querySelectorAll('[data-op]').forEach(b=>b.onclick=()=>bulkOpModal(parseInt(b.dataset.op,10), box));
+}
+
+async function bulkOpModal(opId, historyBox){
+  let o;
+  try{ o=await api(`/accounts/bulk/history/${opId}`); }catch(e){ return toastErr(e); }
+  const pr=o.job_progress||{};
+  const jobsTotal=Object.values(pr).reduce((s,n)=>s+n,0);
+  const doneJobs=(pr.success||0)+(pr.partial||0)+(pr.failed||0)+(pr.cancelled||0);
+  const params=Object.entries(o.params||{}).filter(([k,v])=>v!==''&&v!==null&&v!==undefined)
+    .map(([k,v])=>`<span class="tag">${esc(k)}: ${esc(typeof v==='object'?JSON.stringify(v):String(v))}</span>`).join(' ');
+  const r={total:o.total, counts:{ok:o.ok, skip:o.skipped, fail:o.failed}, results:o.results||[], reasons:{}, warnings:[], jobs:[]};
+  (o.results||[]).forEach(x=>{ if(x.status==='skip') r.reasons[x.detail]=(r.reasons[x.detail]||0)+1; });
+  const m=modal(`Групповое действие №${o.id}: ${o.label}`, `
+    <div class="kv"><div class="k">Когда и кто</div><div>${esc(fmtDate(o.created_at))} · ${esc(o.user)}</div></div>
+    ${params?`<div class="kv"><div class="k">Параметры</div><div>${params}</div></div>`:''}
+    <div class="kv"><div class="k">Итог</div><div>${esc(o.summary)}</div></div>
+    ${jobsTotal?`<div class="card" style="margin:12px 0">
+      <b>Задания операции: ${fmtNum(doneJobs)} из ${fmtNum(jobsTotal)} завершены</b>
+      <div class="progress" style="margin:8px 0"><span style="width:${Math.round(100*doneJobs/Math.max(1,jobsTotal))}%"></span></div>
+      <div class="small">${Object.entries(pr).map(([s,n])=>`<span class="badge ${esc(s)}">${esc(STATUS_LBL[s]||s)}: ${fmtNum(n)}</span>`).join(' ')}</div>
+      ${o.jobs_active?`<button class="btn danger sm" id="opCancel" style="margin-top:10px">⏹️ Отменить незавершённые (${fmtNum(o.jobs_active)})</button>`:''}
+    </div>`:''}
+    <div data-res>${bulkResultHtml(r, false)}</div>`, {wide:true});
+  bulkWireResults(m.body.querySelector('[data-res]'), r, false);
+  const cb=$('#opCancel', m.el);
+  if(cb) cb.onclick=async()=>{
+    if(!await confirmDlg('Отменить незавершённые задания?', `Задания этой операции, которые ещё ждут очереди или выполняются (${o.jobs_active}), будут отменены. Уже сделанное останется.`, {okText:'Отменить задания'})) return;
+    try{ const res=await api(`/accounts/bulk/history/${o.id}/cancel`,{method:'POST'}); toast('Готово', `Отменено заданий: ${res.cancelled}`); m.close(); bulkOpModal(opId, historyBox); if(historyBox) loadBulkHistory(historyBox); }
+    catch(e){ toastErr(e); }
+  };
+}
+
+// ---------- Добавление ящиков списком ----------
+function bulkCreateModal(){
+  State.bulkActions=null;
+  bulkMeta().then(meta=>{
+    const d=meta.create_defaults||{};
+    const m=modal('Добавить ящики списком', `
+      <p class="muted" style="margin-top:0">По одному ящику в строке: <b>адрес;пароль</b>. Пароль можно не указывать —
+        такой ящик заведётся выключенным, а пароли загрузите потом файлом («Загрузить пароли»). Подойдут и две колонки,
+        скопированные из Excel, и строки вида «Иванов Иван &lt;ivanov@company.ru&gt;;пароль». Если адрес есть в
+        справочнике сотрудников, ящик получит ФИО и сразу свяжется с карточкой.</p>
+      <div class="form-row"><label>Список ящиков</label><textarea id="c-text" rows="7" class="mono" placeholder="ivanov@company.ru;Пароль1&#10;petrova@company.ru"></textarea></div>
+      <div class="grid cols-2">
+        <div class="form-row"><label>IMAP-сервер</label><input type="text" id="c-host" value="${esc(d.host||'')}" placeholder="imap.company.ru"></div>
+        <div class="form-row"><label>Порт</label><input type="number" id="c-port" min="1" max="65535" value="${esc(d.port||993)}"></div>
+      </div>
+      <div class="grid cols-2">
+        <div class="form-row"><label>Шифрование</label><select id="c-sec">
+          <option value="ssl" ${d.security!=='starttls'&&d.security!=='plain'?'selected':''}>SSL/TLS (порт 993)</option>
+          <option value="starttls" ${d.security==='starttls'?'selected':''}>STARTTLS (порт 143)</option>
+          <option value="plain" ${d.security==='plain'?'selected':''}>Без шифрования</option></select></div>
+        <div class="form-row"><label>Вход в ящики</label><select id="c-auth"><option value="password">по паролю ящика</option>
+          ${d.master?'<option value="master">через администратора почты</option>':''}</select></div>
+      </div>
+      <div class="form-row check"><span class="switch"><input type="checkbox" id="c-en" checked><span class="track"></span></span><label>Сразу включить ящики, у которых есть пароль</label></div>
+      <div class="form-row check"><span class="switch"><input type="checkbox" id="c-sch" ${d.global_schedule?'':'checked'}><span class="track"></span></span><label>Завести каждому своё расписание копирования</label></div>
+      <div class="form-row" id="c-timerow"><label>Время копирования (каждый день)</label><input type="time" id="c-time" value="02:00"></div>
+      ${d.global_schedule?'<div class="hint" style="margin-bottom:12px">🔁 Включено копирование всех ящиков по очереди — новые ящики попадут в него и без своего расписания.</div>':''}
+      <div data-preview></div>`,
+      {wide:true, footer:'<button class="btn ghost" data-c>Отмена</button><button class="btn" data-check>Проверить</button><button class="btn primary" data-go disabled>Добавить</button>'});
+    const g=x=>m.body.querySelector(x);
+    const box=g('[data-preview]'), go=m.foot.querySelector('[data-go]');
+    const syncTime=()=>{ g('#c-timerow').style.display=g('#c-sch').checked?'':'none'; };
+    g('#c-sch').addEventListener('change', syncTime); syncTime();
+    const body=(preview)=>({text:g('#c-text').value, host:g('#c-host').value.trim(), port:parseInt(g('#c-port').value||'993',10),
+      security:g('#c-sec').value, auth_type:g('#c-auth').value, enable:g('#c-en').checked,
+      schedule_time:g('#c-sch').checked?(g('#c-time').value||''):'', preview});
+    let seq=0;
+    const check=async()=>{
+      const my=++seq; go.disabled=true;
+      if(!g('#c-text').value.trim()){ box.innerHTML=''; return; }
+      box.innerHTML='<div class="empty"><span class="spinner"></span> Проверяем список…</div>';
+      try{
+        const r=await api('/accounts/bulk-create',{method:'POST',body:body(true)});
+        if(my!==seq) return;
+        box.innerHTML=bulkResultHtml(r, true); bulkWireResults(box, r, true);
+        go.disabled=!r.counts.ok; go.textContent=r.counts.ok?`Добавить ${fmtNum(r.counts.ok)} ${plural(r.counts.ok,'ящик','ящика','ящиков')}`:'Добавлять нечего';
+      }catch(e){ if(my!==seq) return; box.innerHTML=`<div class="hint warnbox">⚠️ ${esc(e.message)}</div>`; }
+    };
+    let t=null;
+    m.body.addEventListener('input', ()=>{ clearTimeout(t); t=setTimeout(check, 700); });
+    m.body.addEventListener('change', ()=>{ clearTimeout(t); t=setTimeout(check, 200); });
+    m.foot.querySelector('[data-check]').onclick=check;
+    m.foot.querySelector('[data-c]').onclick=()=>m.close();
+    go.onclick=async()=>{
+      go.disabled=true; go.innerHTML='<span class="spinner"></span> Добавляем…';
+      try{
+        const r=await api('/accounts/bulk-create',{method:'POST',body:body(false)});
+        box.innerHTML=`<div class="hint okbox">✅ ${esc(r.summary)}</div>`+bulkResultHtml(r, false); bulkWireResults(box, r, false);
+        m.foot.innerHTML='<button class="btn primary" data-close>Готово</button>';
+        m.foot.querySelector('[data-close]').onclick=()=>{ m.close(); route(); };
+        g('#c-text').value='';
+        toast('Ящики добавлены', r.summary);
+      }catch(e){ toastErr(e); go.disabled=false; go.textContent='Добавить'; }
+    };
+  }).catch(toastErr);
+}
+
+// ---------- Кнопки на странице ящиков ----------
+/** «Копия всех ящиков с нуля»: групповое действие над всеми включёнными ящиками. */
+function rebuildAllModal(){
+  const accs=State.accounts||[];
+  const ids=accs.filter(a=>a.enabled).map(a=>a.id);
+  if(!ids.length) return toast('Нет включённых ящиков','','warn');
+  bulkDialog('rebuild_full', ids, {}, {title:'🧨 Копия всех ящиков с нуля', intro:`
+    <p style="margin-top:0">Для каждого включённого ящика прежняя локальная копия будет перенесена в <b>карантин</b>
+      («Прежние копии»), а все письма — скачаны с почтового сервера заново.</p>
+    <ul class="small" style="margin:0 0 12px;padding-left:20px;line-height:1.6">
+      <li>Письма, которых на сервере уже нет, останутся только в карантине: в просмотре, поиске и экспорте их не будет.</li>
+      <li>Карантин занимает место на диске, пока вы его не удалите (Групповые действия → «Удалить прежние копии»).</li>
+      <li>Все письма скачиваются заново — это долго и нагружает почтовый сервер; ящики идут через общую очередь.</li>
+      <li>Ящики с удержанием архива, выключенные и без пароля пропускаются.</li>
+      <li>Если нужно лишь вернуть пропавшие файлы, безопаснее «Докачать потерянные письма» — ничего не удаляется.</li>
+    </ul>`});
+}
+
+/** Список ящиков файлом Excel. */
+async function exportAccountList(ids){
+  try{
+    await apiDownload('/accounts/export-list', {ids: ids&&ids.length?ids:null, format:'xlsx'}, 'mailboxes.xlsx');
+    toast('Список выгружен', ids&&ids.length?`Ящиков: ${fmtNum(ids.length)}`:'Все ящики');
+  }catch(e){ toastErr(e); }
+}
+
+/** Скачать файл, который сервер отдаёт на POST-запрос. */
+async function apiDownload(path, body, fallbackName){
+  const res=await fetch('/api'+path, {method:'POST', headers:{'Content-Type':'application/json','X-Requested-With':'fetch'}, body:JSON.stringify(body||{})});
+  if(!res.ok){
+    let msg='Ошибка '+res.status;
+    try{ const d=await res.json(); msg=d.message||(typeof d.detail==='string'?d.detail:'')||msg; }catch(_){}
+    if(res.status===401) sessionGone();
+    throw new Error(msg);
+  }
+  const blob=await res.blob();
+  const cd=res.headers.get('content-disposition')||'';
+  const mm=/filename="([^"]+)"/.exec(cd);
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob); a.download=(mm&&mm[1])||fallbackName;
+  document.body.appendChild(a); a.click();
+  setTimeout(()=>{ URL.revokeObjectURL(a.href); a.remove(); }, 1500);
 }
 
 function fieldHelp(group, key){ return (State.help && State.help[group] && State.help[group][key]) || null; }
@@ -1583,8 +2306,9 @@ function purgeModal(a){
 }
 
 async function retentionModal(a){
-  let cur = a.retention_days;
-  if(cur===undefined){ try{ cur=(await api(`/accounts/${a.id}`)).retention_days; }catch(e){ cur=-1; } }
+  let cur = a.retention_days, retired = 0;
+  try{ const full=await api(`/accounts/${a.id}`); cur=full.retention_days; retired=full.retired||0; }
+  catch(e){ if(cur===undefined) cur=-1; }
   const label = cur===-1?'глобальная настройка':(cur===0?'хранить всё (бессрочно)':`последние ${cur} дн.`);
   const m=modal(`Хранение копий: ${a.name}`, `
     <p class="muted">Сколько дней хранить <b>локальные копии</b> писем этого ящика от текущей даты. Копии старше выбранного срока будут автоматически удаляться (ежедневная очистка). На письма на самом сервере это не влияет.</p>
@@ -1595,8 +2319,19 @@ async function retentionModal(a){
       <button class="btn ${cur===0?'primary':''}" data-days="0">♾️ Хранить всё</button>
     </div>
     <div class="form-row"><label>Свой срок (дней, 0 = хранить всё, пусто = глобально)</label>
-      <input id="ret-custom" type="number" min="0" placeholder="напр. 30"></div>`,
+      <input id="ret-custom" type="number" min="0" placeholder="напр. 30"></div>
+    ${retired?`<div class="hint" style="margin-top:12px">Отсеяно по сроку хранения: <b>${fmtNum(retired)}</b> ${plural(retired,'письмо','письма','писем')} —
+      копирование их не скачивает (они старше срока) или очистка уже удалила их из архива, а на почтовом сервере они ещё лежат.
+      <div style="margin-top:8px"><button class="btn sm" data-forget>Забыть отсеянные письма</button></div>
+      <div class="small muted" style="margin-top:6px">Следующее копирование заново проверит даты этих писем на сервере: моложе срока — скачаются,
+      старше — снова будут пропущены. Нужно, если часы сервера архива уходили вперёд или у писем на почтовом сервере были неверные даты.</div></div>`:''}`,
     {footer:`<button class="btn ghost" data-c>Закрыть</button><button class="btn primary" data-save>Сохранить свой срок</button>`});
+  const fg=m.body.querySelector('[data-forget]');
+  if(fg) fg.onclick=async()=>{
+    if(!await confirmDlg('Забыть отсеянные письма?', `Следующее копирование ящика «${a.name}» заново проверит даты ${fmtNum(retired)} ${plural(retired,'письма','писем','писем')} на сервере. Письма моложе срока хранения скачаются.`, {okText:'Забыть', okClass:'primary'})) return;
+    try{ const r=await api(`/accounts/${a.id}/retired/clear`,{method:'POST'}); toast('Готово', `Забыто: ${fmtNum(r.cleared)}. Проверка — при следующем копировании.`); m.close(); }
+    catch(e){ toastErr(e); }
+  };
   const apply=async(days)=>{
     try{ const r=await api(`/accounts/${a.id}/retention`,{method:'POST',body:{days:days,run_now:true}});
       toast('Сохранено', days>0?`Хранить последние ${days} дн. Старые копии очищаются ежедневно.`:(days===0?'Хранить всё':'Глобальная настройка'));
@@ -1735,12 +2470,12 @@ function renderJobsRows(jobs){
   jobs.forEach(j=>{
     const prog=jobProgressHtml(j);
     const tr=h(`<tr data-job="${j.id}">
-      <td class="muted">${j.id}</td>
+      <td class="muted nowrap">${j.id}</td>
       <td>${esc(j.type_label)}</td>
       <td class="small">${esc(j.account_name||accName(j.account_id))||'—'}</td>
       <td><span class="badge ${j.status}">${esc(j.status_label)}</span></td>
       <td style="min-width:160px" data-prog>${prog}</td>
-      <td class="small muted">${fmtDate(j.created_at)}</td>
+      <td class="small muted nowrap">${fmtDate(j.created_at)}</td>
       <td style="text-align:right;white-space:nowrap">
         <button class="btn sm" data-info>Детали</button>
         ${(j.status==='running'||j.status==='queued') && canTouchJob(j)?`<button class="btn danger sm" data-cancel>Отмена</button>`:''}
@@ -1788,13 +2523,56 @@ function jobProgressHtml(j){
   return j.status==='running' ? '<span class="muted small">выполняется…</span>' : '—';
 }
 
+//: Подписи полей итога задания (остальные показываются как есть).
+const RESULT_LBL={summary:'Итог', final_status:'Статус итога', total:'Всего ящиков', ok:'Успешно', partial:'Частично',
+  failed:'С ошибкой', skipped:'Пропущено', messages:'Новых писем', bytes:'Скачано', left:'Не успели',
+  messages_new:'Новых писем', bytes_new:'Скачано', errors:'Ошибок', messages_failed:'Сервер не отдал писем',
+  messages_vanished:'Удалено на сервере во время копирования', reconnects:'Переподключений', rebuild:'Режим пересоздания',
+  empty_unreadable_folders:'Пустые нечитаемые папки', container_folders:'Папки-контейнеры',
+  known_unreadable_folders:'Давно нечитаемые папки', purged:'Удалено ящиков', quarantines:'Удалено прежних копий',
+  files:'Файлов', freed:'Освобождено', removed:'Удалено писем', restored:'Восстановлено', missing:'Отсутствует файлов',
+  corrupt:'Повреждено', unreadable:'Не читается', no_key:'Без ключа шифрования', exported:'Выгружено писем',
+  path:'Файл', size:'Размер', messages_relinked:'Узнано в архиве после смены нумерации (не скачивались)',
+  messages_outside_retention:'Старше срока хранения — не скачано', with_problems:'С неоткрывающимися папками',
+  messages_lost:'Писем в неоткрывающихся папках', indexed:'Переиндексировано писем'};
+const RESULT_BYTES=new Set(['bytes','bytes_new','freed','size']);
+
 async function jobDetails(id){
   const j=await api(`/jobs/${id}`); const ev=await api(`/jobs/${id}/events`);
   // Непрочитанные папки показываем отдельным блоком с кнопкой: так их можно
   // сразу перестать копировать, а не искать ящик и править список руками.
   const skipped=(j.result&&j.result.skipped_folders)||[];
-  const resEntries=j.result?Object.entries(j.result).filter(([k])=>k!=='skipped_folders'):[];
-  const res=resEntries.map(([k,v])=>`<div class="kv"><div class="k">${esc(k)}</div><div>${esc(typeof v==='object'?JSON.stringify(v):v)}</div></div>`).join('');
+  // Длинные списки результата показываются таблицами ниже, а не строкой JSON.
+  const LISTS=new Set(['skipped_folders','items','skip_reasons','problems','rebuild_info','hosts_down','not_reached','final_status']);
+  // Нули «частично / пропущено / не успели» ничего не говорят — не загромождаем ими итог.
+  const HIDE_ZERO=new Set(['partial','skipped','left','messages_relinked','messages_outside_retention','messages_lost']);
+  const notReached=(j.result&&Array.isArray(j.result.not_reached))?j.result.not_reached:[];
+  const resEntries=j.result?Object.entries(j.result).filter(([k,v])=>!LISTS.has(k) && !(HIDE_ZERO.has(k) && v===0)):[];
+  const items=(j.result&&Array.isArray(j.result.items))?j.result.items:[];
+  const probs=(j.result&&Array.isArray(j.result.problems))?j.result.problems:[];
+  const IST={success:['ok','успешно'],partial:['warn','частично'],failed:['err','ошибка'],skipped:['','пропущен']};
+  // сначала ящики с ошибкой, неполные и пропущенные — среди сотен удачных их иначе не найти
+  const IRANK={failed:0, partial:1, skipped:2, success:3};
+  // Что считает числовая колонка — зависит от задания.
+  const NCOL={backup_all:'Новых писем', quarantine_check:'Только в прежней', quarantine_rescue:'Возвращено писем',
+              folders_check:'Проблемных папок', search_reindex:'Писем'}[j.type]||'Новых писем';
+  const ITEMS_TITLE={quarantine_check:'Прежние копии', quarantine_rescue:'Прежние копии'}[j.type]||'Ящики';
+  const hasNum=items.some(it=>it.new!==undefined);
+  const itemsBlock = items.length ? `<h3 style="margin-top:16px">${ITEMS_TITLE} (${fmtNum(items.length)})</h3>
+    <div class="table-wrap" style="max-height:320px;overflow:auto"><table class="tbl"><thead><tr><th>${ITEMS_TITLE==='Ящики'?'Ящик':'Каталог'}</th><th>Итог</th>${hasNum?`<th>${NCOL}</th>`:''}<th>Подробности</th></tr></thead><tbody>
+    ${items.slice().reverse().sort((a,b)=>(IRANK[a.status]??3)-(IRANK[b.status]??3)).map(it=>{ const [cls,lbl]=IST[it.status]||['',it.status]; return `<tr><td>${esc(it.name)}</td><td><span class="tag ${cls}">${esc(lbl)}</span></td>
+      ${hasNum?`<td class="small">${fmtNum(it.new||0)}${it.bytes?` (${esc(fmtBytes(it.bytes))})`:''}</td>`:''}<td class="small muted">${esc(it.detail||'')}</td></tr>`; }).join('')}
+    </tbody></table></div>` : '';
+  const probBlock = (probs.length ? `<div class="card warn-card" style="margin:14px 0"><b>Не обработано (${probs.length})</b>
+    <div class="small" style="margin-top:6px">${probs.map(esc).join('<br>')}</div></div>` : '')
+    + (notReached.length ? `<div class="card warn-card" style="margin:14px 0"><b>Не дошла очередь (${fmtNum(notReached.length)})</b>
+    <div class="small muted" style="margin-top:4px">В следующий проход эти ящики пойдут первыми.</div>
+    <div class="small" style="margin-top:6px">${notReached.map(esc).join(', ')}</div></div>` : '');
+  const res=resEntries.map(([k,v])=>{
+    const label=RESULT_LBL[k]||k;
+    const val=(RESULT_BYTES.has(k) && typeof v==='number') ? `${fmtBytes(v)}` : (typeof v==='object'?JSON.stringify(v):v);
+    return `<div class="kv"><div class="k">${esc(label)}</div><div>${esc(val)}</div></div>`;
+  }).join('');
   const evs=ev.map(e=>`<div class="l-${e.level}">${fmtDate(e.ts)} [${e.level}] ${esc(e.message)}</div>`).join('')||'<span class="muted">нет событий</span>';
   const skipBlock = skipped.length ? `
     <div class="card" style="margin:14px 0;border-color:var(--warn)">
@@ -1803,7 +2581,7 @@ async function jobDetails(id){
       <div class="muted small">Причина у каждой папки — в журнале событий ниже. Если папку на почтовом
         сервере не восстановить, добавьте её в «Пропускать папки» — тогда копия перестанет считаться
         неполной из-за неё.</div>
-      ${(j.account_id && !isMailbox())?'<button class="btn small" id="jobExclude" style="margin-top:10px">🚫 Больше не копировать эти папки</button>':''}
+      ${(j.account_id && isAdmin())?'<button class="btn small" id="jobExclude" style="margin-top:10px">🚫 Больше не копировать эти папки</button>':''}
     </div>` : '';
   const m=modal(`Задание #${j.id} — ${j.type_label}`, `
     <div class="kv"><div class="k">Статус</div><div><span class="badge ${j.status}">${esc(j.status_label)}</span></div></div>
@@ -1811,8 +2589,11 @@ async function jobDetails(id){
     <div class="kv"><div class="k">Попыток</div><div>${j.attempts}/${j.max_attempts}</div></div>
     ${j.error?`<div class="kv"><div class="k">Ошибка</div><div style="color:var(--danger)">${esc(j.error)}</div></div>`:''}
     ${res}
+    ${j.restricted?'<div class="hint" style="margin-top:10px">Подробности этого задания (списки писем, файлов, параметры) видит администратор.</div>':''}
     ${skipBlock}
-    <h3 style="margin-top:16px">Журнал событий</h3><div class="log-view">${evs}</div>`, {wide:true});
+    ${probBlock}
+    ${itemsBlock}
+    ${j.restricted?'':`<h3 style="margin-top:16px">Журнал событий</h3><div class="log-view">${evs}</div>`}`, {wide:true});
   const ex=$('#jobExclude', m.el);
   if(ex) ex.onclick=async()=>{
     const ok=await confirmDlg('Больше не копировать эти папки?',
@@ -1867,58 +2648,160 @@ async function viewExports(c){
 // ===================================================================
 async function viewSchedules(c){
   const [sch, accs]=await Promise.all([api('/schedules'), api('/accounts')]); State.accounts=accs;
-  c.innerHTML=''; c.appendChild(h(`<div class="section-title"><h2 style="margin:0">Расписания</h2><div class="spacer"></div><button class="btn primary" id="add" ${accs.length?'':'disabled'}>+ Добавить расписание</button></div>`));
-  $('#add',c).onclick=()=>scheduleModal(null, accs);
-  if(!accs.length){ c.appendChild(h('<div class="card"><div class="empty">Сначала добавьте хотя бы один ящик.</div></div>')); return; }
-  if(!sch.length){ c.appendChild(h('<div class="card"><div class="empty"><div class="big">⏰</div>Нет расписаний. Добавьте, чтобы бэкап шёл автоматически.</div></div>')); return; }
-  const wrap=h('<div class="card table-wrap"><table class="tbl"><thead><tr><th>Ящик</th><th>Задание</th><th>Когда</th><th>Последний</th><th>Следующий</th><th>Вкл</th><th></th></tr></thead><tbody></tbody></table></div>');
+  c.innerHTML='';
+  // Оператор видит расписания, но менять их может только администратор.
+  const admin=isAdmin();
+  c.appendChild(h(`<div class="section-title"><h2 style="margin:0">Расписания</h2><div class="spacer"></div>
+    ${admin?`<button class="btn" id="addAll" ${accs.length?'':'disabled'} title="Одно задание в заданное время копирует все включённые ящики строго по одному">🔁 Копирование всех ящиков по очереди</button>
+    <button class="btn primary" id="add" ${accs.length?'':'disabled'}>+ Добавить расписание</button>`:'<span class="muted small">только просмотр — расписания меняет администратор</span>'}</div>`));
+  if(admin){
+    $('#add',c).onclick=()=>scheduleModal(null, accs, sch);
+    $('#addAll',c).onclick=()=>scheduleModal(null, accs, sch, {job_type:'backup_all', cron_expr:'0 1 * * *'});
+  }
+  if(!accs.length){ c.appendChild(h(`<div class="card"><div class="empty">${admin?'Сначала добавьте хотя бы один ящик.':'Ящиков пока нет.'}</div></div>`)); return; }
+  if(!sch.length){ c.appendChild(h(`<div class="card"><div class="empty"><div class="big">⏰</div>Нет расписаний.${admin?` Добавьте, чтобы бэкап шёл автоматически.<br><br>
+      <span class="small">Чтобы каждую ночь копировать все ящики строго по одному — нажмите «Копирование всех ящиков по очереди».</span>`:' Их настраивает администратор.'}</div></div>`)); return; }
+  // Общее расписание «все ящики по очереди» и собственные расписания ящиков вместе
+  // означают, что ящики копируются дважды — предупреждаем и предлагаем убрать лишнее.
+  const global=sch.filter(s=>s.job_type==='backup_all' && s.enabled);
+  const ownIds=[...new Set(sch.filter(s=>s.account_id && s.job_type==='backup' && s.enabled).map(s=>s.account_id))];
+  if(global.length && ownIds.length){
+    const warn=h(`<div class="card warn-card" style="margin-bottom:14px">⚠️ Включено копирование всех ящиков по очереди, и при этом у
+      <b>${fmtNum(ownIds.length)}</b> ${plural(ownIds.length,'ящика','ящиков','ящиков')} есть свои расписания копирования — такие ящики копируются дважды.
+      ${admin?'<button class="btn sm" id="dropOwn" style="margin-left:8px">Удалить свои расписания ящиков…</button>':''}</div>`);
+    c.appendChild(warn);
+    const dropOwn=$('#dropOwn',warn);
+    if(dropOwn) dropOwn.onclick=async()=>{ if(await bulkDialog('schedule_remove', ownIds, {which:'backup'})) route(); };
+  }
+  const wrap=h('<div class="card table-wrap"><table class="tbl sched-tbl"><thead><tr><th>Ящик</th><th>Задание</th><th>Когда</th><th>Последний запуск</th><th>Следующий</th><th>Вкл</th><th></th></tr></thead><tbody></tbody></table></div>');
   const tb=wrap.querySelector('tbody');
-  sch.forEach(s=>{
-    const when=s.kind==='cron'?`cron: <code>${esc(s.cron_expr)}</code>`:`каждые ${Math.round(s.interval_seconds/60)} мин`;
+  const ordered=sch.slice().sort((a,b)=>(a.account_id?1:0)-(b.account_id?1:0));
+  ordered.forEach(s=>{
+    const human=s.kind==='cron'?cronHuman(s.cron_expr):null;
+    let when=s.kind==='cron'?(human?`<span title="cron: ${esc(s.cron_expr)}">${esc(human)}</span>`:`cron: <code>${esc(s.cron_expr)}</code>`)
+                           :`каждые ${Math.round(s.interval_seconds/60)} мин`;
+    const o=s.options||{};
+    if(s.job_type==='backup_all'){
+      const extra=[];
+      if(o.pause_seconds) extra.push(`пауза ${esc(o.pause_seconds)} с`);
+      if(o.stop_at) extra.push(`не начинать после ${esc(o.stop_at)}`);
+      extra.push(o.order==='name'?'по алфавиту':'давние первыми');
+      when+=`<div class="small muted">${extra.join(' · ')}</div>`;
+    }
+    const who=s.account_id ? esc(accName(s.account_id)||('№'+s.account_id))
+      : '<b>Все включённые ящики</b><div class="small muted">по очереди, ящик за ящиком</div>';
     const tr=h(`<tr>
-      <td>${esc(accName(s.account_id))}</td>
+      <td>${who}</td>
       <td><span class="tag">${esc(JOBLBL[s.job_type]||s.job_type)}</span></td>
       <td class="small">${when}</td>
-      <td class="small muted">${fmtDate(s.last_run)}</td>
-      <td class="small muted">${fmtDate(s.next_run)}</td>
-      <td><span class="badge ${s.enabled?'success':'queued'}">${s.enabled?'да':'нет'}</span></td>
-      <td style="text-align:right;white-space:nowrap"><button class="btn sm" data-edit>✏️</button><button class="btn danger sm" data-del>✕</button></td></tr>`);
-    tr.querySelector('[data-edit]').onclick=()=>scheduleModal(s, accs);
-    tr.querySelector('[data-del]').onclick=async()=>{ if(await confirmDlg('Удалить расписание?','')){ try{await api(`/schedules/${s.id}`,{method:'DELETE'});toast('Удалено');route();}catch(e){toastErr(e);} } };
+      <td class="small muted nowrap">${fmtDate(s.last_run)}</td>
+      <td class="small muted nowrap">${fmtDate(s.next_run)}</td>
+      <td><span class="badge nowrap ${s.enabled?'success':'queued'}">${s.enabled?'да':'нет'}</span></td>
+      <td style="text-align:right;white-space:nowrap">${admin?'<button class="btn sm" data-edit title="Изменить">✏️</button><button class="btn danger sm" data-del title="Удалить">✕</button>':''}</td></tr>`);
+    if(admin){
+      tr.querySelector('[data-edit]').onclick=()=>scheduleModal(s, accs, sch);
+      tr.querySelector('[data-del]').onclick=async()=>{ if(await confirmDlg('Удалить расписание?','')){ try{await api(`/schedules/${s.id}`,{method:'DELETE'});toast('Удалено');route();}catch(e){toastErr(e);} } };
+    }
     tb.appendChild(tr);
   });
   c.appendChild(wrap);
 }
-function scheduleModal(s, accs){
+
+/** Человеческое описание простых cron-выражений: «ежедневно в 02:00». */
+function cronHuman(expr){
+  const m=/^(\d{1,2}) (\d{1,2}) \* \* (\*|1-5|2-6|0,6|6,0|[0-7])$/.exec(String(expr||'').trim());
+  if(!m || +m[1]>59 || +m[2]>23) return null;
+  const t=`${m[2].padStart(2,'0')}:${m[1].padStart(2,'0')}`;
+  const days=['воскресеньям','понедельникам','вторникам','средам','четвергам','пятницам','субботам'];
+  const d={'*':'ежедневно','1-5':'по будням','2-6':'со вторника по субботу','0,6':'по выходным','6,0':'по выходным'}[m[3]] || ('по '+days[(+m[3])%7]);
+  return `${d} в ${t}`;
+}
+
+function scheduleModal(s, accs, allSchedules, preset){
   const H=(k)=>helpIcon(fieldHelp('schedule',k));
-  s=s||{account_id:accs[0].id,kind:'cron',job_type:'backup',cron_expr:'0 3 * * *',interval_seconds:21600,enabled:true};
+  s=s||Object.assign({account_id:accs[0]?accs[0].id:null,kind:'cron',job_type:'backup',cron_expr:'0 3 * * *',interval_seconds:21600,enabled:true,options:{}}, preset||{});
+  const o=s.options||{};
   const accOpts=accs.map(a=>`<option value="${a.id}" ${a.id===s.account_id?'selected':''}>${esc(a.name)}</option>`).join('');
+  // Разбор времени из простого cron: «M H * * дни» — для полей «Когда» и «Время».
+  const cm=/^(\d{1,2}) (\d{1,2}) \* \* (\*|1-5|0,6)$/.exec(String(s.cron_expr||'').trim());
+  const when=cm?({'*':'daily','1-5':'weekdays','0,6':'weekends'}[cm[3]]):'custom';
+  const time=cm?`${cm[2].padStart(2,'0')}:${cm[1].padStart(2,'0')}`:'03:00';
   const body=`
-    <div class="form-row"><label>Ящик</label><select id="s-acc">${accOpts}</select></div>
-    <div class="grid cols-2">
-      <div class="form-row"><label>Задание ${H('job_type')}</label><select id="s-job">
-        <option value="backup"${s.job_type==='backup'?' selected':''}>Резервное копирование</option>
-        <option value="retention"${s.job_type==='retention'?' selected':''}>Очистка (ретеншн)</option>
-        <option value="verify"${s.job_type==='verify'?' selected':''}>Проверка целостности</option>
-        ${s.job_type==='restore'?'<option value="restore" selected>Восстановление</option>':''}</select></div>
-      <div class="form-row"><label>Тип ${H('kind')}</label><select id="s-kind">
-        <option value="cron"${s.kind==='cron'?' selected':''}>По времени (cron)</option>
-        <option value="interval"${s.kind==='interval'?' selected':''}>Через интервал</option></select></div>
+    <div class="form-row"><label>Что делать ${H('job_type')}</label><select id="s-job">
+      <option value="backup_all"${s.job_type==='backup_all'?' selected':''}>Копирование ВСЕХ включённых ящиков по очереди</option>
+      <option value="backup"${s.job_type==='backup'?' selected':''}>Резервное копирование одного ящика</option>
+      <option value="retention"${s.job_type==='retention'?' selected':''}>Очистка (ретеншн) ящика</option>
+      <option value="verify"${s.job_type==='verify'?' selected':''}>Проверка целостности ящика</option>
+      ${s.job_type==='restore'?'<option value="restore" selected>Восстановление ящика</option>':''}</select></div>
+    <div class="form-row" id="s-accrow"><label>Ящик</label><select id="s-acc">${accOpts}</select></div>
+    <div class="hint" id="s-allhint" style="margin-bottom:14px">🔁 В заданное время запускается <b>одно задание</b>, которое копирует все включённые ящики
+      <b>строго по одному</b>: следующий ящик начинается, когда закончен предыдущий. Сначала — ящики, которые копировались
+      давнее всего, поэтому незаконченный проход в следующий раз продолжится с тех, до кого очередь не дошла.
+      Выключенные ящики и ящики без пароля пропускаются.</div>
+    <div class="form-row"><label>Тип ${H('kind')}</label><select id="s-kind">
+      <option value="cron"${s.kind==='cron'?' selected':''}>В определённое время</option>
+      <option value="interval"${s.kind==='interval'?' selected':''}>Через интервал</option></select></div>
+    <div id="s-cronbox">
+      <div class="grid cols-2">
+        <div class="form-row"><label>Когда</label><select id="s-when">
+          <option value="daily"${when==='daily'?' selected':''}>каждый день</option>
+          <option value="weekdays"${when==='weekdays'?' selected':''}>по будням (пн–пт)</option>
+          <option value="weekends"${when==='weekends'?' selected':''}>по выходным (сб, вс)</option>
+          <option value="custom"${when==='custom'?' selected':''}>своё cron-выражение</option></select></div>
+        <div class="form-row" id="s-timerow"><label>Время</label><input type="time" id="s-time" value="${esc(time)}"></div>
+      </div>
+      <div class="form-row"><label>Cron-выражение ${H('cron_expr')}</label><input id="s-cron" type="text" value="${esc(s.cron_expr||'0 3 * * *')}">
+        <div class="hint">Примеры: <code>0 3 * * *</code> — ежедневно в 03:00; <code>0 */6 * * *</code> — каждые 6 часов; <code>30 2 * * 1</code> — по понедельникам в 02:30.</div></div>
     </div>
-    <div class="form-row" id="s-cronrow" style="display:${s.kind==='interval'?'none':'block'}"><label>Cron-выражение ${H('cron_expr')}</label><input id="s-cron" type="text" value="${esc(s.cron_expr||'0 3 * * *')}">
-      <div class="hint">Примеры: <code>0 3 * * *</code> — ежедневно в 03:00; <code>0 */6 * * *</code> — каждые 6 часов; <code>30 2 * * 1</code> — по понедельникам в 02:30.</div></div>
-    <div class="form-row" id="s-introw" style="display:${s.kind==='interval'?'block':'none'}"><label>Интервал (минут) ${H('interval_seconds')}</label><input id="s-int" type="number" min="1" value="${Math.round((s.interval_seconds||21600)/60)}"></div>
+    <div class="form-row" id="s-introw"><label>Интервал (минут) ${H('interval_seconds')}</label><input id="s-int" type="number" min="1" value="${Math.round((s.interval_seconds||21600)/60)}"></div>
+    <div id="s-allopts">
+      <div class="grid cols-2">
+        <div class="form-row"><label>Пауза между ящиками, секунд</label><input id="s-pause" type="number" min="0" max="3600" value="${esc(o.pause_seconds||0)}">
+          <div class="hint">Передышка почтовому серверу. 0 — без паузы.</div></div>
+        <div class="form-row"><label>Не начинать новые ящики после</label><input id="s-stop" type="time" value="${esc(o.stop_at||'')}">
+          <div class="hint">Например 07:00 — к началу рабочего дня. Пусто — без ограничения.</div></div>
+      </div>
+      <div class="form-row"><label>Порядок ящиков</label><select id="s-order">
+        <option value="oldest"${o.order!=='name'?' selected':''}>сначала те, что копировались давнее всего</option>
+        <option value="name"${o.order==='name'?' selected':''}>по алфавиту</option></select></div>
+      <div id="s-ownwarn"></div>
+    </div>
     <div class="form-row check"><span class="switch"><input type="checkbox" id="s-en" ${s.enabled?'checked':''}><span class="track"></span></span><label>Расписание включено</label></div>`;
   const m=modal(s.id?'Редактирование расписания':'Новое расписание', body, {footer:`<button class="btn ghost" data-c>Отмена</button><button class="btn primary" data-save>Сохранить</button>`});
   const g=x=>m.body.querySelector(x);
-  g('#s-kind').onchange=()=>{ g('#s-cronrow').style.display=g('#s-kind').value==='cron'?'block':'none'; g('#s-introw').style.display=g('#s-kind').value==='interval'?'block':'none'; };
+  const isAll=()=>g('#s-job').value==='backup_all';
+  const cronFromWhen=()=>{
+    const w=g('#s-when').value; if(w==='custom') return;
+    const [hh,mm]=(g('#s-time').value||'03:00').split(':');
+    g('#s-cron').value=`${parseInt(mm||'0',10)} ${parseInt(hh||'0',10)} * * ${({daily:'*',weekdays:'1-5',weekends:'0,6'})[w]}`;
+  };
+  const sync=()=>{
+    const all=isAll(), cron=g('#s-kind').value==='cron';
+    g('#s-accrow').style.display=all?'none':'';
+    g('#s-allhint').style.display=all?'':'none';
+    g('#s-allopts').style.display=all?'':'none';
+    g('#s-cronbox').style.display=cron?'':'none';
+    g('#s-introw').style.display=cron?'none':'';
+    g('#s-timerow').style.display=g('#s-when').value==='custom'?'none':'';
+    const own=(allSchedules||[]).filter(x=>x.account_id && x.job_type==='backup' && x.enabled);
+    g('#s-ownwarn').innerHTML = all && own.length ? `<div class="hint warnbox">⚠️ У ${fmtNum(new Set(own.map(x=>x.account_id)).size)} ящиков есть свои расписания копирования — вместе с этим они будут копироваться дважды.
+      Уберите их: «Почтовые ящики → Групповые действия → Удалить расписания» или кнопкой на странице расписаний.</div>` : '';
+  };
+  g('#s-job').onchange=sync; g('#s-kind').onchange=sync;
+  g('#s-when').onchange=()=>{ cronFromWhen(); sync(); };
+  g('#s-time').onchange=cronFromWhen; g('#s-time').oninput=cronFromWhen;
+  g('#s-cron').oninput=()=>{ g('#s-when').value='custom'; sync(); };
+  if(when!=='custom') cronFromWhen();
+  sync();
   m.foot.querySelector('[data-c]').onclick=m.close;
   m.foot.querySelector('[data-save]').onclick=async()=>{
-    // options не отправляем: при правке сервер сохраняет прежние параметры
-    // задания (раньше каждое сохранение их обнуляло).
-    const body={account_id:parseInt(g('#s-acc').value),job_type:g('#s-job').value,kind:g('#s-kind').value,
-      cron_expr:g('#s-cron').value,interval_seconds:parseInt(g('#s-int').value||'60')*60,enabled:g('#s-en').checked};
-    if(!s.id) body.options={};
+    const all=isAll();
+    const body={account_id: all?null:parseInt(g('#s-acc').value,10), job_type:g('#s-job').value, kind:g('#s-kind').value,
+      cron_expr:g('#s-cron').value, interval_seconds:parseInt(g('#s-int').value||'60',10)*60, enabled:g('#s-en').checked};
+    // Параметры: у «всех по очереди» — пауза и время; у остальных при правке их
+    // не отправляем, сервер сохраняет прежние (раньше каждое сохранение их обнуляло).
+    if(all) body.options={pause_seconds:parseInt(g('#s-pause').value||'0',10)||0, stop_at:g('#s-stop').value||'', order:g('#s-order').value};
+    else if(!s.id) body.options={};
     try{ if(s.id) await api(`/schedules/${s.id}`,{method:'PUT',body}); else await api('/schedules',{method:'POST',body}); toast('Сохранено'); m.close(); route(); }catch(e){toastErr(e);}
   };
 }
@@ -2325,14 +3208,27 @@ function monitoringCard(card, rows, set, secretsSet){
 // ===================================================================
 //  Пользователи и аудит (админ)
 // ===================================================================
+/** Что может роль — для подсказок на странице пользователей. */
+const ROLE_HELP = {
+  admin:'всё: ящики, письма, настройки, пользователи, удаление',
+  operator:'следит за копированием и запускает его: копия ящиков, «Докачать потерянные», проверки входа, папок и целостности, отмена и повтор этих заданий, журнал. Писем не читает, настроек не меняет, ничего не удаляет и не выгружает',
+};
 async function viewUsers(c){
   const users=await api('/users');
   c.innerHTML=''; c.appendChild(h('<div class="section-title"><h2 style="margin:0">Пользователи</h2><div class="spacer"></div><button class="btn primary" id="add">+ Добавить</button></div>'));
   $('#add',c).onclick=()=>userModal();
+  c.appendChild(h(`<div class="hint" style="margin-bottom:12px"><b>Администратор</b> — ${esc(ROLE_HELP.admin)}.<br>
+    <b>Оператор</b> — ${esc(ROLE_HELP.operator)}.<br>
+    Сотрудники входят в свой ящик по email и паролю ящика — отдельные пользователи для этого не нужны.</div>`));
   const wrap=h('<div class="card table-wrap"><table class="tbl"><thead><tr><th>Имя</th><th>Роль</th><th>2FA</th><th>Создан</th><th>Вход</th><th></th></tr></thead><tbody></tbody></table></div>');
   const tb=wrap.querySelector('tbody');
   users.forEach(u=>{
-    const tr=h(`<tr><td><strong>${esc(u.username)}</strong>${u.disabled?' <span class="tag">выключен</span>':''}</td><td><span class="tag">${esc(u.role)}</span></td>
+    const self=u.id===State.user.id;
+    const roleCell = self ? `<span class="tag ${u.role==='admin'?'ok':''}" title="Свою роль поменять нельзя">${esc(ROLE_LABELS[u.role]||u.role)}</span>`
+      : `<select data-role aria-label="Роль пользователя ${esc(u.username)}" title="Сменить роль (сеансы пользователя будут завершены)">
+          <option value="admin" ${u.role==='admin'?'selected':''}>администратор</option>
+          <option value="operator" ${u.role==='operator'?'selected':''}>оператор</option></select>`;
+    const tr=h(`<tr><td><strong>${esc(u.username)}</strong>${u.disabled?' <span class="tag">выключен</span>':''}</td><td>${roleCell}</td>
       <td>${u.totp_enabled?'<span class="tag ok">🔐 вкл.</span>':'<span class="tag">нет</span>'}</td>
       <td class="small muted">${fmtDate(u.created_at)}</td><td class="small muted">${fmtDate(u.last_login)}</td>
       <td style="text-align:right;white-space:nowrap"><button class="btn sm" data-pw>Пароль</button><button class="btn sm" data-logout title="Завершить все открытые сеансы этого пользователя (его текущие cookie перестанут действовать)">Завершить сеансы</button>${u.totp_enabled && u.id!==State.user.id?'<button class="btn sm" data-reset2fa title="Отключить двухфакторный вход (например, пользователь потерял телефон)">Сбросить 2FA</button>':''}<button class="btn danger sm" data-del>✕</button></td></tr>`);
@@ -2341,14 +3237,32 @@ async function viewUsers(c){
     if(r2) r2.onclick=async()=>{ if(await confirmDlg('Сбросить двухфакторный вход?',`Пользователь «${u.username}» сможет войти по одному паролю и должен будет заново привязать приложение. Все его сеансы будут завершены.`)){ try{await api(`/users/${u.id}/2fa/reset`,{method:'POST'});toast('2FA сброшена');route();}catch(e){toastErr(e);} } };
     tr.querySelector('[data-logout]').onclick=async()=>{ if(await confirmDlg('Завершить все сеансы?',`Пользователю «${u.username}» придётся войти заново на всех устройствах.`)){ try{const r=await api(`/users/${u.id}/logout-all`,{method:'POST'});toast(`Завершено сеансов: ${r.closed}`);}catch(e){toastErr(e);} } };
     tr.querySelector('[data-del]').onclick=async()=>{ if(await confirmDlg('Удалить пользователя?','')){ try{await api(`/users/${u.id}`,{method:'DELETE'});toast('Удалено');route();}catch(e){toastErr(e);} } };
+    const rs=tr.querySelector('[data-role]');
+    if(rs) rs.onchange=async()=>{
+      const role=rs.value;
+      const ok=await confirmDlg('Сменить роль?', `«${u.username}» станет: ${ROLE_LABELS[role]||role}. `+
+        (role==='operator'?'Оператор не читает письма, не меняет настроек и ничего не удаляет. ':'Администратору доступно всё. ')+
+        'Открытые сеансы пользователя будут завершены.', {okText:'Сменить', okClass:'primary'});
+      if(!ok){ rs.value=u.role; return; }
+      try{ await api(`/users/${u.id}/role`,{method:'POST',body:{role}}); toast('Роль изменена'); route(); }
+      catch(e){ rs.value=u.role; toastErr(e); }
+    };
     tb.appendChild(tr);
   });
   c.appendChild(wrap);
 }
 function userModal(){
-  const m=modal('Новый пользователь',`<div class="form-row"><label>Имя</label><input id="u-name" type="text"></div><div class="form-row"><label>Пароль</label><input id="u-pass" type="password"></div>`,{footer:`<button class="btn ghost" data-c>Отмена</button><button class="btn primary" data-ok>Создать</button>`});
+  const m=modal('Новый пользователь',`<div class="form-row"><label>Имя</label><input id="u-name" type="text" autocomplete="off"></div>
+    <div class="form-row"><label>Пароль</label><input id="u-pass" type="password" autocomplete="new-password"></div>
+    <div class="form-row"><label>Роль</label><select id="u-role">
+      <option value="operator">Оператор — следит за копированием и запускает его</option>
+      <option value="admin">Администратор — всё</option></select></div>
+    <div class="hint small" id="u-role-help"></div>`,{footer:`<button class="btn ghost" data-c>Отмена</button><button class="btn primary" data-ok>Создать</button>`});
+  const help=()=>{ const t=ROLE_HELP[m.body.querySelector('#u-role').value]||'';
+    m.body.querySelector('#u-role-help').textContent=t?t.charAt(0).toUpperCase()+t.slice(1)+'.':''; };
+  m.body.querySelector('#u-role').onchange=help; help();
   m.foot.querySelector('[data-c]').onclick=m.close;
-  m.foot.querySelector('[data-ok]').onclick=async()=>{try{await api('/users',{method:'POST',body:{username:m.body.querySelector('#u-name').value,password:m.body.querySelector('#u-pass').value}});toast('Создан');m.close();route();}catch(e){toastErr(e);}};
+  m.foot.querySelector('[data-ok]').onclick=async()=>{try{await api('/users',{method:'POST',body:{username:m.body.querySelector('#u-name').value,password:m.body.querySelector('#u-pass').value,role:m.body.querySelector('#u-role').value}});toast('Создан');m.close();route();}catch(e){toastErr(e);}};
 }
 async function viewAudit(c){
   const rows=await api('/audit');
@@ -2369,7 +3283,7 @@ const SEC_ACTIONS = {login:'вход', login_failed:'неверный логин
   login_busy:'вход по ящику: сервер занят', '2fa_enabled':'2FA включена', '2fa_disabled':'2FA выключена', '2fa_reset':'2FA сброшена',
   '2fa_code_failed':'неверный код 2FA (настройки)', '2fa_disable_bad_password':'неверный пароль при отключении 2FA',
   '2fa_recovery_regenerated':'новые резервные коды', user_password:'смена пароля', user_logout_all:'завершены сеансы',
-  user_disable:'пользователь отключён', user_create:'создан пользователь', user_delete:'удалён пользователь',
+  user_disable:'пользователь отключён', user_create:'создан пользователь', user_delete:'удалён пользователь', user_role:'смена роли',
   create_admin:'создан администратор', account_logout_sessions:'завершены сеансы сотрудника', security_unblock:'снята блокировка',
   search:'поиск по почте'};
 const SEC_KIND = {'':'пароль', otp:'код 2FA', imap:'пароль ящика'};
@@ -2664,7 +3578,7 @@ async function loadMailMessage(accId, pk){
 // ===================================================================
 const CHART_COLORS = ['#2f6fed','#1f9d55','#d98a00','#d64545','#2b8ca6','#7c5cff','#e0567f','#2bb0a6','#b0862e','#8e6bd8','#3aa0a0','#c76b3a'];
 const STATUS_LBL = {queued:'в очереди',running:'выполняется',success:'успешно',failed:'ошибка',cancelled:'отменено',partial:'частично'};
-const JOBLBL = {backup:'Резервное копирование',restore:'Восстановление',export:'Экспорт',import_pst:'Импорт PST',test:'Проверка подключения',retention:'Очистка (ретеншн)',verify:'Проверка целостности',analyze:'Глубокий анализ писем',sync_employees:'Синхронизация сотрудников',storage_convert:'Шифрование копии',check_logins:'Проверка паролей',replicate:'Копия вне сервера',db_snapshot:'Снимок базы',search_index:'Индексация поиска',dedup_report:'Отчёт об одинаковых вложениях'};
+const JOBLBL = {backup:'Резервное копирование',restore:'Восстановление',export:'Экспорт',import_pst:'Импорт PST',test:'Проверка подключения',retention:'Очистка (ретеншн)',verify:'Проверка целостности',analyze:'Глубокий анализ писем',sync_employees:'Синхронизация сотрудников',storage_convert:'Шифрование копии',check_logins:'Проверка паролей',replicate:'Копия вне сервера',db_snapshot:'Снимок базы',search_index:'Индексация поиска',dedup_report:'Отчёт об одинаковых вложениях',cleanup:'Удаление архивов и прежних копий',backup_all:'Копирование всех ящиков по очереди',quarantine_check:'Сравнение прежней копии с новой',quarantine_rescue:'Возврат писем из прежней копии',folders_check:'Проверка папок на сервере',search_reindex:'Переиндексация поиска'};
 function cvar(n,f){ const v=getComputedStyle(document.documentElement).getPropertyValue(n).trim(); return v||f; }
 function fmtNum(n){ return Number(n||0).toLocaleString('ru-RU'); }
 function trunc(s,n){ s=String(s==null?'':s); return s.length>n? s.slice(0,n-1)+'…':s; }
@@ -2874,8 +3788,9 @@ async function viewAnalytics(c){
     }
   }
 
-  // Одинаковые вложения: отчёт догружается отдельно (его подсчёт — фоновое задание)
-  if(!scope){
+  // Одинаковые вложения: отчёт догружается отдельно (его подсчёт — фоновое задание).
+  // Он читает письма — только администратору.
+  if(!scope && isAdmin()){
     const ddWrap=h('<div id="dedupWrap"></div>'); c.appendChild(ddWrap);
     loadDedup(ddWrap, redraws);
   }
@@ -2886,7 +3801,7 @@ async function viewAnalytics(c){
     <div class="card"><h3>🛡️ Топ действий (аудит)</h3><div class="an-chart" id="auditBars"></div></div></div>`);
   c.appendChild(botGrid);
   const up=d.schedules.upcoming;
-  $('#upNext',botGrid).innerHTML = up.length? `<table class="an-mini-table">${up.map(u=>`<tr><td>${esc(accName(u.account_id)||('#'+u.account_id))}</td><td>${esc(JOBLBL[u.job_type]||u.job_type)}</td><td>${fmtDate(u.next_run)}</td></tr>`).join('')}</table>` : '<div class="an-empty-hint">Нет включённых расписаний</div>';
+  $('#upNext',botGrid).innerHTML = up.length? `<table class="an-mini-table">${up.map(u=>`<tr><td>${u.account_id?esc(accName(u.account_id)||('#'+u.account_id)):'все ящики по очереди'}</td><td>${esc(JOBLBL[u.job_type]||u.job_type)}</td><td>${fmtDate(u.next_run)}</td></tr>`).join('')}</table>` : '<div class="an-empty-hint">Нет включённых расписаний</div>';
   if(d.audit_top.length) reg(()=>chartHBars($('#auditBars',botGrid), d.audit_top, {colorByIndex:true, labelChars:22, height:Math.max(80,d.audit_top.length*24)}));
   else $('#auditBars',botGrid).innerHTML='<div class="an-empty-hint">Нет записей аудита</div>';
 

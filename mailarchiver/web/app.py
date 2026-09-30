@@ -26,6 +26,7 @@ from ..service import Services
 from ..version import __version__, APP_TITLE
 from . import auth as auth_mod
 from .api import router as api_router
+from .bulk_api import router as bulk_router
 from .proxy import ProxyHeadersMiddleware, SecurityHeadersMiddleware
 from .ws import router as ws_router
 
@@ -150,6 +151,8 @@ def create_app() -> FastAPI:
                        trusted=_cfg.server.get("trusted_proxies", "127.0.0.1, ::1"),
                        enabled=bool(_cfg.server.get("behind_proxy", False)))
 
+    # групповые действия — раньше общих путей /accounts/{id}: «bulk» не номер ящика
+    app.include_router(bulk_router)
     app.include_router(api_router)
     app.include_router(ws_router)
 
@@ -185,10 +188,14 @@ def create_app() -> FastAPI:
             else:
                 text = "некорректное значение"
             parts.append(f"{loc or 'запрос'} — {text}")
+        # Присланные значения в ответ не возвращаем: среди них бывают пароли
+        # (вход, список ящиков с паролями), а ответы оседают в журналах прокси.
+        details = [{k: v for k, v in err.items() if k not in ("input", "ctx", "url")}
+                   for err in exc.errors()]
         return JSONResponse(status_code=422, content={
             "error": True, "code": "validation_error",
             "message": "Некорректные данные запроса: " + "; ".join(parts) + ".",
-            "hint": None, "detail": jsonable_encoder(exc.errors())})
+            "hint": None, "detail": jsonable_encoder(details)})
 
     @app.exception_handler(OverflowError)
     async def _overflow(request: Request, exc: OverflowError):

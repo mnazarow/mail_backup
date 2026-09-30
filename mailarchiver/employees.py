@@ -1116,6 +1116,9 @@ def account_template(svc) -> Dict[str, Any]:
         "retention_days": retention_days,
         "schedule_enabled": bool(svc.rt("employees", "account_schedule_enabled")),
         "schedule_cron": _text("account_schedule_cron", "0 2 * * *") or "0 2 * * *",
+        # Включено копирование всех ящиков по очереди — новый ящик попадёт в
+        # проход и без своего расписания; своё копировало бы его дважды.
+        "sequence_covers": global_backup_schedule_enabled(svc),
         # Вход через администратора почты — только если он включён и настроен на ТОТ ЖЕ сервер.
         "use_master": bool(svc.rt("employees", "account_use_master")) and bool(svc.rt("mailadmin", "enabled"))
         and _text("account_host").lower() == str(svc.rt("mailadmin", "host") or "").strip().lower() != "",
@@ -1140,8 +1143,18 @@ def preview_account_template(svc, full_name: str = "Иванов Иван Ива
         "enabled": tpl["enabled"], "folder_include": tpl["folder_include"],
         "folder_exclude": tpl["folder_exclude"], "retention_days": tpl["retention_days"],
         "schedule_enabled": tpl["schedule_enabled"], "schedule_cron": tpl["schedule_cron"],
+        "sequence_covers": tpl["sequence_covers"],
         "use_master": tpl["use_master"],
     }
+
+
+def global_backup_schedule_enabled(svc) -> bool:
+    """Есть ли включённое расписание «копирование всех ящиков по очереди»."""
+    try:
+        return bool(svc.db.scalar("SELECT 1 FROM schedules WHERE account_id IS NULL AND job_type=? "
+                                  "AND enabled=1 LIMIT 1", (JobType.BACKUP_ALL,)))
+    except Exception:  # noqa: BLE001 — база прежней версии без общих расписаний
+        return False
 
 
 def _row_value(row, key: str, default=None):
@@ -1204,7 +1217,10 @@ def ensure_account_for_employee(svc, employee_id: int, full_name: str, email: st
     account_id = svc.db.create_account(acc)
     svc.db.set_employee_account(employee_id, account_id)
 
-    if tpl["schedule_enabled"]:
+    if tpl["schedule_enabled"] and tpl.get("sequence_covers"):
+        log.info("Ящику %s своё расписание не заведено: все ящики копируются по очереди общим расписанием.",
+                 username)
+    elif tpl["schedule_enabled"]:
         # Расписание — часть шаблона: без него новый ящик так и не попал бы в
         # копирование, пока администратор не завёл бы расписание руками.
         try:
@@ -1472,6 +1488,10 @@ def dismiss_employee(svc, employee_id: int, *, by: str = "system", reason: str =
         if not (acc.hold_until and acc.hold_until > until):
             # Ручное удержание дольше «увольнительного» не сокращаем.
             svc.db.set_account_hold(acc.id, until, "dismissed")
+        # Сроки хранения больше не действуют: письма, не скачанные (или удалённые
+        # очисткой) по сроку и ещё лежащие на сервере, скачает последняя копия.
+        from .accountops import after_hold_set
+        after_hold_set(svc, acc.id)
         out["hold_until"] = max(until, acc.hold_until or "")
         svc.db.mark_account_dismissed(acc.id, now)
         out["account"] = acc.name

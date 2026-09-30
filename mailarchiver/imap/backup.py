@@ -99,6 +99,12 @@ class BackupResult:
     messages_vanished: int = 0
     # Сколько раз пришлось переподключаться из-за обрыва связи.
     reconnects: int = 0
+    # Письма, узнанные в архиве после смены UIDVALIDITY (переезд почты, пересозданная
+    # папка): привязаны к новым номерам на сервере вместо повторного скачивания.
+    messages_relinked: int = 0
+    # Письма старше срока хранения ящика: на сервере есть, но не скачиваются —
+    # ночная очистка всё равно удалила бы их из копии.
+    messages_outside_retention: int = 0
     cancelled: bool = False
 
     def add_error(self, text: str) -> None:
@@ -161,8 +167,10 @@ class BackupEngine:
     def __init__(self, db, store: MaildirStore, options: ConnectOptions,
                  *, skip_larger_than_mb: int = 0, download_flags: bool = True,
                  global_exclude: Optional[List[str]] = None, global_include: Optional[List[str]] = None,
-                 unreadable_grace_runs: int = 3) -> None:
+                 unreadable_grace_runs: int = 3, retention_days: int = 0) -> None:
         self.db = db
+        #: срок хранения ящика в днях (0 — хранить всё): письма старше не скачиваются
+        self.retention_days = max(0, int(retention_days or 0))
         self.store = store
         self.options = options
         self.skip_larger_than = int(skip_larger_than_mb) * 1024 * 1024
@@ -203,10 +211,14 @@ class BackupEngine:
             emit("INFO", "Подробности по папкам, которые сервер не даёт открыть. "
                          + ". ".join(part.rstrip(". ") for part in parts) + ".")
 
-    def _note_unreadable(self, account: Account, folder: str, error: str) -> int:
-        """Запомнить очередную неудачу и вернуть, сколько их подряд."""
+    def _note_unreadable(self, account: Account, folder: str, error: str, delimiter: str = "") -> int:
+        """Запомнить очередную неудачу и вернуть, сколько их подряд.
+
+        Разделитель папок сервера запоминается вместе с папкой: по нему
+        сравнение прежней копии находит каталог этой папки на диске.
+        """
         try:
-            return int(self.db.record_folder_problem(account.id, folder, error))
+            return int(self.db.record_folder_problem(account.id, folder, error, delimiter=delimiter or ""))
         except Exception as exc:  # noqa: BLE001
             # История неудач — вспомогательная вещь: если БД её не приняла,
             # копирование всё равно должно продолжаться.
@@ -300,7 +312,8 @@ class BackupEngine:
     # ------------------------------------------------------------------
     def _register_loss(self, account: Account, name: str, body: str, detail: str,
                        result: BackupResult, emit: EventCB, *, twin: str = "",
-                       exc: Optional[BaseException] = None, error_text: str = "") -> None:
+                       exc: Optional[BaseException] = None, error_text: str = "",
+                       delimiter: str = "") -> None:
         """Папку прочитать не удалось, и письма в ней (возможно) есть.
 
         Первые ``unreadable_grace_runs`` суток это ошибка («КОПИЯ НЕПОЛНАЯ»),
@@ -308,7 +321,7 @@ class BackupEngine:
         больше не помечаем, иначе предупреждение висит вечно и перестаёт что-либо
         значить.
         """
-        fails = self._note_unreadable(account, name, error_text or detail)
+        fails = self._note_unreadable(account, name, error_text or detail, delimiter)
         if self.unreadable_grace_runs and fails > self.unreadable_grace_runs:
             result.known_unreadable_folders.append(name)
             since = self._unreadable_since(account, name)
@@ -376,7 +389,7 @@ class BackupEngine:
         if verdict and not children:
             body += f"; {verdict}"
         self._register_loss(account, f.name, body, detail, result, emit, twin=twin, exc=exc,
-                            error_text=exc.message)
+                            error_text=exc.message, delimiter=f.delimiter)
 
     # ------------------------------------------------------------------
     #  Прогон
@@ -532,7 +545,7 @@ class BackupEngine:
                             account, f.name,
                             f"сервер обрывает связь или не отвечает при открытии папки ({exc.message})",
                             f"Сервер обрывает связь или не отвечает при открытии папки: {exc.message}",
-                            result, emit, error_text=exc.message)
+                            result, emit, error_text=exc.message, delimiter=f.delimiter)
                         session.reconnect(exc)
                         break
                     session.reconnect(exc)
@@ -645,16 +658,20 @@ class BackupEngine:
                             f"проверка смены пропущена, работаем по прежнему значению "
                             f"({old_uidvalidity}).")
             uidvalidity = old_uidvalidity
-        elif state is not None and old_uidvalidity != uidvalidity:
-            # Настоящая смена UIDVALIDITY. Ничего не удаляем: ни файлы, ни
-            # индекс. Письма будут скачаны заново под новым uidvalidity
-            # (он входит в UNIQUE(account_id, folder, uidvalidity, uid)),
-            # а прежние записи останутся как исторические.
+        uidvalidity_changed = False
+        if state is not None and uidvalidity and old_uidvalidity != uidvalidity:
+            # Настоящая смена UIDVALIDITY (переезд почты, пересозданная папка).
+            # Ничего не удаляем: ни файлы, ни индекс. Письма, которые уже есть в
+            # архиве, узнаём по Message-ID, размеру и дате и привязываем к новым
+            # номерам (см. _relink); остальные скачаются под новым UIDVALIDITY,
+            # а записи, которых на сервере больше нет, останутся историческими.
+            uidvalidity_changed = True
             if old_uidvalidity:
                 emit("WARNING", f"UIDVALIDITY папки «{f.name}» изменился "
-                                f"({old_uidvalidity} → {uidvalidity}): письма будут перекачаны заново под "
-                                f"новым UIDVALIDITY. Ранее скачанные файлы и записи индекса сохранены "
-                                f"как исторические — ничего не удаляется.")
+                                f"({old_uidvalidity} → {uidvalidity}): письма, которые уже есть в архиве, "
+                                f"будут узнаны по Message-ID, размеру и дате и повторно не скачаются; остальные "
+                                f"скачаются заново. Ранее скачанные файлы и записи индекса сохраняются — "
+                                f"ничего не удаляется.")
             else:
                 emit("WARNING", f"Папка «{f.name}»: сервер впервые сообщил UIDVALIDITY ({uidvalidity}) — "
                                 f"письма будут переписаны под ним; ранее скачанное сохранено.")
@@ -666,7 +683,7 @@ class BackupEngine:
             self._register_loss(account, f.name,
                                 f"открылась, но сервер отказал в поиске писем (SEARCH): {exc.message}",
                                 f"Сервер отказал в поиске писем (SEARCH): {exc.message}",
-                                result, emit, error_text=exc.message)
+                                result, emit, error_text=exc.message, delimiter=f.delimiter)
             return None
         result.folders_read += 1
         self._forget_unreadable(account, f.name)
@@ -676,6 +693,13 @@ class BackupEngine:
         # удалённое ретеншном каждую ночь скачивалось бы заново.
         existing = self.db.existing_uids(account.id, f.name, uidvalidity)
         new_uids = sorted(u for u in all_uids if u not in existing)
+        # Сначала — срок хранения: у ящика со сроком «3 дня» после переезда почты
+        # сверять с архивом (и тем более скачивать) многолетнюю историю незачем.
+        if new_uids and self.retention_days:
+            new_uids = self._drop_outside_retention(conn, account, f, uidvalidity, new_uids, result, emit)
+        if new_uids and uidvalidity_changed:
+            relinked = self._relink(conn, account, f, uidvalidity, new_uids, result, emit)
+            new_uids = [u for u in new_uids if u not in relinked]
         prune = getattr(self.db, "prune_retired_uids", None)
         if prune is not None:
             try:
@@ -690,6 +714,144 @@ class BackupEngine:
         if not new_uids:
             return None
         return {"folder": f, "uidvalidity": uidvalidity, "uids": new_uids, "server_count": info["exists"]}
+
+    def _relink(self, conn: ImapConnection, account: Account, f, uidvalidity: int, wanted: List[int],
+                result: BackupResult, emit: EventCB) -> Set[int]:
+        """После смены UIDVALIDITY узнать письма сервера, которые уже есть в архиве.
+
+        Сравниваем Message-ID, размер и дату: совпавшая запись индекса получает новые
+        UID и UIDVALIDITY (файл остаётся тем же), и письмо не скачивается второй
+        раз. Раньше переезд почты на другой сервер удваивал архив: всё скачивалось
+        заново, а прежние записи оставались «историческими».
+
+        Привязываем только ОДНОЗНАЧНЫЕ совпадения — пара «Message-ID, размер»
+        встречается ровно один раз и в архиве, и на сервере. Сканеры и рассылки
+        повторяют Message-ID у разных писем одного размера: сопоставление «по
+        порядку» привязало бы номера сервера к чужим письмам архива, и новые
+        письма не скачались бы никогда. Неоднозначные, без Message-ID и с другим
+        размером (сервер пересобрал письмо) — скачиваются, как и раньше.
+        Возвращает UID, привязанные к архиву.
+        """
+        rekey_candidates = getattr(self.db, "rekey_candidates", None)
+        if rekey_candidates is None or not wanted:
+            return set()
+        candidates = rekey_candidates(account.id, f.name, uidvalidity)
+        if not candidates:
+            return set()
+        try:
+            seen = conn.fetch_ids_and_sizes(wanted)
+        except (ImapConnectionError, ImapTimeoutError):
+            raise
+        except MailArchiverError as exc:
+            emit("WARNING", f"Папка «{f.name}»: не удалось узнать Message-ID писем для сверки с архивом "
+                            f"({exc.message}) — письма скачаются заново.")
+            return set()
+        # Ключ письма — Message-ID, размер и заголовок Date: ежедневные отчёты с одним
+        # Message-ID и одного размера различаются только датой.
+        server: Dict[tuple, List[int]] = {}
+        for uid, (mid, size, date) in seen.items():
+            # Без заголовка Date письма одного Message-ID и размера не различить — скачиваем.
+            if mid and date:
+                server.setdefault((mid, int(size), date), []).append(int(uid))
+        wanted_keys = {(mid, size) for mid, size, _date in server}
+        archive: Dict[tuple, List[int]] = {}
+        for row in candidates:
+            key2 = (row["message_id"], int(row["size"] or 0))
+            if key2 not in wanted_keys:
+                continue
+            date = self._archived_date(account, row["stored_path"])
+            if date is None:
+                continue                      # файла в архиве нет — письмо лучше скачать заново
+            archive.setdefault((key2[0], key2[1], date), []).append(int(row["id"]))
+        pairs = []
+        ambiguous = 0
+        for key, uids in server.items():
+            ids = archive.get(key)
+            if not ids:
+                continue
+            if len(ids) == 1 and len(uids) == 1:
+                pairs.append((ids[0], uids[0]))
+            else:
+                ambiguous += len(uids)
+        pairs.sort(key=lambda pair: pair[1])
+        if not pairs:
+            emit("INFO", f"Папка «{f.name}»: писем, которые уже есть в архиве, на сервере не найдено — "
+                         f"скачиваются все {len(wanted)}.")
+            return set()
+        done = self.db.rekey_messages(uidvalidity, pairs)
+        relinked = {uid for _id, uid in done}
+        result.messages_relinked += len(relinked)
+        text = (f"Папка «{f.name}»: писем, которые уже есть в архиве (совпали Message-ID, размер и дата), — "
+                f"{len(relinked)}: привязаны к новым номерам на сервере без повторного скачивания; "
+                f"скачать осталось {len(wanted) - len(relinked)}.")
+        if ambiguous:
+            text += (f" Писем, которые однозначно не сопоставить (одинаковые Message-ID, размер и дата у "
+                     f"нескольких писем), — {ambiguous}: они скачиваются.")
+        emit("INFO", text)
+        return relinked
+
+    def _archived_date(self, account: Account, stored_path: str) -> Optional[str]:
+        """Заголовок Date письма из файла архива (None — файл не прочитать)."""
+        try:
+            fh = self.store.open_message(account.id, stored_path or "")
+        except Exception:  # noqa: BLE001 — файла нет: такое письмо лучше скачать заново
+            return None
+        head = b""
+        try:
+            while len(head) < HEADER_PARSE_LIMIT:
+                chunk = fh.read(16 * 1024)
+                if not chunk:
+                    break
+                head += chunk
+                if b"\n\r\n" in head or b"\n\n" in head:
+                    break
+        except Exception:  # noqa: BLE001
+            return None
+        finally:
+            try:
+                fh.close()
+            except Exception:  # noqa: BLE001
+                pass
+        return " ".join(header_value(self._header_block(head), "Date").split())[:120]
+
+    def _drop_outside_retention(self, conn: ImapConnection, account: Account, f, uidvalidity: int,
+                                new_uids: List[int], result: BackupResult, emit: EventCB) -> List[int]:
+        """Не скачивать письма старше срока хранения ящика.
+
+        Ночная очистка всё равно удалила бы их из копии, а при первом копировании
+        ящика со сроком «3 дня» это вся его многолетняя история. Отбираем в два
+        шага: поиск по дате на сервере (``SEARCH SINCE``, с запасом в сутки)
+        быстро находит свежие письма; письма, которых в ответе нет, проверяем по
+        их собственной дате (``FETCH INTERNALDATE``) — и не скачиваем только те,
+        что действительно старше. Сбойный или неполный ответ поиска не должен
+        навсегда лишить копию новых писем. Если сервер не выполнил ни одну из
+        команд — качаем всё, как раньше. UID отсеянных писем запоминаются как
+        «вычищенные по сроку»: следующие прогоны их не перепроверяют, а при
+        увеличении срока хранения (или удержании архива) они скачаются.
+        """
+        from datetime import date, timedelta
+        since = date.today() - timedelta(days=self.retention_days + 1)
+        try:
+            recent = set(conn.search_since(since, new_uids))
+            maybe_old = [u for u in new_uids if u not in recent]
+            dates = conn.fetch_internaldates(maybe_old) if maybe_old else {}
+        except (ImapConnectionError, ImapTimeoutError):
+            raise
+        except MailArchiverError as exc:
+            log.info("Папка «%s»: отбор писем по дате не удался (%s) — скачиваем все.", f.name, exc.message)
+            return new_uids
+        cutoff = time.time() - (self.retention_days + 1) * 86400
+        old = [u for u in maybe_old if u in dates and dates[u] < cutoff]
+        if not old:
+            return new_uids
+        drop = set(old)
+        result.messages_outside_retention += len(old)
+        retire = getattr(self.db, "retire_uids", None)
+        if retire is not None:
+            retire(account.id, f.name, uidvalidity, old)
+        emit("INFO", f"Папка «{f.name}»: писем старше срока хранения ящика ({self.retention_days} дн.): "
+                     f"{len(old)} — не скачиваются.")
+        return [u for u in new_uids if u not in drop]
 
     def _load_folder(self, session: _Session, account: Account, p: Dict, remaining: List[int],
                      handled: Set[int], result: BackupResult, emit_msg: EventCB,

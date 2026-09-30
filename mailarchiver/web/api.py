@@ -24,8 +24,13 @@ from ..employees import (
     sync_employees,
 )
 from ..errors import MailArchiverError, ValidationError
+from ..accountops import (after_account_retention_change, after_hold_set, credential_problem, hold_label,
+                          longer_retention, validate_cron,
+                          validate_restore_options as _validate_restore_options)
 from ..imap.client import diagnose_folders, probe_account
 from ..models import Account, AuthType, JobStatus, JobType, ScheduleKind, Security
+from ..queue.manager import LOCAL_JOB_TYPES
+from .. import roles
 from ..util import human_size, safe_filename
 from ..version import __version__
 from . import auth as auth_mod
@@ -129,6 +134,38 @@ def _mailbox_flood_guard(svc, user: dict, job_type: str, account_id) -> None:
                                        "затем запустите новую.")
 
 
+def _operator_job_guard(svc, user: dict, job_type: str, account_id, *, need_enabled: bool = False,
+                        rebuild: str = "") -> None:
+    """Проверки для оператора перед запуском (или повтором) задания по ящику.
+
+    Кнопки в интерфейсе у выключенных ящиков и так неактивны, но сервер не
+    должен на это полагаться: выключенный ящик часто выключен из-за неверного
+    пароля, и повторные неудачные входы на почтовый сервер могут привести к
+    блокировке адреса архива (fail2ban) — тогда встанет копирование всех
+    ящиков. Задание, которое уже стоит в очереди, второй раз не ставится.
+    """
+    if not roles.is_operator(user) or account_id is None:
+        return
+    acc = svc.db.get_account(int(account_id))
+    if acc is None:
+        raise HTTPException(404, "Ящик не найден")
+    if need_enabled:
+        if not acc.enabled:
+            raise ValidationError(f"Копирование ящика «{acc.name}» выключено.",
+                                  hint="Включает ящик администратор.")
+        problem = credential_problem(acc)
+        if problem:
+            raise ValidationError(f"Ящик «{acc.name}» не скопировать: {problem}.",
+                                  hint="Пароль ящика задаёт администратор.")
+    for job in svc.db.active_jobs():
+        if job["type"] != job_type or job["account_id"] != acc.id:
+            continue
+        if job_type == JobType.BACKUP and str(roles.job_params(job).get("rebuild") or "") != (rebuild or ""):
+            continue          # «Докачать потерянные» после обычной копии — не повтор
+        raise ValidationError(f"Такое задание по ящику «{acc.name}» уже выполняется или стоит в очереди "
+                              f"(№{job['id']}).", hint="Дождитесь его окончания в «Очереди и заданиях».")
+
+
 def _is_own_job(user: dict, row) -> bool:
     """Задание запущено самим пользователем-ящиком (а не администратором или планировщиком)."""
     return row is not None and (row["created_by"] or "") == (user.get("username") or "")
@@ -229,7 +266,8 @@ class RestoreBody(BaseModel):
 
 
 class ScheduleBody(BaseModel):
-    account_id: int
+    #: ящик; для «копирования всех ящиков по очереди» (job_type=backup_all) — не нужен
+    account_id: Optional[int] = None
     kind: str = ScheduleKind.CRON
     job_type: str = JobType.BACKUP
     cron_expr: str = Field("", max_length=200)
@@ -262,7 +300,12 @@ class EmployeeCreateBody(EmployeeBody):
 class UserBody(BaseModel):
     username: str = Field(max_length=USERNAME_MAX)
     password: str = Field(max_length=PASSWORD_MAX)
-    role: str = "admin"
+    #: без роли — оператор: права администратора выдаются только явно
+    role: str = Field("operator", max_length=16)
+
+
+class UserRoleBody(BaseModel):
+    role: str = Field(max_length=16)
 
 
 class PasswordBody(BaseModel):
@@ -340,8 +383,8 @@ class OtpDisableBody(BaseModel):
 
 
 def _own_web_user(request: Request) -> dict:
-    """Текущий пользователь веб-интерфейса (не вход по ящику)."""
-    user = auth_mod.require_user(request)
+    """Текущий пользователь веб-интерфейса (не вход по ящику): администратор или оператор."""
+    user = auth_mod.require_login(request)
     if user.get("role") == "mailbox" or not user.get("id"):
         raise HTTPException(403, "Двухфакторный вход настраивается для пользователей веб-интерфейса; "
                                  "при входе по ящику защита — пароль самого ящика.")
@@ -512,11 +555,21 @@ def state(request: Request, user: dict = Depends(auth_mod.require_user)):
         "engines": list_engines(),
         "workers": svc.queue.max_workers(),
         # шифрование включено, а ключа нет — копирование писем остановлено
-        # (в тексте причины бывает путь к файлу ключа — только администратору)
-        "encryption_blocked": (str(getattr(svc.store, "encryption_blocked", "") or "")
-                               if user.get("role") == "admin" else ""),
-        "replica_alert": _replica_alert(svc) if user.get("role") == "admin" else "",
+        # (в тексте причины бывает путь к файлу ключа — только администратору;
+        # оператор видит сам факт: он следит за копированием)
+        "encryption_blocked": _encryption_banner(svc, user),
+        "replica_alert": _replica_alert(svc) if user.get("role") in roles.STAFF_ROLES else "",
     }
+
+
+def _encryption_banner(svc, user: dict) -> str:
+    reason = str(getattr(svc.store, "encryption_blocked", "") or "")
+    if not reason or user.get("role") not in roles.STAFF_ROLES:
+        return ""
+    if user.get("role") == roles.ROLE_ADMIN:
+        return reason
+    return "Копирование писем остановлено: нет ключа шифрования локальной копии. Сообщите администратору."
+
 
 
 #: Через сколько часов без удачного прогона копия вне сервера считается отставшей.
@@ -562,14 +615,15 @@ def live(request: Request, user: dict = Depends(auth_mod.require_user)):
     return collect_live(svc_dep(request), user)
 
 
-#: Поля карточки ящика, которые сотруднику (вход по ящику) не показываем:
-#: заметки администратора и технические настройки OAuth2.
+#: Поля карточки ящика, которые видит только администратор: заметки
+#: администратора и технические настройки OAuth2 (сотруднику, вошедшему по
+#: ящику, и оператору их не показываем).
 _ADMIN_ONLY_ACCOUNT_FIELDS = ("notes", "oauth_client_id", "oauth_token_url", "has_oauth_secret")
 
 
 def _account_view(acc: Account, user: dict) -> dict:
     data = acc.redacted()
-    if user.get("role") == "mailbox":
+    if user.get("role") != roles.ROLE_ADMIN:
         for key in _ADMIN_ONLY_ACCOUNT_FIELDS:
             data.pop(key, None)
     return data
@@ -648,9 +702,11 @@ def list_accounts(request: Request, user: dict = Depends(auth_mod.require_user))
         accounts = [a for a in accounts if a.id == user.get("account_id")]
     totals = svc.db.message_totals_by_account()
     last_runs = svc.db.last_runs_by_account()
+    quarantines = svc.store.quarantine_counts() if user.get("role") != "mailbox" else {}
     out = []
     for a in accounts:
         item = _account_view(a, user)
+        item["quarantines"] = int(quarantines.get(a.id, 0))
         t = totals.get(a.id) or {}
         item["messages"] = int(t.get("messages", 0))
         item["bytes"] = int(t.get("bytes", 0))
@@ -671,7 +727,7 @@ class CheckLoginsBody(BaseModel):
 
 @router.post("/accounts/check-logins")
 def check_logins(request: Request, body: Optional[CheckLoginsBody] = None,
-                 user: dict = Depends(auth_mod.require_admin)):
+                 user: dict = Depends(auth_mod.require_staff)):
     """Проверить пароли (вход) всех ящиков — или перечисленных — фоновым заданием."""
     svc = svc_dep(request)
     body = body or CheckLoginsBody()
@@ -724,6 +780,9 @@ def get_account(request: Request, account_id: int, user: dict = Depends(auth_mod
     data = _account_view(acc, user)
     data["folders"] = [{"folder": r["folder"], "count": r["cnt"], "bytes": r["bytes"],
                         "bytes_h": human_size(r["bytes"])} for r in svc.db.folders_summary(account_id)]
+    if user.get("role") in roles.STAFF_ROLES:
+        # сколько писем копирование пропускает по сроку хранения (окно «Хранение копий»)
+        data["retired"] = svc.db.count_retired(account_id)
     return data
 
 
@@ -799,6 +858,17 @@ def delete_account(request: Request, account_id: int, user: dict = Depends(auth_
     acc = svc.db.get_account(account_id)
     if acc is None:
         raise HTTPException(404, "Ящик не найден")
+    if acc.on_hold():
+        # Без ящика и индекса архив недоступен ни в просмотре, ни в поиске, ни для
+        # выгрузки — удержание (увольнение, проверка) защищает и от этого.
+        raise ValidationError(f"Архив ящика удерживается ({hold_label(acc.hold_until)}) — ящик не удаляется.",
+                              hint="Если удержание больше не нужно, сначала снимите его (меню ящика → «Удержание архива»).")
+    if any(j["account_id"] == account_id and j["status"] == JobStatus.RUNNING for j in svc.db.active_jobs()) or \
+            account_id in svc.queue.held_accounts():
+        # Копирование, которое пишет в индекс удалённого ящика, падало бы на
+        # каждом письме, а файлы оставались бы сиротами.
+        raise ValidationError("По ящику выполняется задание — дождитесь его окончания или отмените.",
+                              hint="Ящик может копироваться в проходе «все ящики по очереди».")
     svc.db.delete_account(account_id)
     svc.db.add_audit(user["username"], "account_delete", acc.name)
     return {"ok": True}
@@ -827,6 +897,8 @@ def set_hold(request: Request, account_id: int, body: HoldBody, user: dict = Dep
     else:
         until = ""
     svc.db.set_account_hold(account_id, until, "manual" if until else "")
+    if until:
+        after_hold_set(svc, account_id)
     svc.db.add_audit(user["username"], "account_hold",
                      f"{acc.name}: " + ("снято" if not until else ("бессрочно" if until == HOLD_FOREVER else f"до {until}")))
     return {"ok": True, "hold_until": until}
@@ -845,17 +917,24 @@ def purge_account(request: Request, account_id: int, body: PurgeBody, user: dict
     if (body.confirm_name or "").strip() != acc.name.strip():
         raise ValidationError("Для подтверждения введите название ящика точно.")
     if acc.on_hold():
-        raise ValidationError(f"Архив ящика удерживается до {acc.hold_until} — удалить его нельзя.",
+        raise ValidationError(f"Архив ящика удерживается ({hold_label(acc.hold_until)}) — удалить его нельзя.",
                               hint="Если удержание больше не нужно, сначала снимите его (меню ящика → «Удержание архива»).")
-    if any(j["account_id"] == account_id for j in svc.db.active_jobs()):
+    if any(j["account_id"] == account_id for j in svc.db.active_jobs()) or \
+            account_id in svc.queue.held_accounts():
+        raise ValidationError("По ящику выполняется задание — дождитесь его окончания или отмените.",
+                              hint="Ящик может копироваться в проходе «все ящики по очереди».")
+    if not svc.queue.acquire_account(account_id, -account_id):
         raise ValidationError("По ящику выполняется задание — дождитесь его окончания или отмените.")
-    files, size = svc.store.delete_account_files(account_id)
     try:
-        import shutil
-        shutil.rmtree(svc.store.account_dir(account_id), ignore_errors=True)
-    except OSError:
-        pass
-    svc.db.delete_account(account_id)
+        files, size = svc.store.delete_account_files(account_id)
+        try:
+            import shutil
+            shutil.rmtree(svc.store.account_dir(account_id), ignore_errors=True)
+        except OSError:
+            pass
+        svc.db.delete_account(account_id)
+    finally:
+        svc.queue.release_account(account_id, -account_id)
     svc.db.add_audit(user["username"], "account_purge", f"{acc.name}: удалено файлов {files} ({human_size(size)})")
     return {"ok": True, "files": files, "bytes": size}
 
@@ -933,17 +1012,85 @@ def list_account_quarantines(request: Request, account_id: int,
     пересоздание пошло не так. Но без этого списка он лежал бы на диске вечно и
     незаметно.
     """
+    from .. import quarantine as qmod
     svc = svc_dep(request)
     if svc.db.get_account(account_id) is None:
         raise HTTPException(404, "Ящик не найден")
+    from ..queue.jobs import effective_retention_days
+    acc = svc.db.get_account(account_id)
+    days = effective_retention_days(svc, acc)
     items = svc.store.list_quarantines(account_id)
-    return {"quarantines": [{"path": path, "name": os.path.basename(path),
-                             "files": files, "bytes": size, "bytes_h": human_size(size)}
-                            for path, files, size in items]}
+    active = _quarantine_jobs(svc, account_id)
+    out = []
+    for path, files, size in items:
+        check = qmod.stored_check(svc.db, path)
+        if check is not None:
+            # «Вернуть» доступно, как только копия стала полной, — не дожидаясь нового сравнения
+            check = dict(check, new_copy_complete=qmod.new_copy_complete(svc, account_id, path))
+        safe, why = qmod.is_safe_to_delete(check, days)
+        out.append({"path": path, "name": os.path.basename(path), "files": files, "bytes": size,
+                    "bytes_h": human_size(size), "check": check, "check_label": qmod.check_label(check),
+                    "safe": safe, "unsafe_reason": why})
+    return {"quarantines": out,
+            "job": ({"id": active[0]["id"], "type": active[0]["type"], "status": active[0]["status"]}
+                    if active else None)}
+
+
+def _quarantine_jobs(svc, account_id: int) -> List[Any]:
+    """Задания, которые сейчас работают с прежними копиями ящика (или ждут очереди):
+    сравнение, возврат писем, удаление."""
+    out = []
+    for job in svc.db.active_jobs():
+        if job["account_id"] == account_id and job["type"] in (JobType.QUARANTINE_CHECK, JobType.QUARANTINE_RESCUE):
+            out.append(job)
+        elif job["type"] == JobType.CLEANUP:
+            try:
+                items = (json.loads(job["params"] or "{}") or {}).get("items") or []
+            except (TypeError, ValueError):
+                items = []
+            if any(int(it.get("account_id") or 0) == account_id for it in items if isinstance(it, dict)):
+                out.append(job)
+    return out
 
 
 class QuarantineBody(BaseModel):
     path: str
+    #: удалить, даже если сравнение не подтвердило, что все письма есть в новой копии
+    force: bool = False
+
+
+class QuarantineCheckBody(BaseModel):
+    #: пусто — все прежние копии ящика
+    path: str = Field("", max_length=4096)
+    #: True — не только сравнить, но и вернуть в архив письма, которых нет в новой копии
+    rescue: bool = False
+
+
+@router.post("/accounts/{account_id}/quarantines/check")
+def check_account_quarantine(request: Request, account_id: int, body: QuarantineCheckBody,
+                             user: dict = Depends(auth_mod.require_admin)):
+    """Сравнить прежнюю копию с новой (или вернуть недостающие письма) — фоновым заданием."""
+    svc = svc_dep(request)
+    acc = svc.db.get_account(account_id)
+    if acc is None:
+        raise HTTPException(404, "Ящик не найден")
+    known = svc.store.quarantine_paths(account_id)
+    if not known:
+        raise ValidationError("У ящика нет прежних копий.")
+    paths: List[str] = []
+    if body.path:
+        norm = os.path.normpath(body.path)
+        paths = [p for p in known if os.path.normpath(p) == norm]
+        if not paths:
+            raise ValidationError("Такой прежней копии у этого ящика нет.", hint="Обновите список прежних копий.")
+    job_type = JobType.QUARANTINE_RESCUE if body.rescue else JobType.QUARANTINE_CHECK
+    for job in svc.db.active_jobs():
+        if job["account_id"] == account_id and job["type"] in (JobType.QUARANTINE_CHECK, JobType.QUARANTINE_RESCUE):
+            return {"ok": True, "job_id": job["id"], "already": True}
+    job_id = svc.queue.enqueue(job_type, account_id, {"paths": paths}, priority=4, created_by=user["username"])
+    svc.db.add_audit(user["username"], "quarantine_rescue" if body.rescue else "quarantine_check",
+                     f"{acc.name}: {', '.join(os.path.basename(p) for p in (paths or known))}"[:500])
+    return {"ok": True, "job_id": job_id}
 
 
 @router.post("/accounts/{account_id}/quarantines/delete")
@@ -951,15 +1098,37 @@ def delete_account_quarantine(request: Request, account_id: int, body: Quarantin
                               user: dict = Depends(auth_mod.require_admin)):
     """Удалить карантинную копию — по явной команде администратора."""
     svc = svc_dep(request)
-    if svc.db.get_account(account_id) is None:
+    acc = svc.db.get_account(account_id)
+    if acc is None:
         raise HTTPException(404, "Ящик не найден")
-    known = {path for path, _f, _b in svc.store.list_quarantines(account_id)}
-    if body.path not in known:
+    if acc.on_hold():
+        # Прежняя копия может хранить письма, которых уже нет ни на сервере, ни в
+        # новой копии, — удержание архива (проверка, спор) защищает и её.
+        raise ValidationError("Архив ящика удерживается — прежние копии не удаляются.",
+                              hint="Если удержание больше не нужно, снимите его: меню ящика → «Удержание архива».")
+    from .. import quarantine as qmod
+    if body.path not in set(svc.store.quarantine_paths(account_id)):
         raise ValidationError("Такой карантинной копии у этого ящика нет.",
                               hint="Обновите список карантинных копий.")
-    svc.store.drop_quarantine(body.path)
-    svc.db.add_audit(user["username"], "quarantine_delete", body.path[:500])
-    return {"ok": True}
+    busy = _quarantine_jobs(svc, account_id) + [
+        j for j in svc.db.active_jobs() if j["account_id"] == account_id and j["type"] in LOCAL_JOB_TYPES]
+    if busy or account_id in svc.queue.held_accounts():
+        # Возврат писем читает прежнюю копию прямо сейчас, копия «с нуля» может
+        # сделать новую — удалять, пока по ящику идёт работа, нельзя.
+        raise ValidationError("По ящику выполняется задание — прежнюю копию удалить сейчас нельзя.",
+                              hint="Дождитесь окончания задания (раздел «Задания») и повторите.")
+    from ..queue.jobs import effective_retention_days
+    safe, why = qmod.is_safe_to_delete(qmod.stored_check(svc.db, body.path), effective_retention_days(svc, acc))
+    if not safe and not body.force:
+        raise ValidationError(f"Прежнюю копию не удаляем: {why}.",
+                              hint="Если письма из неё точно не нужны, удалите с подтверждением потери писем.")
+    # Удаление сотен тысяч файлов — минуты: фоновым заданием, как у группового действия.
+    item = {"account_id": account_id, "name": acc.name, "what": "quarantine", "paths": [body.path],
+            "only_safe": not body.force}
+    job_id = svc.queue.enqueue(JobType.CLEANUP, None, {"items": [item]}, priority=4, created_by=user["username"])
+    svc.db.add_audit(user["username"], "quarantine_delete_request",
+                     (f"{acc.name}: {os.path.basename(body.path)}" + ("" if safe else f" — без проверки ({why})"))[:500])
+    return {"ok": True, "job_id": job_id, "forced": bool(body.force and not safe)}
 
 
 @router.post("/accounts/{account_id}/folders/diagnose")
@@ -1019,11 +1188,17 @@ def start_backup(request: Request, account_id: int, body: Optional[BackupBody] =
                               hint="Допустимо: пусто (обычная копия), missing, full.")
     if rebuild == "full":
         # Стирание локальной копии — не то действие, которое можно доверить
-        # владельцу ящика: письма, удалённые на сервере, после него не вернуть.
-        if (user.get("role") or "") != "admin":
+        # владельцу ящика или оператору: письма, удалённые на сервере, после
+        # него не вернуть.
+        if (user.get("role") or "") != roles.ROLE_ADMIN:
             raise HTTPException(403, "Полное пересоздание копии доступно только администратору")
+        if acc.on_hold():
+            raise ValidationError(f"Архив ящика удерживается ({hold_label(acc.hold_until)}) — копию «с нуля» не делаем.",
+                                  hint="Если удержание больше не нужно, снимите его (меню ящика → "
+                                       "«Удержание архива»). Потерянные письма вернёт режим «Докачать потерянные».")
         svc.db.add_audit(user["username"], "backup_rebuild_full_request", acc.name)
     _mailbox_flood_guard(svc, user, JobType.BACKUP, account_id)
+    _operator_job_guard(svc, user, JobType.BACKUP, account_id, need_enabled=True, rebuild=rebuild)
     params = {"rebuild": rebuild} if rebuild else {}
     max_attempts = int(svc.rt("backup", "retry_attempts") or 1)
     # Пересоздание не повторяем автоматически: повтор «полной» копии стёр бы
@@ -1035,15 +1210,40 @@ def start_backup(request: Request, account_id: int, body: Optional[BackupBody] =
     return {"ok": True, "job_id": jid, "rebuild": rebuild}
 
 
+class BackupAllBody(BaseModel):
+    #: True — одним заданием, ящик за ящиком (бережно к почтовому серверу);
+    #: False — по заданию на ящик, параллельно (сколько позволяет очередь)
+    sequential: bool = False
+    pause_seconds: int = 0
+    stop_at: str = Field("", max_length=5)
+
+
 @router.post("/accounts/backup-all")
-def start_backup_all(request: Request, user: dict = Depends(auth_mod.require_admin)):
+def start_backup_all(request: Request, body: Optional[BackupAllBody] = None,
+                     user: dict = Depends(auth_mod.require_staff)):
     """Поставить в очередь резервное копирование СРАЗУ ВСЕХ включённых ящиков.
 
     Выключенные ящики пропускаются (они намеренно исключены из копирования).
     Ящики, по которым копирование уже идёт или стоит в очереди, тоже
     пропускаются — чтобы повторное нажатие кнопки не удваивало работу.
+
+    ``sequential`` — одно задание, которое копирует ящики строго по одному
+    (как расписание «Копирование всех ящиков по очереди»).
     """
     svc = svc_dep(request)
+    body = body or BackupAllBody()
+    if body.sequential:
+        options = backup_all_options({"pause_seconds": body.pause_seconds, "stop_at": body.stop_at})
+        from ..queue.jobs import is_global_pass
+        running = next((j for j in svc.db.active_jobs() if is_global_pass(j)), None)
+        if running is not None:
+            return {"ok": True, "sequential": True, "job_id": running["id"], "already": True}
+        enabled = len(svc.db.list_accounts(only_enabled=True))
+        jid = svc.queue.enqueue(JobType.BACKUP_ALL, None, options,
+                                max_attempts=int(svc.rt("backup", "retry_attempts") or 1),
+                                created_by=user["username"])
+        svc.db.add_audit(user["username"], "backup_all", f"по очереди: ящиков {enabled}, задание №{jid}")
+        return {"ok": True, "sequential": True, "job_id": jid, "total_enabled": enabled}
     max_attempts = int(svc.rt("backup", "retry_attempts") or 1)
     busy = {j["account_id"] for j in svc.db.active_jobs() if j["type"] == JobType.BACKUP}
     started, skipped = [], []
@@ -1101,6 +1301,7 @@ def start_verify(request: Request, account_id: int, user: dict = Depends(auth_mo
     _ensure_account_access(user, account_id)
     svc.require_account(account_id)
     _mailbox_flood_guard(svc, user, JobType.VERIFY, account_id)
+    _operator_job_guard(svc, user, JobType.VERIFY, account_id)
     jid = svc.queue.enqueue(JobType.VERIFY, account_id, {}, created_by=user["username"])
     return {"ok": True, "job_id": jid}
 
@@ -1130,15 +1331,27 @@ def set_retention(request: Request, account_id: int, body: RetentionBody, user: 
 
 
 def _after_account_retention_change(svc, before, new_days: int) -> None:
-    """Срок хранения ящика стал длиннее — письма, вычищенные по старому сроку и
-    ещё лежащие на сервере, снова должны скачаться при следующем копировании."""
-    from ..queue.jobs import effective_retention_days
-    old_effective = effective_retention_days(svc, before)
-    after = svc.db.get_account(before.id)
-    if after is None:
-        return
-    if _longer_retention(old_effective, effective_retention_days(svc, after)):
-        svc.db.clear_retired(before.id)
+    """Срок хранения ящика стал длиннее — вычищенные письма снова скачиваются
+    (см. :func:`mailarchiver.accountops.after_account_retention_change`)."""
+    after_account_retention_change(svc, before)
+
+
+@router.post("/accounts/{account_id}/retired/clear")
+def clear_account_retired(request: Request, account_id: int, user: dict = Depends(auth_mod.require_admin)):
+    """Забыть письма ящика, отсеянные по сроку хранения.
+
+    Копирование не скачивает письма старше срока хранения и не качает заново
+    удалённые очисткой — их номера помнит список «отсеянных». Если даты тогда
+    были неверными (часы сервера архива уходили вперёд, у писем на почтовом
+    сервере стояли не те даты), список можно забыть: следующее копирование
+    заново проверит даты этих писем — моложе срока скачаются, старше снова
+    будут пропущены.
+    """
+    svc = svc_dep(request)
+    acc = svc.require_account(_bounded_id(account_id))
+    cleared = svc.db.clear_retired(acc.id)
+    svc.db.add_audit(user["username"], "account_retired_clear", f"{acc.name}: забыто отсеянных писем {cleared}")
+    return {"ok": True, "cleared": cleared}
 
 
 @router.post("/accounts/{account_id}/import-pst")
@@ -1331,13 +1544,31 @@ def visible_author(author: str, viewer: Optional[dict]) -> str:
     return "администратор"
 
 
+def _job_scope_label(row) -> str:
+    """Что обрабатывает задание без своего ящика — для колонки «Ящик»."""
+    try:
+        params = json.loads(row["params"] or "{}") or {}
+    except (TypeError, ValueError):
+        params = {}
+    if row["type"] == JobType.BACKUP_ALL:
+        ids = params.get("account_ids")
+        return f"выбранные ящики ({len(ids)}), по очереди" if ids else "все включённые ящики, по очереди"
+    if row["type"] == JobType.CLEANUP:
+        return f"ящиков: {len(params.get('items') or [])}"
+    if row["type"] in (JobType.CHECK_LOGINS, JobType.FOLDERS_CHECK, JobType.SEARCH_REINDEX) \
+            and params.get("account_ids"):
+        return f"ящиков: {len(params['account_ids'])}"
+    return ""
+
+
 def serialize_job(row, names: Optional[Dict[int, str]] = None, viewer: Optional[dict] = None) -> dict:
-    return {
+    data = {
         "id": row["id"], "type": row["type"], "type_label": JobType.LABELS.get(row["type"], row["type"]),
         "account_id": row["account_id"],
         # имя ящика — с сервера: после обновления страницы список ящиков в
         # браузере ещё пуст, и колонка «Ящик» показывала «—»
-        "account_name": (names or {}).get(row["account_id"], "") if row["account_id"] else "",
+        "account_name": ((names or {}).get(row["account_id"], "") if row["account_id"]
+                         else _job_scope_label(row)),
         "status": row["status"],
         "status_label": JobStatus.LABELS.get(row["status"], row["status"]),
         "priority": row["priority"], "created_at": row["created_at"], "started_at": row["started_at"],
@@ -1349,7 +1580,20 @@ def serialize_job(row, names: Optional[Dict[int, str]] = None, viewer: Optional[
         "created_by": visible_author(row["created_by"], viewer),
         "percent": (round(100 * row["progress_current"] / row["progress_total"])
                     if row["progress_total"] else (100 if row["status"] in JobStatus.TERMINAL else 0)),
+        # может ли оператор отменить и повторить это задание (кнопки в интерфейсе)
+        "operator_can_manage": roles.operator_may_manage(row),
     }
+    return redact_job_for(viewer, data)
+
+
+def redact_job_for(viewer: Optional[dict], data: dict) -> dict:
+    """Задание глазами оператора: у выгрузок, восстановления, анализа писем и
+    сравнения прежних копий текст ошибки и хода бывает с именами файлов, папок и
+    писем — оператор видит только, что задание идёт или завершилось ошибкой."""
+    if not roles.is_operator(viewer) or data.get("type") in roles.OPERATOR_JOB_TYPES:
+        return data
+    return dict(data, progress_message="",
+                error=("ошибка — подробности у администратора" if data.get("error") else ""))
 
 
 @router.get("/jobs")
@@ -1378,6 +1622,15 @@ def get_job(request: Request, job_id: int, user: dict = Depends(auth_mod.require
     except json.JSONDecodeError:
         data["result"] = {}
     data["params"] = json.loads(row["params"] or "{}")
+    if roles.is_operator(user) and not roles.operator_sees_job(row):
+        # Выгрузки, восстановление, анализ писем, сравнение прежних копий: в
+        # их итогах бывают темы и отправители писем — оператору только итог.
+        result = data["result"] if isinstance(data["result"], dict) else {}
+        data["result"] = {k: result[k] for k in ("summary", "final_status") if k in result}
+        data["params"] = {}
+        data["restricted"] = True
+    elif roles.is_operator(user) and isinstance(data["result"], dict):
+        data["result"].pop("rebuild_info", None)     # пути прежних копий на диске сервера
     return data
 
 
@@ -1388,6 +1641,8 @@ def job_events(request: Request, job_id: int, user: dict = Depends(auth_mod.requ
     if row is None:
         raise HTTPException(404, "Задание не найдено")
     _ensure_job_access(user, row)
+    if roles.is_operator(user) and not roles.operator_sees_job(row):
+        return []
     rows = svc.db.list_job_events(job_id, limit=500)
     return [{"ts": r["ts"], "level": r["level"], "message": r["message"]} for r in rows][::-1]
 
@@ -1403,8 +1658,17 @@ def cancel_job(request: Request, job_id: int, user: dict = Depends(auth_mod.requ
         # Иначе сотрудник мог бы снимать каждое копирование своего ящика по
         # расписанию сразу после старта — и архив перестал бы пополняться.
         raise HTTPException(403, "Отменить можно только задание, запущенное вами")
+    if roles.is_operator(user) and not roles.operator_may_manage(row):
+        raise HTTPException(403, _OPERATOR_JOB_REFUSAL)
     svc.queue.cancel(job_id)
+    if user.get("role") != "mailbox":
+        svc.db.add_audit(user["username"], "job_cancel", f"#{job_id} {row['type']}")
     return {"ok": True}
+
+
+#: Отказ оператору в отмене и повторе задания, которое ему не подвластно.
+_OPERATOR_JOB_REFUSAL = ("Оператор отменяет и повторяет только копирование и проверки "
+                         "(не «Скопировать с нуля» и не последнюю копию перед выключением ящика)")
 
 
 @router.post("/jobs/{job_id}/retry")
@@ -1416,8 +1680,12 @@ def retry_job(request: Request, job_id: int, user: dict = Depends(auth_mod.requi
     _ensure_job_access(user, row)
     if user.get("role") == "mailbox" and not _is_own_job(user, row):
         raise HTTPException(403, "Повторить можно только задание, запущенное вами")
+    if roles.is_operator(user) and not roles.operator_may_manage(row):
+        raise HTTPException(403, _OPERATOR_JOB_REFUSAL)
     if row["status"] not in JobStatus.TERMINAL:
         raise ValidationError("Повторить можно только завершённое задание.")
+    _operator_job_guard(svc, user, row["type"], row["account_id"], need_enabled=row["type"] == JobType.BACKUP,
+                        rebuild=str(roles.job_params(row).get("rebuild") or ""))
     if user.get("role") == "mailbox":
         # те же ограничения, что и при запуске: иначе «выгрузить → отменить →
         # повторить» давало десятки одновременных выгрузок одного ящика
@@ -1541,54 +1809,50 @@ def list_schedules(request: Request, user: dict = Depends(auth_mod.require_user)
 
 
 def _validate_cron(expr: str) -> None:
-    """Проверить cron-выражение (5 полей и понятный APScheduler синтаксис)."""
-    expr = (expr or "").strip()
-    hint = "Пример: «0 3 * * *» — каждый день в 03:00."
-    if len(expr.split()) != 5:
-        raise ValidationError(f"Некорректное cron-выражение: «{expr}» (нужно 5 полей).", hint=hint)
-    try:
-        from apscheduler.triggers.cron import CronTrigger
-        CronTrigger.from_crontab(expr)
-    except Exception as exc:  # noqa: BLE001
-        raise ValidationError(f"Некорректное cron-выражение: «{expr}» ({exc}).", hint=hint) from exc
+    """Проверить cron-выражение (общая проверка — в :mod:`mailarchiver.accountops`)."""
+    validate_cron(expr)
 
 
-
-def validate_restore_options(data: dict) -> dict:
-    """Проверить и нормализовать параметры восстановления.
-
-    Общая для ручного запуска и для расписаний: заливка в ИСХОДНЫЕ папки живого
-    ящика должна быть только осознанным выбором, а пустой префикс — не молчаливым
-    синонимом этого выбора.
-    """
-    out = dict(data or {})
-    mode = str(out.get("target_mode") or "prefixed").strip().lower()
-    if mode not in ("original", "single", "prefixed"):
-        raise ValidationError(f"Неизвестный режим восстановления «{out.get('target_mode')}».",
-                              hint="Допустимо: original, single, prefixed.")
-    out["target_mode"] = mode
-    out["target_prefix"] = str(out.get("target_prefix") or "").strip()
-    out["target_folder"] = str(out.get("target_folder") or "").strip()
-    if mode == "prefixed" and not out["target_prefix"]:
-        raise ValidationError("Укажите префикс папок — иначе письма попадут прямо в рабочие папки ящика.",
-                              hint="Например «Восстановлено». Для заливки в исходные папки выберите режим «в исходные папки».")
-    if mode == "single" and not out["target_folder"]:
-        raise ValidationError("Укажите папку назначения.", hint="Например «Восстановлено».")
-    try:
-        limit = int(out.get("limit") or 0)
-    except (TypeError, ValueError):
-        raise ValidationError("Ограничение числа писем должно быть целым числом.")
-    if limit < 0:
-        raise ValidationError("Ограничение числа писем не может быть отрицательным.")
-    out["limit"] = limit
-    return out
+#: Проверка параметров восстановления — общая с групповыми действиями и
+#: расписаниями (см. :func:`mailarchiver.accountops.validate_restore_options`).
+validate_restore_options = _validate_restore_options
 
 
 #: Что можно запускать по расписанию. Остальное (выгрузка, перешифровка,
 #: импорт .pst, пересоздание копии) — только вручную: раньше API принимал любой
 #: тип и любые параметры, например backup {"rebuild": "full"} в обход проверок
 #: ручного запуска или выгрузку каждую минуту.
-SCHEDULE_JOB_TYPES = (JobType.BACKUP, JobType.RETENTION, JobType.VERIFY, JobType.RESTORE)
+SCHEDULE_JOB_TYPES = (JobType.BACKUP, JobType.RETENTION, JobType.VERIFY, JobType.RESTORE,
+                      JobType.BACKUP_ALL)
+#: Расписания без ящика: задание само проходит по всем включённым ящикам.
+GLOBAL_SCHEDULE_JOB_TYPES = (JobType.BACKUP_ALL,)
+
+
+def backup_all_options(raw: Optional[dict]) -> Dict[str, Any]:
+    """Параметры копирования всех ящиков по очереди: пауза, «не начинать после», порядок."""
+    raw = dict(raw or {})
+    out: Dict[str, Any] = {}
+    try:
+        pause = int(raw.get("pause_seconds") or 0)
+    except (TypeError, ValueError):
+        raise ValidationError("Пауза между ящиками — целое число секунд.")
+    if not 0 <= pause <= 3600:
+        raise ValidationError("Пауза между ящиками — от 0 до 3600 секунд.")
+    out["pause_seconds"] = pause
+    stop_at = str(raw.get("stop_at") or "").strip()
+    if stop_at:
+        import re as _re
+        m = _re.fullmatch(r"(\d{1,2}):(\d{2})", stop_at)
+        if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+            raise ValidationError(f"Время «не начинать новые ящики после» указано неверно: «{stop_at}».",
+                                  hint="Формат ЧЧ:ММ, например 07:00. Пусто — без ограничения.")
+        stop_at = f"{int(m.group(1)):02d}:{m.group(2)}"
+    out["stop_at"] = stop_at
+    order = str(raw.get("order") or "oldest").strip()
+    if order not in ("oldest", "name"):
+        raise ValidationError("Порядок ящиков — oldest (давно не копировавшиеся первыми) или name (по алфавиту).")
+    out["order"] = order
+    return out
 #: Самый длинный интервал расписания — год.
 MAX_SCHEDULE_INTERVAL_S = 366 * 86400
 
@@ -1612,6 +1876,8 @@ def _validate_schedule(body: ScheduleBody, existing_options: Optional[dict] = No
         # обработчик с умолчанием target_mode="original" и регулярно заливало
         # весь архив прямо в рабочие папки живого ящика.
         options = validate_restore_options(options)
+    elif body.job_type == JobType.BACKUP_ALL:
+        options = backup_all_options(options)
     else:
         # у копирования, очистки и проверки по расписанию параметров нет
         options = {}
@@ -1629,13 +1895,29 @@ def _validate_schedule(body: ScheduleBody, existing_options: Optional[dict] = No
     return options
 
 
+def _schedule_target(svc, body: ScheduleBody) -> None:
+    """Проверить, к чему относится расписание: к ящику или ко всем ящикам сразу."""
+    if body.job_type in GLOBAL_SCHEDULE_JOB_TYPES:
+        body.account_id = None            # проход сам берёт все включённые ящики
+        if not svc.db.schedules_allow_global():
+            raise ValidationError("База данных не обновлена для общих расписаний.",
+                                  hint="Перезапустите службу: таблица расписаний обновляется при запуске "
+                                       "(подробности — в журнале службы).")
+        return
+    if body.account_id is None:
+        raise ValidationError("Выберите ящик для расписания.",
+                              hint="Для копирования всех включённых ящиков выберите задание "
+                                   "«Копирование всех ящиков по очереди».")
+    svc.require_account(body.account_id)
+
+
 @router.post("/schedules")
 def create_schedule(request: Request, body: ScheduleBody, user: dict = Depends(auth_mod.require_user)):
     svc = svc_dep(request)
     # Расписаниями определяется, копируется ли ящик вообще и что чистится —
     # у сотрудника доступ к ним только на просмотр.
     _require_not_mailbox(user, "Изменение расписаний")
-    svc.require_account(body.account_id)
+    _schedule_target(svc, body)
     options = _validate_schedule(body)
     sid = svc.db.create_schedule(body.account_id, body.kind, body.job_type, body.cron_expr.strip(),
                                  body.interval_seconds, body.enabled, options)
@@ -1651,7 +1933,7 @@ def update_schedule(request: Request, schedule_id: int, body: ScheduleBody, user
     existing = svc.db.get_schedule(schedule_id)
     if existing is None:
         raise HTTPException(404, "Расписание не найдено")
-    svc.require_account(body.account_id)
+    _schedule_target(svc, body)
     try:
         old_options = json.loads(existing["options"] or "{}")
     except (TypeError, ValueError):
@@ -1805,11 +2087,8 @@ def _retention_policy(svc) -> Dict[str, Any]:
             "days": int(svc.rt("retention", "keep_days") or 0)}
 
 
-def _longer_retention(old_days: int, new_days: int) -> bool:
-    """Новый срок хранения длиннее прежнего (0 — «хранить всё» — длиннее любого)."""
-    if old_days <= 0:
-        return False
-    return new_days <= 0 or new_days > old_days
+#: Новый срок хранения длиннее прежнего (0 — «хранить всё» — длиннее любого).
+_longer_retention = longer_retention
 
 
 def _after_retention_change(svc, before: Dict[str, Any]) -> None:
@@ -2116,10 +2395,10 @@ def mailadmin_convert(request: Request, body: MailadminConvertBody, user: dict =
 #  Мониторинг и сводка
 # =====================================================================
 @router.get("/monitoring/summary")
-def monitoring_summary_preview(request: Request, user: dict = Depends(auth_mod.require_admin)):
+def monitoring_summary_preview(request: Request, user: dict = Depends(auth_mod.require_staff)):
     from ..monitoring import weekly_summary
     svc = svc_dep(request)
-    subject, body = weekly_summary(svc)
+    subject, body = weekly_summary(svc, fresh=False, security=user.get("role") == roles.ROLE_ADMIN)
     return {"subject": subject, "body": body, "last_sent": svc.db.get_meta("summary_last_sent") or "",
             "next_run": svc.scheduler.next_run_of("weekly_summary")}
 
@@ -2143,9 +2422,9 @@ def monitoring_summary_send(request: Request, user: dict = Depends(auth_mod.requ
 #  Логи, статистика, аудит
 # =====================================================================
 @router.get("/logs")
-def get_logs(limit: int = 300, level: Optional[str] = None, user: dict = Depends(auth_mod.require_admin)):
+def get_logs(limit: int = 300, level: Optional[str] = None, user: dict = Depends(auth_mod.require_staff)):
     """Общий лог сервиса: содержит имена и хосты всех ящиков и ошибки чужих
-    заданий, поэтому доступен только администратору."""
+    заданий, поэтому доступен только администратору и оператору."""
     from ..logging_setup import memory_handler
     limit = max(1, min(2000, int(limit)))
     return memory_handler.tail(limit=limit, level=level)
@@ -2182,7 +2461,7 @@ def get_audit(request: Request, limit: int = 200, user: dict = Depends(auth_mod.
 # =====================================================================
 @router.get("/analytics/system")
 def analytics_system(request: Request, account_id: Optional[int] = None, days: int = 90,
-                     user: dict = Depends(auth_mod.require_admin)):
+                     user: dict = Depends(auth_mod.require_staff)):
     """Аналитика по всем параметрам системы (хранилище, задания, прогоны и т.д.)."""
     svc = svc_dep(request)
     from ..analytics import system_analytics
@@ -2670,12 +2949,7 @@ def reset_user_2fa(request: Request, user_id: int, user: dict = Depends(auth_mod
 def create_user(request: Request, body: UserBody, user: dict = Depends(auth_mod.require_admin)):
     svc = svc_dep(request)
     from ..security import check_password_policy, hash_password
-    role = (body.role or "admin").strip().lower()
-    if role != "admin":
-        # вход по ящику (role=mailbox) выполняется по email и паролю ящика,
-        # отдельная запись пользователя для этого не создаётся и не работает
-        raise ValidationError("Здесь можно создать только пользователя с ролью «admin».",
-                              hint="Для доступа к своему ящику пользователь входит по email и паролю ящика.")
+    role = _staff_role(body.role or roles.ROLE_OPERATOR)
     # Сначала strip, потом проверки: логин « adm» раньше проходил проверку
     # уникальности и падал в БД с ошибкой 500, а «   » создавал пустое имя.
     username = (body.username or "").strip()
@@ -2690,8 +2964,46 @@ def create_user(request: Request, body: UserBody, user: dict = Depends(auth_mod.
         uid = svc.db.create_user(username, hash_password(body.password), role)
     except sqlite3.IntegrityError:
         raise ValidationError("Пользователь с таким именем уже существует.")
-    svc.db.add_audit(user["username"], "user_create", username)
+    svc.db.add_audit(user["username"], "user_create", f"{username} ({roles.ROLE_LABELS[role]})")
     return {"ok": True, "id": uid}
+
+
+#: Отказ, если после действия не осталось бы ни одного включённого администратора.
+_LAST_ADMIN_REFUSAL = ("Нельзя: в системе не останется ни одного включённого администратора.")
+
+
+def _staff_role(raw: str) -> str:
+    role = (raw or "").strip().lower()
+    if role not in roles.STAFF_ROLES:
+        # вход по ящику (role=mailbox) выполняется по email и паролю ящика,
+        # отдельная запись пользователя для этого не создаётся и не работает
+        raise ValidationError("Роль пользователя — «admin» (администратор) или «operator» (оператор).",
+                              hint="Для доступа к своему ящику сотрудник входит по email и паролю ящика.")
+    return role
+
+
+@router.post("/users/{user_id}/role")
+def set_user_role(request: Request, user_id: int, body: UserRoleBody,
+                  user: dict = Depends(auth_mod.require_admin)):
+    """Сменить роль пользователя (администратор ↔ оператор). Сеансы завершаются."""
+    svc = svc_dep(request)
+    role = _staff_role(body.role)
+    if user_id == user["id"]:
+        # так в системе всегда остаётся хотя бы один администратор — тот, кто меняет роли
+        raise ValidationError("Свою роль поменять нельзя.",
+                              hint="Попросите другого администратора.")
+    target = svc.db.get_user_by_id(_bounded_id(user_id))
+    if target is None:
+        raise ValidationError("Пользователь не найден.")
+    if (target["role"] or roles.ROLE_ADMIN) == role:
+        return {"ok": True, "changed": False}
+    if not svc.db.set_user_role(user_id, role):
+        raise ValidationError(_LAST_ADMIN_REFUSAL)
+    # права берутся из сессии при каждом запросе, но открытые вкладки с прежним
+    # набором разделов лучше закрыть явно
+    svc.db.delete_user_sessions(user_id)
+    svc.db.add_audit(user["username"], "user_role", f"{target['username']}: {roles.ROLE_LABELS[role]}")
+    return {"ok": True, "changed": True}
 
 
 @router.put("/users/{user_id}/password")
@@ -2736,7 +3048,8 @@ def disable_user(request: Request, user_id: int, disabled: bool = True, user: di
         raise ValidationError("Нельзя отключить самого себя.")
     if svc.db.get_user_by_id(user_id) is None:
         raise ValidationError("Пользователь не найден.")
-    svc.db.set_user_disabled(user_id, disabled)
+    if not svc.db.set_user_disabled(user_id, disabled):
+        raise ValidationError(_LAST_ADMIN_REFUSAL)
     svc.db.add_audit(user["username"], "user_disable" if disabled else "user_enable", str(user_id))
     return {"ok": True}
 
@@ -2750,6 +3063,7 @@ def delete_user(request: Request, user_id: int, user: dict = Depends(auth_mod.re
         raise ValidationError("Нельзя удалить последнего пользователя.")
     if svc.db.get_user_by_id(user_id) is None:
         raise ValidationError("Пользователь не найден.")
-    svc.db.delete_user(user_id)
+    if not svc.db.delete_user(user_id):
+        raise ValidationError(_LAST_ADMIN_REFUSAL)
     svc.db.add_audit(user["username"], "user_delete", str(user_id))
     return {"ok": True}

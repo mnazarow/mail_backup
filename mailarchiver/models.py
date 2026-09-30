@@ -25,9 +25,16 @@ class JobType:
     DB_SNAPSHOT = "db_snapshot"          # снимок базы данных
     SEARCH_INDEX = "search_index"        # индексация писем для поиска
     DEDUP_REPORT = "dedup_report"        # отчёт: сколько места займут одинаковые вложения, если хранить их один раз
+    CLEANUP = "cleanup"                  # удаление архивов ящиков и прежних копий (групповые действия)
+    BACKUP_ALL = "backup_all"            # копирование всех (или выбранных) ящиков по очереди, по одному
+    QUARANTINE_CHECK = "quarantine_check"    # сравнить прежнюю копию ящика (карантин) с новой
+    QUARANTINE_RESCUE = "quarantine_rescue"  # вернуть в архив письма, которые есть только в прежней копии
+    FOLDERS_CHECK = "folders_check"      # проверить папки на сервере у многих ящиков
+    SEARCH_REINDEX = "search_reindex"    # переиндексировать поиск по письмам выбранных ящиков
 
     ALL = [BACKUP, RESTORE, EXPORT, IMPORT_PST, TEST, RETENTION, VERIFY, ANALYZE, SYNC_EMPLOYEES,
-           STORAGE_CONVERT, CHECK_LOGINS, REPLICATE, DB_SNAPSHOT, SEARCH_INDEX, DEDUP_REPORT]
+           STORAGE_CONVERT, CHECK_LOGINS, REPLICATE, DB_SNAPSHOT, SEARCH_INDEX, DEDUP_REPORT, CLEANUP,
+           BACKUP_ALL, QUARANTINE_CHECK, QUARANTINE_RESCUE, FOLDERS_CHECK, SEARCH_REINDEX]
     LABELS = {
         BACKUP: "Резервное копирование",
         RESTORE: "Восстановление",
@@ -44,6 +51,12 @@ class JobType:
         DB_SNAPSHOT: "Снимок базы",
         SEARCH_INDEX: "Индексация поиска",
         DEDUP_REPORT: "Отчёт об одинаковых вложениях",
+        CLEANUP: "Удаление архивов и прежних копий",
+        BACKUP_ALL: "Копирование всех ящиков по очереди",
+        QUARANTINE_CHECK: "Сравнение прежней копии с новой",
+        QUARANTINE_RESCUE: "Возврат писем из прежней копии",
+        FOLDERS_CHECK: "Проверка папок на сервере",
+        SEARCH_REINDEX: "Переиндексация поиска",
     }
 
 

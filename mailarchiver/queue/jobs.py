@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -14,6 +15,7 @@ import time
 from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional
 
+from ..accountops import hold_label
 from ..errors import ExportError, JobCancelled, MailArchiverError, ValidationError
 from ..imap.backup import BackupEngine
 from ..imap.client import probe_account
@@ -228,15 +230,91 @@ def _rebuild_full(ctx: JobContext, acc) -> Dict[str, int]:
                                       "затем запустите пересоздание копии заново.")
 
     quarantine, files, freed = svc.store.quarantine_account_files(acc.id)
+    # Возврат писем из ЛЮБОЙ прежней копии ждёт полного копирования после этого
+    # момента: имя каталога хранит время лишь с точностью до секунды и только своё.
+    from .. import quarantine as qmod
+    from ..util import utcnow_iso
+    ctx.db.set_meta(f"{qmod.REBUILD_META}{acc.id}", utcnow_iso())
     removed_index = ctx.db.purge_account_index(acc.id)
     invalidate_mail_analytics_cache()
-    where = f" Прежние файлы перемещены в «{os.path.basename(quarantine)}»." if quarantine else ""
-    ctx.event("WARNING", f"Локальная копия ящика стёрта: записей индекса {removed_index}, "
-                         f"файлов {files} ({human_size(freed)}).{where} Скачиваем всё заново.")
+    where = f" в «{os.path.basename(quarantine)}»" if quarantine else ""
+    ctx.event("WARNING", f"Прежняя копия ящика убрана в карантин{where}: файлов {files} ({human_size(freed)}), "
+                         f"записей индекса очищено {removed_index}. Скачиваем всё заново.")
     ctx.db.add_audit("system", "backup_rebuild_full",
                      f"{acc.name}: индекс {removed_index}, файлов {files}, карантин={quarantine or '—'}")
     return {"index": removed_index, "files": files, "bytes": freed,
             "quarantine": quarantine or ""}
+
+
+#: Отметка «копия «с нуля» этим заданием уже начата»: meta-ключ + «<задание>:<ящик>».
+_REBUILD_DONE = "rebuild_full_done:"
+
+
+def _rebuild_full_once(ctx: JobContext, acc, emit) -> Dict:
+    """Убрать прежнюю копию в карантин — ровно один раз на задание.
+
+    Задание, прерванное перезапуском службы или упавшее и поставленное на
+    повтор, приходит сюда снова с тем же «с нуля». Без отметки оно убрало бы в
+    карантин уже скачанную часть НОВОЙ копии и начало бы всё заново — а с
+    очередным перезапуском ещё раз.
+    """
+    key = f"{_REBUILD_DONE}{ctx.job_id}:{acc.id}"
+    raw = ctx.db.get_meta(key)
+    if raw:
+        try:
+            info = json.loads(raw)
+        except (TypeError, ValueError):
+            info = None
+        if isinstance(info, dict):
+            qname = os.path.basename(info.get("quarantine") or "")
+            emit("INFO", "Копия «с нуля» этим заданием уже начата" + (f" (прежняя копия — в «{qname}»)" if qname else "")
+                 + ": продолжаем скачивание, уже скачанное повторно не качается.")
+            return dict(info, resumed=True)
+    # Отметки заданий, которые так и не закончились, больше не нужны.
+    active = {int(j["id"]) for j in ctx.db.active_jobs()}
+    for row in ctx.db.query("SELECT key FROM meta WHERE key LIKE ?", (_REBUILD_DONE + "%",)):
+        try:
+            other = int(row["key"][len(_REBUILD_DONE):].split(":", 1)[0])
+        except ValueError:
+            continue
+        if other != ctx.job_id and other not in active:
+            ctx.db.delete_meta(row["key"])
+    info = _rebuild_full(ctx, acc)
+    ctx.db.set_meta(key, json.dumps(info, ensure_ascii=False))
+    return info
+
+
+def _compare_after_rebuild(ctx: JobContext, acc, rebuild_info: Dict, res, emit) -> str:
+    """После удачной копии «с нуля» поставить в очередь сравнение прежней копии с новой.
+
+    Отдельным заданием, а не здесь же: сравнение читает каждый файл прежней
+    копии и на большом ящике идёт долго. Если бы оно шло внутри задания
+    копирования, перезапуск службы в это время вернул бы в очередь САМО задание
+    «с нуля» — и оно пересоздало бы уже готовую новую копию ещё раз. Новую копию
+    с ошибками не сравниваем: непрочитанные папки выглядели бы «потерями».
+    """
+    path = rebuild_info.get("quarantine") or ""
+    if not path:
+        return ""
+    if res.status_label != JobStatus.SUCCESS:
+        return ("Прежнюю копию сравните с новой, когда копирование прочитает все папки ящика: меню ящика → "
+                "«Прежние копии» → «Сравнить».")
+    params = {"paths": [path], "after_rebuild": ctx.job_id}
+    try:
+        queue = getattr(ctx.services, "queue", None)
+        if queue is not None:
+            job_id = queue.enqueue(JobType.QUARANTINE_CHECK, acc.id, params, priority=6, created_by="system")
+        else:
+            job_id = ctx.db.enqueue_job(JobType.QUARANTINE_CHECK, acc.id, params, 6, 1, "system")
+    except Exception as exc:  # noqa: BLE001 — сравнение не должно портить итог самой копии
+        log.exception("Не удалось поставить сравнение прежней копии %s", path)
+        emit("WARNING", f"Поставить сравнение прежней копии с новой не удалось: {getattr(exc, 'message', None) or exc}")
+        return ""
+    rebuild_info["check_job"] = job_id
+    text = (f"Прежняя копия сравнится с новой отдельным заданием №{job_id} — итог будет в «Прежних копиях» "
+            f"ящика.")
+    emit("INFO", text)
+    return text
 
 
 def _note_login(db, acc, status: str, error: str = "") -> None:
@@ -287,8 +365,16 @@ def _require_credentials(acc, db=None) -> None:
 
 
 def handle_backup(ctx: JobContext) -> Dict:
-    """Резервное копирование ящика. Параметр ``final`` — последняя копия уволенного
-    сотрудника: после неё копирование ящика выключается (даже если она не удалась)."""
+    """Резервное копирование ящика.
+
+    Параметр ``final`` — последняя копия уволенного сотрудника: после неё
+    копирование ящика выключается (даже если она не удалась — ящик на сервере
+    могли уже удалить). ``disable_after`` — «последняя копия» по команде
+    администратора (групповые действия): копирование выключается, только если
+    копия получилась, иначе ящик остаётся включённым, чтобы её можно было повторить.
+    """
+    if ctx.params.get("disable_after") and not ctx.params.get("final"):
+        return _backup_then_disable(ctx)
     if not ctx.params.get("final"):
         return _handle_backup(ctx)
     try:
@@ -301,6 +387,28 @@ def handle_backup(ctx: JobContext) -> Dict:
     _finish_dismissed(ctx, failed=False)
     result["summary"] = result.get("summary", "") + " Это последняя копия уволенного сотрудника — " \
                                                     "копирование ящика выключено."
+    return result
+
+
+def _backup_then_disable(ctx: JobContext) -> Dict:
+    """Последняя копия по команде администратора: удалась — копирование выключается."""
+    try:
+        result = _handle_backup(ctx)
+    except JobCancelled:
+        raise
+    except BaseException:
+        ctx.event("WARNING", "Последняя копия не удалась — копирование ящика НЕ выключено. "
+                             "Исправьте ошибку и повторите задание.")
+        raise
+    if result.get("final_status") in (JobStatus.SUCCESS, JobStatus.PARTIAL):
+        acc = ctx.db.get_account(ctx.account_id)
+        if acc is not None and acc.enabled:
+            ctx.db.set_account_enabled(acc.id, False)
+            ctx.db.add_audit("system", "account_disabled_after_final", acc.name)
+        ctx.event("INFO", "Последняя копия сделана — копирование ящика выключено.")
+        result["summary"] = result.get("summary", "") + " Это была последняя копия — копирование ящика выключено."
+    else:
+        ctx.event("WARNING", "Последняя копия не удалась — копирование ящика НЕ выключено.")
     return result
 
 
@@ -322,10 +430,38 @@ def _handle_backup(ctx: JobContext) -> Dict:
     # rebuild: "" — обычная копия; "missing" — вернуть потерянные файлы;
     # "full" — стереть локальную копию и скачать всё заново.
     rebuild = str(ctx.params.get("rebuild") or "").strip().lower()
+    return _backup_account(ctx, acc, rebuild=rebuild)
+
+
+def _backup_account(ctx: JobContext, acc, *, rebuild: str = "",
+                    progress_cb: Optional[Callable] = None,
+                    event_cb: Optional[Callable[[str, str], None]] = None) -> Dict:
+    """Скопировать один ящик в рамках задания ``ctx``.
+
+    Отдельно от обработчика задания — чтобы тем же кодом (с записью прогона,
+    датами копий, статистикой и итогом входа) пользовалось копирование всех
+    ящиков по очереди, где одно задание проходит сотни ящиков. ``progress_cb`` и
+    ``event_cb`` позволяют такому заданию показывать ход по-своему.
+    """
+    svc = ctx.services
+    emit = event_cb or ctx.event
+    progress = progress_cb or ctx.progress
     label = {"missing": " (докачка потерянных писем)", "full": " (полностью заново)"}.get(rebuild, "")
-    ctx.event("INFO", f"Старт резервного копирования ящика «{acc.name}»{label}. "
-                      f"MailArchiver {__version__}.")
+    emit("INFO", f"Старт резервного копирования ящика «{acc.name}»{label}. "
+                 f"MailArchiver {__version__}.")
+    if rebuild == "full" and acc.on_hold():
+        # Архив под удержанием (увольнение, проверка): стереть его ради копии
+        # «с нуля» значило бы потерять письма, которых уже нет на сервере.
+        raise ValidationError(
+            f"Архив ящика «{acc.name}» удерживается ({hold_label(acc.hold_until)}) — копию «с нуля» не делаем.",
+            hint="Если удержание больше не нужно, снимите его (меню ящика → «Удержание архива»). "
+                 "Потерянные письма можно вернуть режимом «Докачать потерянные».")
     _require_credentials(acc, ctx.db)
+    if acc.on_hold() and ctx.db.count_retired(acc.id):
+        # Удержание могли поставить, пока шло прошлое копирование со сроком хранения:
+        # оно успело бы запомнить старые письма как «не скачивать». Под удержанием
+        # срок не действует — скачивается всё, что ещё лежит на сервере.
+        ctx.db.clear_retired(acc.id)
     if svc.store.encryption_blocked:
         # Шифрование включено, а ключа нет: качать письма, которые всё равно
         # нельзя сохранить (открытым текстом — запрещено), бессмысленно.
@@ -338,10 +474,10 @@ def _handle_backup(ctx: JobContext) -> Dict:
     rebuild_info: Dict[str, int] = {}
     try:
         if rebuild == "missing":
-            ctx.event("INFO", "Сверяем индекс с файлами на диске…")
+            emit("INFO", "Сверяем индекс с файлами на диске…")
             rebuild_info["restored"] = _rebuild_missing(ctx, acc)
         elif rebuild == "full":
-            rebuild_info = _rebuild_full(ctx, acc)
+            rebuild_info = _rebuild_full_once(ctx, acc, emit)
 
         engine = BackupEngine(
             ctx.db, svc.store, svc.connect_options(),
@@ -350,8 +486,12 @@ def _handle_backup(ctx: JobContext) -> Dict:
             global_exclude=svc.rt("backup", "folder_exclude") or [],
             global_include=svc.rt("backup", "folder_include") or [],
             unreadable_grace_runs=int(svc.rt("backup", "unreadable_folder_grace_runs") or 0),
+            # Письма старше срока хранения ящика не скачиваем: ночная очистка
+            # всё равно удалила бы их, а ящик со сроком «3 дня» иначе при первом
+            # копировании (и после «с нуля») тянул бы всю многолетнюю историю.
+            retention_days=effective_retention_days(svc, acc),
         )
-        res = engine.run(acc, progress_cb=ctx.progress, cancel_cb=ctx.is_cancelled, event_cb=ctx.event)
+        res = engine.run(acc, progress_cb=progress, cancel_cb=ctx.is_cancelled, event_cb=emit)
     except JobCancelled:
         ctx.db.finish_run(run_id, JobStatus.CANCELLED, detail=ctx.stop_reason())
         raise
@@ -371,6 +511,12 @@ def _handle_backup(ctx: JobContext) -> Dict:
         raise
     _note_login(ctx.db, acc, "ok")
     ctx.db.note_backup_result(acc.id, res.status_label)
+    if not res.skipped_folders and not res.cancelled and res.folders_read > 0:
+        # Все папки ящика прочитаны: по этой отметке прежние копии решают, можно ли
+        # возвращать из них письма (ошибки отдельных писем полноту не нарушают).
+        # Прогон, не прочитавший ни одной папки (пустой список папок на сервере,
+        # «Копировать только» с опечаткой), полным не считается.
+        ctx.db.note_complete_backup(acc.id)
 
     ctx.db.finish_run(run_id, res.status_label, messages_new=res.messages_new, bytes_new=res.bytes_new,
                       messages_total=res.messages_total, errors=res.errors,
@@ -387,8 +533,22 @@ def _handle_backup(ctx: JobContext) -> Dict:
     if rebuild == "missing":
         summary += f" Докачка потерянных: возвращено в очередь {rebuild_info.get('restored', 0)} писем."
     elif rebuild == "full":
-        summary += (f" Копия пересоздана с нуля (стёрто записей {rebuild_info.get('index', 0)}, "
-                    f"файлов {rebuild_info.get('files', 0)}).")
+        qname = os.path.basename(rebuild_info.get("quarantine") or "")
+        if rebuild_info.get("resumed"):
+            summary += (f" Продолжение копии «с нуля»: прежние файлы — в карантине"
+                        f"{f' «{qname}»' if qname else ''}, повторно не переносились.")
+        else:
+            summary += (f" Копия пересоздана с нуля: прежние файлы ({rebuild_info.get('files', 0)}) — в карантине"
+                        f"{f' «{qname}»' if qname else ''}, записей индекса очищено {rebuild_info.get('index', 0)}.")
+        compared = _compare_after_rebuild(ctx, acc, rebuild_info, res, emit)
+        if compared:
+            summary += " " + compared
+    if res.messages_relinked:
+        summary += (f" Сервер сменил нумерацию писем (UIDVALIDITY): узнано в архиве писем — "
+                    f"{res.messages_relinked}, повторно они не скачивались.")
+    if res.messages_outside_retention:
+        summary += (f" Писем старше срока хранения ящика ({effective_retention_days(svc, acc)} дн.) "
+                    f"не скачано: {res.messages_outside_retention}.")
     if res.messages_skipped:
         # письма, не скачанные из-за лимита размера, иначе «потерялись» бы без объяснений
         summary += f" Пропущено по лимиту размера: {res.messages_skipped}."
@@ -430,6 +590,8 @@ def _handle_backup(ctx: JobContext) -> Dict:
             "container_folders": res.container_folders,
             "known_unreadable_folders": res.known_unreadable_folders,
             "messages_failed": res.messages_failed, "messages_vanished": res.messages_vanished,
+            "messages_relinked": res.messages_relinked,
+            "messages_outside_retention": res.messages_outside_retention,
             "reconnects": res.reconnects,
             "rebuild": rebuild or "", **({"rebuild_info": rebuild_info} if rebuild_info else {})}
 
@@ -879,6 +1041,13 @@ def handle_retention(ctx: JobContext) -> Dict:
         ctx.event("INFO", f"Ящик «{acc.name}»: хранение {eff_days} дн., к удалению писем {planned}.")
         last_id = 0
         while True:
+            fresh = svc.db.get_account(acc.id)
+            if fresh is None or effective_retention_days(svc, fresh) != eff_days:
+                # Поставили удержание архива или поменяли срок хранения — прежний план
+                # больше не годится: письма, которые теперь надо хранить, не трогаем.
+                ctx.event("WARNING", f"Ящик «{acc.name}»: срок хранения или удержание архива изменились во "
+                                     f"время очистки — очистка ящика остановлена.")
+                break
             rows = _page_older_than(svc.db, acc.id, cutoff_iso, last_id, MESSAGE_PAGE_SIZE)
             if not rows:
                 break
@@ -1374,6 +1543,169 @@ def handle_search_index(ctx: JobContext) -> Dict:
     return {"final_status": JobStatus.SUCCESS, "summary": summary, **res}
 
 
+def handle_search_reindex(ctx: JobContext) -> Dict:
+    """Переиндексировать поиск по выбранным ящикам (групповое действие).
+
+    Параметр ``account_ids`` — какие ящики. Остальной индекс не трогается.
+    """
+    from .. import search as search_mod
+    svc = ctx.services
+    names = {a.id: a.name for a in svc.db.list_accounts()}
+    ids = [int(i) for i in (ctx.params.get("account_ids") or []) if int(i) in names]
+    if not ids:
+        return {"final_status": JobStatus.SUCCESS, "summary": "Ящиков для переиндексации нет.", "items": []}
+    items: List[Dict] = []
+
+    def on_account(account_id: int, stat: Dict[str, int]) -> None:
+        errs = int(stat.get("errors") or 0)
+        items.append({"id": account_id, "name": names.get(account_id, f"#{account_id}"),
+                      "status": JobStatus.PARTIAL if errs else JobStatus.SUCCESS,
+                      "new": int(stat.get("indexed") or 0),
+                      "detail": f"не перечитано (файл не прочитан, в индексе — прежняя запись): {errs}" if errs else ""})
+
+    ctx.event("INFO", f"Переиндексация поиска: ящиков {len(ids)}"
+                      + ("" if search_mod.bodies_enabled(svc) else "; текст писем не индексируется (так настроено)")
+                      + ".")
+    res = search_mod.reindex_accounts(svc, ids, progress=ctx.progress, cancelled=ctx.is_cancelled,
+                                      event=ctx.event, on_account=on_account)
+    if not res.get("available"):
+        return {"final_status": JobStatus.SUCCESS,
+                "summary": "Полнотекстовый поиск недоступен: SQLite собран без FTS5.", "items": []}
+    if not res["total"]:
+        summary = ("Писем этих ящиков в индексе поиска пока нет — их проиндексирует общий проход "
+                   "«Индексация поиска».")
+    else:
+        summary = (f"Переиндексировано писем: {res['indexed']} из {res['total']}, ящиков: {len(items)} из {len(ids)}"
+                   + (f"; не перечитано (файл не прочитан, в индексе осталась прежняя запись): {res['errors']}"
+                      if res["errors"] else "")
+                   + ("" if res.get("bodies") else "; текст писем не индексируется") + ".")
+    if res.get("stopped") == "reset":
+        summary += (" Индекс поиска перестроили целиком во время работы — остальные ящики проиндексирует "
+                    "общий проход.")
+    if ctx.is_cancelled():
+        raise JobCancelled(ctx.stop_reason() + ". " + summary)
+    ctx.event("INFO" if not res["errors"] else "WARNING", summary)
+    status = JobStatus.PARTIAL if res["errors"] else JobStatus.SUCCESS
+    return {"final_status": status, "summary": summary, "indexed": res["indexed"], "errors": res["errors"],
+            "items": items}
+
+
+# ---------------------------------------------------------------------------
+#  FOLDERS_CHECK (проверить папки многих ящиков на сервере)
+# ---------------------------------------------------------------------------
+#: Сколько проблемных ящиков расписывать в журнале задания (остальные — в таблице итога).
+FOLDERS_CHECK_MAX_EVENTS = 100
+
+
+def _broken_folders_text(broken: List[Dict]) -> str:
+    parts = []
+    for row in broken[:5]:
+        msgs = row.get("messages")
+        parts.append(f"«{row.get('name')}» — " + (f"писем {msgs}" if msgs is not None else "писем сколько — неизвестно"))
+    more = len(broken) - 5
+    return (f"не открываются папки ({len(broken)}): " + ", ".join(parts)
+            + (f" и ещё {more}" if more > 0 else ""))
+
+
+def handle_folders_check(ctx: JobContext) -> Dict:
+    """Проверить папки выбранных ящиков на сервере — по одному ящику, письма не скачиваются.
+
+    По каждому ящику — открываются ли все его папки и сколько писем в тех, что
+    не открываются (то есть не попадают в копию). Это та же проверка, что кнопка
+    «Проверить папки» в карточке ящика, только сразу для многих. Сервер, который
+    не отвечает несколько ящиков подряд, дальше не проверяется — чтобы не ждать
+    тайм-аут на каждом его ящике.
+    """
+    from ..accountops import credential_problem
+    from ..imap.client import diagnose_folders
+    svc = ctx.services
+    ids = ctx.params.get("account_ids")
+    accounts = svc.db.list_accounts()
+    if ids:
+        wanted = {int(i) for i in ids}
+        accounts = [a for a in accounts if a.id in wanted]
+    accounts.sort(key=lambda a: (a.name or "").lower())
+    total = len(accounts)
+    ctx.event("INFO", f"Проверка папок на сервере: ящиков {total}, по одному; письма не скачиваются.")
+    opts = svc.connect_options()
+    include = svc.rt("backup", "folder_include") or []
+    exclude = svc.rt("backup", "folder_exclude") or []
+    counts = {"ok": 0, "with_problems": 0, "failed": 0, "skipped": 0}
+    lost_total = 0
+    reported = 0
+    items: List[Dict] = []
+    host_fails: Dict[str, int] = {}
+    down: Dict[str, int] = {}
+    for n, acc in enumerate(accounts):
+        if ctx.is_cancelled():
+            raise JobCancelled(f"Проверка папок отменена (проверено ящиков {n} из {total}).")
+        ctx.progress(n, max(total, 1), f"{n + 1}/{total} «{acc.name}»")
+        base = {"id": acc.id, "name": acc.name}
+        problem = credential_problem(acc)
+        host = (acc.host or "").strip().lower()
+        if problem:
+            counts["skipped"] += 1
+            items.append({**base, "status": "skipped", "detail": problem})
+            continue
+        if host in down:
+            down[host] += 1
+            counts["skipped"] += 1
+            items.append({**base, "status": "skipped", "detail": f"сервер {acc.host} не отвечает"})
+            continue
+        res = diagnose_folders(acc, opts, global_include=include, global_exclude=exclude)
+        if not res.get("ok"):
+            counts["failed"] += 1
+            error = str(res.get("error") or "не удалось подключиться")
+            items.append({**base, "status": "failed", "new": 0, "detail": error[:300]})
+            if res.get("error_type") in ("ImapConnectionError", "ImapTimeoutError"):
+                host_fails[host] = host_fails.get(host, 0) + 1
+                if host_fails[host] >= SEQUENCE_MAX_CONN_FAILS and host not in down:
+                    down[host] = 0
+                    ctx.event("WARNING", f"Сервер {acc.host} не отвечает: {host_fails[host]} ящиков подряд — "
+                                         f"остальные его ящики не проверяются.")
+            else:
+                host_fails[host] = 0
+            continue
+        host_fails[host] = 0
+        folders = res.get("folders") or []
+        broken = [r for r in folders if r.get("verdict") == "broken"]
+        if broken:
+            counts["with_problems"] += 1
+            lost = int(res.get("messages_lost") or 0)
+            lost_total += lost
+            detail = _broken_folders_text(broken)
+            items.append({**base, "status": "partial", "new": len(broken), "detail": detail[:300]})
+            reported += 1
+            if reported <= FOLDERS_CHECK_MAX_EVENTS:
+                ctx.event("WARNING", f"«{acc.name}»: {detail}")
+        else:
+            counts["ok"] += 1
+            empty = int((res.get("counts") or {}).get("empty_broken") or 0)
+            detail = f"папок {len(folders)}, все открываются"
+            if empty:
+                detail += f"; пустых, которые не открываются: {empty} (писем в них нет)"
+            items.append({**base, "status": "success", "new": 0, "detail": detail})
+    checked = counts["ok"] + counts["with_problems"]
+    summary = (f"Проверено ящиков: {checked} из {total}. Все папки открываются: {counts['ok']}; "
+               f"есть папки, которые не открываются: {counts['with_problems']}"
+               + (f" (писем в них по данным сервера: {lost_total})" if lost_total else "")
+               + (f"; не удалось подключиться: {counts['failed']}" if counts["failed"] else "")
+               + (f"; пропущено: {counts['skipped']}" if counts["skipped"] else "") + ".")
+    if counts["with_problems"]:
+        summary += (" Письма из неоткрывающихся папок в копию не попадают: папку чинят (или удаляют) на почтовом "
+                    "сервере либо добавляют в «Пропускать папки» ящика.")
+    ctx.progress(total, max(total, 1), "Готово")
+    ctx.event("INFO" if not (counts["with_problems"] or counts["failed"]) else "WARNING", summary)
+    if counts["failed"] and not checked:
+        status = JobStatus.FAILED
+    elif counts["with_problems"] or counts["failed"]:
+        status = JobStatus.PARTIAL
+    else:
+        status = JobStatus.SUCCESS
+    return {"final_status": status, "summary": summary, "total": total, **counts,
+            "messages_lost": lost_total, "items": items[-SEQUENCE_MAX_ITEMS:]}
+
+
 # ---------------------------------------------------------------------------
 #  DEDUP_REPORT (отчёт «Одинаковые вложения»: сколько места сэкономило бы
 #  хранение одной копии; формат хранения не меняется)
@@ -1418,6 +1750,696 @@ def handle_dedup_report(ctx: JobContext) -> Dict:
             "savings_bytes": report["savings"]["bytes"]}
 
 
+# ---------------------------------------------------------------------------
+#  BACKUP_ALL (все включённые ящики по очереди, по одному)
+# ---------------------------------------------------------------------------
+#: После стольких ящиков подряд без связи с сервером проход останавливается:
+#: иначе при лежащем сервере задание часами ждало бы тайм-аут на каждом из сотен ящиков.
+SEQUENCE_MAX_CONN_FAILS = 5
+#: Раз в столько удачных ящиков в журнал задания пишется строка «готово N из M».
+SEQUENCE_REPORT_EVERY = 25
+#: Сколько сообщений от самих ящиков (предупреждения, ошибки) переносить в журнал задания.
+SEQUENCE_MAX_EVENTS = 300
+#: Сколько строк итога по ящикам хранить в результате задания.
+SEQUENCE_MAX_ITEMS = 2000
+_SEQ_STATE = "backup_all_state_"
+#: Время ручного «Повторить» прохода (meta): от него считается «не начинать после».
+#: Отдельный ключ, а не поле состояния: состояние чужих незаконченных проходов
+#: чистится при старте каждого прохода, и повтор не должен от этого зависеть.
+_SEQ_RETRY = "backup_all_retry_at_"
+
+
+def is_global_pass(job) -> bool:
+    """Задание — проход по ВСЕМ включённым ящикам (а не по выбранным)."""
+    try:
+        params = json.loads(job["params"] or "{}") or {}
+    except (TypeError, ValueError, KeyError, IndexError):
+        params = {}
+    return job["type"] == JobType.BACKUP_ALL and not params.get("account_ids")
+
+
+def _last_attempt(acc, last_runs: Dict[int, object]) -> str:
+    """Когда ящик пытались копировать в последний раз (удачно или нет); '' — никогда.
+
+    Порядок прохода строится по ПОПЫТКЕ, а не по удаче: иначе ящики на
+    мёртвом сервере навсегда оставались бы «самыми давними» и каждую ночь
+    шли первыми, съедая проход ещё до исправных ящиков.
+    """
+    run = last_runs.get(acc.id)
+    stamps = [acc.last_backup_at or "", acc.login_checked_at or ""]
+    if run is not None:
+        stamps.append(run["started_at"] or "")
+    return max(stamps)
+
+
+def _sequence_deadline(svc, stop_at: str, started: datetime) -> Optional[datetime]:
+    """Когда перестать брать новые ящики: ближайшее «ЧЧ:ММ» после начала прохода."""
+    stop_at = (stop_at or "").strip()
+    if not stop_at:
+        return None
+    try:
+        hh, mm = (int(x) for x in stop_at.split(":", 1))
+    except ValueError:
+        return None
+    local = started.astimezone(svc.local_tz())
+    target = local.replace(hour=hh % 24, minute=mm % 60, second=0, microsecond=0)
+    if target <= local:
+        from datetime import timedelta
+        target += timedelta(days=1)
+    return target
+
+
+def _duration_text(seconds: float) -> str:
+    seconds = int(max(0, seconds))
+    h, rest = divmod(seconds, 3600)
+    m, s = divmod(rest, 60)
+    if h:
+        return f"{h} ч {m} мин"
+    if m:
+        return f"{m} мин {s} с"
+    return f"{s} с"
+
+
+def handle_backup_all(ctx: JobContext) -> Dict:
+    """Копирование всех включённых ящиков (или перечисленных) СТРОГО ПО ОЧЕРЕДИ.
+
+    Одно задание проходит ящики один за другим — сам проход никогда не
+    копирует два ящика сразу, сколько бы ни было свободных слотов в очереди
+    (другие задания копирования — свои расписания ящиков, кнопки — могут идти
+    параллельно с ним). Порядок — сначала ящики, копировавшиеся давнее
+    всего (никогда — первыми): если проход не успел до «не начинать после» или
+    прервался, следующий начнёт с тех, до кого очередь не дошла.
+
+    Пока задание работает с ящиком, очередь не запускает по нему других
+    заданий (ящик «занят»), а ящик, по которому уже идёт своё задание,
+    откладывается в конец прохода. Ход сохраняется в базе: после перезапуска
+    службы проход продолжается с того же места, а не начинается заново.
+    """
+    import json as _json
+    from ..accountops import credential_problem
+    from ..errors import DiskSpaceError, ImapAuthError, ImapConnectionError, ImapTimeoutError, StorageError
+
+    svc = ctx.services
+    p = ctx.params
+    queue = getattr(svc, "queue", None)
+    started = datetime.now(timezone.utc)
+    if svc.store.encryption_blocked:
+        raise StorageError("Копирование не начато: " + svc.store.encryption_blocked,
+                           hint="Верните файл ключа шифрования или выключите шифрование в "
+                                "«Настройки → Хранилище».")
+    try:
+        pause = max(0, min(3600, int(p.get("pause_seconds") or 0)))
+    except (TypeError, ValueError):
+        pause = 0
+    order = str(p.get("order") or "oldest")
+    only_ids = p.get("account_ids")
+    wanted = {int(i) for i in only_ids} if only_ids else None
+
+    state_key = f"{_SEQ_STATE}{ctx.job_id}"
+    # Следы прежних проходов, которые так и не закончились (упали без повтора),
+    # убираем: они больше никому не нужны.
+    active_ids = {int(j["id"]) for j in ctx.db.active_jobs()}
+    for row in ctx.db.query("SELECT key FROM meta WHERE key LIKE ?", (_SEQ_STATE + "%",)):
+        try:
+            other = int(row["key"][len(_SEQ_STATE):])
+        except ValueError:
+            continue
+        if other != ctx.job_id and other not in active_ids:
+            ctx.db.execute("DELETE FROM meta WHERE key=?", (row["key"],))
+    try:
+        state = _json.loads(ctx.db.get_meta(state_key) or "{}") or {}
+    except (TypeError, ValueError):
+        state = {}
+    resumed = bool(state.get("done"))
+    done = set(int(i) for i in state.get("done") or [])
+    stats = {"ok": 0, "partial": 0, "failed": 0, "skipped": 0, "messages": 0, "bytes": 0}
+    stats.update(state.get("stats") or {})
+    items: List[Dict] = list(state.get("items") or [])
+    skip_reasons: Dict[str, int] = dict(state.get("skip_reasons") or {})
+    if state.get("started"):
+        try:
+            started = datetime.fromisoformat(state["started"])
+        except ValueError:
+            pass
+    if state.get("deadline"):
+        try:
+            deadline = datetime.fromisoformat(state["deadline"])
+        except ValueError:
+            deadline = None
+    else:
+        # «Не начинать после» отсчитывается от времени запуска по расписанию, а
+        # не от фактического старта: проход, поставленный в 01:00 с пределом
+        # 07:00, но дождавшийся свободного места в очереди лишь к 07:30, не
+        # должен идти весь рабочий день до 07:00 завтрашнего. Ручной «Повторить»
+        # — от времени повтора (см. JobQueue.retry): иначе повтор после 07:00
+        # сразу заканчивался ничем.
+        base = started
+        job_row = ctx.db.get_job(ctx.job_id)
+        retry_base = str(ctx.db.get_meta(f"{_SEQ_RETRY}{ctx.job_id}") or state.get("retry_base") or "")
+        if retry_base:
+            try:
+                base = datetime.fromisoformat(retry_base)
+            except ValueError:
+                base = started
+        elif job_row is not None and job_row["created_at"]:
+            try:
+                base = datetime.fromisoformat(job_row["created_at"])
+                if base.tzinfo is None:
+                    base = base.replace(tzinfo=timezone.utc)
+            except ValueError:
+                base = started
+        deadline = _sequence_deadline(svc, str(p.get("stop_at") or ""), base)
+
+    # Без списка — все включённые ящики; со списком — ровно перечисленные
+    # (выключенные из них будут пропущены с понятной причиной).
+    accounts = [a for a in svc.db.list_accounts() if (a.id in wanted if wanted is not None else a.enabled)]
+    if order == "name":
+        accounts.sort(key=lambda a: (a.name or "").lower())
+    else:
+        last_runs = svc.db.last_runs_by_account()
+        accounts.sort(key=lambda a: (_last_attempt(a, last_runs), (a.name or "").lower()))
+    total = len(accounts)
+
+    def save_state() -> None:
+        ctx.db.set_meta(state_key, _json.dumps({
+            "done": sorted(done), "stats": stats, "items": items[-SEQUENCE_MAX_ITEMS:],
+            "skip_reasons": skip_reasons, "started": started.isoformat(),
+            "deadline": deadline.isoformat() if deadline else ""}, ensure_ascii=False))
+
+    def note(acc, status: str, detail: str = "", new: int = 0, size: int = 0) -> None:
+        items.append({"id": acc.id, "name": acc.name, "status": status, "new": new, "bytes": size,
+                      "detail": detail[:300]})
+
+    head = (f"Копирование ящиков по очереди: {total} "
+            f"{'выбранных' if wanted is not None else 'включённых'} ящиков, по одному"
+            + (", сначала те, что копировались давнее всего" if order != "name" else ", по алфавиту"))
+    if pause:
+        head += f"; пауза между ящиками {pause} с"
+    if deadline:
+        head += f"; новые ящики не начинаются после {deadline.astimezone(svc.local_tz()).strftime('%H:%M')}"
+    ctx.event("INFO", head + "." + (f" Продолжение прерванного прохода: уже готово {len(done)}." if resumed else ""))
+    if not total:
+        ctx.event("INFO", "Включённых ящиков нет — копировать нечего.")
+
+    forwarded = [0]
+    # Ящики подряд без связи — по каждому серверу отдельно: лежащий старый
+    # сервер не должен останавливать копирование ящиков на исправном.
+    host_fails: Dict[str, int] = {}
+    down_hosts: Dict[str, int] = {}          # сервер -> сколько ящиков пропущено
+    stopped_by_deadline = False
+    deferred: List = []
+    since_report = [0]
+
+    def host_of(acc) -> str:
+        return (acc.host or "").strip().lower()
+
+    def run_one(acc, second_try: bool) -> bool:
+        """Обработать ящик. True — было копирование (после него — пауза)."""
+        fresh = ctx.db.get_account(acc.id)
+        if fresh is None or not fresh.enabled:
+            stats["skipped"] += 1
+            reason = "ящик удалён" if fresh is None else "копирование выключено"
+            skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+            note(acc, "skipped", reason)
+            done.add(acc.id)
+            return False
+        problem = credential_problem(fresh)
+        if problem:
+            stats["skipped"] += 1
+            skip_reasons[problem] = skip_reasons.get(problem, 0) + 1
+            note(fresh, "skipped", problem)
+            done.add(acc.id)
+            return False
+        if host_of(fresh) in down_hosts:
+            # Сервер не отвечает: ящик НЕ отмечается сделанным — при повторе
+            # задания или в следующий проход до него дойдёт очередь.
+            down_hosts[host_of(fresh)] += 1
+            return False
+        if queue is not None and not queue.acquire_account(acc.id, ctx.job_id):
+            if not second_try:
+                deferred.append(acc)          # по ящику идёт своё задание — вернёмся к нему в конце
+                return False
+            reason = "по ящику выполнялось другое задание"
+            stats["skipped"] += 1
+            skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+            note(fresh, "skipped", reason)
+            ctx.event("INFO", f"«{fresh.name}» пропущен: {reason}.")
+            done.add(acc.id)
+            return False
+        index = len(done)
+
+        def emit(level: str, message: str) -> None:
+            if level == "INFO":
+                return                       # подробности ящика — в его истории копий
+            forwarded[0] += 1
+            if forwarded[0] <= SEQUENCE_MAX_EVENTS:
+                ctx.event(level, f"«{fresh.name}»: {message}")
+            elif forwarded[0] == SEQUENCE_MAX_EVENTS + 1:
+                ctx.event("WARNING", "Сообщений от ящиков слишком много — дальше только итог по каждому "
+                                     "ящику (он в результате задания и в истории копий ящика).")
+
+        def progress(cur, tot, label="", bytes_done=0, speed=0.0) -> None:
+            ctx.progress(index, max(total, 1), f"{index + 1}/{total} «{fresh.name}»: {label}",
+                         int(stats["bytes"]) + int(bytes_done or 0), speed)
+
+        host = host_of(fresh)
+        try:
+            res = _backup_account(ctx, fresh, progress_cb=progress, event_cb=emit)
+            host_fails[host] = 0
+            status = res.get("final_status")
+            stats["messages"] += int(res.get("messages_new") or 0)
+            stats["bytes"] += int(res.get("bytes_new") or 0)
+            if status == JobStatus.SUCCESS:
+                stats["ok"] += 1
+            elif status == JobStatus.PARTIAL:
+                stats["partial"] += 1
+                ctx.event("WARNING", f"«{fresh.name}»: частично — {res.get('summary', '')[:400]}")
+            else:
+                stats["failed"] += 1
+                ctx.event("ERROR", f"«{fresh.name}»: {res.get('summary', '')[:400]}")
+            note(fresh, status or "success", "" if status == JobStatus.SUCCESS else _problem_text(res),
+                 int(res.get("messages_new") or 0), int(res.get("bytes_new") or 0))
+        except (JobCancelled, DiskSpaceError):
+            raise
+        except MailArchiverError as exc:
+            stats["failed"] += 1
+            ctx.db.bump_daily_stats(fresh.id, jobs=1, errors=1)
+            text = exc.message + (f" {exc.hint}" if exc.hint else "")
+            ctx.event("ERROR", f"«{fresh.name}»: {text[:500]}")
+            note(fresh, "failed", exc.message)
+            if isinstance(exc, (ImapConnectionError, ImapTimeoutError)) and not isinstance(exc, ImapAuthError):
+                host_fails[host] = host_fails.get(host, 0) + 1
+                if host_fails[host] >= SEQUENCE_MAX_CONN_FAILS and host not in down_hosts:
+                    down_hosts[host] = 0
+                    ctx.event("WARNING", f"Сервер {fresh.host} не отвечает: {host_fails[host]} ящиков подряд без "
+                                         f"связи — остальные его ящики в этом проходе пропускаются, чтобы не ждать "
+                                         f"тайм-аут на каждом.")
+            else:
+                host_fails[host] = 0
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Копирование ящика «%s» в проходе по очереди упало", fresh.name)
+            stats["failed"] += 1
+            ctx.db.bump_daily_stats(fresh.id, jobs=1, errors=1)
+            ctx.event("ERROR", f"«{fresh.name}»: {type(exc).__name__}: {exc}"[:500])
+            note(fresh, "failed", f"{type(exc).__name__}: {exc}")
+            host_fails[host] = 0
+        finally:
+            if queue is not None:
+                queue.release_account(acc.id, ctx.job_id)
+        done.add(acc.id)
+        since_report[0] += 1
+        if since_report[0] >= SEQUENCE_REPORT_EVERY:
+            since_report[0] = 0
+            ctx.event("INFO", f"Готово ящиков: {len(done)} из {total} (новых писем {stats['messages']}, "
+                              f"{human_size(stats['bytes'])}).")
+        return True
+
+    def summary_text(stopped: str = "") -> str:
+        processed = stats["ok"] + stats["partial"] + stats["failed"]
+        text = (f"Скопировано ящиков по очереди: {stats['ok'] + stats['partial']} из {total}"
+                + (f" (частично: {stats['partial']})" if stats["partial"] else "")
+                + f"; новых писем {stats['messages']} ({human_size(stats['bytes'])})")
+        if stats["failed"]:
+            names = [it["name"] for it in items if it["status"] == "failed"][:10]
+            more = stats["failed"] - len(names)
+            text += f"; с ошибкой: {stats['failed']} ({', '.join(names)}{f' и ещё {more}' if more > 0 else ''})"
+        if stats["skipped"]:
+            reasons = ", ".join(f"{k} — {v}" for k, v in sorted(skip_reasons.items(), key=lambda kv: -kv[1]))
+            text += f"; пропущено: {stats['skipped']} ({reasons})"
+        text += f". Обработано {processed + stats['skipped']} из {total} за {_duration_text((datetime.now(timezone.utc) - started).total_seconds())}."
+        for host, skipped in down_hosts.items():
+            if skipped:
+                text += (f" Сервер {host} не отвечал — не скопировано его ящиков: {skipped} (они будут первыми "
+                         f"в следующий раз).")
+        if stopped:
+            text += " " + stopped
+        return text
+
+    def wait_pause() -> None:
+        end = time.time() + pause
+        while time.time() < end:
+            if ctx.is_cancelled():
+                return
+            time.sleep(min(1.0, max(0.0, end - time.time())))
+
+    try:
+        pending = [a for a in accounts if a.id not in done]
+        for n, acc in enumerate(pending):
+            if ctx.is_cancelled():
+                raise JobCancelled(ctx.stop_reason())
+            if deadline is not None and datetime.now(timezone.utc) >= deadline:
+                stopped_by_deadline = True
+                break
+            copied = run_one(acc, second_try=False)
+            save_state()
+            if copied and pause and n < len(pending) - 1:
+                wait_pause()
+        if not stopped_by_deadline:
+            for acc in list(deferred):
+                if ctx.is_cancelled():
+                    raise JobCancelled(ctx.stop_reason())
+                if deadline is not None and datetime.now(timezone.utc) >= deadline:
+                    stopped_by_deadline = True
+                    break
+                run_one(acc, second_try=True)
+                save_state()
+        if down_hosts and not (stats["ok"] + stats["partial"]):
+            # Ни одного удачного ящика и сервер не отвечает — это сбой прохода:
+            # очередь повторит задание позже, и оно продолжится с того же места.
+            hosts = ", ".join(down_hosts)
+            raise ImapConnectionError(
+                f"Почтовый сервер недоступен ({hosts}): {SEQUENCE_MAX_CONN_FAILS} ящиков подряд не удалось "
+                f"подключиться — проход остановлен, чтобы не ждать тайм-аут на каждом ящике.",
+                hint="Проверьте доступность почтового сервера. Проход продолжится с того же места при повторе "
+                     "задания.")
+    except JobCancelled as exc:
+        if queue is not None and queue.is_shutting_down() and not ctx.db.is_cancel_requested(ctx.job_id):
+            save_state()                      # служба останавливается — продолжим после запуска
+            raise
+        ctx.db.execute("DELETE FROM meta WHERE key IN (?, ?)", (state_key, f"{_SEQ_RETRY}{ctx.job_id}"))
+        raise JobCancelled(f"{exc.message if hasattr(exc, 'message') else exc}. " + summary_text()) from None
+    except MailArchiverError:
+        save_state()                           # повтор задания продолжит с того же места
+        raise
+    ctx.db.execute("DELETE FROM meta WHERE key IN (?, ?)", (state_key, f"{_SEQ_RETRY}{ctx.job_id}"))
+    left = total - len(done)
+    # До кого очередь не дошла (время вышло, сервер не отвечал) — поимённо для письма-итога.
+    not_reached = [a.name for a in accounts if a.id not in done][:SEQUENCE_MAX_ITEMS]
+    stopped = ""
+    if stopped_by_deadline and left > 0:
+        stopped = (f"Время прохода вышло ({deadline.astimezone(svc.local_tz()).strftime('%H:%M')}): "
+                   f"не дошла очередь до {left} ящиков — в следующий раз они будут первыми.")
+        ctx.event("WARNING", stopped)
+    ctx.progress(total, max(total, 1), "Готово")
+    summary = summary_text(stopped)
+    ctx.event("INFO" if not stats["failed"] else "WARNING", summary)
+    good = stats["ok"] + stats["partial"]
+    if stats["failed"] and not good:
+        final = JobStatus.FAILED
+    elif stats["failed"] or stats["partial"] or (stopped_by_deadline and left > 0) or any(down_hosts.values()):
+        final = JobStatus.PARTIAL
+    else:
+        final = JobStatus.SUCCESS
+    return {"final_status": final, "summary": summary, "total": total, **stats,
+            "left": left if (stopped_by_deadline or down_hosts) else 0, "skip_reasons": skip_reasons,
+            "hosts_down": {h: n for h, n in down_hosts.items() if n}, "items": items[-SEQUENCE_MAX_ITEMS:],
+            **({"not_reached": not_reached} if (stopped_by_deadline or down_hosts) and not_reached else {})}
+
+
+def _problem_text(res: Dict) -> str:
+    """Коротко — что не так с копией ящика: для списка ящиков прохода и письма-итога.
+
+    Полный итог ящика длинный («новых писем …, папок прочитано …»), и главное —
+    какие папки не прочитаны — в обрезанной строке терялось.
+    """
+    parts: List[str] = []
+    skipped = list(res.get("skipped_folders") or [])
+    if skipped:
+        more = len(skipped) - 5
+        parts.append(f"не прочитаны папки ({len(skipped)}): {', '.join(skipped[:5])}"
+                     + (f" и ещё {more}" if more > 0 else ""))
+    if res.get("messages_failed"):
+        parts.append(f"сервер не отдал писем: {res['messages_failed']}")
+    if res.get("errors") and not parts:
+        parts.append(f"ошибок: {res['errors']}")
+    return "; ".join(parts) or str(res.get("summary") or "")
+
+
+#: Сколько ящиков каждой группы перечислять в письме-итоге прохода.
+REPORT_MAX_NAMES = 60
+
+
+def backup_all_report(result: Dict) -> str:
+    """Подробности прохода «все ящики по очереди» для письма-уведомления.
+
+    В итоге задания — только числа и первые имена; администратору, который
+    читает письмо утром, нужны поимённо ящики с ошибкой, частичные, пропущенные
+    и те, до кого очередь не дошла, — чтобы не открывать веб-интерфейс.
+    """
+    items = [it for it in (result.get("items") or []) if isinstance(it, dict)]
+    lines: List[str] = []
+    for key, title in (("failed", "С ошибкой"), ("partial", "Скопированы частично"), ("skipped", "Пропущены")):
+        rows = [it for it in items if it.get("status") == key]
+        if not rows:
+            continue
+        lines.append(f"{title} ({len(rows)}):")
+        for it in rows[:REPORT_MAX_NAMES]:
+            detail = " ".join(str(it.get("detail") or "").split())
+            lines.append(f"  • {it.get('name')}" + (f" — {detail[:240]}" if detail else ""))
+        if len(rows) > REPORT_MAX_NAMES:
+            lines.append(f"  … и ещё {len(rows) - REPORT_MAX_NAMES} (полный список — в карточке задания).")
+        lines.append("")
+    not_reached = list(result.get("not_reached") or [])
+    if not_reached:
+        shown = ", ".join(not_reached[:REPORT_MAX_NAMES])
+        more = len(not_reached) - REPORT_MAX_NAMES
+        lines.append(f"Не дошла очередь ({len(not_reached)}) — в следующий раз они будут первыми:")
+        lines.append(f"  {shown}" + (f" и ещё {more}" if more > 0 else ""))
+        lines.append("")
+    for host, skipped in sorted((result.get("hosts_down") or {}).items()):
+        lines.append(f"Сервер {host} не отвечал: пропущено его ящиков {skipped}.")
+    top = sorted((it for it in items if int(it.get("new") or 0) > 0), key=lambda it: -int(it.get("new") or 0))[:10]
+    if top:
+        if lines and lines[-1]:
+            lines.append("")
+        lines.append("Больше всего новых писем:")
+        for it in top:
+            lines.append(f"  • {it.get('name')} — {int(it['new'])} ({human_size(int(it.get('bytes') or 0))})")
+    return "\n".join(lines).strip()
+
+
+# ---------------------------------------------------------------------------
+#  QUARANTINE_CHECK / QUARANTINE_RESCUE (прежние копии ящика)
+# ---------------------------------------------------------------------------
+def handle_quarantine(ctx: JobContext) -> Dict:
+    """Сравнить прежние копии ящика с новой или вернуть из них недостающие письма."""
+    from .. import quarantine as qmod
+    svc = ctx.services
+    acc = svc.require_account(ctx.account_id)
+    rescue = ctx.job_type == JobType.QUARANTINE_RESCUE
+    known = svc.store.quarantine_paths(acc.id)
+    wanted = {os.path.normpath(p) for p in (ctx.params.get("paths") or [])}
+    paths = [p for p in known if not wanted or os.path.normpath(p) in wanted]
+    if not paths:
+        return {"final_status": JobStatus.SUCCESS, "summary": f"Ящик «{acc.name}»: прежних копий нет.",
+                "items": []}
+    lines: List[str] = []
+    items: List[Dict] = []
+    problems = 0
+    attention = 0          # после «с нуля»: в прежней копии нашлись письма, которых нет в новой
+    for n, path in enumerate(paths, start=1):
+        name = os.path.basename(path)
+
+        def prog(cur: int, total: int, message: str, _name=name, _n=n) -> None:
+            ctx.progress(cur, max(total, 1), f"{_n}/{len(paths)} «{_name}»: {message}")
+
+        if rescue:
+            ctx.event("INFO", f"«{name}»: ищем письма, которых нет в новой копии, и возвращаем их в архив…")
+            try:
+                r = qmod.rescue(svc, acc, path, progress=prog, cancelled=ctx.is_cancelled)
+            except ValidationError as exc:
+                text = f"«{name}»: {exc.message}"
+                items.append({"name": name, "status": "skipped", "new": 0, "detail": exc.message[:300]})
+                problems += 1
+                ctx.event("WARNING", text + (f" {exc.hint}" if exc.hint else ""))
+                lines.append(text)
+                continue
+            after = r["after"]
+            text = f"«{name}»: возвращено в архив писем {r['rescued']} ({human_size(r['rescued_bytes'])})"
+            if r["skipped_old"]:
+                text += (f"; старше срока хранения ящика ({r['retention_days']} дн.) не возвращено "
+                         f"{r['skipped_old']} — их удалила бы ночная очистка")
+            if r["skipped_unreadable"]:
+                text += (f"; из папок, которые сейчас не открываются на сервере, не возвращено "
+                         f"{r['skipped_unreadable']} — вернутся, когда папки снова начнут копироваться")
+            if r["failed"]:
+                text += f"; не удалось вернуть {r['failed']} (подробности — в журнале службы)"
+                problems += 1
+            text += f". Осталось только в прежней копии: {after.get('unique', 0)}."
+            items.append({"name": name, "status": "partial" if r["failed"] else "success",
+                          "new": r["rescued"], "bytes": r["rescued_bytes"], "detail": qmod.check_label(after)})
+            level = "WARNING" if r["failed"] else "INFO"
+        else:
+            ctx.event("INFO", f"«{name}»: сравниваем с новой копией…")
+            check = qmod.compare(svc, acc.id, path, progress=prog, cancelled=ctx.is_cancelled)
+            text = f"«{name}»: {qmod.check_label(check)}."
+            safe, why = qmod.is_safe_to_delete(check)
+            if safe:
+                text += " Все её письма есть в новой копии — её можно удалить."
+            elif check.get("unique"):
+                text += (f" Писем, которых нет в новой копии, — {check['unique']}: они удалены на сервере, лежат в "
+                         f"исключённых или неоткрывающихся папках либо больше лимита размера.")
+                if int(check.get("unique_unreadable") or 0) >= int(check["unique"]):
+                    text += " Это письма папок, которые сейчас не открываются на сервере, — сравните ещё раз, когда они начнут копироваться."
+                else:
+                    text += " Вернуть их в архив: меню ящика → «Прежние копии» → «Вернуть»."
+                if not check.get("new_copy_complete"):
+                    text += (" Новая копия после «с нуля» ещё не прочитала все папки — сравните ещё раз после "
+                             "полного копирования.")
+            if check.get("unreadable"):
+                problems += 1
+            status = "partial" if check.get("unreadable") else "success"
+            if check.get("unique") and ctx.params.get("after_rebuild"):
+                attention += 1
+            items.append({"name": name, "status": status, "new": int(check.get("unique") or 0),
+                          "bytes": int(check.get("unique_bytes") or 0), "detail": qmod.check_label(check)})
+            level = "WARNING" if (check.get("unique") or check.get("unreadable")) else "INFO"
+        ctx.event(level, text)
+        lines.append(text)
+    summary = f"Ящик «{acc.name}»: " + " ".join(lines)
+    # Сравнение, которое поставила копия «с нуля», нашло письма только в прежней
+    # копии — это требует внимания администратора (и уведомления об «ошибках»).
+    return {"final_status": JobStatus.PARTIAL if (problems or attention) else JobStatus.SUCCESS,
+            "summary": summary, "items": items, **({"notify": True} if attention else {})}
+
+
+# ---------------------------------------------------------------------------
+#  CLEANUP (удаление архивов ящиков и прежних копий — групповые действия)
+# ---------------------------------------------------------------------------
+def handle_cleanup(ctx: JobContext) -> Dict:
+    """Удалить с диска архивы ящиков (вместе с самими ящиками) или их прежние копии.
+
+    Выполняется фоновым заданием: удаление сотен тысяч файлов занимает минуты,
+    и в веб-запросе оно упиралось бы в тайм-аут. Перед каждым ящиком ещё раз
+    проверяется, что его архив не удерживается и по нему не идёт задание —
+    за время ожидания в очереди многое могло измениться.
+    """
+    from .. import quarantine as qmod
+    svc = ctx.services
+    store = svc.store
+    queue = getattr(svc, "queue", None)
+    items = list(ctx.params.get("items") or [])
+    total = len(items)
+    job_row = ctx.db.get_job(ctx.job_id)
+    author = (job_row["created_by"] if job_row is not None else "") or "system"
+    purged = quarantines = files_total = 0
+    freed = 0
+    problems: List[str] = []
+    ctx.progress(0, max(total, 1), "Подготовка…")
+
+    def skip(name: str, reason: str) -> None:
+        problems.append(f"«{name}»: {reason}")
+        ctx.event("WARNING", f"«{name}» пропущен: {reason}.")
+
+    for i, item in enumerate(items):
+        if ctx.is_cancelled():
+            raise JobCancelled(f"{ctx.stop_reason()}: обработано {i} из {total}, "
+                               f"освобождено {human_size(freed)}.")
+        try:
+            acc_id = int(item.get("account_id") or 0)
+        except (TypeError, ValueError):
+            continue
+        what = str(item.get("what") or "")
+        name = str(item.get("name") or f"№{acc_id}")
+        acc = ctx.db.get_account(acc_id)
+        # Пока ящик обрабатывается, очередь не запустит по нему других заданий
+        # (копирование, очистку, проверку) — они ждут, как при своём задании ящика.
+        held = False
+        try:
+            if acc is not None and queue is not None:
+                if not queue.acquire_account(acc_id, ctx.job_id):
+                    skip(name, "по ящику выполняется задание")
+                    continue
+                held = True
+            running = [j for j in ctx.db.active_jobs()
+                       if j["account_id"] == acc_id and j["id"] != ctx.job_id and j["status"] == JobStatus.RUNNING]
+            if running:
+                skip(name, "по ящику выполняется задание")
+                continue
+            if what == "purge":
+                if acc is None:
+                    ctx.event("INFO", f"«{name}»: ящик уже удалён.")
+                    continue
+                if acc.on_hold():
+                    skip(name, f"архив удерживается ({hold_label(acc.hold_until)})")
+                    continue
+                # задания, ждущие своей очереди по удаляемому ящику, всё равно
+                # упали бы с «ящик не найден» — снимаем их заранее
+                if queue is not None:
+                    for job in ctx.db.active_jobs():
+                        if job["account_id"] == acc_id and job["status"] == JobStatus.QUEUED:
+                            queue.cancel(int(job["id"]))
+                count, size = store.delete_account_files(acc_id)
+                shutil.rmtree(store.account_dir(acc_id), ignore_errors=True)
+                q_count = 0
+                if item.get("with_quarantine"):
+                    for path, n_files, q_size in store.list_quarantines(acc_id):
+                        store.drop_quarantine(path)
+                        qmod.forget(ctx.db, path)
+                        count += n_files
+                        size += q_size
+                        q_count += 1
+                ctx.db.delete_account(acc_id)
+                purged += 1
+                quarantines += q_count
+                files_total += count
+                freed += size
+                ctx.db.add_audit(author, "account_purge",
+                                 f"{name}: удалено файлов {count} ({human_size(size)})"
+                                 + (f", прежних копий {q_count}" if q_count else "") + " — групповое действие")
+                ctx.event("INFO", f"«{name}»: ящик и архив удалены ({count} файлов, {human_size(size)}).")
+            elif what == "quarantine":
+                if acc is not None and acc.on_hold():
+                    skip(name, f"архив удерживается ({hold_label(acc.hold_until)})")
+                    continue
+                # Только каталоги, показанные администратору при проверке: карантин,
+                # созданный позже (новая копия «с нуля»), не трогаем.
+                allowed = set(item.get("paths") or [])
+                n_dirs = 0
+                for path, n_files, q_size in store.list_quarantines(acc_id):
+                    if path not in allowed:
+                        continue
+                    if item.get("only_safe"):
+                        # Сравниваем заново прямо перед удалением: после прежнего сравнения
+                        # могли пропасть файлы новой копии или измениться срок хранения, а
+                        # сохранённый итог «можно удалять» тогда уже неверен.
+                        if acc is None:
+                            skip(name, f"«{os.path.basename(path)}»: ящика нет — сравнить не с чем")
+                            continue
+                        ctx.event("INFO", f"«{name}»: перед удалением сравниваем «{os.path.basename(path)}» с "
+                                          f"новой копией…")
+                        try:
+                            fresh = qmod.compare(svc, acc_id, path, cancelled=ctx.is_cancelled)
+                        except JobCancelled:
+                            raise
+                        except MailArchiverError as exc:
+                            skip(name, f"«{os.path.basename(path)}»: сравнить не удалось — {exc.message}")
+                            continue
+                        safe, why = qmod.is_safe_to_delete(fresh, effective_retention_days(svc, acc))
+                        if not safe:
+                            skip(name, f"«{os.path.basename(path)}»: {why}")
+                            continue
+                    store.drop_quarantine(path)
+                    qmod.forget(ctx.db, path)
+                    n_dirs += 1
+                    files_total += n_files
+                    freed += q_size
+                quarantines += n_dirs
+                if n_dirs:
+                    ctx.db.add_audit(author, "quarantine_delete", f"{name}: прежних копий {n_dirs} — групповое действие")
+                    ctx.event("INFO", f"«{name}»: удалено прежних копий {n_dirs}.")
+        except MailArchiverError as exc:
+            problems.append(f"«{name}»: {exc.message}")
+            ctx.event("ERROR", f"«{name}»: {exc.message}")
+        except OSError as exc:
+            problems.append(f"«{name}»: {exc}")
+            ctx.event("ERROR", f"«{name}»: {exc}")
+        finally:
+            if held and queue is not None:
+                queue.release_account(acc_id, ctx.job_id)
+            ctx.progress(i + 1, max(total, 1), f"Обработано {i + 1} из {total} ({human_size(freed)})")
+    if purged:
+        invalidate_mail_analytics_cache()
+    summary = (f"Удалено ящиков с архивом: {purged}; прежних копий: {quarantines}; "
+               f"файлов: {files_total}; освобождено {human_size(freed)}.")
+    if problems:
+        summary += f" Не обработано: {len(problems)} ({'; '.join(problems[:5])}{' …' if len(problems) > 5 else ''})."
+    ctx.event("INFO" if not problems else "WARNING", summary)
+    return {"final_status": JobStatus.PARTIAL if problems else JobStatus.SUCCESS, "summary": summary,
+            "purged": purged, "quarantines": quarantines, "files": files_total, "freed": freed,
+            "problems": problems[:200]}
+
+
 HANDLERS: Dict[str, Callable[[JobContext], Dict]] = {
     JobType.BACKUP: handle_backup,
     JobType.RESTORE: handle_restore,
@@ -1434,4 +2456,10 @@ HANDLERS: Dict[str, Callable[[JobContext], Dict]] = {
     JobType.DB_SNAPSHOT: handle_db_snapshot,
     JobType.SEARCH_INDEX: handle_search_index,
     JobType.DEDUP_REPORT: handle_dedup_report,
+    JobType.BACKUP_ALL: handle_backup_all,
+    JobType.CLEANUP: handle_cleanup,
+    JobType.QUARANTINE_CHECK: handle_quarantine,
+    JobType.QUARANTINE_RESCUE: handle_quarantine,
+    JobType.FOLDERS_CHECK: handle_folders_check,
+    JobType.SEARCH_REINDEX: handle_search_reindex,
 }

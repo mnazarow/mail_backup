@@ -18,7 +18,7 @@ from typing import Dict, List, Optional
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from ..logging_setup import get_logger, memory_handler
-from .api import serialize_job, visible_author
+from .api import redact_job_for, serialize_job, visible_author
 from .proxy import check_origin, host_is_trusted
 from . import auth as auth_mod
 
@@ -44,6 +44,9 @@ def _ws_user(websocket: WebSocket):
     # Перепроверка сессии открытым сокетом НЕ продлевает её: иначе открытая
     # вкладка держала бы сессию живой вечно, и «Тайм-аут бездействия» не работал.
     user = auth_mod.user_from_cookies(services, websocket.cookies, touch=False)
+    if user is not None and user.get("role") not in (auth_mod.ROLE_ADMIN, auth_mod.ROLE_OPERATOR,
+                                                     auth_mod.ROLE_MAILBOX):
+        return None          # незнакомая роль — как и в REST (require_user), ничего не отдаём
     if user is not None and auth_mod.two_factor_required(services, user):
         # администратор, которому 2FA обязательна, пока её не включил —
         # как и в REST, до этого ему недоступно ничего, кроме её настройки
@@ -221,8 +224,11 @@ def _personal_snapshot(snapshot: dict, user: dict) -> dict:
         # видит количество только своих активных заданий.
         out["job_counts"] = {"running": sum(1 for j in own if j["status"] == "running"),
                              "queued": sum(1 for j in own if j["status"] == "queued")}
-    if user.get("role") != "admin":
+    if user.get("role") == auth_mod.ROLE_OPERATOR:
+        # ход и ошибки выгрузок, восстановления и т. п. — без подробностей (как в /api/jobs)
+        out["active_jobs"] = [redact_job_for(user, j) for j in snapshot.get("active_jobs", [])]
+    if user.get("role") not in auth_mod.STAFF_ROLES:
         # Общий лог сервиса (имена и хосты чужих ящиков, ошибки чужих заданий)
-        # отдаём только администратору — как и /api/logs.
+        # отдаём только администратору и оператору — как и /api/logs.
         out.pop("logs", None)
     return out

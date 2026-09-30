@@ -36,12 +36,15 @@ log = get_logger("queue")
 #: работали бы с одними и теми же файлами и строками индекса наперегонки
 #: (удалённое письмо оставалось сиротой, бэкап качал всё дважды).
 LOCAL_JOB_TYPES = (JobType.BACKUP, JobType.RETENTION, JobType.STORAGE_CONVERT, JobType.VERIFY,
-                   JobType.EXPORT, JobType.ANALYZE, JobType.RESTORE)
+                   JobType.EXPORT, JobType.ANALYZE, JobType.RESTORE,
+                   JobType.QUARANTINE_CHECK, JobType.QUARANTINE_RESCUE)
 #: Задания, которые не запускаются параллельно сами с собой.
 SINGLETON_JOB_TYPES = (JobType.SYNC_EMPLOYEES, JobType.CHECK_LOGINS, JobType.REPLICATE,
-                       JobType.DB_SNAPSHOT, JobType.SEARCH_INDEX, JobType.DEDUP_REPORT)
+                       JobType.DB_SNAPSHOT, JobType.SEARCH_INDEX, JobType.DEDUP_REPORT,
+                       JobType.BACKUP_ALL, JobType.SEARCH_REINDEX, JobType.FOLDERS_CHECK)
 #: О каких заданиях не слать уведомления (служебные, по кнопке).
-_QUIET_TYPES = (JobType.TEST, JobType.CHECK_LOGINS, JobType.SEARCH_INDEX, JobType.DEDUP_REPORT)
+_QUIET_TYPES = (JobType.TEST, JobType.CHECK_LOGINS, JobType.SEARCH_INDEX, JobType.DEDUP_REPORT,
+                JobType.QUARANTINE_CHECK, JobType.FOLDERS_CHECK, JobType.SEARCH_REINDEX)
 
 
 class QueueManager:
@@ -55,7 +58,15 @@ class QueueManager:
         self._pool_size = 0                   # фактический размер пула (настройка могла измениться)
         self._running: Dict[int, dict] = {}   # job_id -> {account_id, type, started}
         self._to_requeue: Dict[int, dict] = {}  # job_id -> как вернуть в очередь после снятия с учёта
+        # Ящики, которые сейчас обрабатывает задание без своего ящика (копирование
+        # всех ящиков по очереди): account_id -> id задания. Пока ящик занят,
+        # другие задания по нему не запускаются — как если бы по ящику шло своё.
+        self._held: Dict[int, int] = {}
         self._lock = threading.Lock()
+        # Выбор задания из очереди и занятие ящика последовательным копированием
+        # взаимно исключаются: иначе между «ящик свободен?» и «занять» поллер
+        # успел бы запустить по нему второе задание.
+        self._claim_lock = threading.Lock()
         self._wake = threading.Event()
 
     # -- параметры (устойчивы к некорректным значениям настроек) -------------
@@ -136,8 +147,68 @@ class QueueManager:
 
     def retry(self, job_id: int) -> None:
         """Ручной «Повторить»: снова все попытки и снятый флаг отмены."""
+        row = self.db.get_job(job_id)
+        if row is not None and row["type"] == JobType.BACKUP and row["status"] == JobStatus.SUCCESS:
+            # Удачно законченную копию «с нуля» «Повторить» пересоздаёт заново, а не
+            # «продолжает» (задание, прерванное сбоем, по-прежнему продолжается).
+            for mark in self.db.query("SELECT key FROM meta WHERE key LIKE ?", (f"rebuild_full_done:{int(job_id)}:%",)):
+                self.db.delete_meta(mark["key"])
+        if row is not None and row["type"] == JobType.BACKUP_ALL:
+            self._restart_sequence_window(int(job_id))
         self.db.requeue_job(job_id, reset_attempts=True, clear_cancel=True)
         self._wake.set()
+
+    def _restart_sequence_window(self, job_id: int) -> None:
+        """Ручной повтор прохода «все ящики по очереди»: предел «не начинать после»
+        считается заново от времени повтора, а не от давнего запуска по расписанию
+        (иначе повтор в 09:00 прохода с пределом 07:00 сразу заканчивался, не
+        скопировав ни одного ящика). Ящики, уже скопированные этим проходом,
+        повторно не копируются."""
+        from .jobs import _SEQ_RETRY, _SEQ_STATE
+        self.db.set_meta(f"{_SEQ_RETRY}{job_id}", datetime.now(timezone.utc).isoformat())
+        key = f"{_SEQ_STATE}{job_id}"
+        raw = self.db.get_meta(key)
+        if not raw:
+            return
+        try:
+            state = json.loads(raw) or {}
+        except (TypeError, ValueError):
+            return
+        if isinstance(state, dict) and ("deadline" in state or "started" in state):
+            state.pop("deadline", None)
+            state.pop("started", None)
+            self.db.set_meta(key, json.dumps(state, ensure_ascii=False))
+
+    # -- ящики, занятые последовательным копированием -------------------------
+    def acquire_account(self, account_id: int, job_id: int) -> bool:
+        """Занять ящик для задания без своего ящика (копирование всех по очереди).
+
+        False — по ящику уже выполняется другое задание с его локальной копией
+        (или его занял кто-то ещё): тогда ящик нужно обработать позже.
+        """
+        with self._claim_lock:
+            with self._lock:
+                for jid, info in self._running.items():
+                    if (jid != job_id and info.get("account_id") == account_id
+                            and info.get("type") in LOCAL_JOB_TYPES):
+                        return False
+                holder = self._held.get(account_id)
+                if holder is not None and holder != job_id:
+                    return False
+                self._held[account_id] = job_id
+        return True
+
+    def release_account(self, account_id: int, job_id: Optional[int] = None) -> None:
+        """Освободить ящик: отложенные по нему задания снова можно запускать."""
+        with self._lock:
+            if job_id is None or self._held.get(account_id) == job_id:
+                self._held.pop(account_id, None)
+        self._wake.set()
+
+    def held_accounts(self) -> Dict[int, int]:
+        """Ящики, занятые сейчас последовательным копированием: {account_id: id задания}."""
+        with self._lock:
+            return dict(self._held)
 
     def running_ids(self) -> List[int]:
         with self._lock:
@@ -154,21 +225,22 @@ class QueueManager:
             try:
                 self._maybe_resize_pool()
                 while not self._stop.is_set():
-                    with self._lock:
-                        # свободные слоты считаем по ФАКТИЧЕСКОМУ размеру пула
-                        free = self._pool_size - len(self._running)
-                        busy = sorted({info["account_id"] for info in self._running.values()
-                                       if info.get("account_id") is not None
-                                       and info.get("type") in LOCAL_JOB_TYPES})
-                        running_types = {info.get("type") for info in self._running.values()}
-                    if free <= 0:
-                        break
-                    job = self.db.claim_next_job_filtered(
-                        "worker", busy_accounts=busy, local_types=LOCAL_JOB_TYPES,
-                        skip_types=[t for t in SINGLETON_JOB_TYPES if t in running_types])
-                    if job is None:
-                        break
-                    self._submit(job)
+                    with self._claim_lock:
+                        with self._lock:
+                            # свободные слоты считаем по ФАКТИЧЕСКОМУ размеру пула
+                            free = self._pool_size - len(self._running)
+                            busy = sorted({info["account_id"] for info in self._running.values()
+                                           if info.get("account_id") is not None
+                                           and info.get("type") in LOCAL_JOB_TYPES} | set(self._held))
+                            running_types = {info.get("type") for info in self._running.values()}
+                        if free <= 0:
+                            break
+                        job = self.db.claim_next_job_filtered(
+                            "worker", busy_accounts=busy, local_types=LOCAL_JOB_TYPES,
+                            skip_types=[t for t in SINGLETON_JOB_TYPES if t in running_types])
+                        if job is None:
+                            break
+                        self._submit(job)
                     submitted = True
             except Exception:  # noqa: BLE001
                 log.exception("Ошибка в цикле поллера очереди")
@@ -205,6 +277,10 @@ class QueueManager:
         with self._lock:
             self._running.pop(job_id, None)
             requeue = self._to_requeue.pop(job_id, None)
+            # Задание, занимавшее ящики (копирование по очереди), могло упасть,
+            # не освободив текущий: освобождаем всё, что за ним числится.
+            for account_id in [a for a, holder in self._held.items() if holder == job_id]:
+                self._held.pop(account_id, None)
         if requeue is not None:
             try:
                 self.db.requeue_job(job_id, run_after=requeue.get("run_after"),
@@ -235,7 +311,7 @@ class QueueManager:
             final = result.get("final_status", JobStatus.SUCCESS)
             self.db.finish_job(job_id, final, result)
             log.info("Задание #%s (%s) завершено: %s", job_id, job_type, final)
-            self._after_final(job, final, result.get("summary") or "", result.get("hint"))
+            self._after_final(job, final, result.get("summary") or "", result.get("hint"), result)
         except JobCancelled as exc:
             if self._shutting_down.is_set() and not self.db.is_cancel_requested(job_id):
                 # Не отмена пользователем, а остановка службы: задание вернётся
@@ -288,7 +364,8 @@ class QueueManager:
         self._after_final(job, JobStatus.FAILED, message, hint)
 
     # -- итог задания: статистика и уведомления ------------------------------
-    def _after_final(self, job: dict, status: str, summary: str, hint: Optional[str]) -> None:
+    def _after_final(self, job: dict, status: str, summary: str, hint: Optional[str],
+                     result: Optional[dict] = None) -> None:
         job_type = job.get("type")
         account_id = job.get("account_id")
         if status == JobStatus.FAILED and job_type == JobType.BACKUP and account_id is not None:
@@ -298,7 +375,8 @@ class QueueManager:
                 self.db.bump_daily_stats(int(account_id), jobs=1, errors=1)
             except Exception:  # noqa: BLE001
                 log.debug("Не удалось учесть провал в статистике", exc_info=True)
-        if job_type in _QUIET_TYPES or status == JobStatus.CANCELLED:
+        quiet = job_type in _QUIET_TYPES and not (result or {}).get("notify")
+        if quiet or status == JobStatus.CANCELLED:
             return
         notifier = getattr(self.services, "notifier", None)
         if notifier is None:
@@ -312,11 +390,27 @@ class QueueManager:
             except Exception:  # noqa: BLE001
                 where = ""
         status_label = JobStatus.LABELS.get(status, status)
+        subject = f"[MailArchiver] {label}{where}: {status_label}"
         body = f"{label}{where}: {status_label}.\n\n{summary}"
+        if job_type == JobType.BACKUP_ALL and result:
+            # Проход по сотням ящиков: в письме — поимённо, что не получилось.
+            from .jobs import backup_all_report
+            try:
+                report = backup_all_report(result)
+            except Exception:  # noqa: BLE001 — подробности не должны мешать самому уведомлению
+                log.debug("Не удалось собрать подробности прохода", exc_info=True)
+                report = ""
+            if report:
+                body += "\n\n" + report
+            total = int(result.get("total") or 0)
+            if total:
+                good = int(result.get("ok") or 0) + int(result.get("partial") or 0)
+                subject += f" — {good} из {total}" + (f", с ошибкой {int(result['failed'])}"
+                                                      if result.get("failed") else "")
         if hint:
             body += f"\n\nЧто сделать: {hint}"
         body += f"\n\nЗадание №{job.get('id')}."
-        notifier.notify_job_async(job_type, status, f"[MailArchiver] {label}{where}: {status_label}", body)
+        notifier.notify_job_async(job_type, status, subject, body)
 
 
 def _is_transient(exc: BaseException) -> bool:

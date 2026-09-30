@@ -925,9 +925,17 @@ class ImapConnection:
             return None
         return found & set(int(u) for u in uids)
 
-    def search_since(self, date) -> List[int]:
+    def search_since(self, date, uids: Optional[List[int]] = None) -> List[int]:
+        """UID писем открытой папки, пришедших на сервер начиная с даты ``date``.
+
+        С ``uids`` поиск ограничен диапазоном этих номеров (от меньшего до
+        большего): ответ по папке в сотни тысяч писем не тянет весь её список.
+        """
+        criteria: List = ["SINCE", date]
+        if uids:
+            criteria = ["UID", f"{min(uids)}:{max(uids)}", "SINCE", date]
         try:
-            return list(self.client.search(["SINCE", date]))
+            return [int(u) for u in self.client.search(criteria)]
         except Exception as exc:  # noqa: BLE001
             raise _map_exception(exc) from exc
 
@@ -959,6 +967,60 @@ class ImapConnection:
                 except (TypeError, ValueError):
                     continue
         return sizes
+
+    def fetch_internaldates(self, uids: List[int]) -> Dict[int, float]:
+        """Дата письма на сервере (INTERNALDATE, секунды эпохи) — без тел писем, порциями."""
+        out: Dict[int, float] = {}
+        if not uids:
+            return out
+        batch = max(1, int(SIZE_PROBE_BATCH_SIZE))
+        for start in range(0, len(uids), batch):
+            chunk = uids[start:start + batch]
+            try:
+                data = self.client.fetch(chunk, [b"INTERNALDATE"])
+            except Exception as exc:  # noqa: BLE001
+                raise _map_exception(exc) from exc
+            for uid, item in (data or {}).items():
+                value = (item or {}).get(b"INTERNALDATE")
+                try:
+                    out[int(uid)] = float(value.timestamp())
+                except (AttributeError, OverflowError, OSError, ValueError, TypeError):
+                    continue
+        return out
+
+    def fetch_ids_and_sizes(self, uids: List[int]) -> Dict[int, tuple]:
+        """
+        Message-ID, размер и заголовок Date писем без их тел:
+        ``{uid: (message_id, размер, date)}``.
+
+        `UID FETCH <uids> (RFC822.SIZE BODY.PEEK[HEADER.FIELDS (MESSAGE-ID DATE)])` —
+        порциями, как и :meth:`fetch_sizes`. Нужно, чтобы после смены UIDVALIDITY
+        (переезд почты, пересозданная папка) узнать письма, которые уже есть в
+        архиве, и не скачивать их второй раз.
+        """
+        out: Dict[int, tuple] = {}
+        if not uids:
+            return out
+        batch = max(1, int(SIZE_PROBE_BATCH_SIZE))
+        for start in range(0, len(uids), batch):
+            chunk = uids[start:start + batch]
+            try:
+                data = self.client.fetch(chunk, [b"RFC822.SIZE", b"BODY.PEEK[HEADER.FIELDS (MESSAGE-ID DATE)]"])
+            except Exception as exc:  # noqa: BLE001
+                raise _map_exception(exc) from exc
+            for uid, item in (data or {}).items():
+                item = item or {}
+                mid = date = ""
+                for key, value in item.items():
+                    if isinstance(key, bytes) and b"HEADER.FIELDS" in key:
+                        mid = _header_message_id(value)
+                        date = header_value(value, "Date")
+                try:
+                    size = int(item.get(b"RFC822.SIZE"))
+                except (TypeError, ValueError):
+                    continue
+                out[int(uid)] = (mid[:250], size, " ".join(date.split())[:120])
+        return out
 
     def fetch_messages(self, uids: List[int], *, skip_larger_than: int = 0,
                        on_skipped: Optional[Callable[[int, int], None]] = None) -> Iterator[dict]:
@@ -1401,6 +1463,9 @@ def diagnose_folders(account: Account, options: Optional[ConnectOptions] = None,
             result["ok"] = True
     except Exception as exc:  # noqa: BLE001
         from ..errors import MailArchiverError
+        # Вид сбоя — чтобы проверка многих ящиков отличала «сервер не отвечает»
+        # (дальше его ящики не мучить) от неверного пароля одного ящика.
+        result["error_type"] = type(exc).__name__
         if isinstance(exc, MailArchiverError):
             result["error"] = exc.message
             result["hint"] = exc.hint
