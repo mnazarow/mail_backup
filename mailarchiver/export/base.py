@@ -21,6 +21,8 @@ class MailItem:
     internaldate: Optional[float] = None   # epoch-секунды
     message_id: str = ""
     size: int = 0
+    #: разделитель уровней папок на сервере («/», «.»…); пусто — неизвестен
+    delimiter: str = ""
 
 
 @dataclass

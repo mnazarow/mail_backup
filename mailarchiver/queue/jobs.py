@@ -693,6 +693,8 @@ def handle_export(ctx: JobContext) -> Dict:
         "aspose_license_path": svc.rt("export", "aspose_license_path"),
         "tmp_dir": svc.cfg.tmp_dir,
         "pst_split_size_mb": p.get("pst_split_size_mb") or svc.rt("export", "pst_split_size_mb"),
+        # имя хранилища в Outlook — как у ящика, а не имя файла выгрузки
+        "pst_display_name": acc.name,
     }
     skipped: List[str] = []
 

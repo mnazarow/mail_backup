@@ -1421,7 +1421,7 @@ class ExportAction(Handler):
             Param("engine", "Формат / движок", "select", default, options=tuple(engines)),
             Param("pst_format", "Формат PST", "select", "unicode",
                   options=(("unicode", "Unicode — Outlook 2003 и новее"), ("ansi", "ANSI — Outlook 97–2002 (до 2 ГБ)")),
-                  show_if={"engine": ["aspose", "native"]}),
+                  show_if={"engine": ["aspose"]}),        # встроенный движок пишет только Unicode
             Param("date_from", "Письма с даты", "date", ""),
             Param("date_to", "Письма по дату", "date", ""),
             Param("folders", "Только папки (пусто — все)", "textarea", "", placeholder="INBOX\nОтправленные"),
@@ -1472,7 +1472,8 @@ class ExportAction(Handler):
         params = {"engine": d["engine"], "format": d["fmt"], "folders": d["folders"],
                   "date_from": d["date_from"], "date_to": d["date_to"], "limit": 0}
         if d["fmt"] == "pst":
-            params["pst_format"] = ctx.params.get("pst_format") or "unicode"
+            params["pst_format"] = (ctx.params.get("pst_format") or "unicode") if d["engine"] == "aspose" \
+                else "unicode"
         job_id = ctx.enqueue(JobType.EXPORT, acc.id, params)
         ctx.db.add_audit(ctx.username, "export_start", f"account={acc.id} engine={d['engine']} — групповое действие")
         return "выгрузка в очереди", job_id

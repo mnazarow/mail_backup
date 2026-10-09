@@ -1,150 +1,88 @@
 """
-Встроенный (native) ЭКСПЕРИМЕНТАЛЬНЫЙ генератор .pst без внешних зависимостей.
+Встроенный движок экспорта в .pst (Outlook) — без внешних программ.
 
-⚠️  ВАЖНО. Корректных open-source генераторов .pst под Linux не существует, а
-    формат MS-PST закрыто-сложный (документирован как [MS-PST], но реализация
-    писателя огромна и хрупка). Этот модуль реализует подмножество формата
-    ANSI PST, достаточное, чтобы файл открывался утилитами семейства libpst
-    (readpst) и, как правило, Microsoft Outlook. Он покрывает: иерархию папок и
-    письма с основными свойствами (тема, отправитель, получатель, дата, текст,
-    заголовки). Вложения и сложные MIME-структуры в native-режиме
-    упрощаются — для полной точности используйте движок Aspose либо экспорт
-    eml/mbox, которые Outlook импортирует без потерь.
+Пишет файл формата Unicode PST (Outlook 2003 и новее) модулем
+:mod:`pstformat`: папки ящика, письма с темой, отправителем, получателями
+(«Кому», «Копия», «Скрытая»), датами, флагами «прочитано/отвечено/помечено»,
+текстом и HTML-версией письма, заголовками и ВЛОЖЕНИЯМИ. Картинки, встроенные
+в HTML (ссылки ``cid:``), скрыты из списка вложений и показываются в теле
+письма; вложенные письма (message/rfc822) прикладываются файлами .eml.
 
-    Формат по умолчанию — ANSI (лимит 2 ГБ). Для больших ящиков берите Aspose
-    (Unicode) или разбивайте экспорт по папкам/датам.
+Порядок работы:
 
-Реализованы слои формата: заголовок PST, NDB (BTree узлов NBT и блоков BBT,
-блоки с трейлерами), LTP (куча HN, BTH, контекст свойств PC). Дерево папок
-libpst строит по полю nidParent записей NBT.
+1. письма сбрасываются во временные файлы (в памяти — только короткие записи);
+2. папки IMAP раскладываются в дерево Outlook: INBOX становится «Входящими»,
+   корзина — «Удалёнными», «Отправленные» отмечаются как папка отправленных;
+3. письма пишутся папка за папкой: MIME разбирается потоково
+   (:mod:`mimestream`), вложения любого размера уходят в файл кусками;
+4. крупный ящик делится на части до ~1,9 ГБ — каждая часть открывается в
+   Outlook сама по себе и повторяет дерево папок.
 """
 from __future__ import annotations
 
-import email
+import codecs
+import math
 import email.utils
 import errno
+import mimetypes
 import os
 import re
 import shutil
-import struct
 import tempfile
 import time
+import uuid
+from array import array
 from html import unescape
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from ..errors import PstEngineError
 from ..logging_setup import get_logger
 from ..util import decode_mime_header, disk_free_bytes, human_size
-from .base import CancelCB, ExportEngine, ExportResult, MailItem, ProgressCB, folder_to_fs
+from . import pstformat as pf
+from .base import CancelCB, ExportEngine, ExportResult, MailItem, ProgressCB
 
 log = get_logger("export.native")
 
-# --- Константы формата ------------------------------------------------------
-PST_MAGIC = 0x4E444221          # "!BDN"
-MAGIC_CLIENT = 0x4D53           # "SM"
-VER_ANSI = 14                   # версия формата (ANSI)
-VER_CLIENT = 19
-
-# Типы страниц (ptype)
-PTYPE_BBT = 0x80
-PTYPE_NBT = 0x81
-
-# Типы свойств MAPI
-PT_INT32 = 0x0003
-PT_BOOL = 0x000B
-PT_TIME = 0x0040
-PT_STRING = 0x001F     # UTF-16LE
-PT_BINARY = 0x0102
-
-# Идентификаторы свойств (PidTag*)
-TAG_DISPLAY_NAME = 0x3001
-TAG_CONTENT_COUNT = 0x3602
-TAG_CONTENT_UNREAD = 0x3603
-TAG_SUBFOLDERS = 0x360A
-TAG_MESSAGE_CLASS = 0x001A
-TAG_SUBJECT = 0x0037
-TAG_BODY = 0x1000
-TAG_SENDER_NAME = 0x0C1A
-TAG_SENDER_EMAIL = 0x0C1F
-TAG_SENT_REP_NAME = 0x0042
-TAG_DISPLAY_TO = 0x0E04
-TAG_DISPLAY_CC = 0x0E03
-TAG_DELIVERY_TIME = 0x0E06
-TAG_SUBMIT_TIME = 0x0039
-TAG_TRANSPORT_HEADERS = 0x007D
-TAG_MESSAGE_FLAGS = 0x0E07
-#: Значения PidTagMessageFlags (MS-OXCMSG).
-MSGFLAG_READ = 0x01
-MSGFLAG_UNSENT = 0x08
-
-# Специальные NID
-NID_MESSAGE_STORE = 0x21
-NID_ROOT_FOLDER = 0x122
-NID_TYPE_NORMAL_FOLDER = 0x02
-NID_TYPE_NORMAL_MESSAGE = 0x04
-
-# Windows FILETIME epoch difference (секунды между 1601 и 1970)
-_FILETIME_EPOCH_DIFF = 11644473600
-
-# Максимальный размер данных PC в ОДНОМ блоке. ANSI PST: блок не больше 8192 байт
-# (включая трейлер). native-движок не поддерживает деревья данных (XBLOCK), поэтому
-# свойства одного письма должны помещаться в один блок; слишком длинные тело и
-# заголовки автоматически обрезаются под этот бюджет (см. _message_props).
-MAX_PC_BLOCK = 8000
-
-# Верхние границы, с которых начинается подбор длин (см. _message_props).
-# Смысл только в том, чтобы не гонять бинарный поиск по мегабайтному телу:
-# в блок всё равно влезает несколько тысяч символов.
-BODY_SCAN_LIMIT = 20000
-HEADERS_SCAN_LIMIT = 10000
-#: Письма крупнее разбираются потоково (только заголовки и текст).
-STREAM_PARSE_BYTES = 8 * 1024 * 1024
-# Сколько символов заголовков стараемся сохранить, когда ради тела письма
-# заголовки приходится ужимать.
-HEADERS_FLOOR = 400
-CUT_MARK = "\n\n[…текст письма обрезан для native-PST; полная копия — в экспорте eml…]"
-
-
-def _sig(ib: int, bid: int) -> int:
-    """Блочная/страничная сигнатура wSig (MS-PST 5.5)."""
-    x = (ib ^ bid) & 0xFFFFFFFF
-    return ((x >> 16) ^ x) & 0xFFFF
-
-
-def _unlink_quiet(path: str) -> None:
-    """Удалить файл, если он есть; отсутствие файла и ошибки ФС игнорируем."""
-    try:
-        os.unlink(path)
-    except OSError:
-        pass
-
-
-def _to_filetime(epoch: Optional[float]) -> int:
-    if not epoch:
-        epoch = time.time()
-    return int((epoch + _FILETIME_EPOCH_DIFF) * 10_000_000)
-
-
+#: Предел одной части. Формат Unicode допускает больше, но за ~2 ГБ нужны
+#: страницы FPMap, которые этот движок не создаёт.
+PART_LIMIT_BYTES = 1_900_000_000
+#: Меньше этого делить .pst нет смысла (и так проще не наделать тысячи файлов).
+MIN_SPLIT_BYTES = 50 * 1024 * 1024
 #: Сколько отдельных ошибок перечислять в результате экспорта.
 MAX_ERROR_DETAILS = 200
+#: Текст и HTML письма длиннее этого сохраняются вложением-файлом.
+BODY_CAP = 16 * 1024 * 1024
+#: Заголовки письма (PidTagTransportMessageHeaders) — не больше этого.
+HEADERS_CAP = 1024 * 1024
+#: Сколько байт письма просматривать в поисках конца блока заголовков.
+HEADER_SCAN_LIMIT = 16 * 1024 * 1024
+#: Частей письма больше этого не разбираем (защита от «бомб» из тысяч частей).
+MAX_PARTS = 5000
+#: Строки в таблице содержимого папки обрезаются, как у самого Outlook/Exchange.
+TABLE_TEXT = 255
+
+INBOX_NAME = "Входящие"
+TRASH_NAME = "Удаленные"
+_TRASH_NAMES = ("trash", "deleted items", "deleted messages", "deleted", "корзина",
+                "удаленные", "удалённые")
+_SENT_NAMES = ("sent", "sent items", "sent messages", "sent mail", "отправленные")
+
+# Флаги IMAP в виде битов (держим число, а не список строк на каждое письмо)
+F_SEEN, F_ANSWERED, F_FLAGGED, F_DRAFT, F_FORWARDED = 1, 2, 4, 8, 16
+
+MSGFLAG_READ = 0x01
+MSGFLAG_UNSENT = 0x08
+MSGFLAG_HASATTACH = 0x10
+
+BASE_WARNING = ("Файл .pst создан встроенным движком (формат Unicode, Outlook 2003 и новее): "
+                "папки, письма, получатели, текст и HTML, вложения. Перед массовой выгрузкой "
+                "откройте пробный файл в своём Outlook.")
+ANSI_NOTE = ("Формат ANSI (Outlook 97–2002) встроенный движок не пишет — создан Unicode PST, "
+             "его открывает Outlook 2003 и все более новые. ")
 
 
 class PstWriteError(PstEngineError):
-    """Фатальная ошибка записи файла .pst.
-
-    Отличается от обычной PstEngineError тем, что её НЕЛЬЗЯ проглотить в цикле
-    писем: если файл перестал писаться или упёрся в предел формата, продолжать
-    экспорт бессмысленно — получится «успешный» нечитаемый .pst.
-    """
-
-
-#: Предел формата ANSI PST. Реально спецификация даёт 2 ГБ; берём с запасом,
-#: чтобы служебные страницы BTree в конце файла гарантированно поместились.
-ANSI_PST_LIMIT_BYTES = 1_900_000_000
-#: Запас под страницы BTree и узлы папок, которые дописываются в конце части.
-SPLIT_RESERVE_BYTES = 64 * 1024 * 1024
-#: Меньше этого делить .pst нет смысла (и так проще не наделать тысячи файлов).
-MIN_SPLIT_BYTES = 50 * 1024 * 1024
+    """Фатальная ошибка записи .pst: продолжать экспорт бессмысленно."""
 
 
 def part_path(out_path: str, number: int) -> str:
@@ -153,104 +91,161 @@ def part_path(out_path: str, number: int) -> str:
     return f"{base}_part{number}{ext or '.pst'}"
 
 
-def _decode_hdr(value) -> str:
-    """Заголовок письма в читаемом виде (см. util.decode_mime_header).
+def _unlink_quiet(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
-    Принимает и ``str``, и объект ``Header``, который стандартный парсер
-    возвращает для заголовков с 8-битными байтами.
-    """
+
+# ---------------------------------------------------------------------------
+#  Текст: заголовки, строки, HTML
+# ---------------------------------------------------------------------------
+_SURROGATES = re.compile("[\ud800-\udfff]")
+_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _clean_text(value) -> str:
+    """Строка, пригодная для UTF-16: без «сырых» байтов-суррогатов и NUL."""
+    if value is None:
+        return ""
+    text = str(value)
+    if _SURROGATES.search(text):
+        try:
+            raw = text.encode("utf-8", "surrogateescape")
+            from ..mailview import decode_text_bytes
+            text = decode_text_bytes(raw, None)
+        except UnicodeError:
+            pass
+        text = _SURROGATES.sub("�", text)
+    return text.replace("\x00", "")
+
+
+def _one_line(value) -> str:
+    text = _clean_text(value)
+    text = text.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    return _CONTROL.sub("", text).strip()
+
+
+def _decode_hdr(value) -> str:
+    """Заголовок письма в читаемом виде (см. util.decode_mime_header)."""
     return decode_mime_header(value)
 
 
-def _safe_hdr(msg, name: str, headers_blob: bytes) -> str:
-    """Значение заголовка, которое не роняет экспорт на кривом письме.
+class _RawHeaders:
+    """Заголовки письма из «сырого» блока: один проход, без разбора политикой email.
 
-    Потоковый разбор отдаёт заголовки с политикой email.policy.default, а она
-    разбирает адресные заголовки при чтении: обрезанный список вида
-    ``To: "Doe, John" <j@x>, "`` давал IndexError, и весь экспорт .pst падал
-    на одном письме. При ошибке берём сырое значение из блока заголовков.
+    Политика email.policy.default разбирает адресные заголовки в дерево
+    объектов: на письме с тремя тысячами получателей это съедало сотни
+    мегабайт и секунду времени. Здесь значения только склеиваются из
+    свёрнутых строк; адреса разбирает email.utils.getaddresses.
     """
-    if msg is not None:
-        try:
-            return _decode_hdr(msg.get(name, "") or "")
-        except Exception:  # noqa: BLE001
-            pass
-    try:
-        from ..imap.client import header_value
-        return _decode_hdr(header_value(headers_blob, name))
-    except Exception:  # noqa: BLE001
-        return ""
 
+    def __init__(self, blob: bytes) -> None:
+        self._values: Dict[str, List[bytes]] = {}
+        current: Optional[List[bytes]] = None
+        for line in blob.replace(b"\r\n", b"\n").split(b"\n"):
+            if line[:1] in (b" ", b"\t"):
+                if current:
+                    current[-1] = current[-1] + b" " + line.strip()
+                continue
+            name, sep, value = line.partition(b":")
+            if not sep or not name.strip() or b" " in name.strip():
+                current = None
+                continue
+            current = self._values.setdefault(name.strip().lower().decode("latin-1"), [])
+            current.append(value.strip())
 
-def _part_text(part) -> str:
-    """Текст MIME-части с устойчивым декодированием (кодировка может врать)."""
-    payload = part.get_payload(decode=True) or b""
-    charset = part.get_content_charset() or "utf-8"
-    try:
-        return payload.decode(charset, "replace")
-    except (LookupError, UnicodeDecodeError):
-        return payload.decode("utf-8", "replace")
-
-
-
-def _stream_headers_and_body(raw: bytes):
-    """Заголовки и текст крупного письма без построения полного дерева MIME."""
-    import io
-    from .. import mimestream
-    from ..mailview import decode_text_bytes
-    top = None
-    picked = {}
-    bufs = {}
-    cap = BODY_SCAN_LIMIT * 4          # байт закодированного текста с запасом на UTF-8/QP
-    try:
-        for kind, leaf, payload in mimestream.scan(io.BytesIO(raw)):
-            if kind == "top":
-                top = payload
-            elif kind == "leaf":
-                if leaf.disp == "attachment":
-                    continue
-                if leaf.ctype in ("text/plain", "text/html") and leaf.ctype not in picked:
-                    picked[leaf.ctype] = leaf
-                    bufs[leaf.ctype] = bytearray()
-                    leaf.want = True
-            elif kind == "data":
-                buf = bufs.get(leaf.ctype)
-                if buf is None or picked.get(leaf.ctype) is not leaf:
-                    continue
-                buf += payload[: max(0, cap - len(buf))]
-                if len(buf) >= cap:
-                    leaf.want = False
-    except Exception:  # noqa: BLE001 — тело не критично, письмо всё равно попадёт в .pst
-        pass
-
-    def _text(ctype: str) -> str:
-        leaf = picked.get(ctype)
-        if leaf is None:
+    def raw(self, name: str, *, joined: bool = False) -> str:
+        values = self._values.get(name.lower()) or []
+        if not values:
             return ""
-        dec = mimestream.decoder_for(leaf.cte)
-        data = dec.feed(bytes(bufs[ctype])) + dec.close()
-        return decode_text_bytes(data, leaf.charset)
+        chosen = values if joined else values[:1]
+        return ", ".join(v.decode("utf-8", "surrogateescape") for v in chosen)
 
-    body = _text("text/plain")
-    if not body:
-        body = html_to_text(_text("text/html"))
-    return top, body
+    def text(self, name: str) -> str:
+        """Значение для показа: RFC 2047 и 8-битные байты расшифрованы."""
+        value = self.raw(name)[:65536]
+        if not value:
+            return ""
+        try:
+            return _decode_hdr(value)
+        except Exception:  # noqa: BLE001
+            return value
 
 
-_RE_SCRIPT = re.compile(r"(?is)<(script|style)[^>]*>.*?</\1\s*>")
-_RE_BREAK = re.compile(r"(?i)<br\s*/?>|</p\s*>|</div\s*>|</tr\s*>|<li[^>]*>")
-_RE_TAG = re.compile(r"(?s)<[^>]*>")
+def _getaddresses(value: str):
+    try:
+        return email.utils.getaddresses([value], strict=False)
+    except TypeError:                     # Python без параметра strict
+        return email.utils.getaddresses([value])
+
+
+def _addresses(headers: _RawHeaders, name: str) -> List[Tuple[str, str]]:
+    """[(имя, адрес)] из адресного заголовка — устойчиво к кривым спискам."""
+    raw = headers.raw(name, joined=True)[:4 * 1024 * 1024]
+    if not raw:
+        return []
+    try:
+        pairs = _getaddresses(raw)
+    except Exception:  # noqa: BLE001
+        pairs = []
+    out: List[Tuple[str, str]] = []
+    for display, spec in pairs:
+        if display:
+            try:
+                display = _decode_hdr(display)
+            except Exception:  # noqa: BLE001
+                pass
+        display, spec = _one_line(display), _one_line(spec)
+        if spec in ("<>", "@"):
+            spec = ""
+        if display or spec:
+            out.append((display, spec))
+    return out
+
+
+_RE_BLOCK_START = re.compile(r"<(script|style|head)\b", re.I)
+_RE_BLOCK_END = {name: re.compile(r"</" + name + r"\b[^>]*>", re.I) for name in ("script", "style", "head")}
+_RE_BODY_START = re.compile(r"<body\b", re.I)
+_RE_BREAK = re.compile(r"(?i)<\s*(br|/p|/div|/tr|/h[1-6]|/li)\b[^>]*>")
+_RE_TAG = re.compile(r"<[^>]+>")
+
+
+def _strip_blocks(html_src: str) -> str:
+    """Убрать <script>, <style> и <head> вместе с содержимым — за один проход.
+
+    Регулярное выражение с «ленивым» ``.*?`` на каждом незакрытом теге
+    просматривало текст до конца: письмо с тысячами незакрытых <style>
+    разбиралось минутами. Здесь закрывающий тег ищется один раз от места
+    открывающего. Незакрытые <script>/<style> обрезают хвост (как браузер),
+    незакрытый <head> заканчивается на <body>.
+    """
+    out = []
+    pos = 0
+    while True:
+        found = _RE_BLOCK_START.search(html_src, pos)
+        if not found:
+            out.append(html_src[pos:])
+            break
+        out.append(html_src[pos:found.start()])
+        name = found.group(1).lower()
+        close = _RE_BLOCK_END[name].search(html_src, found.end())
+        if close is not None:
+            pos = close.end()
+            continue
+        if name == "head":
+            body = _RE_BODY_START.search(html_src, found.end())
+            if body is not None:
+                pos = body.start()
+                continue
+        break
+    return " ".join(out)
 
 
 def html_to_text(html_src: str) -> str:
-    """
-    Грубо снять HTML-теги. Точность не нужна: задача — чтобы у письма без
-    text/plain тело в .pst не оказалось пустым (native — упрощённый экспорт,
-    полная копия доступна в eml/mbox).
-    """
-    if not html_src:
-        return ""
-    text = _RE_SCRIPT.sub(" ", html_src)
+    """Грубо превратить HTML в текст (для текстовой версии письма)."""
+    text = _strip_blocks(html_src)
     text = _RE_BREAK.sub("\n", text)
     text = _RE_TAG.sub("", text)
     text = unescape(text)
@@ -259,361 +254,636 @@ def html_to_text(html_src: str) -> str:
     return text.strip()
 
 
-class _Heap:
-    """Строитель кучи HN в пределах ОДНОГО блока (для PC небольшого размера)."""
+_META_CHARSET = re.compile(rb"""<meta[^>]+charset\s*=\s*["']?\s*([A-Za-z0-9_\-:.]+)""", re.I)
+_META_CHARSET_TEXT = re.compile(r"""(<meta[^>]{0,500}?charset\s*=\s*["']?\s*)[A-Za-z0-9_\-:.]+""", re.I)
 
-    def __init__(self, client_sig: int) -> None:
-        self.client_sig = client_sig
-        self.allocs: List[bytes] = []      # индексы с 1
-        self.user_root_hid = 0
-
-    def alloc(self, data: bytes) -> int:
-        self.allocs.append(data)
-        index = len(self.allocs)           # 1-based
-        # HID: type=0 (5 бит), hidIndex (11 бит) с 1, hidBlockIndex (16 бит)=0
-        return (index << 5) & 0xFFFFFFFF
-
-    def build(self) -> bytes:
-        # Раскладка: HNHDR (12), затем аллокации подряд, затем HNPAGEMAP.
-        header_size = 12
-        body = bytearray()
-        offsets = [header_size]            # rgibAlloc[0] = начало первой аллокации
-        for a in self.allocs:
-            body += a
-            offsets.append(header_size + len(body))
-        ib_hnpm = header_size + len(body)
-        # Куча HN должна помещаться в один блок (native-движок не поддерживает
-        # деревья данных XBLOCK). Смещения хранятся как 16-бит, поэтому > 64 КБ
-        # невозможно физически — в этом случае возбуждаем управляемую ошибку.
-        if ib_hnpm > 0xFFF0 or any(o > 0xFFFF for o in offsets):
-            raise PstEngineError("native PST: узел не помещается в один блок (слишком длинное письмо).",
-                                 code="pst_engine_error")
-        # HNPAGEMAP
-        c_alloc = len(self.allocs)
-        pagemap = bytearray()
-        pagemap += struct.pack("<HH", c_alloc, 0)   # cAlloc, cFree
-        for off in offsets:
-            pagemap += struct.pack("<H", off)
-        # HNHDR
-        hdr = struct.pack("<HBBI I", ib_hnpm, 0xEC, self.client_sig, self.user_root_hid, 0)
-        # struct above: H(ibHnpm) B(bSig=0xEC) B(bClientSig) I(hidUserRoot) I(rgbFillLevel)
-        return bytes(hdr) + bytes(body) + bytes(pagemap)
+# Кодировка → кодовая страница Windows (PidTagInternetCodepage).
+_CODEPAGES = {
+    "utf-8": 65001, "ascii": 20127, "iso8859-1": 28591, "iso8859-2": 28592, "iso8859-3": 28593,
+    "iso8859-4": 28594, "iso8859-5": 28595, "iso8859-6": 28596, "iso8859-7": 28597,
+    "iso8859-8": 28598, "iso8859-9": 28599, "iso8859-13": 28603, "iso8859-15": 28605,
+    "cp1250": 1250, "cp1251": 1251, "cp1252": 1252, "cp1253": 1253, "cp1254": 1254,
+    "cp1255": 1255, "cp1256": 1256, "cp1257": 1257, "cp1258": 1258, "koi8-r": 20866,
+    "koi8-u": 21866, "cp866": 866, "mac-cyrillic": 10007, "gb2312": 936, "gbk": 936,
+    "gb18030": 54936, "big5": 950, "shift_jis": 932, "cp932": 932, "euc_jp": 51932,
+    "iso2022_jp": 50220, "euc_kr": 51949, "cp949": 949, "utf-16": 1200, "utf-16-le": 1200,
+    "utf-16-be": 1201, "tis-620": 874, "cp874": 874,
+}
 
 
-def build_pc_block(props: List[Tuple[int, int, object]]) -> bytes:
-    """
-    Собрать блок данных PC (Property Context) в одной куче HN.
-    props: список (propId, propType, value). value:
-        PT_INT32/PT_BOOL  -> int (хранится инлайн)
-        PT_TIME           -> int epoch (хранится как 8 байт через HID)
-        PT_STRING         -> str  (UTF-16LE через HID)
-        PT_BINARY         -> bytes (через HID)
-    """
-    heap = _Heap(client_sig=0xBC)  # bTypePC
-    # Сначала сформируем записи BTH (по возрастанию propId)
-    records: List[bytes] = []
-    for prop_id, prop_type, value in sorted(props, key=lambda p: p[0]):
-        if prop_type in (PT_INT32, PT_BOOL):
-            hnid = int(value) & 0xFFFFFFFF
-        elif prop_type == PT_TIME:
-            hnid = heap.alloc(struct.pack("<Q", _to_filetime(value)))
-        elif prop_type == PT_STRING:
-            data = (value or "").encode("utf-16-le")
-            hnid = heap.alloc(data)
-        elif prop_type == PT_BINARY:
-            hnid = heap.alloc(bytes(value or b""))
-        else:
-            raise PstEngineError(f"native PST: неподдерживаемый тип свойства {prop_type:#06x}")
-        records.append(struct.pack("<HHI", prop_id, prop_type, hnid))
-    # BTH-лист: массив записей (8 байт каждая), затем BTHHEADER, ссылающийся на него
-    leaf = b"".join(records)
-    leaf_hid = heap.alloc(leaf)
-    bth_header = struct.pack("<BBBBI", 0xB5, 2, 6, 0, leaf_hid)  # bType,cbKey,cbEnt,idxLevels,hidRoot
-    bth_hid = heap.alloc(bth_header)
-    heap.user_root_hid = bth_hid
-    data = heap.build()
-    if len(data) > MAX_PC_BLOCK:
-        raise PstEngineError("native PST: свойства письма не помещаются в один блок.",
-                             code="pst_engine_error")
-    return data
-
-
-def _build_or_none(props: List[Tuple[int, int, object]]) -> Optional[bytes]:
-    """build_pc_block, но «не влезло в блок» -> None (а не исключение)."""
-    try:
-        return build_pc_block(props)
-    except PstEngineError:
+def _codepage(charset: Optional[str]) -> Optional[int]:
+    if not charset:
         return None
+    try:
+        name = codecs.lookup(charset.strip().strip("\"'")).name
+    except (LookupError, ValueError):
+        return None
+    return _CODEPAGES.get(name)
 
 
-def _fit_longest(make_props: Callable[[int], List[Tuple[int, int, object]]], hi: int) -> Tuple[Optional[bytes], int]:
-    """
-    Подобрать бинарным поиском НАИБОЛЬШУЮ длину n ∈ [0, hi], при которой блок PC
-    ещё укладывается в бюджет MAX_PC_BLOCK. ``make_props(n)`` собирает свойства
-    для длины n; размер блока растёт вместе с n, поэтому поиск корректен.
-
-    Деление пополам («не влезло — режем вдвое») недопустимо: оно перелетает мимо
-    и оставляет половину бюджета блока пустой.
-
-    Возвращает (готовый блок, n) либо (None, -1), если не влезает даже n = 0.
-    """
-    lo = 0
-    best_data: Optional[bytes] = None
-    best_n = -1
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        data = _build_or_none(make_props(mid))
-        if data is None:
-            hi = mid - 1
-        else:
-            best_data, best_n = data, mid
-            lo = mid + 1
-    return best_data, best_n
+def _html_body(raw: bytes, charset: Optional[str]) -> Tuple[bytes, int, str]:
+    """(байты HTML, кодовая страница, текст) — исходные байты по возможности сохраняются."""
+    from ..mailview import decode_text_bytes
+    declared = charset
+    if not declared:
+        found = _META_CHARSET.search(raw[:8192])
+        if found:
+            declared = found.group(1).decode("ascii", "ignore")
+    cp = _codepage(declared)
+    if cp and cp not in (1200, 1201):
+        try:
+            return raw, cp, raw.decode(codecs.lookup(declared).name, "replace")
+        except (LookupError, ValueError):
+            pass
+    text = decode_text_bytes(raw, declared)
+    # Байты перекодированы в UTF-8 — объявление кодировки в самом HTML должно
+    # сказать то же, иначе показ письма зависел бы от того, чему верит программа.
+    text = _META_CHARSET_TEXT.sub(r"\g<1>utf-8", text)
+    return text.encode("utf-8"), 65001, text
 
 
-class PstWriter:
-    """Сборщик ANSI PST-файла из набора узлов (папки и письма)."""
+_PREFIX = re.compile(r"^\s*(?:(?:re|fw|fwd|aw|wg|sv|vs|tr|rv|ha|отв|ответ|пересл|перес)"
+                     r"\s*(?:\[\d+\]|\(\d+\))?\s*[:：]\s*)+", re.I)
 
-    def __init__(self) -> None:
-        # Узлы НЕ копятся в памяти: каждый блок пишется в файл сразу, а здесь
-        # остаются только листовые записи BBT/NBT (12 и 16 байт на узел).
-        # Прежняя схема держала в оперативной памяти и все блоки, и собранный
-        # файл целиком: на ящике в 200 000 писем это ~3,3 ГБ и OOM посреди
-        # экспорта.
-        self._fh = None                      # файл, в который пишем
-        self._path = ""
-        self._pos = 0                        # текущее смещение в файле
-        self._bbt: List[tuple] = []          # (bid, BBTENTRY)
-        self._nbt: List[tuple] = []          # (nid, NBTENTRY)
-        self._next_bid = 4
-        self._next_folder_index = 0x20
-        self._next_msg_index = 0x2000
 
-    # -- жизненный цикл файла ------------------------------------------------
-    def open(self, path: str) -> None:
-        """Открыть файл и зарезервировать место под заголовок (512 байт)."""
-        self._path = path
-        self._fh = open(path, "wb")
-        self._fh.write(b"\x00" * 512)
-        self._pos = 512
+def _topic(subject: str) -> str:
+    """Тема без «Re:», «Fwd:», «Отв:» — для группировки писем в беседы."""
+    found = _PREFIX.match(subject[:512])
+    return (subject[found.end():] if found else subject).strip()
 
-    @property
-    def position(self) -> int:
-        """Сколько байт уже записано в файл (для решения о разбиении на части)."""
-        return self._pos
+
+def _epoch_of(value) -> Optional[float]:
+    if not value:
+        return None
+    try:
+        dt = email.utils.parsedate_to_datetime(str(value))
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        from datetime import timezone
+        dt = dt.replace(tzinfo=timezone.utc)
+    try:
+        epoch = dt.timestamp()
+    except (OverflowError, OSError, ValueError):
+        return None
+    if not 0 < epoch < 4102444800:          # 1970–2100
+        return None
+    return epoch
+
+
+def _flag_bits(flags) -> int:
+    if isinstance(flags, int):
+        return flags
+    names = {str(f).strip().lstrip("\\").lower() for f in (flags or [])}
+    bits = 0
+    if "seen" in names:
+        bits |= F_SEEN
+    if "answered" in names:
+        bits |= F_ANSWERED
+    if "flagged" in names:
+        bits |= F_FLAGGED
+    if "draft" in names:
+        bits |= F_DRAFT
+    if "$forwarded" in names or "forwarded" in names:
+        bits |= F_FORWARDED
+    return bits
+
+
+_EXT = {"text/plain": ".txt", "text/html": ".html", "text/calendar": ".ics", "text/csv": ".csv",
+        "message/rfc822": ".eml", "image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
+        "application/pdf": ".pdf", "application/zip": ".zip", "application/ms-tnef": ".dat",
+        "text/rfc822-headers": ".txt", "application/pkcs7-signature": ".p7s",
+        "application/x-pkcs7-signature": ".p7s", "application/pkcs7-mime": ".p7m"}
+
+
+def _clean_filename(name) -> str:
+    text = _one_line(name)
+    text = re.sub(r'[\\/:*?"<>|]+', "_", text).strip(" .")
+    return text[:200]
+
+
+# ---------------------------------------------------------------------------
+#  Разбор письма
+# ---------------------------------------------------------------------------
+class _Att:
+    __slots__ = ("name", "ctype", "cid", "value", "size", "inline")
+
+    def __init__(self, name: str, ctype: str, cid: str, value, size: int, inline: bool) -> None:
+        self.name = name
+        self.ctype = ctype
+        self.cid = cid
+        self.value = value
+        self.size = size
+        self.inline = inline
+
+
+class _Sink:
+    """Приёмник тела одной части письма: текст/HTML в память, вложение — в файл."""
+
+    def __init__(self, leaf, role: str, pst: pf.PstFile) -> None:
+        from .. import mimestream
+        self.leaf = leaf
+        self.role = role
+        self.pst = pst
+        self.dec = mimestream.decoder_for(leaf.cte)
+        self.buf: Optional[bytearray] = bytearray() if role != "att" else None
+        self.stream = pst.stream() if role == "att" else None
+        self.head = bytearray()          # начало вложенного письма — для его темы
+        self.moved = False               # текст оказался слишком большим — стал вложением
+
+    def _put(self, data: bytes) -> None:
+        if self.buf is not None:
+            self.buf += data
+            if len(self.buf) > BODY_CAP:
+                self.stream = self.pst.stream()
+                self.stream.write(bytes(self.buf))
+                self.buf = None
+                self.moved = True
+            return
+        if self.leaf.ctype == "message/rfc822" and len(self.head) < 65536:
+            self.head += data[:65536 - len(self.head)]
+        self.stream.write(data)
+
+    def feed(self, chunk: bytes) -> None:
+        out = self.dec.feed(chunk)
+        if out:
+            self._put(out)
 
     def close(self) -> None:
-        if self._fh is not None:
-            try:
-                self._fh.close()
-            finally:
-                self._fh = None
+        tail = self.dec.close()
+        if tail:
+            self._put(tail)
 
-    def _write(self, blob: bytes) -> None:
-        """Записать кусок файла и СВЕРИТЬ позицию с фактической.
 
-        Считать «сколько просили записать» нельзя: при частичной записи
-        (кончилось место, квота, сетевой диск) реальная позиция расходится с
-        расчётной, и все последующие смещения в BTree указывают мимо — файл
-        собирается «успешно», но не читается ничем.
-        """
+class _Parsed:
+    def __init__(self) -> None:
+        self.headers = None
+        self.text: Optional[bytes] = None
+        self.text_charset: Optional[str] = None
+        self.html: Optional[bytes] = None
+        self.html_charset: Optional[str] = None
+        self.attachments: List[_Att] = []
+        self.skipped_parts = 0
+
+
+def _attachment_from(sink: _Sink, index: int) -> _Att:
+    leaf = sink.leaf
+    value = sink.stream.finish()
+    size = sink.stream.size
+    ctype = leaf.ctype or "application/octet-stream"
+    name = _clean_filename(leaf.filename or "")
+    if not name and ctype == "message/rfc822" and sink.head:
         try:
-            self._fh.write(blob)
-            self._pos = self._fh.tell()
-        except OSError as exc:
-            raise PstWriteError(
-                f"Не удалось записать в файл .pst: {exc}",
-                hint="Проверьте свободное место и права на каталог экспортов.") from exc
+            subject = _clean_filename(_RawHeaders(_raw_header_block(bytes(sink.head))).text("Subject"))[:80]
+        except Exception:  # noqa: BLE001
+            subject = ""
+        if subject:
+            name = subject + ".eml"
+    if not name and sink.moved:
+        name = "message.html" if ctype == "text/html" else "message.txt"
+    if not name:
+        ext = _EXT.get(ctype) or mimetypes.guess_extension(ctype) or ""
+        name = (f"forwarded_{index}" if ctype == "message/rfc822" else f"attachment_{index}") + ext
+    elif ctype == "message/rfc822" and not name.lower().endswith(".eml"):
+        name += ".eml"
+    cid = ""
+    try:
+        raw_cid = leaf.headers.get("Content-ID")
+        if raw_cid:
+            cid = _one_line(str(raw_cid)).strip().strip("<>").strip()
+    except Exception:  # noqa: BLE001
+        cid = ""
+    return _Att(name, ctype, cid, value, size, leaf.disp == "inline")
 
-    def _alloc_bid(self) -> int:
-        bid = self._next_bid
-        self._next_bid += 4
-        return bid
 
-    def new_folder_nid(self) -> int:
-        idx = self._next_folder_index
-        self._next_folder_index += 1
-        return ((idx << 5) | NID_TYPE_NORMAL_FOLDER) & 0xFFFFFFFF
+def parse_message(fh, pst: pf.PstFile) -> _Parsed:
+    """Один проход по письму: заголовки, текст, HTML; вложения — сразу в .pst."""
+    from .. import mimestream
+    from ..mailview import _is_attachment
+    parsed = _Parsed()
+    events = mimestream.scan(fh)
+    sink: Optional[_Sink] = None
+    parts = 0
+    text_busy = html_busy = False
+    try:
+        for kind, leaf, payload in events:
+            if kind == "top":
+                parsed.headers = payload
+                continue
+            if kind == "leaf":
+                parts += 1
+                if parts > MAX_PARTS:
+                    parsed.skipped_parts += 1
+                    continue
+                is_att = _is_attachment(leaf.ctype, leaf.disp, leaf.filename)
+                ctype = leaf.ctype
+                if ctype.startswith("multipart/"):
+                    ctype = "text/plain"          # multipart без boundary — модуль email читает как текст
+                if not is_att and ctype == "text/plain" and not text_busy:
+                    role, text_busy = "text", True
+                elif not is_att and ctype == "text/html" and not html_busy:
+                    role, html_busy = "html", True
+                else:
+                    role = "att"
+                sink = _Sink(leaf, role, pst)
+                leaf.want = True
+                continue
+            if sink is None or leaf is not sink.leaf:
+                continue
+            if kind == "data":
+                sink.feed(payload)
+                continue
+            if kind == "end":
+                sink.close()
+                if sink.buf is not None:
+                    body = bytes(sink.buf)
+                    if sink.role == "text":
+                        if body.strip():
+                            parsed.text, parsed.text_charset = body, leaf.charset
+                        else:
+                            text_busy = False          # пустая часть: текст возьмём из следующей
+                    else:
+                        if body.strip():
+                            parsed.html, parsed.html_charset = body, leaf.charset
+                        else:
+                            html_busy = False
+                else:
+                    parsed.attachments.append(_attachment_from(sink, len(parsed.attachments) + 1))
+                sink = None
+    finally:
+        events.close()
+    return parsed
 
-    def new_message_nid(self) -> int:
-        idx = self._next_msg_index
-        self._next_msg_index += 1
-        return ((idx << 5) | NID_TYPE_NORMAL_MESSAGE) & 0xFFFFFFFF
 
-    def add_node(self, nid: int, parent_nid: int, data: bytes) -> None:
-        """Записать узел (папку или письмо) в файл и запомнить его в BTree."""
-        if self._fh is None:
-            raise PstEngineError("Внутренняя ошибка: файл .pst не открыт для записи.")
-        bid = self._alloc_bid()
-        ib = self._pos
-        block = self._block_bytes(data, bid, ib)
-        if ib + len(block) > ANSI_PST_LIMIT_BYTES:
-            # Смещения в ANSI PST 32-битные, а сам формат ограничен 2 ГБ.
-            # Проверяем ПО ХОДУ записи: иначе экспорт крупного ящика молча
-            # собирал бы нечитаемый файл, а за 4 ГБ падал с невнятным
-            # struct.error уже в самом конце — после часа работы.
-            raise PstWriteError(
-                f"Файл .pst превысит предел формата ANSI "
-                f"({ANSI_PST_LIMIT_BYTES / (1024 ** 3):.1f} ГБ, записано "
-                f"{ib / (1024 ** 3):.1f} ГБ).",
-                hint="Разбейте экспорт по папкам или по датам, либо используйте движок Aspose "
-                     "(формат Unicode) или экспорт в EML/MBOX — у них такого ограничения нет.")
-        self._write(block)
-        # BBTENTRY (ANSI): bid(4), ib(4), cb(2), cRef(2)
-        self._bbt.append((bid, struct.pack("<IIHH", bid, ib, len(data), 2)))
-        # NBTENTRY (ANSI): nid(4), bidData(4), bidSub(4), nidParent(4)
-        self._nbt.append((nid, struct.pack("<IIII", nid, bid, 0, parent_nid)))
+def _raw_header_block(head: bytes) -> bytes:
+    for sep in (b"\r\n\r\n", b"\n\n"):
+        cut = head.find(sep)
+        if cut >= 0:
+            return head[:cut]
+    return head
 
-    # -- сериализация --------------------------------------------------------
-    def _block_bytes(self, data: bytes, bid: int, ib: int) -> bytes:
-        cb = len(data)
-        total = cb + 12  # ANSI BLOCKTRAILER = 12
-        padded = (total + 63) & ~63
-        buf = bytearray(padded)
-        buf[0:cb] = data
-        # ANSI BLOCKTRAILER: cb(2), wSig(2), bid(4), dwCRC(4)  — bid ДО dwCRC!
-        trailer = struct.pack("<HHII", cb, _sig(ib, bid), bid, 0)
-        buf[padded - 12:padded] = trailer
-        return bytes(buf)
 
-    # libpst (ANSI) читает служебные поля страницы по фиксированным смещениям:
-    #   0x1F0 cEnt, 0x1F1 cEntMax, 0x1F2 cbEnt, 0x1F3 cLevel (0 = лист),
-    #   0x1F4 ptype, 0x1F5 ptypeRepeat, 0x1F6 wSig, 0x1F8 backlink(bid), 0x1FC dwCRC.
-    _PAGE_ENTRY_REGION = 0x1F0  # 496 байт под записи
+def _importance(headers: _RawHeaders) -> Tuple[int, int]:
+    imp = headers.text("Importance").strip().lower()
+    xp = headers.text("X-Priority").strip()
+    ms = headers.text("X-MSMail-Priority").strip().lower()
+    prio = headers.text("Priority").strip().lower()
+    if imp == "high" or xp[:1] in ("1", "2") or ms == "high" or prio == "urgent":
+        return 2, 1
+    if imp == "low" or xp[:1] in ("4", "5") or ms == "low" or prio == "non-urgent":
+        return 0, -1
+    return 1, 0
 
-    def _btpage_bytes(self, entries_bytes: bytes, count: int, ent_size: int, level: int,
-                      ptype: int, bid: int, ib: int) -> bytes:
-        buf = bytearray(512)
-        buf[0:len(entries_bytes)] = entries_bytes
-        buf[0x1F0] = count & 0xFF
-        buf[0x1F1] = (self._PAGE_ENTRY_REGION // ent_size) & 0xFF
-        buf[0x1F2] = ent_size & 0xFF
-        buf[0x1F3] = level & 0xFF
-        struct.pack_into("<BBH", buf, 0x1F4, ptype, ptype, _sig(ib, bid))
-        struct.pack_into("<I", buf, 0x1F8, bid)   # backlink
-        struct.pack_into("<I", buf, 0x1FC, 0)     # dwCRC (readpst не проверяет)
-        return bytes(buf)
 
-    def _align_page(self) -> None:
-        rem = self._pos % 512
-        if rem:
-            self._write(b"\x00" * (512 - rem))
+def _sensitivity(headers: _RawHeaders) -> int:
+    value = headers.text("Sensitivity").strip().lower()
+    return {"personal": 1, "private": 2, "company-confidential": 3}.get(value, 0)
 
-    def _emit_page(self, entries_bytes: bytes, count: int, ent_size: int, level: int, ptype: int):
-        self._align_page()
-        bid = self._alloc_bid()
-        ib = self._pos
-        self._write(self._btpage_bytes(entries_bytes, count, ent_size, level, ptype, bid, ib))
-        return bid, ib
 
-    def _build_btree(self, entry_list: List[bytes], keys: List[int], ent_size: int, ptype: int):
-        """Собрать многоуровневый BTree страниц из отсортированных листовых записей."""
-        max_leaf = self._PAGE_ENTRY_REGION // ent_size
-        max_branch = self._PAGE_ENTRY_REGION // 12
-        if not entry_list:
-            return self._emit_page(b"", 0, ent_size, 0, ptype)
-        pages: List[tuple] = []  # (start_key, bid, ib)
-        for start in range(0, len(entry_list), max_leaf):
-            chunk = entry_list[start:start + max_leaf]
-            chunk_keys = keys[start:start + max_leaf]
-            bid, ib = self._emit_page(b"".join(chunk), len(chunk), ent_size, 0, ptype)
-            pages.append((chunk_keys[0], bid, ib))
-        level = 1
-        while len(pages) > 1:
-            new_pages: List[tuple] = []
-            for start in range(0, len(pages), max_branch):
-                chunk = pages[start:start + max_branch]
-                # BTENTRY (32-bit): start_key(4), backpointer=child_bid(4), offset=child_ib(4)
-                blob = b"".join(struct.pack("<III", k, cbid, cib) for (k, cbid, cib) in chunk)
-                bid, ib = self._emit_page(blob, len(chunk), 12, level, ptype)
-                new_pages.append((chunk[0][0], bid, ib))
-            pages = new_pages
-            level += 1
-        return pages[0][1], pages[0][2]
+def _address_props(prefix: str, name: str, address: str) -> List[Tuple[int, int, object]]:
+    """Свойства отправителя (SenderXxx или SentRepresentingXxx)."""
+    ids = {"sender": (0x0C1A, 0x0C1F, 0x0C1E, 0x0C19, 0x0C1D),
+           "repr": (0x0042, 0x0065, 0x0064, 0x0041, 0x003B)}[prefix]
+    out: List[Tuple[int, int, object]] = [(ids[0], pf.PT_UNICODE, name or address)]
+    if address:
+        out += [(ids[1], pf.PT_UNICODE, address), (ids[2], pf.PT_UNICODE, "SMTP"),
+                (ids[3], pf.PT_BINARY, pf.one_off_entry_id(name, address)),
+                (ids[4], pf.PT_BINARY, pf.smtp_search_key(address))]
+    return out
 
-    def finish(self) -> int:
-        """Дописать страницы BTree и заголовок. Возвращает размер файла.
 
-        Заголовок пишется в конце: до этого момента неизвестны ни смещения
-        корней BTree, ни размер файла. Место под него зарезервировано при
-        открытии, поэтому хватает одного seek(0).
-        """
-        if self._fh is None:
-            raise PstEngineError("Внутренняя ошибка: файл .pst не открыт для записи.")
-        self._bbt.sort(key=lambda x: x[0])
-        self._nbt.sort(key=lambda x: x[0])
-        bbt_bid, bbt_ib = self._build_btree([e[1] for e in self._bbt],
-                                            [e[0] for e in self._bbt], 12, PTYPE_BBT)
-        nbt_bid, nbt_ib = self._build_btree([e[1] for e in self._nbt],
-                                            [e[0] for e in self._nbt], 16, PTYPE_NBT)
-        file_eof = self._pos
-        header = self._build_header(nbt_bid, nbt_ib, bbt_bid, bbt_ib, file_eof)
-        self._fh.seek(0)
-        self._fh.write(header)
-        self._fh.flush()
-        self.close()
-        return file_eof
+def _table_text(value: str) -> str:
+    """Строка для таблицы содержимого: не длиннее 255 знаков UTF-16 (как у MAPI)."""
+    text = value[:TABLE_TEXT]
+    units = len(text) + sum(1 for ch in text if ord(ch) > 0xFFFF)
+    while units > TABLE_TEXT:
+        units -= 2 if ord(text[-1]) > 0xFFFF else 1
+        text = text[:-1]
+    return text
 
-    def _build_header(self, nbt_bid: int, nbt_ib: int, bbt_bid: int, bbt_ib: int, file_eof: int) -> bytes:
-        h = bytearray(512)
-        struct.pack_into("<I", h, 0x00, PST_MAGIC)
-        struct.pack_into("<I", h, 0x04, 0)              # dwCRCPartial (не проверяется readpst)
-        struct.pack_into("<H", h, 0x08, MAGIC_CLIENT)
-        struct.pack_into("<H", h, 0x0A, VER_ANSI)
-        struct.pack_into("<H", h, 0x0C, VER_CLIENT)
-        struct.pack_into("<B", h, 0x0E, 0x01)
-        struct.pack_into("<B", h, 0x0F, 0x01)
-        struct.pack_into("<I", h, 0x10, 0)              # dwReserved1
-        struct.pack_into("<I", h, 0x14, 0)              # dwReserved2
-        struct.pack_into("<I", h, 0x18, self._next_bid + 8)   # bidNextB
-        struct.pack_into("<I", h, 0x1C, self._next_bid + 16)  # bidNextP
-        struct.pack_into("<I", h, 0x20, 1)              # dwUnique
-        # rgnid[32] с 0x24 (128 байт) — оставим нулями
-        root_off = 0x24 + 128                            # 0xA4
-        # ROOT (ANSI, 40 байт): dwReserved, ibFileEof, ibAMapLast, cbAMapFree,
-        #   cbPMapFree, BREF_NBT{bid,ib}, BREF_BBT{bid,ib}, fAMapValid, bReserved, wReserved
-        struct.pack_into("<I", h, root_off + 0, 0)
-        struct.pack_into("<I", h, root_off + 4, file_eof)
-        struct.pack_into("<I", h, root_off + 8, 0)
-        struct.pack_into("<I", h, root_off + 12, 0)
-        struct.pack_into("<I", h, root_off + 16, 0)
-        struct.pack_into("<II", h, root_off + 20, nbt_bid, nbt_ib)   # BREFNBT
-        struct.pack_into("<II", h, root_off + 28, bbt_bid, bbt_ib)   # BREFBBT
-        struct.pack_into("<B", h, root_off + 36, 0)     # fAMapValid = INVALID (0)
-        struct.pack_into("<B", h, root_off + 37, 0)
-        struct.pack_into("<H", h, root_off + 38, 0)
-        # bSentinel (0x1CC) = 0x80 и bCryptMethod (0x1CD) = 0 (NDB_CRYPT_NONE).
-        # readpst их не проверяет, а Outlook может отбраковать файл без них.
-        struct.pack_into("<BB", h, 0x1CC, 0x80, 0x00)
-        # Для совместимости с readpst достаточно валидных BREF в ROOT и магии.
-        return bytes(h)
+
+class _Row:
+    """Строка таблицы содержимого папки — компактно (кортеж вместо словаря)."""
+    __slots__ = ("nid", "importance", "sensitivity", "subject", "submit", "sender", "topic",
+                 "cc", "to", "delivery", "flags", "size")
+
+    def __init__(self, **kw) -> None:
+        for key, value in kw.items():
+            setattr(self, key, value)
+
+    def cells(self) -> Dict[int, object]:
+        return {0x00170003: self.importance, 0x001A001F: "IPM.Note", 0x00360003: self.sensitivity,
+                0x0037001F: self.subject or None, 0x00390040: self.submit or None,
+                0x0042001F: self.sender or None, 0x0070001F: self.topic or None,
+                0x0E03001F: self.cc or None, 0x0E04001F: self.to or None,
+                0x0E060040: self.delivery or None, 0x0E070003: self.flags,
+                0x0E080003: self.size, 0x0E170003: 0}
+
+
+def write_message(pst: pf.PstFile, fh, folder_nid: int, *, flags: int,
+                  internaldate: Optional[float], size: int,
+                  now_ft: int = 0) -> Tuple[_Row, List[str]]:
+    """Разобрать письмо из файла и записать его в .pst. → (строка таблицы, замечания)."""
+    notes: List[str] = []
+    head = fh.read(HEADERS_CAP)
+    # Блок заголовков бывает огромным (тысячи Received, гигантский X-…): тема
+    # и адреса могут стоять после первого мегабайта — дочитываем до пустой строки.
+    while len(head) < HEADER_SCAN_LIMIT and b"\r\n\r\n" not in head and b"\n\n" not in head:
+        more = fh.read(HEADERS_CAP)
+        if not more:
+            break
+        head += more
+    fh.seek(0)
+    parsed = parse_message(fh, pst)
+    blob = _raw_header_block(head)
+    headers = _RawHeaders(blob)
+
+    subject = _one_line(headers.text("Subject")).lstrip("\x01")
+    topic = _topic(subject)
+    senders = _addresses(headers, "From") or _addresses(headers, "Sender")
+    sender_name, sender_addr = senders[0] if senders else ("", "")
+    groups = [(1, _addresses(headers, "To")), (2, _addresses(headers, "Cc")),
+              (3, _addresses(headers, "Bcc"))]
+    submit_epoch = _epoch_of(headers.raw("Date"))
+    delivery_epoch = internaldate or submit_epoch
+    submit_ft = pf.to_filetime(submit_epoch or delivery_epoch) if (submit_epoch or delivery_epoch) else 0
+    delivery_ft = pf.to_filetime(delivery_epoch) if delivery_epoch else 0
+    importance, priority = _importance(headers)
+    sensitivity = _sensitivity(headers)
+
+    from ..mailview import decode_text_bytes
+    text = decode_text_bytes(parsed.text, parsed.text_charset) if parsed.text is not None else None
+    html_bytes = html_cp = None
+    html_text = ""
+    if parsed.html is not None:
+        html_bytes, html_cp, html_text = _html_body(parsed.html, parsed.html_charset)
+    if text is None and html_text:
+        text = html_to_text(html_text)
+    text = _clean_text(text) if text else ""
+
+    # Картинки, на которые ссылается HTML (cid:), прячем из списка вложений.
+    lowered = html_text.lower() if html_text else ""
+    attachments = []
+    visible = 0
+    for att in parsed.attachments:
+        hidden = bool(att.cid) and lowered and ("cid:" + att.cid.lower()) in lowered
+        if not hidden:
+            visible += 1
+        ext = os.path.splitext(att.name)[1]
+        props = [(0x3705, pf.PT_I4, 1), (0x3701, pf.PT_BINARY, att.value),
+                 (0x0E20, pf.PT_I4, min(att.size, 0x7FFFFFFF)),
+                 (0x3704, pf.PT_UNICODE, att.name), (0x3707, pf.PT_UNICODE, att.name),
+                 (0x3001, pf.PT_UNICODE, att.name), (0x3703, pf.PT_UNICODE, ext or None),
+                 (0x370E, pf.PT_UNICODE, att.ctype), (0x370B, pf.PT_I4, -1),
+                 (0x3712, pf.PT_UNICODE, att.cid or None),
+                 (0x3714, pf.PT_I4, 4 if hidden else None),
+                 (0x7FFE, pf.PT_BOOL, bool(hidden)), (0x7FFA, pf.PT_I4, 0),
+                 (0x7FFD, pf.PT_I4, 0), (0x7FFF, pf.PT_BOOL, False)]
+        cells = {0x0E200003: min(att.size, 0x7FFFFFFF), 0x3704001F: att.name, 0x37050003: 1,
+                 0x370B0003: -1}
+        attachments.append((props, cells))
+    if parsed.skipped_parts:
+        notes.append(f"в письме больше {MAX_PARTS} частей, лишние не выгружены ({parsed.skipped_parts})")
+
+    recipients = []
+    displays = {1: [], 2: [], 3: []}
+    for rtype, pairs in groups:
+        for name, addr in pairs:
+            if not addr:
+                continue
+            displays[rtype].append(name or addr)
+            recipients.append({0x0C150003: rtype, 0x3001001F: name or addr, 0x3002001F: "SMTP",
+                               0x3003001F: addr, 0x0FFF0102: pf.one_off_entry_id(name, addr),
+                               0x300B0102: pf.smtp_search_key(addr), 0x0FFE0003: 6,
+                               0x39000003: 0})
+    display_to = "; ".join(displays[1])
+    display_cc = "; ".join(displays[2])
+    display_bcc = "; ".join(displays[3])
+
+    msg_flags = 0
+    if flags & F_SEEN:
+        msg_flags |= MSGFLAG_READ
+    if flags & F_DRAFT:
+        msg_flags |= MSGFLAG_UNSENT
+    if visible:
+        msg_flags |= MSGFLAG_HASATTACH
+
+    headers_text = ""
+    if blob:
+        headers_text = _clean_text(decode_text_bytes(blob[:HEADERS_CAP], None))
+        if not headers_text.endswith("\n"):
+            headers_text += "\r\n"
+
+    props: List[Tuple[int, int, object]] = [
+        (0x001A, pf.PT_UNICODE, "IPM.Note"),
+        (0x0037, pf.PT_UNICODE, subject),
+        (0x0070, pf.PT_UNICODE, topic),
+        (0x0039, pf.PT_SYSTIME, submit_ft or None),
+        (0x0E06, pf.PT_SYSTIME, delivery_ft or None),
+        # время создания и изменения обязательны — без дат письма берём момент выгрузки
+        (0x3007, pf.PT_SYSTIME, delivery_ft or now_ft or pf.to_filetime(time.time())),
+        (0x3008, pf.PT_SYSTIME, delivery_ft or now_ft or pf.to_filetime(time.time())),
+        (0x0E07, pf.PT_I4, msg_flags),
+        (0x0E08, pf.PT_I4, min(size, 0x7FFFFFFF)),
+        (0x0E17, pf.PT_I4, 0),
+        (0x0017, pf.PT_I4, importance),
+        (0x0026, pf.PT_I4, priority),
+        (0x0036, pf.PT_I4, sensitivity),
+        (0x0E04, pf.PT_UNICODE, display_to),
+        (0x0E03, pf.PT_UNICODE, display_cc),
+        (0x0E02, pf.PT_UNICODE, display_bcc),
+        (0x0E1B, pf.PT_BOOL, bool(visible)),
+        (0x300B, pf.PT_BINARY, uuid.uuid4().bytes),
+        (0x007D, pf.PT_UNICODE, headers_text or None),
+        (0x1035, pf.PT_UNICODE, _one_line(headers.text("Message-ID")) or None),
+        (0x1042, pf.PT_UNICODE, _one_line(headers.text("In-Reply-To")) or None),
+        (0x1039, pf.PT_UNICODE, _one_line(headers.text("References")) or None),
+        (0x1000, pf.PT_UNICODE, text or None),
+    ]
+    if html_bytes is not None:
+        props += [(0x1013, pf.PT_BINARY, html_bytes), (0x3FDE, pf.PT_I4, html_cp)]
+    if sender_name or sender_addr:
+        props += _address_props("sender", sender_name, sender_addr)
+        props += _address_props("repr", sender_name, sender_addr)
+    if flags & F_FORWARDED:
+        props += [(0x1080, pf.PT_I4, 0x106), (0x1081, pf.PT_I4, 104)]
+    elif flags & F_ANSWERED:
+        props += [(0x1080, pf.PT_I4, 0x105), (0x1081, pf.PT_I4, 102)]
+    if flags & F_FLAGGED:
+        props += [(0x1090, pf.PT_I4, 2), (0x1095, pf.PT_I4, 6)]
+
+    nid = pst.write_message(folder_nid, props, recipients, attachments)
+    row = _Row(nid=nid, importance=importance, sensitivity=sensitivity,
+               subject=_table_text(subject), submit=submit_ft, sender=_table_text(sender_name or sender_addr),
+               topic=_table_text(topic), cc=_table_text(display_cc), to=_table_text(display_to),
+               delivery=delivery_ft, flags=msg_flags, size=min(size, 0x7FFFFFFF))
+    return row, notes
 
 
 # ---------------------------------------------------------------------------
-#  Высокоуровневый движок экспорта
+#  Дерево папок
+# ---------------------------------------------------------------------------
+class _Folder:
+    __slots__ = ("key", "name", "parent", "role", "children")
+
+    def __init__(self, key: Tuple[str, ...], name: str, parent, role: str) -> None:
+        self.key = key
+        self.name = name
+        self.parent = parent            # ключ родителя (None — верх дерева)
+        self.role = role                # inbox | trash | sent | ""
+        self.children: List[Tuple[str, ...]] = []
+
+
+def _split_folder(name: str, delimiter: str = "") -> Tuple[str, ...]:
+    """Имя папки IMAP → уровни дерева. Разделитель сервера неизвестен — «/» и «\\»."""
+    pieces = (name or "").split(delimiter) if delimiter else re.split(r"[/\\]", name or "")
+    parts = tuple(p for p in (_one_line(x) for x in pieces) if p)
+    return parts or ("INBOX",)
+
+
+def plan_folders(names) -> Tuple[List[_Folder], Dict[str, Tuple[str, ...]]]:
+    """Разложить папки IMAP в дерево .pst → (папки в порядке записи, имя IMAP → ключ).
+
+    names — имена папок или словарь «имя → разделитель уровней на сервере».
+    """
+    delims = dict(names) if isinstance(names, dict) else {name: "" for name in names}
+    keys = {name: _split_folder(name, delim) for name, delim in delims.items()}
+    # Courier, Cyrus и часть Dovecot держат все папки внутри «INBOX.» (личное
+    # пространство имён): почтовые программы показывают их рядом со «Входящими»,
+    # так же раскладываем и в .pst.
+    nested = [k for k in keys.values() if len(k) > 1]
+    if nested and all(k[0].lower() == "inbox" for k in keys.values()) \
+            and any(delims.get(n) == "." for n, k in keys.items() if len(k) > 1):
+        keys = {n: (k[1:] if len(k) > 1 else k) for n, k in keys.items()}
+    tops = {key[0].lower(): key[0] for key in keys.values()}
+    trash = next((tops[n] for n in _TRASH_NAMES if n in tops), None)
+    sent = next((tops[n] for n in _SENT_NAMES if n in tops), None)
+
+    def norm(key: Tuple[str, ...]) -> Tuple[str, ...]:
+        head = key[0]
+        if head.lower() == "inbox":
+            return ("\x00inbox",) + key[1:]
+        if trash is not None and head == trash:
+            return ("\x00trash",) + key[1:]
+        return key
+
+    mapping = {name: norm(key) for name, key in keys.items()}
+    folders: Dict[Tuple[str, ...], _Folder] = {}
+    for key in list(mapping.values()) + [("\x00inbox",)]:
+        for depth in range(1, len(key) + 1):
+            sub = key[:depth]
+            if sub in folders:
+                continue
+            if sub == ("\x00inbox",):
+                folder = _Folder(sub, INBOX_NAME, None, "inbox")
+            elif sub == ("\x00trash",):
+                folder = _Folder(sub, TRASH_NAME, None, "trash")
+            else:
+                role = "sent" if depth == 1 and sent is not None and sub[0] == sent else ""
+                folder = _Folder(sub, sub[-1][:255] or "(без имени)", sub[:-1] or None, role)
+            folders[sub] = folder
+            if folder.parent is not None:
+                folders[folder.parent].children.append(sub)
+
+    # Имена соседей не должны совпадать (Outlook так не умеет).
+    def sort_key(k):
+        return (0 if k[0] == "\x00inbox" and len(k) == 1 else 1, folders[k].name.lower())
+
+    top_keys = sorted((k for k in folders if len(k) == 1 and k[0] != "\x00trash"), key=sort_key)
+    if ("\x00trash",) in folders:
+        top_keys.append(("\x00trash",))
+    reserved = {INBOX_NAME.lower(), TRASH_NAME.lower()}
+
+    def dedupe(siblings: List[Tuple[str, ...]], taken: set) -> None:
+        for k in siblings:
+            folder = folders[k]
+            if folder.role in ("inbox", "trash"):
+                continue
+            base = folder.name
+            name, n = base, 1
+            while name.lower() in taken:
+                n += 1
+                name = f"{base} ({n})"
+            folder.name = name
+            taken.add(name.lower())
+
+    dedupe(top_keys, set(reserved))
+    ordered: List[_Folder] = []
+
+    def visit(k: Tuple[str, ...]) -> None:
+        folder = folders[k]
+        ordered.append(folder)
+        kids = sorted(folder.children, key=lambda c: folders[c].name.lower())
+        dedupe(kids, set())
+        folder.children = kids
+        for child in kids:
+            visit(child)
+
+    for k in top_keys:
+        visit(k)
+    return ordered, mapping
+
+
+# ---------------------------------------------------------------------------
+#  Движок
 # ---------------------------------------------------------------------------
 class _Spooled:
-    """
-    Лёгкая запись об одном письме: тело сброшено во временный файл (spool), в
-    памяти остаются только метаданные и путь к нему.
+    """Лёгкая запись об одном письме; тело — во временном файле."""
 
-    Держать сырые байты всех писем в списке нельзя: на ящике в десятки
-    гигабайт столько же уйдёт в оперативную память. Тело читается обратно
-    ровно в тот момент, когда нужно собрать узел письма, и тут же забывается.
-    """
+    __slots__ = ("folder", "path", "size", "flags", "internaldate")
 
-    # message_id не хранится: он нигде не используется при сборке .pst, а на
-    # ящике в 200 000 писем это десятки мегабайт строк. flags держим числом.
-    __slots__ = ("folder", "key", "path", "size", "flags", "internaldate")
-
-    def __init__(self, folder: str, key: str, path: str, size: int,
-                 flags: int, internaldate: Optional[float]) -> None:
+    def __init__(self, folder: str, path: str, size: int, flags: int,
+                 internaldate: Optional[float]) -> None:
         self.folder = folder
-        self.key = key                 # путь папки внутри PST («Work/2024»)
-        self.path = path               # файл со сырым телом письма
+        self.path = path
         self.size = size
-        self.flags = flags             # уже готовое значение PidTagMessageFlags
+        self.flags = flags
         self.internaldate = internaldate
+
+
+class _SpoolIndex:
+    """Сведения о сброшенных на диск письмах — в массивах, ~20 байт на письмо.
+
+    На ящике в сотни тысяч писем объект на письмо со строкой пути занимал бы
+    десятки мегабайт; здесь путь вычисляется по номеру письма.
+    """
+
+    def __init__(self, spool_dir: str) -> None:
+        self.dir = spool_dir
+        self.folders: List[str] = []
+        self._folder_ids: Dict[str, int] = {}
+        self.folder = array("I")
+        self.size = array("Q")
+        self.flags = array("B")
+        self.date = array("d")
+
+    def __len__(self) -> int:
+        return len(self.size)
+
+    def path(self, index: int) -> str:
+        return os.path.join(self.dir, f"{index:08d}.eml")
+
+    def add(self, folder: str, size: int, flags: int, internaldate: Optional[float]) -> None:
+        fid = self._folder_ids.get(folder)
+        if fid is None:
+            fid = self._folder_ids[folder] = len(self.folders)
+            self.folders.append(folder)
+        self.folder.append(fid)
+        self.size.append(max(0, int(size)))
+        self.flags.append(flags & 0xFF)
+        self.date.append(float(internaldate) if internaldate else math.nan)
+
+    def get(self, index: int) -> _Spooled:
+        date = self.date[index]
+        return _Spooled(self.folders[self.folder[index]], self.path(index), self.size[index],
+                        self.flags[index], None if math.isnan(date) else date)
+
+
+#: Строк в таблице содержимого одной папки одной части не больше этого:
+#: куча таблицы ограничена 65 535 блоками (формат), здесь — с большим запасом.
+MAX_TABLE_ROWS = 500_000
 
 
 class NativePstExportEngine(ExportEngine):
@@ -625,409 +895,282 @@ class NativePstExportEngine(ExportEngine):
     def available(cls):
         return True, ""
 
-    def _folder_props(self, name: str, count: int, has_subfolders: bool,
-                      unread: int = 0) -> bytes:
-        return build_pc_block([
-            (TAG_DISPLAY_NAME, PT_STRING, name),
-            (TAG_CONTENT_COUNT, PT_INT32, count),
-            (TAG_CONTENT_UNREAD, PT_INT32, unread),
-            (TAG_SUBFOLDERS, PT_BOOL, 1 if has_subfolders else 0),
-        ])
-
     @staticmethod
     def _message_flags(flags) -> int:
-        """Флаги IMAP → PidTagMessageFlags.
-
-        Раньше здесь всегда стояло MSGFLAG_READ, и в .pst все письма выглядели
-        прочитанными, а «ответил»/«переслал» терялись.
-        """
-        if isinstance(flags, int):
-            return flags
-        names = {str(f).lstrip("\\").lower() for f in (flags or [])}
-        value = 0
-        if "seen" in names:
-            value |= MSGFLAG_READ
-        if "draft" in names:
-            value |= MSGFLAG_UNSENT
-        return value
-
-    def _message_props(self, raw: bytes, internaldate: Optional[float],
-                       flags: Optional[List[str]] = None) -> Tuple[bytes, bool]:
-        """Блок свойств письма. Возвращает (блок PC, обрезано ли тело)."""
-        msg_flags = self._message_flags(flags)
-        if len(raw) > STREAM_PARSE_BYTES:
-            # Крупное письмо: полный разбор модулем email занял бы около
-            # десятикратного объёма (письмо в 100 МБ — полтора гигабайта), а
-            # в .pst нужны только заголовки и текст. Потоковый разбор читает
-            # письмо один раз и держит в памяти лишь текстовую часть.
-            msg, body = _stream_headers_and_body(raw)
-        else:
-            try:
-                msg = email.message_from_bytes(raw)
-            except Exception:  # noqa: BLE001
-                msg = None
-            body = self._extract_body(msg) if msg else ""
-        headers_blob = raw.split(b"\r\n\r\n", 1)[0].split(b"\n\n", 1)[0]
-        subject = _safe_hdr(msg, "Subject", headers_blob)
-        from_hdr = _safe_hdr(msg, "From", headers_blob)
-        to_hdr = _safe_hdr(msg, "To", headers_blob)
-        cc_hdr = _safe_hdr(msg, "Cc", headers_blob)
-        try:
-            sender_name, sender_email = email.utils.parseaddr(from_hdr)
-        except Exception:  # noqa: BLE001
-            sender_name, sender_email = from_hdr, ""
-        try:
-            headers_text = headers_blob.decode("utf-8", "replace")
-        except Exception:  # noqa: BLE001
-            headers_text = ""
-
-        def make(body_txt: str, headers_txt: str):
-            return [
-                (TAG_MESSAGE_CLASS, PT_STRING, "IPM.Note"),
-                (TAG_SUBJECT, PT_STRING, (subject or "(без темы)")[:400]),
-                (TAG_BODY, PT_STRING, body_txt),
-                (TAG_SENDER_NAME, PT_STRING, (sender_name or sender_email or "")[:255]),
-                (TAG_SENDER_EMAIL, PT_STRING, (sender_email or "")[:255]),
-                (TAG_SENT_REP_NAME, PT_STRING, (sender_name or sender_email or "")[:255]),
-                (TAG_DISPLAY_TO, PT_STRING, to_hdr[:500]),
-                (TAG_DISPLAY_CC, PT_STRING, cc_hdr[:500]),
-                (TAG_TRANSPORT_HEADERS, PT_STRING, headers_txt),
-                (TAG_DELIVERY_TIME, PT_TIME, internaldate),
-                (TAG_SUBMIT_TIME, PT_TIME, internaldate),
-                (TAG_MESSAGE_FLAGS, PT_INT32, msg_flags),
-            ]
-
-        # Тело и заголовки в UTF-16LE занимают вдвое больше байт, а весь узел
-        # должен поместиться в один блок. Порядок жертв: сначала служебные
-        # заголовки, тело письма режем в последнюю очередь и ровно настолько,
-        # чтобы выбрать бюджет блока целиком (native — упрощённый экспорт; для
-        # полной точности используйте Aspose или экспорт eml).
-        body = body[:BODY_SCAN_LIMIT]
-        headers_text = headers_text[:HEADERS_SCAN_LIMIT]
-
-        # 1) всё целиком
-        block = _build_or_none(make(body, headers_text))
-        if block is not None:
-            return block, False
-
-        # 2) ужимаем заголовки: ищем их наибольшую длину, при которой ПОЛНОЕ
-        #    тело письма ещё помещается в блок
-        block, _n = _fit_longest(lambda n: make(body, headers_text[:n]), len(headers_text))
-        if block is not None:
-            return block, False
-
-        # 3) тело не влезает даже без заголовков — оставляем заголовкам минимум
-        #    и подбираем длину тела под весь оставшийся бюджет
-        headers_text = headers_text[:HEADERS_FLOOR]
-        block, _n = _fit_longest(lambda n: make(body[:n] + CUT_MARK, headers_text),
-                                 max(0, len(body) - 1))
-        if block is not None:
-            return block, True
-
-        # 4) крайний случай (гигантские тема/адресаты) — минимальный набор свойств
-        block, _n = _fit_longest(lambda n: [
-            (TAG_MESSAGE_CLASS, PT_STRING, "IPM.Note"),
-            (TAG_SUBJECT, PT_STRING, (subject or "(без темы)")[:200]),
-            (TAG_BODY, PT_STRING, body[:n] + CUT_MARK),
-            (TAG_DELIVERY_TIME, PT_TIME, internaldate),
-            (TAG_MESSAGE_FLAGS, PT_INT32, msg_flags),
-        ], min(len(body), 200))
-        if block is None:
-            raise PstEngineError("native PST: свойства письма не помещаются в один блок.",
-                                 code="pst_engine_error")
-        return block, True
+        """Флаги IMAP → PidTagMessageFlags (прочитано, черновик)."""
+        bits = _flag_bits(flags)
+        return (MSGFLAG_READ if bits & F_SEEN else 0) | (MSGFLAG_UNSENT if bits & F_DRAFT else 0)
 
     @staticmethod
-    def _extract_body(msg) -> str:
+    def _part_limit(options: dict) -> Tuple[int, int]:
+        """(где кончаются данные части, заявленный размер части) в байтах."""
+        limit = PART_LIMIT_BYTES
         try:
-            if msg.is_multipart():
-                html_body = ""
-                for part in msg.walk():
-                    if part.is_multipart():
-                        continue
-                    if "attachment" in str(part.get("Content-Disposition", "")):
-                        continue
-                    ctype = part.get_content_type()
-                    if ctype == "text/plain":
-                        return _part_text(part)
-                    if ctype == "text/html" and not html_body:
-                        html_body = _part_text(part)
-                # text/plain нет (обычное письмо «HTML + картинки внутри») —
-                # берём HTML и грубо снимаем теги, иначе письмо ушло бы в .pst
-                # с пустым телом и без единой ошибки.
-                return html_to_text(html_body) if html_body else ""
-            text = _part_text(msg)
-            return html_to_text(text) if msg.get_content_type() == "text/html" else text
-        except Exception:  # noqa: BLE001
-            return ""
+            wanted = int(options.get("pst_split_size_mb") or 0) * 1024 * 1024
+        except (TypeError, ValueError):
+            wanted = 0
+        if wanted > 0:
+            limit = min(limit, max(wanted, MIN_SPLIT_BYTES))
+        # Файл растёт целыми областями карты размещения (248 КБ): последняя
+        # запись должна оставлять место на ещё одну область под индексы.
+        regions = max(2, (limit - pf.AMAP_FIRST) // pf.AMAP_SPAN - 1)
+        return pf.AMAP_FIRST + regions * pf.AMAP_SPAN, limit
 
     def export(self, items: Iterable[MailItem], out_path: str, *,
                options: Optional[dict] = None, progress_cb: Optional[ProgressCB] = None,
                cancel_cb: Optional[CancelCB] = None, total_hint: int = 0) -> ExportResult:
+        options = options or {}
         result = ExportResult(path=out_path, is_dir=False, engine=self.name, fmt="pst",
-                              warning="Файл .pst создан встроенным ЭКСПЕРИМЕНТАЛЬНЫМ движком: в нём папки, "
-                                      "тема, адреса, дата и текст писем, но НЕТ вложений. "
-                                      "Обязательно проверьте открытие в вашей версии Outlook. "
-                                      "Для полной выгрузки с вложениями используйте движок Aspose или экспорт eml/mbox.")
-        # Встроенный движок пишет только ANSI. Молчать об этом нельзя: в диалоге
-        # экспорта по умолчанию выбран Unicode, и пользователь, выбравший его
-        # именно ради обхода предела 2 ГБ, получал бы ANSI-файл и тот же предел.
-        wanted_format = str((options or {}).get("pst_format") or "").strip().lower()
-        if wanted_format and wanted_format != "ansi":
-            result.warning = ("Встроенный движок умеет только формат ANSI (Outlook 97–2002) "
-                              "с пределом 2 ГБ — запрошенный Unicode он не поддерживает. "
-                              "Для Unicode используйте движок Aspose либо экспорт EML/MBOX. ") + result.warning
-            log.warning("Запрошен формат PST «%s», встроенный движок пишет ANSI.", wanted_format)
-        writer = PstWriter()
+                              warning=BASE_WARNING)
+        wanted_format = str(options.get("pst_format") or "").strip().lower()
+        if wanted_format == "ansi":
+            result.warning = ANSI_NOTE + result.warning
+            log.info("Запрошен формат PST ANSI — встроенный движок пишет Unicode.")
+        display = _one_line(options.get("pst_display_name") or "") or \
+            os.path.splitext(os.path.basename(out_path))[0]
+        allowed_end, nominal = self._part_limit(options)
         spool_dir = self._make_spool_dir(options)
-        writer_open = False
+        pst: Optional[pf.PstFile] = None
         done_ok = False
-        truncated = 0
-        cancelled = False
         try:
-            # --- проход 1: тела писем на диск, в памяти — только лёгкие записи
-            spooled: List[_Spooled] = []
-            counts: Dict[str, int] = {}
-            unread: Dict[str, int] = {}
-            spool_bytes = 0
-            folder_keys: Dict[str, str] = {}
-            for item in items:
-                if cancel_cb and cancel_cb():
-                    cancelled = True
-                    break
-                key = folder_to_fs(item.folder).replace("\\", "/")
-                path = os.path.join(spool_dir, f"{len(spooled):08d}.eml")
-                try:
-                    with open(path, "wb") as fh:
-                        fh.write(item.raw)
-                except OSError as exc:
-                    # Нет места — это не беда одного письма: дальше будут
-                    # сыпаться все подряд, а экспорт объявится «частичным».
-                    if getattr(exc, "errno", None) in (errno.ENOSPC, errno.EDQUOT, errno.EROFS):
-                        raise PstWriteError(
-                            f"Не удалось подготовить письма к экспорту: {exc}",
-                            hint="Освободите место в каталоге временных файлов "
-                                 f"({spool_dir}) или укажите другой каталог.") from exc
-                    result.errors += 1
-                    if len(result.error_details) < MAX_ERROR_DETAILS:
-                        result.error_details.append(
-                            f"{item.folder}: не удалось сохранить тело во временный файл: {exc}")
-                    continue
-                msg_flags = self._message_flags(item.flags)
-                # Имя папки интернируем: разных значений десятки, а писем сотни
-                # тысяч — отдельная строка на каждое письмо не нужна.
-                key = folder_keys.setdefault(key, key)
-                spooled.append(_Spooled(folder_keys.setdefault(item.folder, item.folder), key, path,
-                                        item.size or len(item.raw), msg_flags, item.internaldate))
-                spool_bytes += len(item.raw)
-                if len(spooled) % 500 == 0:
-                    # Сырые тела занимают на диске примерно столько же, сколько
-                    # займёт итоговый .pst: если места впритык, лучше сказать об
-                    # этом сразу, а не после часа работы.
-                    free = disk_free_bytes(spool_dir)
-                    if free and free < spool_bytes:
-                        raise PstWriteError(
-                            f"Не хватит места для экспорта: подготовлено {human_size(spool_bytes)}, "
-                            f"свободно {human_size(free)}.",
-                            hint="Освободите место или экспортируйте ящик по частям "
-                                 "(по папкам или по датам).")
-                counts[key] = counts.get(key, 0) + 1
-                if not msg_flags & MSGFLAG_READ:
-                    unread[key] = unread.get(key, 0) + 1
-
+            spooled, delims, cancelled = self._spool(items, spool_dir, result, cancel_cb,
+                                                     progress_cb, total_hint)
             if cancelled:
-                writer.close()     # файл закрываем до удаления недоделанного результата
                 return self._cancelled_result(result, out_path, progress_cb, total_hint)
 
-            # --- узлы папок: строятся по лёгким записям, тела для этого не нужны
-            # Полный список папок (вместе с промежуточными уровнями).
-            paths: set = set()
-            for key in counts:
-                accum = ""
-                for part in key.split("/"):
-                    accum = f"{accum}/{part}" if accum else part
-                    paths.add(accum)
-            # У какой папки есть подпапки (признак PidTagSubfolders).
-            has_sub = {p: False for p in paths}
-            root_has_sub = False
-            for p in paths:
-                parent_path = p.rsplit("/", 1)[0] if "/" in p else ""
-                if parent_path:
-                    has_sub[parent_path] = True
-                else:
-                    root_has_sub = True
+            plan, mapping = plan_folders(delims)
+            by_folder: Dict[Tuple[str, ...], array] = {}
+            for index in range(len(spooled)):
+                key = mapping[spooled.folders[spooled.folder[index]]]
+                by_folder.setdefault(key, array("I")).append(index)
+            order = [f for f in plan if f.key in by_folder]
+            now_ft = pf.to_filetime(time.time())
 
-            # Разбиение на части. Формат ANSI ограничен 2 ГБ: раньше экспорт
-            # крупного ящика после часа работы падал с «превысит предел формата».
-            # Теперь, дойдя до предела (или до размера из export.pst_split_size_mb),
-            # движок закрывает текущий файл и продолжает в следующем — с той же
-            # структурой папок. Узлы папок пишутся В КОНЦЕ каждой части, поэтому
-            # число писем в папке у каждой части своё и верное.
-            split_limit = ANSI_PST_LIMIT_BYTES - SPLIT_RESERVE_BYTES
-            try:
-                wanted = int((options or {}).get("pst_split_size_mb") or 0) * 1024 * 1024
-            except (TypeError, ValueError):
-                wanted = 0
-            if wanted > 0:
-                split_limit = min(split_limit, max(wanted, MIN_SPLIT_BYTES))
-            store_props = self._store_props()
-            ordered_paths = sorted(paths)   # родитель — префикс потомка, идёт раньше
-            idx = 0
-            pending = None                  # письмо, не влезшее в предыдущую часть
+            fi = mi = 0
             part_no = 0
             total_written = 0
             while True:
+                while fi < len(order) and mi >= len(by_folder[order[fi].key]):
+                    fi, mi = fi + 1, 0
+                if part_no and fi >= len(order):
+                    break                        # предыдущая часть взяла последние письма
                 part_no += 1
-                current = out_path if part_no == 1 else part_path(out_path, part_no)
-                if part_no > 1:
-                    writer = PstWriter()
-                writer.open(current)
-                writer_open = True
-                result.parts.append(current)
-                writer.add_node(NID_MESSAGE_STORE, 0, store_props)
-                folder_nids: Dict[str, int] = {"": NID_ROOT_FOLDER}
-                for accum in ordered_paths:
-                    folder_nids[accum] = writer.new_folder_nid()
-                part_counts: Dict[str, int] = {}
-                part_unread: Dict[str, int] = {}
-                nodes = 0
-                part_full = False
-
-                # --- проход 2: узлы писем (тело читается обратно по одному)
-                while idx < len(spooled):
-                    if cancel_cb and cancel_cb():
-                        cancelled = True
-                        break
-                    rec = spooled[idx]
-                    if pending is not None and pending[0] is rec:
-                        _rec, props, was_cut = pending
-                        pending = None
-                    else:
-                        try:
-                            props, was_cut = self._props_from_spool(rec)
-                        except PstWriteError:
-                            raise
-                        except PstEngineError as exc:
-                            result.errors += 1
-                            # Список ошибок ограничиваем: на большом ящике со сбитым
-                            # разбором он вырастал до сотен тысяч строк в памяти.
-                            if len(result.error_details) < MAX_ERROR_DETAILS:
-                                result.error_details.append(str(exc))
-                            elif len(result.error_details) == MAX_ERROR_DETAILS:
-                                result.error_details.append("…остальные ошибки не перечисляются.")
-                            idx += 1
-                            continue
-                        except OSError as exc:
-                            result.errors += 1
-                            if len(result.error_details) < MAX_ERROR_DETAILS:
-                                result.error_details.append(f"{rec.folder}: временный файл недоступен: {exc}")
-                            idx += 1
-                            continue
-                        except Exception as exc:  # noqa: BLE001 — одно кривое письмо не роняет весь экспорт
-                            result.errors += 1
-                            if len(result.error_details) < MAX_ERROR_DETAILS:
-                                result.error_details.append(
-                                    f"{rec.folder}: письмо не разобрано ({type(exc).__name__}: {exc})")
-                            idx += 1
-                            continue
-                    # Запас под то, что допишется в конце части: страницы BTree
-                    # (~30 байт на узел; берём 64 с запасом) и узлы папок (~1 КБ).
-                    reserve = 64 * 1024 + (nodes + len(ordered_paths) + 2) * 64 + len(ordered_paths) * 1024
-                    if nodes and writer.position + len(props) + reserve > split_limit:
-                        pending = (rec, props, was_cut)
-                        part_full = True
-                        break
-                    parent = folder_nids.get(rec.key, NID_ROOT_FOLDER)
-                    writer.add_node(writer.new_message_nid(), parent, props)
-                    nodes += 1
-                    part_counts[rec.key] = part_counts.get(rec.key, 0) + 1
-                    if not rec.flags & MSGFLAG_READ:
-                        part_unread[rec.key] = part_unread.get(rec.key, 0) + 1
-                    result.count += 1
-                    result.bytes_written += rec.size
-                    if was_cut:
-                        truncated += 1
-                    idx += 1
-                    if progress_cb and result.count % 20 == 0:
-                        progress_cb(result.count, total_hint, f"PST(native): {result.count}"
-                                    + (f", часть {part_no}" if part_no > 1 else ""))
-                if cancelled:
-                    break
-
-                # узлы папок — с числом писем именно этой части
-                writer.add_node(NID_ROOT_FOLDER, NID_MESSAGE_STORE,
-                                self._folder_props("Верхний уровень PST", part_counts.get("", 0),
-                                                   root_has_sub, part_unread.get("", 0)))
-                for accum in ordered_paths:
-                    parent_path = accum.rsplit("/", 1)[0] if "/" in accum else ""
-                    name = accum.rsplit("/", 1)[-1]
-                    writer.add_node(folder_nids[accum], folder_nids.get(parent_path, NID_ROOT_FOLDER),
-                                    self._folder_props(name, part_counts.get(accum, 0),
-                                                       has_sub.get(accum, False), part_unread.get(accum, 0)))
+                path = out_path if part_no == 1 else part_path(out_path, part_no)
+                name = display if part_no == 1 else f"{display} (часть {part_no})"
                 try:
-                    written = writer.finish()
-                except PstEngineError:
-                    raise
-                except Exception as exc:  # noqa: BLE001
-                    raise PstEngineError(f"Ошибка сборки PST (native): {exc}", cause=exc) from exc
-                writer_open = False
-                total_written += written
+                    # Предел для данных — с запасом в одну область: оценка размера
+                    # письма бывает неточной, а часть не должна обрываться на полуслове.
+                    pst = pf.PstFile(path, name, max_bytes=allowed_end + pf.AMAP_SPAN)
+                except OSError as exc:
+                    raise PstWriteError(f"Не удалось создать файл {path}: {exc}") from exc
+                result.parts.append(path)
+                nids = self._create_folders(pst, plan)
+                part_msgs = 0
+                part_full = cancelled = False
+                while fi < len(order):
+                    folder = order[fi]
+                    folder_nid = nids[folder.key]
+                    indexes = by_folder[folder.key]
+                    table: Optional[pf.ContentsTable] = None
+                    while mi < len(indexes):
+                        if cancel_cb and cancel_cb():
+                            cancelled = True
+                            break
+                        rec = spooled.get(indexes[mi])
+                        # Письмо в .pst занимает не больше двух своих размеров
+                        # (текст в UTF-16), плюс строка таблицы папки и индексы.
+                        estimate = 2 * rec.size + 64 * 1024
+                        if part_msgs and (pst.position + estimate + pst.overhead_estimate() > allowed_end
+                                          or (table is not None and (len(table) >= MAX_TABLE_ROWS
+                                                                     or table.nearly_full()))):
+                            part_full = True
+                            break
+                        oversize = False
+                        outcome = self._write_one(pst, rec, folder_nid, result, now_ft)
+                        if outcome == "full":
+                            if part_msgs:
+                                part_full = True
+                                break
+                            # Письмо крупнее заявленного размера части: пишем его в
+                            # эту (пустую) часть сверх него — лучше часть побольше,
+                            # чем потерянное письмо. Следующие письма — в новую часть.
+                            soft_limit = pst.ndb.max_bytes
+                            pst.ndb.max_bytes = pf.HARD_LIMIT_BYTES - 64 * 1024 * 1024
+                            try:
+                                outcome = self._write_one(pst, rec, folder_nid, result, now_ft)
+                            finally:
+                                pst.ndb.max_bytes = soft_limit
+                            oversize = True
+                            if outcome == "full":
+                                self._error(result, f"{rec.folder}: письмо ({human_size(rec.size)}) больше "
+                                                    f"предела файла .pst — пропущено")
+                                mi += 1
+                                continue
+                        mi += 1
+                        if outcome is None:
+                            continue
+                        row, notes = outcome
+                        if table is None:
+                            table = pst.open_contents(folder_nid)
+                        table.add(row.nid, row.cells(), not row.flags & MSGFLAG_READ)
+                        part_msgs += 1
+                        result.count += 1
+                        for note in notes:
+                            self._error(result, f"{rec.folder}: {note}", count=False)
+                        if progress_cb and result.count % 20 == 0:
+                            progress_cb(result.count, total_hint,
+                                        f"PST: {result.count}" + (f", часть {part_no}" if part_no > 1 else ""))
+                        if oversize:
+                            part_full = True
+                            break
+                    if table is not None:
+                        table.close()
+                    if cancelled or part_full:
+                        break
+                    fi += 1
+                    mi = 0
+                if cancelled:
+                    pst.abort()
+                    pst = None
+                    for extra in result.parts:
+                        _unlink_quiet(extra)
+                    result.parts = []
+                    return self._cancelled_result(result, out_path, progress_cb, total_hint)
+                try:
+                    total_written += pst.close()
+                except OSError as exc:
+                    raise self._disk_error(exc) from exc
+                pst = None
                 if not part_full:
-                    result.bytes_written = total_written
                     break
                 if part_no == 1:
-                    log.info("PST(native): файл разбивается на части по %s.", human_size(split_limit))
+                    log.info("PST: файл делится на части до %s.", human_size(nominal))
 
-            if cancelled:
-                writer.close()     # файл закрываем до удаления недоделанного результата
-                for extra in result.parts[1:]:
-                    _unlink_quiet(extra)
-                result.parts = []
-                return self._cancelled_result(result, out_path, progress_cb, total_hint)
-
-            if truncated:
-                # одной сводной строкой, а не по строке на письмо
-                result.error_details.append(
-                    f"Тело обрезано под лимит блока native-PST у писем: {truncated}. "
-                    f"Полная копия писем доступна в экспорте eml/mbox.")
+            result.bytes_written = total_written
             if len(result.parts) > 1:
-                # первая часть тоже получает номер: box_part1.pst, box_part2.pst, …
                 first = part_path(out_path, 1)
                 os.replace(out_path, first)
                 result.parts[0] = first
-                result.warning = (f"Файл разбит на {len(result.parts)} части(ей) "
-                                  f"по {human_size(split_limit)}: формат ANSI ограничен 2 ГБ. "
-                                  f"Подключите в Outlook каждый файл. ") + result.warning
+                result.warning = (f"Файл разбит на {len(result.parts)} части(ей) до "
+                                  f"{human_size(nominal)} — подключите в Outlook каждый файл. "
+                                  ) + result.warning
             else:
                 result.parts = []
             done_ok = True
         finally:
-            writer.close()
-            # Недописанный .pst не оставляем НИ ПРИ КАКОМ исходе: при прерывании
-            # с клавиатуры или нехватке памяти в каталоге экспортов иначе
-            # оставался файл с нулевым заголовком, который не открывает ничто.
+            if pst is not None:
+                pst.abort()
             if not done_ok:
-                if writer_open:
-                    _unlink_quiet(out_path)
+                _unlink_quiet(out_path)
                 for extra in list(result.parts):
                     _unlink_quiet(extra)
-            # временные файлы удаляем всегда: и при ошибке, и при отмене
             shutil.rmtree(spool_dir, ignore_errors=True)
 
         if progress_cb:
-            progress_cb(result.count, total_hint or result.count, "PST(native): готово")
+            progress_cb(result.count, total_hint or result.count, "PST: готово")
         return result
 
-    def _props_from_spool(self, rec: "_Spooled") -> Tuple[bytes, bool]:
-        """
-        Прочитать тело письма из временного файла и собрать блок свойств.
+    # -- одно письмо ---------------------------------------------------------
+    def _write_one(self, pst: pf.PstFile, rec: _Spooled, folder_nid: int, result: ExportResult,
+                   now_ft: int = 0):
+        """→ (строка, замечания); None — письмо пропущено с ошибкой; "full" — нет места в части."""
+        try:
+            fh = open(rec.path, "rb")
+        except OSError as exc:
+            self._error(result, f"{rec.folder}: временный файл письма недоступен: {exc}")
+            return None
+        cp = pst.checkpoint()
+        with fh:
+            try:
+                return write_message(pst, fh, folder_nid, flags=rec.flags,
+                                     internaldate=rec.internaldate, size=rec.size, now_ft=now_ft)
+            except pf.PstFullError:
+                pst.rollback(cp)
+                return "full"
+            except OSError as exc:
+                # Файл .pst перестал писаться (место, права) — дальше будут
+                # сыпаться все письма подряд.
+                raise self._disk_error(exc) from exc
+            except MemoryError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — одно кривое письмо не роняет весь экспорт
+                pst.rollback(cp)
+                log.warning("PST: письмо не выгружено (%s): %s", rec.folder, exc, exc_info=True)
+                self._error(result, f"{rec.folder}: письмо не разобрано ({type(exc).__name__}: {exc})")
+                return None
 
-        Тело живёт только внутри этого вызова: на выходе остаётся готовый блок
-        (не больше MAX_PC_BLOCK), а сырые байты письма сразу освобождаются.
-        """
-        with open(rec.path, "rb") as fh:
-            raw = fh.read()
-        return self._message_props(raw, rec.internaldate, rec.flags)
+    @staticmethod
+    def _disk_error(exc: OSError) -> PstWriteError:
+        if getattr(exc, "errno", None) in (errno.ENOSPC, errno.EDQUOT):
+            return PstWriteError(f"Не хватило места для файла .pst: {exc}",
+                                 hint="Освободите место в каталоге выгрузок или экспортируйте ящик по частям.")
+        return PstWriteError(f"Ошибка записи файла .pst: {exc}")
+
+    @staticmethod
+    def _error(result: ExportResult, text: str, count: bool = True) -> None:
+        if count:
+            result.errors += 1
+        if len(result.error_details) < MAX_ERROR_DETAILS:
+            result.error_details.append(text)
+        elif len(result.error_details) == MAX_ERROR_DETAILS:
+            result.error_details.append("…остальные ошибки не перечисляются.")
+
+    @staticmethod
+    def _create_folders(pst: pf.PstFile, plan: List[_Folder]) -> Dict[Tuple[str, ...], int]:
+        nids: Dict[Tuple[str, ...], int] = {}
+        for folder in plan:
+            if folder.role == "trash":
+                pst.rename_folder(pf.NID_DELETED_ITEMS, folder.name)
+                nids[folder.key] = pf.NID_DELETED_ITEMS
+                continue
+            parent = nids[folder.parent] if folder.parent is not None else pf.NID_IPM_SUBTREE
+            nid = pst.add_folder(folder.name, parent)
+            nids[folder.key] = nid
+            if folder.role == "inbox":
+                pst.inbox_nid = nid
+            elif folder.role == "sent":
+                pst.sent_nid = nid
+        if not any(f.role == "trash" for f in plan):
+            pst.rename_folder(pf.NID_DELETED_ITEMS, TRASH_NAME)
+        return nids
+
+    # -- подготовка ----------------------------------------------------------
+    def _spool(self, items, spool_dir: str, result: ExportResult, cancel_cb, progress_cb, total_hint):
+        """Тела писем — во временные файлы. → (записи, разделители папок, отменено ли)."""
+        spooled = _SpoolIndex(spool_dir)
+        spool_bytes = 0
+        folder_names: Dict[str, str] = {}
+        delims: Dict[str, str] = {}
+        for item in items:
+            if cancel_cb and cancel_cb():
+                return spooled, delims, True
+            path = spooled.path(len(spooled))
+            try:
+                with open(path, "wb") as fh:
+                    fh.write(item.raw)
+            except OSError as exc:
+                if getattr(exc, "errno", None) in (errno.ENOSPC, errno.EDQUOT, errno.EROFS):
+                    raise PstWriteError(
+                        f"Не удалось подготовить письма к экспорту: {exc}",
+                        hint="Освободите место в каталоге временных файлов "
+                             f"({spool_dir}) или укажите другой каталог.") from exc
+                self._error(result, f"{item.folder}: не удалось сохранить тело во временный файл: {exc}")
+                continue
+            folder = folder_names.setdefault(item.folder, item.folder)
+            if not delims.get(folder):
+                delims[folder] = getattr(item, "delimiter", "") or ""
+            spooled.add(folder, item.size or len(item.raw), _flag_bits(item.flags), item.internaldate)
+            spool_bytes += len(item.raw)
+            if len(spooled) % 500 == 0:
+                free = disk_free_bytes(spool_dir)
+                if free and free < spool_bytes:
+                    raise PstWriteError(
+                        f"Не хватит места для экспорта: подготовлено {human_size(spool_bytes)}, "
+                        f"свободно {human_size(free)}.",
+                        hint="Освободите место или экспортируйте ящик по частям (по папкам или по датам).")
+                if progress_cb:
+                    progress_cb(0, total_hint, f"PST: подготовка писем — {len(spooled)}")
+        return spooled, delims, False
 
     @staticmethod
     def _make_spool_dir(options: Optional[dict]) -> str:
@@ -1046,15 +1189,5 @@ class NativePstExportEngine(ExportEngine):
         _unlink_quiet(out_path)
         result.bytes_written = 0
         if progress_cb:
-            progress_cb(result.count, total_hint or result.count, "PST(native): отменено")
+            progress_cb(result.count, total_hint or result.count, "PST: отменено")
         return result
-
-    def _store_props(self) -> bytes:
-        # PidTagIpmSubTreeEntryId (0x35E0): EntryID корневой папки (24 байта):
-        #   flags(4)=0, GUID хранилища(16), nid(4)=NID_ROOT_FOLDER.
-        subtree_entryid = b"\x00\x00\x00\x00" + b"\x00" * 16 + struct.pack("<I", NID_ROOT_FOLDER)
-        return build_pc_block([
-            (TAG_DISPLAY_NAME, PT_STRING, "MailArchiver PST"),
-            (0x0FF9, PT_BINARY, b"\x00" * 16),      # PidTagRecordKey (GUID хранилища)
-            (0x35E0, PT_BINARY, subtree_entryid),   # PidTagIpmSubTreeEntryId -> корневая папка
-        ])

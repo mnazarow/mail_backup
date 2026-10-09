@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
-from typing import Iterator, List, Optional
+from typing import Dict, Iterator, List, Optional
 
 from .config import Config
 from .database import Database
@@ -277,6 +277,7 @@ class Services:
         since, until = self.day_bounds_utc(date_from, date_to)
         page = 2000
         count = 0
+        delimiters: Dict[str, str] = {}
         targets = list(dict.fromkeys(f for f in (folders or []) if f)) or [None]
         for fld in targets:
             last_id = 0
@@ -304,12 +305,37 @@ class Services:
                     yield MailItem(folder=row["folder"], raw=raw,
                                    flags=[f for f in (row["flags"] or "").split(",") if f],
                                    internaldate=epoch, message_id=row["message_id"] or "",
-                                   size=row["size"] or len(raw))
+                                   size=row["size"] or len(raw),
+                                   delimiter=self._folder_delimiter(row["folder"], row["stored_path"],
+                                                                    delimiters))
                     count += 1
                     if limit and count >= limit:
                         return
                 if len(rows) < page:
                     break
+
+    def _folder_delimiter(self, folder: str, stored_path: str, cache: Dict[str, str]) -> str:
+        """Разделитель уровней папки на сервере — по тому, как она разложена на диске.
+
+        Письмо лежит в «<папка>/cur/<файл>», где путь папки собран разбиением
+        её имени по разделителю сервера. Разделитель в базе не хранится, но
+        восстанавливается однозначно: «INBOX.Отчёты» на сервере с «.» лежит в
+        INBOX/Отчёты, а на сервере с «/» — в каталоге «INBOX.Отчёты».
+        """
+        if folder in cache:
+            return cache[folder]
+        found = ""
+        rel = os.path.dirname(os.path.dirname(stored_path or ""))
+        if rel:
+            for candidate in ("/", ".", "\\", "|", ":"):
+                try:
+                    if self.store.folder_relpath(folder, candidate) == rel:
+                        found = candidate
+                        break
+                except Exception:  # noqa: BLE001
+                    continue
+        cache[folder] = found
+        return found
 
     def count_mail_items(self, account_id: int, folders: Optional[List[str]] = None,
                          date_from: Optional[str] = None, date_to: Optional[str] = None) -> int:

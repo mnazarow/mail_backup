@@ -2374,12 +2374,13 @@ async function exportModal(a){
     const pick=(sel,val)=>{ const el=g(sel); if(el && [...el.options].some(o=>o.value===val && !o.disabled)) el.value=val; };
     pick('#e-engine', d.engine); pick('#e-pst', d.pst_format);
   }catch(_){}
-  const upd=()=>{ const e=engines.find(x=>x.name===g('#e-engine').value); g('#e-desc').innerHTML=e?esc(e.desc)+(e.experimental?' <strong style="color:var(--warn)">Экспериментально — проверьте результат в своём Outlook.</strong>':''):''; const isPst=e&&e.fmt==='pst'; g('#e-pst').closest('.form-row').style.display=isPst?'block':'none'; };
+  // Встроенный движок пишет только Unicode PST — выбор формата ему не нужен.
+  const upd=()=>{ const e=engines.find(x=>x.name===g('#e-engine').value); g('#e-desc').innerHTML=e?esc(e.desc)+(e.experimental?' <strong style="color:var(--warn)">Новый движок — перед массовой выгрузкой откройте пробный файл в своём Outlook.</strong>':''):''; const isPst=e&&e.fmt==='pst'&&e.name!=='native'; g('#e-pst').closest('.form-row').style.display=isPst?'block':'none'; };
   g('#e-engine').onchange=upd; upd();
   m.foot.querySelector('[data-c]').onclick=m.close;
   m.foot.querySelector('[data-go]').onclick=async()=>{
     const e=engines.find(x=>x.name===g('#e-engine').value);
-    const body={engine:g('#e-engine').value, format:e?e.fmt:'pst', pst_format:g('#e-pst').value,
+    const body={engine:g('#e-engine').value, format:e?e.fmt:'pst', pst_format:(e&&e.name==='native')?'unicode':g('#e-pst').value,
       date_from:g('#e-df').value||null, date_to:g('#e-dt').value||null,
       folders:g('#e-folders').value.split(',').map(s=>s.trim()).filter(Boolean)};
     if(!body.folders.length) body.folders=null;
@@ -2846,7 +2847,7 @@ function renderLogLines(logs, append){
 // ===================================================================
 const ENUM_OPTS = {
   'logging.level':[['DEBUG','DEBUG — максимум подробностей'],['INFO','INFO — обычный'],['WARNING','WARNING — предупреждения'],['ERROR','ERROR — только ошибки']],
-  'export.default_engine':[['auto','Авто'],['aspose','Aspose PST'],['native','Встроенный PST (эксперим.)'],['mbox','MBOX'],['eml','EML']],
+  'export.default_engine':[['auto','Авто'],['aspose','Aspose PST'],['native','Встроенный PST'],['mbox','MBOX'],['eml','EML']],
   'export.pst_format':[['unicode','Unicode (Outlook 2003+)'],['ansi','ANSI (Outlook 97–2002)']],
   'export.outlook_target':[['2016+','2016+'],['2013','2013'],['2010','2010'],['2007','2007'],['2003','2003'],['2002','2002 и старше'],['365','365']],
   'notifications.smtp_security':[['starttls','STARTTLS'],['ssl','SSL'],['none','Без шифрования']],

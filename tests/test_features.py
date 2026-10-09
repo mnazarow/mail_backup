@@ -315,25 +315,17 @@ def test_export_engines_use_the_same_decoder():
     assert eml_engine.extract_subject(raw) == "Тестовая тема"
 
 
-def test_native_pst_reports_ansi_limit():
-    """Предел 2 ГБ — понятная ошибка, а не struct.error через час работы."""
-    from mailarchiver.errors import PstEngineError
-    from mailarchiver.export.pst_native import ANSI_PST_LIMIT_BYTES, PstWriter
+def test_native_pst_part_limit():
+    """Часть .pst не выходит за предел формата: дальше — новая часть, а не битый файл."""
+    from mailarchiver.export import pst_native, pstformat
 
-    import tempfile
-
-    assert ANSI_PST_LIMIT_BYTES < 2 * 1024 ** 3
-    with tempfile.TemporaryDirectory() as tmp:
-        writer = PstWriter()
-        writer.open(os.path.join(tmp, "big.pst"))
-        try:
-            # подменяем сборку блока: «узел» сразу переполняет файл
-            writer._block_bytes = lambda data, bid, ib: b"x" * (ANSI_PST_LIMIT_BYTES + 1)
-            with pytest.raises(PstEngineError) as err:
-                writer.add_node(1, 0, b"x" * 64)
-            assert "ANSI" in str(err.value)
-        finally:
-            writer.close()
+    assert pst_native.PART_LIMIT_BYTES < pstformat.HARD_LIMIT_BYTES < 2 ** 31
+    end, nominal = pst_native.NativePstExportEngine._part_limit({})
+    assert nominal == pst_native.PART_LIMIT_BYTES and end < nominal
+    end, nominal = pst_native.NativePstExportEngine._part_limit({"pst_split_size_mb": 1})
+    assert nominal == pst_native.MIN_SPLIT_BYTES          # слишком мелкие части не режем
+    end, nominal = pst_native.NativePstExportEngine._part_limit({"pst_split_size_mb": 500})
+    assert nominal == 500 * 1024 * 1024 and (end - pstformat.AMAP_FIRST) % pstformat.AMAP_SPAN == 0
 
 
 # ---------------------------------------------------------------------------
