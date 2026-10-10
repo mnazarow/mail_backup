@@ -20,7 +20,9 @@ VENV_DIR="$INSTALL_DIR/venv"
 CONFIG_DIR="${MA_CONFIG_DIR:-/etc/mailarchiver}"
 CONFIG_FILE="$CONFIG_DIR/config.yaml"
 DATA_DIR="${MA_DATA_DIR:-/var/lib/mailarchiver}"
-SERVICE_FILE="/etc/systemd/system/${APP_NAME}.service"
+UNIT_FILE="${MA_UNIT_FILE:-/etc/systemd/system/${APP_NAME}.service}"
+SERVICE_FILE="$UNIT_FILE"
+CLI_WRAPPER="${MA_CLI_WRAPPER:-/usr/local/bin/mailarchiver}"
 BIND_HOST="${MA_HOST:-127.0.0.1}"
 BIND_PORT="${MA_PORT:-8493}"
 LOG_PREFIX="[MailArchiver install]"
@@ -31,23 +33,40 @@ info(){ echo -e "${BLU}${LOG_PREFIX}${NC} $*"; }
 ok(){ echo -e "${GRN}${LOG_PREFIX} ✓${NC} $*"; }
 warn(){ echo -e "${YLW}${LOG_PREFIX} ⚠${NC} $*"; }
 err(){ echo -e "${RED}${LOG_PREFIX} ✗${NC} $*" >&2; }
+# (после подключения common.sh эти четыре функции заменяются его вариантами,
+# которые не обрывают скрипт, если терминал пропал)
+
+# ---------- Общие с update.sh функции (права, проверки, запуск службы) ----------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ ! -f "$SCRIPT_DIR/common.sh" ]; then
+  err "Не найден $SCRIPT_DIR/common.sh — запускайте скрипт из распакованного архива целиком."
+  exit 1
+fi
+# shellcheck source=scripts/common.sh
+. "$SCRIPT_DIR/common.sh"
 
 # ---------- Обработка ошибок и откат ----------
 ROLLBACK_ENABLED=0
 FRESH_INSTALL=0
 ROLLED_BACK=0
+FINISHED=0            # установка доведена до конца
+UNIT_EXISTED=0        # unit-файл был до нас (например установка в другой каталог) — при откате не трогаем
+WRAPPER_CREATED=0     # команду mailarchiver создали мы
 REINSTALL_BACKUP=""   # каталог с копией прежней установки (при переустановке)
 cleanup_on_error(){
-  local ec="${1:-1}"
+  local ec="${1:-1}" back_rc=0
   err "Установка прервана (код $ec)."
   if [ "$ROLLBACK_ENABLED" = "1" ] && [ "$ROLLED_BACK" = "0" ]; then
     ROLLED_BACK=1
-    systemctl stop "$APP_NAME" 2>/dev/null || true
     if [ "$FRESH_INSTALL" = "1" ]; then
       warn "Выполняю откат частичной установки…"
-      systemctl disable "$APP_NAME" 2>/dev/null || true
-      rm -f "$SERVICE_FILE" 2>/dev/null || true
-      systemctl daemon-reload 2>/dev/null || true
+      if [ "$UNIT_EXISTED" = "0" ]; then
+        systemctl stop "$APP_NAME" 2>/dev/null || true
+        systemctl disable "$APP_NAME" 2>/dev/null || true
+        rm -f "$SERVICE_FILE" 2>/dev/null || true
+        systemctl daemon-reload 2>/dev/null || true
+      fi
+      if [ "$WRAPPER_CREATED" = "1" ]; then rm -f "$CLI_WRAPPER" 2>/dev/null || true; fi
       rm -rf "$INSTALL_DIR" 2>/dev/null || true
       warn "Откат завершён. Каталоги данных ($DATA_DIR) и конфигурации ($CONFIG_DIR) НЕ тронуты."
     elif [ -n "$REINSTALL_BACKUP" ] && [ -f "$REINSTALL_BACKUP/.complete" ]; then
@@ -56,14 +75,24 @@ cleanup_on_error(){
       # pip install сервер оставался с наполовину обновлённым окружением
       # и без единого способа вернуться назад.
       warn "Возврат прежней установки из $REINSTALL_BACKUP…"
-      [ -d "$REINSTALL_BACKUP/app" ] && { rm -rf "$APP_DIR"; cp -a "$REINSTALL_BACKUP/app" "$APP_DIR"; }
-      [ -d "$REINSTALL_BACKUP/venv" ] && { rm -rf "$VENV_DIR"; cp -a "$REINSTALL_BACKUP/venv" "$VENV_DIR"; }
+      systemctl stop "$APP_NAME" 2>/dev/null || true
+      if [ -d "$REINSTALL_BACKUP/app" ]; then rm -rf "$APP_DIR"; cp -a "$REINSTALL_BACKUP/app" "$APP_DIR"; fi
+      if [ -d "$REINSTALL_BACKUP/venv" ]; then rm -rf "$VENV_DIR"; cp -a "$REINSTALL_BACKUP/venv" "$VENV_DIR"; fi
       if [ -f "$REINSTALL_BACKUP/mailarchiver.service" ]; then
         cp -a "$REINSTALL_BACKUP/mailarchiver.service" "$SERVICE_FILE" 2>/dev/null || true
         systemctl daemon-reload 2>/dev/null || true
       fi
+      # не «служба перезапущена» вслепую: проверяем, что прежняя установка поднялась
+      SVC_STARTED_AT="$(date '+%Y-%m-%d %H:%M:%S')"
+      systemctl reset-failed "$APP_NAME" 2>/dev/null || true
       systemctl start "$APP_NAME" 2>/dev/null || true
-      warn "Прежняя установка возвращена, служба перезапущена. Копия осталась в $REINSTALL_BACKUP."
+      wait_service_up 60 || back_rc=$?
+      if [ "$back_rc" = "0" ]; then
+        warn "Прежняя установка возвращена, служба работает. Копия осталась в $REINSTALL_BACKUP."
+      else
+        err "Прежняя установка возвращена, но служба НЕ поднялась — проверьте её вручную."
+        show_service_failure
+      fi
     fi
   fi
   err "Подробности выше. Исправьте причину и запустите скрипт заново."
@@ -72,14 +101,29 @@ cleanup_on_error(){
 # Ловим EXIT, а не только ERR: проверки вида `cmd || { err "…"; exit 1; }`
 # события ERR не порождают, а именно так оформлены «не удалось установить
 # пакет» и «служба не запустилась» — самые вероятные отказы установки.
+#
+# О завершении судим по FINISHED, а не по коду: при гибели от сигнала (Ctrl-C,
+# обрыв SSH) ловушка EXIT получает код 0, и прерванная установка оставалась
+# без отката. Внутри ловушки set -e выключен: первый же сбой обрывал бы откат.
 on_exit(){
   local ec=$?
-  if [ "$ec" -ne 0 ]; then
+  trap - EXIT ERR
+  trap '' INT TERM HUP PIPE
+  set +e
+  if [ "$FINISHED" != "1" ]; then
+    [ "$ec" -ne 0 ] || ec=1
     cleanup_on_error "$ec"
   fi
   exit "$ec"
 }
 trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+trap '' PIPE
+# Неожиданный отказ любой команды: называем её и место (при set -e скрипт иначе
+# останавливался молча).
+trap 'err "Команда завершилась с ошибкой (${BASH_SOURCE[0]##*/}:$LINENO): $BASH_COMMAND"' ERR
 
 backup_existing(){
   # Копия прежней установки перед перезаписью (только при установке поверх).
@@ -107,8 +151,7 @@ require_root(){
 SRC_DIR=""
 detect_source(){
   # каталог, где лежит этот скрипт → корень проекта на уровень выше
-  local script_dir; script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  SRC_DIR="$(cd "$script_dir/.." && pwd)"
+  SRC_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
   if [ ! -d "$SRC_DIR/mailarchiver" ] || [ ! -f "$SRC_DIR/requirements.txt" ]; then
     err "Не найден исходный код (каталог mailarchiver/ и requirements.txt)."
     err "Запускайте скрипт из распакованного архива проекта."
@@ -128,7 +171,9 @@ detect_pkg_manager(){
     warn "Не удалось определить менеджер пакетов. Установите вручную: python3 (>=3.10), python3-venv, python3-pip."
     PKG="none"
   fi
-  [ "$PKG" != "none" ] && info "Менеджер пакетов: $PKG"
+  # if, а не «&&»: иначе при PKG=none функция возвращала ошибку, и установка
+  # без менеджера пакетов обрывалась, хотя выше обещано только предупреждение
+  if [ "$PKG" != "none" ]; then info "Менеджер пакетов: $PKG"; fi
 }
 
 install_system_deps(){
@@ -202,19 +247,12 @@ create_user(){
   fi
 }
 
-# Выполнить команду от имени пользователя службы: файлы, которые она создаёт
-# (база, каталоги данных), сразу получают правильного владельца, и не нужен
-# chown -R всего каталога данных (на миллионах писем — долгая пауза, а резервные
-# копии вроде borg/restic из-за смены ctime перечитывают весь архив).
-as_app_user(){
-  if command -v runuser >/dev/null 2>&1; then
-    runuser -u "$APP_USER" -- "$@"
-  else
-    su -s /bin/sh "$APP_USER" -c "$(printf '%q ' "$@")"
-  fi
-}
+# Команды от имени службы выполняет as_app_user (common.sh): файлы, которые она
+# создаёт (база, каталоги данных), сразу получают правильного владельца, и не
+# нужен chown -R всего каталога данных (на миллионах писем — долгая пауза, а
+# резервные копии вроде borg/restic из-за смены ctime перечитывают весь архив).
 
-# Сменить владельца только у файлов, где он не тот (см. as_app_user).
+# Сменить владельца только у файлов, где он не тот.
 fix_owner(){
   local dir="$1"
   [ -d "$dir" ] || return 0
@@ -235,6 +273,8 @@ copy_source(){
     cp -a "$SRC_DIR"/. "$APP_DIR"/ || { err "Не удалось скопировать файлы в $APP_DIR."; exit 1; }
     rm -rf "$APP_DIR/venv" "$APP_DIR/.git" "$APP_DIR/data" 2>/dev/null || true
   fi
+  # Права исходников (их принёс rsync -a / cp -a) приводим к своим: см. common.sh.
+  normalize_app_perms
   ok "Файлы скопированы."
 }
 
@@ -256,17 +296,17 @@ setup_venv(){
   else
     warn "requirements.txt не найден — ставлю зависимости по pyproject.toml."
   fi
+  clean_build_leftovers
   if ! "$VENV_DIR/bin/pip" install -q --no-deps "$APP_DIR"; then
     err "Не удалось установить пакет mailarchiver."
     exit 1
   fi
 
-  # Контроль: пакет должен импортироваться и видеть все зависимости.
-  if ! "$VENV_DIR/bin/python" -c "import mailarchiver, fastapi, uvicorn, jinja2, yaml, apscheduler, imapclient, cryptography" 2>/dev/null; then
-    err "Зависимости установлены не полностью — приложение не импортируется."
-    "$VENV_DIR/bin/python" -c "import mailarchiver" || true
-    exit 1
-  fi
+  # Контроль: пакет должен импортироваться, видеть все зависимости и подходить
+  # установленной версии Python.
+  check_package || exit 1
+  clean_build_leftovers
+  normalize_app_perms
   ok "Зависимости установлены."
 }
 
@@ -274,7 +314,7 @@ setup_dirs(){
   mkdir -p "$CONFIG_DIR" "$DATA_DIR"
   fix_owner "$DATA_DIR"
   chmod 750 "$DATA_DIR"
-  chown -R root:root "$APP_DIR"
+  chmod 755 "$CONFIG_DIR"
 }
 
 write_config(){
@@ -300,9 +340,7 @@ install_service(){
     cp -a "$SERVICE_FILE" "$REINSTALL_BACKUP/mailarchiver.service" || true
   fi
   if [ -f "$APP_DIR/systemd/mailarchiver.service" ]; then
-    sed -e "s|@VENV@|$VENV_DIR|g" -e "s|@APPDIR@|$APP_DIR|g" -e "s|@CONFIG@|$CONFIG_FILE|g" \
-        -e "s|@USER@|$APP_USER|g" -e "s|@GROUP@|$APP_GROUP|g" -e "s|@DATADIR@|$DATA_DIR|g" \
-        "$APP_DIR/systemd/mailarchiver.service" > "$SERVICE_FILE"
+    render_unit "$APP_DIR/systemd/mailarchiver.service"
   else
     cat > "$SERVICE_FILE" <<EOF
 [Unit]
@@ -339,8 +377,9 @@ install_cli_wrapper(){
   # запуск через sudo оставлял бы в каталоге данных файлы root:root, и служба
   # переставала бы в них писать. storage-key выполняется как есть — ключ
   # обычно создают в /etc/mailarchiver, куда служба писать не может.
-  local wrapper="/usr/local/bin/mailarchiver"
-  cat > "$wrapper" <<EOF
+  local wrapper="$CLI_WRAPPER" existed=0
+  if [ -e "$wrapper" ]; then existed=1; fi
+  if cat > "$wrapper" <<EOF
 #!/bin/sh
 # MailArchiver CLI (создан установщиком; перезаписывается при обновлении).
 VENV_BIN="$VENV_DIR/bin/mailarchiver"
@@ -350,32 +389,31 @@ if [ "\$(id -u)" = "0" ] && [ "\${1:-}" != "storage-key" ] && command -v runuser
 fi
 exec "\$VENV_BIN" -c "\$CONFIG" "\$@"
 EOF
-  chmod 755 "$wrapper" && ok "Команда mailarchiver доступна: $wrapper" || warn "Не удалось создать $wrapper"
-}
-
-start_service(){
-  info "Запуск службы…"
-  systemctl restart "$APP_NAME"
-  sleep 3
-  if systemctl is-active --quiet "$APP_NAME"; then
-    ok "Служба запущена."
+  then
+    if [ "$existed" = "0" ]; then WRAPPER_CREATED=1; fi
+    chmod 755 "$wrapper" || true
+    ok "Команда mailarchiver доступна: $wrapper"
   else
-    err "Служба не запустилась. Логи: journalctl -u $APP_NAME -n 50 --no-pager"
-    journalctl -u "$APP_NAME" -n 20 --no-pager 2>/dev/null || true
-    exit 1
+    warn "Не удалось создать $wrapper — команда mailarchiver в PATH недоступна."
   fi
 }
 
-wait_health(){
-  info "Проверка доступности веб-интерфейса…"
-  for i in $(seq 1 15); do
-    if command -v curl >/dev/null 2>&1 && curl -fsS "http://$BIND_HOST:$BIND_PORT/health" >/dev/null 2>&1; then
-      ok "Веб-интерфейс отвечает."
-      return 0
-    fi
-    sleep 1
-  done
-  warn "Не удалось подтвердить доступность (возможно, curl отсутствует). Проверьте вручную."
+start_service(){
+  # Заранее — то, из-за чего служба чаще всего не поднимается: systemd об этом
+  # пишет только в журнал, а установка заканчивалась строкой «не запустилась».
+  info "Проверка доступа службы к файлам…"
+  check_service_access || exit 1
+  info "Пробный импорт веб-приложения от имени службы…"
+  check_app_import || exit 1
+
+  info "Запуск службы…"
+  local rc=0
+  start_service_checked || rc=$?
+  case "$rc" in
+    0) ok "Служба запущена, веб-интерфейс отвечает." ;;
+    2) warn "Служба работает, но подтвердить доступность веб-интерфейса не удалось — проверьте вручную." ;;
+    *) exit 1 ;;
+  esac
 }
 
 create_admin_prompt(){
@@ -414,7 +452,8 @@ main(){
   require_root
   detect_source
   # если это чистая установка — включим откат
-  [ -d "$INSTALL_DIR" ] || FRESH_INSTALL=1
+  if [ ! -d "$INSTALL_DIR" ]; then FRESH_INSTALL=1; fi
+  if [ -f "$SERVICE_FILE" ]; then UNIT_EXISTED=1; fi
   ROLLBACK_ENABLED=1
   detect_pkg_manager
   install_system_deps
@@ -428,10 +467,10 @@ main(){
   install_service
   install_cli_wrapper
   start_service
-  wait_health
   ROLLBACK_ENABLED=0   # дальше откат не нужен
+  FINISHED=1
   # чистим старые копии переустановок (оставляем 3 последних)
-  ls -1dt "$INSTALL_DIR"/backups/reinstall_* 2>/dev/null | tail -n +4 | xargs -r rm -rf || true
+  keep_newest 3 "$INSTALL_DIR/backups" "reinstall_"
   create_admin_prompt
   print_summary
 }

@@ -70,6 +70,8 @@ sudo bash scripts/install.sh
 cd mail_backup   # новая версия исходников
 sudo bash scripts/update.sh
 ```
+Перед запуском новой версии скрипт проверяет доступ службы к файлам и снимает копию базы; если
+служба не поднялась — печатает причину из её журнала и возвращает прежнюю версию вместе с базой.
 
 **Удаление:**
 ```bash
@@ -117,7 +119,7 @@ mail_backup/
 │   ├── cronutil.py        # cron-выражения (дни недели как в crontab)
 │   ├── config.py, database.py, security.py, service.py, ...
 ├── config/config.example.yaml
-├── scripts/               # install.sh, update.sh, uninstall.sh, gen_docs.py
+├── scripts/               # install.sh, update.sh, uninstall.sh, common.sh, gen_docs.py, make_release.py
 ├── systemd/               # unit-файл systemd
 ├── docker/                # Dockerfile, docker-compose.yml, entrypoint.sh
 ├── docs/ru/               # документация
