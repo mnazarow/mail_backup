@@ -2432,15 +2432,46 @@ async function restoreModal(a){
 
 // ---------- Импорт PST ----------
 function importModal(a){
+  const H=(k)=>helpIcon(fieldHelp('import',k));
   const m=modal(`Импорт .pst: ${a.name}`, `
-    <p class="muted small">Файл .pst будет разобран и письма зальются на IMAP-сервер в папку с указанным префиксом. Требуется установленный на сервере <code>readpst</code> (пакет pst-utils).</p>
+    <p class="muted small">Письма из файла Outlook (.pst) переносятся в ящик — на почтовый сервер или сразу в локальную копию. Файл разбирает сам MailArchiver: внешние программы не нужны. Переносятся папки, письма с вложениями, флаги («прочитано», «отвечено», «помечено») и даты получения; контакты, календарь и задачи пропускаются.</p>
     <div class="form-row"><label>Файл .pst</label><input id="i-file" type="file" accept=".pst"></div>
-    <div class="form-row"><label>Префикс папки назначения</label><input id="i-prefix" type="text" value="Импорт PST"></div>`,
+    <div class="form-row"><label>Куда импортировать ${H('target')}</label><select id="i-target">
+      <option value="imap">На почтовый сервер (IMAP)</option>
+      <option value="local">В локальную копию ящика (архив)</option></select></div>
+    <div class="hint" id="i-localhint" style="display:none">Письма будут записаны только в архив MailArchiver: на почтовый сервер ничего не заливается. Письма старше срока хранения ящика не записываются — если импортируете старый архив, сначала поставьте архив ящика на удержание или задайте «хранить всё».</div>
+    <div class="form-row"><label>Префикс папки назначения ${H('target_prefix')}</label><input id="i-prefix" type="text" value="Импорт PST" placeholder="пусто — папки как в файле"></div>
+    <div class="form-row check"><span class="switch"><input type="checkbox" id="i-skip" checked><span class="track"></span></span><label>Пропускать письма, которые уже есть ${H('skip_existing')}</label></div>
+    <details style="margin-top:8px"><summary class="small">Дополнительно</summary>
+      <div class="form-row" style="margin-top:10px"><label>Способ разбора файла ${H('engine')}</label><select id="i-engine">
+        <option value="builtin">Встроенный (без внешних программ)</option>
+        <option value="readpst">readpst (запасной, если установлен на сервере)</option></select></div>
+      <div class="form-row"><label>Кодировка старых файлов (ANSI) ${H('ansi_codepage')}</label><select id="i-cp">
+        <option value="cp1251">Windows-1251 (кириллица)</option>
+        <option value="cp1252">Windows-1252 (Западная Европа)</option>
+        <option value="cp1250">Windows-1250 (Центральная Европа)</option>
+        <option value="cp1257">Windows-1257 (Балтия)</option>
+        <option value="cp866">DOS 866 (кириллица)</option></select></div>
+    </details>`,
     {footer:`<button class="btn ghost" data-c>Отмена</button><button class="btn primary" data-go>Загрузить и импортировать</button>`});
+  const g=x=>m.body.querySelector(x);
+  g('#i-target').onchange=()=>{ g('#i-localhint').style.display=g('#i-target').value==='local'?'block':'none'; };
   m.foot.querySelector('[data-c]').onclick=m.close;
   m.foot.querySelector('[data-go]').onclick=async()=>{
-    const f=m.body.querySelector('#i-file').files[0]; if(!f) return toast('Выберите файл','','warn');
-    const fd=new FormData(); fd.append('file', f); fd.append('target_prefix', m.body.querySelector('#i-prefix').value);
+    const f=g('#i-file').files[0]; if(!f) return toast('Выберите файл','','warn');
+    const target=g('#i-target').value, prefix=g('#i-prefix').value.trim();
+    if(!prefix){
+      // Пустой префикс — письма лягут прямо в рабочие папки ящика («Входящие» из
+      // файла — во «Входящие» сотрудника или архива). Отменить это нельзя.
+      const okGo=await confirmDlg('Импортировать без префикса?',
+        `Папки из файла будут созданы ${target==='local'?'в архиве ящика':'в ящике'} «${a.name}» под своими именами, а письма папок с совпадающими именами смешаются с ${target==='local'?'уже сохранёнными':'текущей почтой'}. Отменить это нельзя.`);
+      if(!okGo) return;
+    }
+    const fd=new FormData(); fd.append('file', f);
+    // «Без префикса» — отдельным полем: пустое значение сервер принял бы за «не указано».
+    if(prefix) fd.append('target_prefix', prefix); else fd.append('no_prefix', '1');
+    fd.append('target', target); fd.append('skip_existing', g('#i-skip').checked?'1':'0');
+    fd.append('engine', g('#i-engine').value); fd.append('ansi_codepage', g('#i-cp').value);
     const btn=m.foot.querySelector('[data-go]');
     btn.disabled=true; btn.innerHTML='<span class="spinner"></span> Загрузка…';
     try{
@@ -2535,7 +2566,11 @@ const RESULT_LBL={summary:'Итог', final_status:'Статус итога', to
   corrupt:'Повреждено', unreadable:'Не читается', no_key:'Без ключа шифрования', exported:'Выгружено писем',
   path:'Файл', size:'Размер', messages_relinked:'Узнано в архиве после смены нумерации (не скачивались)',
   messages_outside_retention:'Старше срока хранения — не скачано', with_problems:'С неоткрывающимися папками',
-  messages_lost:'Писем в неоткрывающихся папках', indexed:'Переиндексировано писем'};
+  messages_lost:'Писем в неоткрывающихся папках', indexed:'Переиндексировано писем',
+  imported:'Импортировано писем', messages_total:'Писем и других элементов в файле', duplicates:'Уже были — пропущено',
+  not_mail:'Не письма (контакты, календарь…) — пропущено', outdated:'Старше срока хранения — не записано',
+  lossy:'Перенесено с потерями', damaged_blocks:'Блоков файла с неверной контрольной суммой',
+  target:'Куда (imap — сервер, local — локальная копия)', engine:'Способ разбора файла'};
 const RESULT_BYTES=new Set(['bytes','bytes_new','freed','size']);
 
 async function jobDetails(id){
@@ -2546,7 +2581,8 @@ async function jobDetails(id){
   // Длинные списки результата показываются таблицами ниже, а не строкой JSON.
   const LISTS=new Set(['skipped_folders','items','skip_reasons','problems','rebuild_info','hosts_down','not_reached','final_status']);
   // Нули «частично / пропущено / не успели» ничего не говорят — не загромождаем ими итог.
-  const HIDE_ZERO=new Set(['partial','skipped','left','messages_relinked','messages_outside_retention','messages_lost']);
+  const HIDE_ZERO=new Set(['partial','skipped','left','messages_relinked','messages_outside_retention','messages_lost',
+                           'duplicates','not_mail','outdated','lossy','damaged_blocks']);
   const notReached=(j.result&&Array.isArray(j.result.not_reached))?j.result.not_reached:[];
   const resEntries=j.result?Object.entries(j.result).filter(([k,v])=>!LISTS.has(k) && !(HIDE_ZERO.has(k) && v===0)):[];
   const items=(j.result&&Array.isArray(j.result.items))?j.result.items:[];

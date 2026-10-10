@@ -7,9 +7,7 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import shutil
-import subprocess
 import tempfile
 import time
 from datetime import datetime, timezone
@@ -32,16 +30,6 @@ log = get_logger("jobs")
 
 # Размер страницы при обходе индекса писем.
 MESSAGE_PAGE_SIZE = 2000
-
-
-def _rel_to_imap_folder(rel_folder: str, delimiter: str) -> str:
-    """
-    Перевести относительный путь каталога (как его отдал readpst) в имя
-    IMAP-папки: разделители ОС («/» и «\\») заменяются на разделитель иерархии
-    сервера, пустые сегменты и «.» отбрасываются.
-    """
-    parts = [p for p in re.split(r"[\\/]+", rel_folder or "") if p and p != "."]
-    return (delimiter or "/").join(parts)
 
 
 def _count_older_than(db, account_id: int, cutoff_iso: str) -> int:
@@ -779,211 +767,89 @@ def _unlink_quiet(path: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-#  IMPORT PST (через readpst) -> в локальную копию или на IMAP
+#  IMPORT PST -> на IMAP-сервер или в локальную копию ящика
 # ---------------------------------------------------------------------------
-def _eml_date(raw: bytes):
-    """Дата письма из заголовка Date (для APPEND). None — если её нет или она кривая."""
-    from email.utils import parsedate_to_datetime
-    from ..imap.client import header_value
-    head = raw[:256 * 1024]
-    end = head.find(b"\r\n\r\n")
-    if end < 0:
-        end = head.find(b"\n\n")
-    value = header_value(head[:end] if end >= 0 else head, "Date")
-    if not value:
-        return None
-    try:
-        dt = parsedate_to_datetime(value)
-    except (TypeError, ValueError, IndexError):
-        return None
-    if dt is None:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
-
-
-def _run_readpst(ctx: JobContext, pst_path: str, out_dir: str) -> None:
-    """readpst с проверкой отмены: на большом .pst он работает до часа."""
-    # -e: .eml по файлу; -o: каталог.
-    # -j 0: без параллельных процессов. В параллельном режиме (по умолчанию)
-    # readpst изредка теряет письма: дочерние процессы выбирают одинаковое
-    # имя файла, и одно письмо затирает другое. Проверено на libpst 0.6.76:
-    # из 300 писем в разных запусках извлекалось то 300, то 299 — без
-    # единой ошибки. Для импорта архива это молчаливая потеря писем.
-    proc = subprocess.Popen(["readpst", "-j", "0", "-e", "-o", out_dir, pst_path],
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    deadline = time.time() + 6 * 3600
-    try:
-        while True:
-            try:
-                out, err = proc.communicate(timeout=1.0)
-                break
-            except subprocess.TimeoutExpired:
-                if ctx.is_cancelled():
-                    proc.kill()
-                    proc.communicate()
-                    raise JobCancelled("Импорт отменён пользователем.")
-                if time.time() > deadline:
-                    proc.kill()
-                    proc.communicate()
-                    raise MailArchiverError("readpst работает дольше 6 часов — прерван.", code="import_error")
-    except BaseException:
-        if proc.poll() is None:
-            proc.kill()
-        raise
-    if proc.returncode != 0:
-        raise MailArchiverError(f"readpst завершился с ошибкой: {out} {err}"[:400], code="import_error")
-
-
 def handle_import_pst(ctx: JobContext) -> Dict:
-    """Импорт .pst на IMAP-сервер (через readpst).
+    """Импорт .pst на IMAP-сервер или в локальную копию ящика.
 
-    Дата каждого письма передаётся в APPEND из его заголовка Date: без неё весь
-    импортированный архив «приходил сегодня» — Outlook сортирует по дате
-    получения, а следующий бэкап записывал в индекс дату импорта (неверные
-    аналитика, фильтр дат экспорта и ретеншн). Обрыв связи не проваливает
-    остаток импорта: движок переподключается и продолжает с того же письма.
+    Файл разбирает встроенный читатель (``mailarchiver.pstimport``), внешние
+    программы не нужны; ``readpst`` остаётся запасным способом
+    (``engine: "readpst"``). Флаги и дата получения каждого письма берутся из
+    самого .pst: без даты весь импортированный архив «приходил сегодня» —
+    Outlook сортирует по дате получения, а следующий бэкап записывал в индекс
+    дату импорта (неверные аналитика, фильтр дат экспорта и ретеншн). Обрыв
+    связи не проваливает остаток импорта: движок переподключается и продолжает
+    с того же письма.
+
+    Загруженный файл удаляется, когда импорт дошёл до конца или отменён. Если
+    импорт остановился из-за почтового сервера (не удалось войти, сервер
+    перестал отвечать, кончилась квота ящика), файл остаётся во временном
+    каталоге — задание можно «Повторить», не загружая файл заново. Брошенный
+    файл уберёт обслуживание через 48 часов или ближайший перезапуск службы.
     """
-    from ..errors import ImapConnectionError, ImapTimeoutError
-    from ..imap.client import ReconnectingSession
+    from ..errors import ImapError
     from ..imap.restore import MAX_MESSAGE_EVENTS
+    from ..pstimport import importer
     svc = ctx.services
     p = ctx.params
     pst_path = p.get("pst_path")
     if not pst_path or not os.path.isfile(pst_path):
-        raise ValidationError("Файл .pst для импорта не найден.", hint="Загрузите файл заново.")
-    if shutil.which("readpst") is None:
-        raise MailArchiverError("Утилита readpst (пакет pst-utils) не установлена на сервере.",
-                                code="dependency_missing",
-                                hint="Установите пакет pst-utils (Debian/Ubuntu) или libpst (RHEL).")
-    target = p.get("target", "imap")  # imap | local
-    if target != "imap":
-        raise ValidationError("Импорт PST в локальную копию пока выполняется только на IMAP-сервер.",
-                              hint="Выберите цель «на IMAP-сервер».")
-    acc = svc.require_account(ctx.account_id)
-    ctx.event("INFO", f"Импорт PST «{os.path.basename(pst_path)}» (цель: {target}).")
-
-    tmp = tempfile.mkdtemp(prefix="pstimport_", dir=svc.cfg.tmp_dir)
-    session = None
+        raise ValidationError("Файл .pst для импорта не найден.",
+                              hint="Загрузите файл заново: загруженный файл хранится, пока идёт импорт, а после "
+                                   "остановки из-за почтового сервера — до 48 часов или до перезапуска службы.")
+    target = p.get("target") or "imap"
+    engine = p.get("engine") or "builtin"
+    # префикс мог прийти пустым намеренно: «в папки с теми же именами, что в файле»
+    prefix = importer.clean_prefix(p.get("target_prefix", importer.DEFAULT_PREFIX))
+    keep_file = False
     try:
-        _run_readpst(ctx, pst_path, tmp)
-        eml_files = []
-        for root, _dirs, files in os.walk(tmp):
-            for fn in sorted(files):
-                if fn.lower().endswith(".eml"):
-                    rel_folder = os.path.relpath(root, tmp)
-                    eml_files.append((rel_folder, os.path.join(root, fn)))
-        total = len(eml_files)
-        ctx.event("INFO", f"В PST найдено писем: {total}.")
-
-        imported = 0
-        errors = 0
-        shown = [0]
-
-        def report(text: str) -> None:
-            shown[0] += 1
-            if shown[0] <= MAX_MESSAGE_EVENTS:
-                ctx.event("ERROR", text)
-            elif shown[0] == MAX_MESSAGE_EVENTS + 1:
-                ctx.event("WARNING", "Ошибок больше — остальные только в итоге и в журнале службы.")
-            log.warning("import_pst %s: %s", acc.name, text)
-
-        prefix = p.get("target_prefix", "Импорт PST")
-
-        def check_cancel() -> None:
-            if ctx.is_cancelled():
-                raise JobCancelled("Импорт отменён пользователем.")
-
-        session = ReconnectingSession(acc, svc.connect_options(), ctx.event, check_cancel)
-        session.open()
-        # list_folders() заодно сообщает разделитель иерархии сервера;
-        # подстраховываемся на случай, если сервер его не прислал —
-        # иначе None попал бы в имя папки строкой "None".
-        session.conn.list_folders()
-        delimiter = session.conn.delimiter or "/"
-        ensured = set()
-        failed_folders = set()
-        lost_link = ""
-        for i, (rel_folder, fp) in enumerate(eml_files, 1):
-            if lost_link:
-                break
-            if ctx.is_cancelled():
-                raise JobCancelled(f"Импорт отменён пользователем (залито {imported} из {total}).")
-            # разделитель каталогов ОС переводим в разделитель IMAP
-            rel = _rel_to_imap_folder(rel_folder, delimiter)
-            folder = f"{prefix}{delimiter}{rel}" if rel else prefix
-            if folder in failed_folders:
-                errors += 1
-                continue
-            try:
-                with open(fp, "rb") as fh:
-                    raw = fh.read()
-            except OSError as exc:
-                errors += 1
-                report(f"Не удалось прочитать файл «{os.path.basename(fp)}»: {exc}")
-                continue
-            for _attempt in range(3):
-                try:
-                    if folder not in ensured:
-                        try:
-                            session.conn.ensure_folder(folder)
-                        except (ImapConnectionError, ImapTimeoutError):
-                            raise
-                        except MailArchiverError as exc:
-                            # папку создать не удалось — письма этой папки
-                            # пропускаем, но весь импорт не роняем
-                            failed_folders.add(folder)
-                            errors += 1
-                            report(f"Папка «{folder}» недоступна: {exc.message}")
-                            break
-                        ensured.add(folder)
-                    session.conn.append(folder, raw, msg_time=_eml_date(raw))
-                    imported += 1
-                    session.progressed()
-                    break
-                except (ImapConnectionError, ImapTimeoutError) as exc:
-                    try:
-                        session.reconnect(exc)
-                    except (ImapConnectionError, ImapTimeoutError) as final:
-                        # Сервер недоступен: сообщаем, сколько успели, а не
-                        # теряем итог в общей «ошибке задания».
-                        lost_link = final.message
-                        break
-                    ensured.clear()
-                except MailArchiverError as exc:
-                    errors += 1
-                    report(f"Ошибка заливки: {exc.message}")
-                    break
-            else:
-                errors += 1
-                report(f"Письмо «{os.path.basename(fp)}» не залито: связь обрывалась при каждой попытке.")
-            if lost_link:
-                break
-            if i % 20 == 0:
-                ctx.progress(i, total, f"Импорт {i}/{total}")
-        summary = f"Импортировано из PST: {imported} писем, ошибок: {errors}."
-        if lost_link:
-            left = total - imported - errors
-            errors += left
-            summary = (f"Импортировано из PST: {imported} из {total} писем. Связь с сервером потеряна "
-                       f"({lost_link}) — остальные {left} писем НЕ залиты. Загрузите файл снова, когда "
-                       f"сервер будет доступен (уже залитые письма при этом повторятся).")
+        acc = svc.require_account(ctx.account_id)
+        where = "в локальную копию ящика" if target == "local" else "на почтовый сервер"
+        ctx.event("INFO", f"Импорт PST «{os.path.basename(pst_path)}» {where}, папки — "
+                          + (f"с префиксом «{prefix}»." if prefix else "с именами как в файле."))
+        try:
+            res = importer.run_import(
+                svc, acc, pst_path, target=target, prefix=prefix,
+                skip_existing=bool(p.get("skip_existing", True)), engine=engine,
+                ansi_codec=str(p.get("ansi_codepage") or "cp1251"),
+                event=ctx.event, progress=ctx.progress, cancelled=ctx.is_cancelled,
+                max_events=MAX_MESSAGE_EVENTS)
+        except ImapError:
+            # Сервер недоступен или не пустил с самого начала (сеть, пароль): файл ещё
+            # пригодится — исправят причину и нажмут «Повторить».
+            keep_file = True
+            raise
+        keep_file = res.keep_file
+        summary = importer.summarize(res)
+        if res.stopped:
+            if keep_file:
+                summary += (" Загруженный файл сохранён (до 48 часов или до перезапуска службы) — нажмите "
+                            "«Повторить» у задания.")
             ctx.event("ERROR", summary)
-        if session.reconnects:
-            summary += f" Переподключений после обрыва связи: {session.reconnects}."
-        ctx.progress(total, total, "Готово")
-        status = JobStatus.PARTIAL if errors else JobStatus.SUCCESS
-        return {"final_status": status, "summary": summary, "imported": imported, "errors": errors}
+        ctx.progress(res.total, res.total, "Готово")
+        if res.incomplete:
+            status = JobStatus.PARTIAL if res.imported or res.duplicates else JobStatus.FAILED
+        else:
+            status = JobStatus.SUCCESS
+        out = {"final_status": status, "summary": summary, "imported": res.imported,
+               "errors": res.errors, "messages_total": res.total, "duplicates": res.duplicates,
+               "not_mail": res.not_mail, "outdated": res.outdated, "lossy": res.lossy,
+               "damaged_blocks": res.damaged, "target": res.target, "engine": res.engine,
+               "problems": res.error_details[:50]}
+        if status == JobStatus.FAILED:
+            out["error_result"] = summary
+        return out
     finally:
-        if session is not None:
-            session.close()
-        shutil.rmtree(tmp, ignore_errors=True)
-        # загруженный .pst больше не нужен: без удаления он навсегда оставался
+        # Загруженный .pst больше не нужен: без удаления он навсегда оставался
         # бы в каталоге временных файлов. Но если задание прервано остановкой
         # службы, оно вернётся в очередь — тогда файл ещё понадобится.
         queue = getattr(svc, "queue", None)
-        if not (queue is not None and queue.is_shutting_down()):
+        if keep_file:
+            try:
+                os.utime(pst_path, None)      # 48 часов обслуживание отсчитывает от этой минуты
+            except OSError:
+                pass
+        elif not (queue is not None and queue.is_shutting_down()):
             try:
                 os.unlink(pst_path)
             except OSError:

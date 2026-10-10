@@ -37,7 +37,10 @@ log = get_logger("queue")
 #: (удалённое письмо оставалось сиротой, бэкап качал всё дважды).
 LOCAL_JOB_TYPES = (JobType.BACKUP, JobType.RETENTION, JobType.STORAGE_CONVERT, JobType.VERIFY,
                    JobType.EXPORT, JobType.ANALYZE, JobType.RESTORE,
-                   JobType.QUARANTINE_CHECK, JobType.QUARANTINE_RESCUE)
+                   JobType.QUARANTINE_CHECK, JobType.QUARANTINE_RESCUE,
+                   # импорт .pst в локальную копию сам выдаёт письмам номера в индексе:
+                   # два импорта в один ящик разом выдали бы одинаковые
+                   JobType.IMPORT_PST)
 #: Задания, которые не запускаются параллельно сами с собой.
 SINGLETON_JOB_TYPES = (JobType.SYNC_EMPLOYEES, JobType.CHECK_LOGINS, JobType.REPLICATE,
                        JobType.DB_SNAPSHOT, JobType.SEARCH_INDEX, JobType.DEDUP_REPORT,

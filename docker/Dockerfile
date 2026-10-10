@@ -1,7 +1,8 @@
 # ============================================================================
 #  MailArchiver — образ Docker
 #  Многоступенчатая сборка: зависимости ставятся в venv, затем копируются в
-#  минимальный финальный образ. Включён readpst (pst-utils) для импорта .pst.
+#  минимальный финальный образ. Импорт .pst внешних программ не требует;
+#  readpst (pst-utils) включён как запасной способ разбора файла.
 # ============================================================================
 FROM python:3.12-slim AS build
 
@@ -24,9 +25,10 @@ FROM python:3.12-slim
 
 LABEL org.opencontainers.image.title="MailArchiver" \
       org.opencontainers.image.description="Резервное копирование почтовых ящиков по IMAP с веб-интерфейсом" \
-      org.opencontainers.image.version="1.8.0"
+      org.opencontainers.image.version="1.9.0"
 
-# readpst нужен только для импорта .pst; ca-certificates — для TLS/OAuth2;
+# readpst — запасной способ разбора .pst (основной встроен в службу);
+# ca-certificates — для TLS/OAuth2;
 # rsync и ssh — для копии архива на другой сервер по SSH
 RUN apt-get update \
  && apt-get install -y --no-install-recommends pst-utils ca-certificates curl rsync openssh-client \

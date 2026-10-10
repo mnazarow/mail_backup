@@ -1359,6 +1359,12 @@ class Database:
         )
         return row["stored_path"] if row else None
 
+    def hash_exists_in_folder(self, account_id: int, folder: str, sha256: str) -> bool:
+        """Есть ли в папке ящика письмо с таким содержимым (повторный импорт того же файла)."""
+        return self.query_one(
+            "SELECT 1 FROM messages WHERE account_id=? AND sha256=? AND folder=? LIMIT 1",
+            (account_id, sha256, folder)) is not None
+
     def count_messages(self, account_id: Optional[int] = None) -> int:
         if account_id is None:
             return int(self.scalar("SELECT COUNT(*) FROM messages") or 0)

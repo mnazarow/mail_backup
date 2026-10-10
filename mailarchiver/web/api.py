@@ -1356,13 +1356,38 @@ def clear_account_retired(request: Request, account_id: int, user: dict = Depend
 
 @router.post("/accounts/{account_id}/import-pst")
 def import_pst(request: Request, account_id: int, file: UploadFile = File(...),
-               target_prefix: str = Form("Импорт PST"), user: dict = Depends(auth_mod.require_user)):
+               target_prefix: str = Form("Импорт PST"), no_prefix: str = Form(""),
+               target: str = Form("imap"), skip_existing: str = Form("1"),
+               engine: str = Form("builtin"), ansi_codepage: str = Form("cp1251"),
+               user: dict = Depends(auth_mod.require_user)):
+    """Импорт .pst в ящик: ``target`` — ``imap`` (на почтовый сервер) или ``local``
+    (в локальную копию); ``engine`` — ``builtin`` (встроенный разбор) или ``readpst``.
+
+    Папки создаются внутри ``target_prefix``. Без общей папки (под своими именами)
+    — только с явным ``no_prefix=1``: пустое поле формы FastAPI заменяет значением
+    по умолчанию, и «пустой префикс» одним полем передать нельзя — да и не стоит:
+    очищенное по ошибке поле не должно заливать архив прямо в рабочие папки."""
+    from ..pstimport import importer
     svc = svc_dep(request)
-    # Разбор .pst выполняет сторонняя утилита (readpst) на присланном файле —
-    # это не то, что стоит открывать каждому сотруднику.
+    # Разбор присланного файла — тяжёлая работа над чужими данными, а импорт
+    # ещё и пишет в ящик: это не то, что стоит открывать каждому сотруднику.
     _require_not_mailbox(user, "Импорт .pst")
     _ensure_account_access(user, account_id)
-    svc.require_account(account_id)
+    acc = svc.require_account(account_id)
+    if target not in importer.TARGETS:
+        raise ValidationError("Неизвестная цель импорта.",
+                              hint="Допустимо: imap (на почтовый сервер) или local (в локальную копию).")
+    if engine not in importer.ENGINES:
+        raise ValidationError("Неизвестный способ разбора файла.", hint="Допустимо: builtin или readpst.")
+    if ansi_codepage not in importer.ANSI_CODECS:
+        raise ValidationError("Неизвестная кодировка для файлов ANSI.",
+                              hint="Допустимо: " + ", ".join(importer.ANSI_CODECS) + ".")
+    off = ("0", "false", "no", "off", "")
+    if str(no_prefix).strip().lower() not in off:
+        prefix = ""
+    else:
+        prefix = importer.clean_prefix(target_prefix) or importer.DEFAULT_PREFIX
+    skip = str(skip_existing).strip().lower() not in off
     # имя файла приходит от клиента: берём только базовое имя и чистим его,
     # иначе «../../» в имени увело бы запись за пределы каталога временных файлов
     origin_name = os.path.basename(file.filename or "")
@@ -1393,8 +1418,13 @@ def import_pst(request: Request, account_id: int, file: UploadFile = File(...),
             pass
         raise
     jid = svc.queue.enqueue(JobType.IMPORT_PST, account_id,
-                            {"pst_path": dest, "target": "imap", "target_prefix": target_prefix},
+                            {"pst_path": dest, "target": target, "target_prefix": prefix,
+                             "skip_existing": skip, "engine": engine, "ansi_codepage": ansi_codepage},
                             created_by=user["username"])
+    svc.db.add_audit(user["username"], "import_pst",
+                     f"{acc.name}: {origin_name}, "
+                     + ("в локальную копию" if target == "local" else "на сервер")
+                     + (f", префикс «{prefix}»" if prefix else ", без префикса"))
     return {"ok": True, "job_id": jid}
 
 

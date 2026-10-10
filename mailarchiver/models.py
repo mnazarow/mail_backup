@@ -13,7 +13,7 @@ class JobType:
     BACKUP = "backup"          # резервное копирование ящика по IMAP
     RESTORE = "restore"        # восстановление копии обратно на IMAP
     EXPORT = "export"          # экспорт локальной копии (mbox/eml/msg/pst)
-    IMPORT_PST = "import_pst"  # импорт .pst в локальную копию/на сервер
+    IMPORT_PST = "import_pst"  # импорт .pst на сервер или в локальную копию
     TEST = "test"              # проверка подключения к ящику
     RETENTION = "retention"    # очистка по политике хранения
     VERIFY = "verify"          # проверка целостности локальной копии

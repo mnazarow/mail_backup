@@ -138,24 +138,24 @@ install_system_deps(){
       export DEBIAN_FRONTEND=noninteractive
       apt-get update -qq || warn "apt-get update завершился с предупреждениями"
       apt-get install -y python3 python3-venv python3-pip ca-certificates || { err "Не удалось установить пакеты через apt"; exit 1; }
-      apt-get install -y pst-utils >/dev/null 2>&1 || warn "pst-utils не установлен (нужен только для импорта .pst)"
+      apt-get install -y pst-utils >/dev/null 2>&1 || warn "pst-utils не установлен (не обязателен: это запасной способ импорта .pst, основной встроен)"
       apt-get install -y rsync openssh-client >/dev/null 2>&1 || warn "rsync/openssh-client не установлены (нужны только для копии архива на сервер по SSH)"
       ;;
     dnf|yum)
       $PKG install -y python3 python3-pip ca-certificates || { err "Не удалось установить пакеты через $PKG"; exit 1; }
-      $PKG install -y libpst >/dev/null 2>&1 || warn "libpst не установлен (нужен только для импорта .pst)"
+      $PKG install -y libpst >/dev/null 2>&1 || warn "libpst не установлен (не обязателен: это запасной способ импорта .pst, основной встроен)"
       $PKG install -y rsync openssh-clients >/dev/null 2>&1 || warn "rsync/openssh-clients не установлены (нужны только для копии архива на сервер по SSH)"
       ;;
     zypper)
       zypper --non-interactive install python3 python3-pip python3-virtualenv ca-certificates || { err "Не удалось установить пакеты через zypper"; exit 1; }
-      zypper --non-interactive install libpst >/dev/null 2>&1 || warn "libpst не установлен (импорт .pst)"
+      zypper --non-interactive install libpst >/dev/null 2>&1 || warn "libpst не установлен (не обязателен: запасной способ импорта .pst)"
       zypper --non-interactive install rsync openssh-clients >/dev/null 2>&1 \
         || zypper --non-interactive install rsync openssh >/dev/null 2>&1 \
         || warn "rsync/openssh не установлены (нужны только для копии архива на сервер по SSH)"
       ;;
     pacman)
       pacman -Sy --noconfirm python python-pip ca-certificates || { err "Не удалось установить пакеты через pacman"; exit 1; }
-      pacman -S --noconfirm libpst >/dev/null 2>&1 || warn "libpst не установлен (импорт .pst)"
+      pacman -S --noconfirm libpst >/dev/null 2>&1 || warn "libpst не установлен (не обязателен: запасной способ импорта .pst)"
       pacman -S --noconfirm rsync openssh >/dev/null 2>&1 || warn "rsync/openssh не установлены (нужны только для копии архива на сервер по SSH)"
       ;;
     none) warn "Пропускаю установку системных пакетов." ;;
