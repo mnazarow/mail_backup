@@ -1122,7 +1122,25 @@ def account_template(svc) -> Dict[str, Any]:
         # Вход через администратора почты — только если он включён и настроен на ТОТ ЖЕ сервер.
         "use_master": bool(svc.rt("employees", "account_use_master")) and bool(svc.rt("mailadmin", "enabled"))
         and _text("account_host").lower() == str(svc.rt("mailadmin", "host") or "").strip().lower() != "",
+        # Копирование через FTP Backup Axigen — только если раздел Axigen включён и сервер шаблона — его.
+        "use_axigen_ftp": bool(svc.rt("employees", "account_use_axigen_ftp")) and _axigen_host_matches(
+            svc, _text("account_host")),
     }
+
+
+def _axigen_host_matches(svc, host: str) -> bool:
+    """Сервер шаблона ящиков — это сервер Axigen из настроек (адрес IMAP или адрес сервера)."""
+    host = (host or "").strip().lower()
+    if not host:
+        return False
+    try:
+        if not bool(svc.rt("axigen", "enabled")):
+            return False
+        known = {str(svc.rt("axigen", "imap_host") or "").strip().lower(),
+                 str(svc.rt("axigen", "host") or "").strip().lower()}
+    except Exception:  # noqa: BLE001 — заглушки служб в тестах могут не знать раздела
+        return False
+    return host in known - {""}
 
 
 #: Пример сотрудника для предпросмотра шаблона: заполнены все поля, поэтому
@@ -1145,6 +1163,7 @@ def preview_account_template(svc, full_name: str = "Иванов Иван Ива
         "schedule_enabled": tpl["schedule_enabled"], "schedule_cron": tpl["schedule_cron"],
         "sequence_covers": tpl["sequence_covers"],
         "use_master": tpl["use_master"],
+        "use_axigen_ftp": tpl.get("use_axigen_ftp", False),
     }
 
 
@@ -1205,7 +1224,8 @@ def ensure_account_for_employee(svc, employee_id: int, full_name: str, email: st
     acc = Account(
         name=render_account_field(tpl["name_template"], values) or full_name or email,
         host=tpl["host"], port=tpl["port"], username=username, password="",
-        auth_type=AuthType.MASTER if tpl.get("use_master") else AuthType.PASSWORD, security=tpl["security"],
+        auth_type=(AuthType.AXIGEN_FTP if tpl.get("use_axigen_ftp") else
+                   AuthType.MASTER if tpl.get("use_master") else AuthType.PASSWORD), security=tpl["security"],
         # Пустой пароль означает, что копирование всё равно не начнётся: даже
         # включённый по шаблону ящик ждёт, пока администратор впишет пароль.
         enabled=bool(tpl["enabled"]),

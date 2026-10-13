@@ -687,7 +687,10 @@ def _mailbox_candidate(services, username: str, password: str):
     acc = services.db.get_account_by_username(username)
     # Ящики, которые копируются входом администратора почты, тоже годятся:
     # пароль сотрудника всё равно проверяется обычным входом в его ящик.
-    if acc is None or not acc.enabled or acc.auth_type not in (AuthType.PASSWORD, AuthType.MASTER):
+    # Ящики, которые копируются через FTP Backup Axigen, — тоже: пароль сотрудника
+    # проверяется входом по IMAP на тот же сервер.
+    if acc is None or not acc.enabled or acc.auth_type not in (AuthType.PASSWORD, AuthType.MASTER,
+                                                               AuthType.AXIGEN_FTP):
         return None
     return acc
 

@@ -65,6 +65,9 @@ def validate_restore_options(data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     префикс — не молчаливым синонимом этого выбора.
     """
     out = dict(data or {})
+    # «подтверждено администратором» ставит только кнопка восстановления, а не тело
+    # запроса, расписание или групповое действие (см. restore_via_ftp)
+    out.pop("ftp_confirmed_by", None)
     mode = str(out.get("target_mode") or "prefixed").strip().lower()
     if mode not in ("original", "single", "prefixed"):
         raise ValidationError(f"Неизвестный режим восстановления «{out.get('target_mode')}».",
@@ -84,6 +87,11 @@ def validate_restore_options(data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if limit < 0:
         raise ValidationError("Ограничение числа писем не может быть отрицательным.")
     out["limit"] = limit
+    via = str(out.get("via") or "auto").strip().lower()
+    if via not in ("auto", "imap", "ftp"):
+        raise ValidationError(f"Неизвестный способ восстановления «{out.get('via')}».",
+                              hint="Допустимо: auto, imap, ftp (FTP Backup Axigen).")
+    out["via"] = via
     return out
 
 

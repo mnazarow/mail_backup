@@ -78,6 +78,10 @@ class SchedulerService:
             self._sched.add_job(self._search_index_tick, IntervalTrigger(minutes=10), id="search_index",
                                 replace_existing=True, coalesce=True, misfire_grace_time=600,
                                 next_run_time=datetime.now(timezone.utc) + timedelta(minutes=3))
+            # состояние сервера Axigen — каждые 15 минут (сама проверка смотрит, включена ли она)
+            self._sched.add_job(self._axigen_monitor_tick, IntervalTrigger(minutes=15), id="axigen_monitor",
+                                replace_existing=True, coalesce=True, max_instances=1, misfire_grace_time=600,
+                                next_run_time=datetime.now(timezone.utc) + timedelta(minutes=1))
         self.reload(catch_up=True)
 
     def stop(self) -> None:
@@ -101,7 +105,7 @@ class SchedulerService:
         enabled = bool(self.services.rt("scheduler", "enabled"))
         # Часовой пояс могли сменить в «Настройках» — триггеры строятся с ним.
         for job in self._sched.get_jobs():
-            if job.id not in ("maintenance", "search_index"):
+            if job.id not in self.ALWAYS_JOBS:
                 self._sched.remove_job(job.id)
         was_enabled, self._enabled = self._enabled, enabled
         if not enabled:
@@ -117,8 +121,12 @@ class SchedulerService:
         self._reload_retention_sweep()
         self._reload_replica()
         self._reload_summary()
+        self._reload_axigen_sync()
         if not was_enabled:
             log.info("Планировщик запущен.")
+
+    #: Служебные задания, которые работают всегда (не зависят от scheduler.enabled).
+    ALWAYS_JOBS = ("maintenance", "search_index", "axigen_monitor")
 
     # -- синхронизация сотрудников ------------------------------------------
     EMPLOYEES_JOB_ID = "employees_sync"
@@ -230,6 +238,43 @@ class SchedulerService:
         except Exception:  # noqa: BLE001
             log.exception("Ошибка при постановке копии вне сервера")
             return None
+
+    # -- сервер Axigen: сверка по расписанию и проверка состояния -----------
+    AXIGEN_SYNC_JOB_ID = "axigen_sync"
+
+    def _reload_axigen_sync(self) -> None:
+        svc = self.services
+        try:
+            if not bool(svc.rt("axigen", "enabled")) or not bool(svc.rt("axigen", "sync_enabled")):
+                return
+            expr = svc.rt("axigen", "sync_cron") or "40 4 * * *"
+        except Exception:  # noqa: BLE001
+            return
+        trigger = self._cron_trigger(expr, "сверки с Axigen")
+        if trigger is None:
+            return
+        self._sched.add_job(self._fire_axigen_sync, trigger, id=self.AXIGEN_SYNC_JOB_ID, **self._job_kwargs())
+
+    def _fire_axigen_sync(self) -> Optional[int]:
+        svc = self.services
+        try:
+            if any(job["type"] == JobType.AXIGEN_SYNC for job in svc.db.active_jobs()):
+                log.warning("Сверка с Axigen по расписанию пропущена: предыдущая ещё идёт.")
+                return None
+            job_id = svc.queue.enqueue(JobType.AXIGEN_SYNC, None, {"requested_by": "scheduler"}, priority=6,
+                                       created_by="scheduler")
+            log.info("Сверка с Axigen по расписанию → задание #%s.", job_id)
+            return job_id
+        except Exception:  # noqa: BLE001
+            log.exception("Ошибка при постановке сверки с Axigen")
+            return None
+
+    def _axigen_monitor_tick(self) -> None:
+        try:
+            from ..axigen.monitor import tick
+            tick(self.services)
+        except Exception:  # noqa: BLE001
+            log.exception("Ошибка проверки состояния сервера Axigen")
 
     # -- еженедельная сводка ----------------------------------------------
     SUMMARY_JOB_ID = "weekly_summary"

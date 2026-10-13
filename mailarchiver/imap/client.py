@@ -418,6 +418,14 @@ class ImapConnection:
                 self.client.oauth2_login(acc.username, access)
             elif acc.auth_type == AuthType.MASTER:
                 self._master_login()
+            elif acc.auth_type == AuthType.AXIGEN_FTP and not acc.password:
+                # Ящик копируется через FTP Backup Axigen, пароля у него нет: пустой
+                # LOGIN — это неудачный вход с адреса архива (fail2ban банит его целиком).
+                raise MailArchiverError(
+                    f"Ящик «{acc.name}» копируется через FTP Backup Axigen, пароля ящика нет — войти в него по IMAP "
+                    f"нельзя.", code="no_password",
+                    hint="Для восстановления на сервер и проверки папок по IMAP задайте ящику пароль (карточка ящика); "
+                         "копирование через FTP Backup пароля не требует.")
             else:
                 self.client.login(acc.username, acc.password)
         except LoginError as exc:

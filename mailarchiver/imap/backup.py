@@ -105,6 +105,12 @@ class BackupResult:
     # Письма старше срока хранения ящика: на сервере есть, но не скачиваются —
     # ночная очистка всё равно удалила бы их из копии.
     messages_outside_retention: int = 0
+    # Копирование через FTP Backup Axigen: письма, которые уже были в архиве
+    # (скопированы раньше по IMAP) — узнаны по содержимому и второй раз не записаны.
+    messages_recognized: int = 0
+    # Копирование через FTP Backup Axigen: файлы в папках, которые не похожи на
+    # письма (служебные файлы сервера) — не копируются.
+    other_files: int = 0
     cancelled: bool = False
 
     def add_error(self, text: str) -> None:

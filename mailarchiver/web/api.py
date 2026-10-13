@@ -61,7 +61,24 @@ MIN_SCHEDULE_INTERVAL_S = 60
 # Параметры-секреты: не отдаются через GET /settings и не затираются пустым
 # значением при сохранении (пустое поле = «оставить как есть»).
 SECRET_SETTINGS = {"notifications.smtp_password", "employees.source_url_password",
-                   "replica.s3_secret_key", "monitoring.metrics_token", "mailadmin.password"}
+                   "replica.s3_secret_key", "monitoring.metrics_token", "mailadmin.password",
+                   "axigen.admin_password", "axigen.ftp_password"}
+#: Секрет, который уходит на адрес из настроек: при смене адреса его нужно ввести заново
+#: (иначе администратор архива мог бы перенаправить пароль администратора почты на свой сервер).
+SECRET_BOUND_TO = {"axigen.admin_password": "axigen.host", "axigen.ftp_password": "axigen.host",
+                   "mailadmin.password": "mailadmin.host"}
+
+
+def _require_axigen_password(svc, new_values: Dict[str, Any]) -> None:
+    """Ослабили или перенаправили соединение с Axigen — пароль вводится заново (см. passwords_to_reenter)."""
+    from ..axigen.common import passwords_to_reenter
+    what, need = passwords_to_reenter(lambda key: svc.rt("axigen", key), new_values)
+    if need:
+        raise ValidationError(
+            f"Меняется защита соединения с Axigen ({', '.join(what)}) — введите {' и '.join(need)} заново в том же "
+            f"сохранении.",
+            hint="Сохранённый пароль не отправляется по соединению, которое ослабили или перенаправили, без "
+                 "подтверждения. Ничего не сохранено.")
 
 
 def svc_dep(request: Request):
@@ -264,6 +281,8 @@ class RestoreBody(BaseModel):
     check_duplicates: bool = True
     dry_run: bool = False
     limit: int = 0
+    #: auto | imap | ftp — для ящиков, которые копируются через FTP Backup Axigen
+    via: str = "auto"
 
 
 class ScheduleBody(BaseModel):
@@ -368,6 +387,8 @@ def me(request: Request):
     out["version"] = __version__
     out["require_2fa"] = bool(svc.rt("security", "require_2fa"))
     out["must_enroll_2fa"] = auth_mod.two_factor_required(svc, user)
+    # разделы, которые включаются в настройках (меню показывает их, только когда они включены)
+    out["features"] = {"axigen": bool(svc.rt("axigen", "enabled")) if user.get("role") == "admin" else False}
     return out
 
 
@@ -560,7 +581,17 @@ def state(request: Request, user: dict = Depends(auth_mod.require_user)):
         # оператор видит сам факт: он следит за копированием)
         "encryption_blocked": _encryption_banner(svc, user),
         "replica_alert": _replica_alert(svc) if user.get("role") in roles.STAFF_ROLES else "",
+        # сервер Axigen требует внимания (недоступен, очередь, лицензия…) — только администратору
+        "axigen_alerts": _axigen_alerts(svc) if user.get("role") == roles.ROLE_ADMIN else [],
     }
+
+
+def _axigen_alerts(svc) -> list:
+    try:
+        from ..axigen.monitor import problems as axigen_problems
+        return axigen_problems(svc)
+    except Exception:  # noqa: BLE001 — дашборд открывается и при сбое раздела Axigen
+        return []
 
 
 def _encryption_banner(svc, user: dict) -> str:
@@ -682,6 +713,9 @@ def _validate_account(acc: Account) -> None:
         raise ValidationError("Некорректный режим шифрования.")
     if acc.auth_type not in AuthType.ALL:
         raise ValidationError("Некорректный способ входа.")
+    if acc.auth_type == AuthType.AXIGEN_FTP and "@" not in acc.username:
+        raise ValidationError("Для копирования через FTP Backup Axigen логин — полный адрес почты.",
+                              hint="Каталог ящика на FTP Backup ищется по адресу, например ivanov@company.ru.")
     if not 1 <= int(acc.port or 0) <= 65535:
         raise ValidationError("Порт IMAP — число от 1 до 65535.", hint="Обычно 993 (SSL) или 143 (STARTTLS).")
     if acc.retention_days is not None and not -1 <= int(acc.retention_days) <= 36500:
@@ -804,6 +838,13 @@ def update_account(request: Request, account_id: int, body: AccountBody, user: d
         update_oauth_token=bool(body.oauth_refresh_token),
     )
     _after_account_retention_change(svc, before, acc.retention_days)
+    if before is not None and (before.username.lower() != acc.username.lower() or before.auth_type != acc.auth_type):
+        # каталог ящика на FTP Backup искался по прежнему логину — ищется заново
+        try:
+            from ..axigen import store as axstore
+            axstore.forget_ftp_path(svc.db, account_id)
+        except Exception:  # noqa: BLE001
+            log.debug("Не удалось забыть путь ящика на FTP Backup", exc_info=True)
     closed = 0
     if body.password or (before is not None and before.username.lower() != acc.username.lower()):
         # Новый пароль (или другой логин) ящика: сеансы сотрудника, вошедшего
@@ -947,7 +988,18 @@ def test_account(request: Request, account_id: int, user: dict = Depends(auth_mo
     acc = svc.db.get_account(account_id)
     if acc is None:
         raise HTTPException(404, "Ящик не найден")
-    result = probe_account(acc, svc.connect_options())
+    if acc.auth_type == AuthType.AXIGEN_FTP:
+        # ящик Axigen проверяется тем же путём, каким копируется, — через FTP Backup,
+        # входом администратора Axigen: это только администратору MailArchiver
+        # (ответ перечисляет чужие каталоги, а частые входы могли бы заблокировать
+        # учётную запись администратора на сервере)
+        if not auth_mod.is_admin(user):
+            raise HTTPException(403, "Проверить ящик, который копируется через FTP Backup Axigen, может только "
+                                     "администратор.")
+        from ..axigen.ftpbackup import probe as axigen_probe
+        result = axigen_probe(svc, acc)
+    else:
+        result = probe_account(acc, svc.connect_options())
     # итог попытки входа запоминаем у ящика (отбор «с неправильным паролем»)
     svc.db.set_login_status(acc.id, "ok" if result.get("ok") else (result.get("kind") or "conn_error"),
                             "" if result.get("ok") else (result.get("error") or ""))
@@ -1288,6 +1340,18 @@ def start_restore(request: Request, account_id: int, body: RestoreBody, user: di
     # же результату: весь архив уходил прямо в рабочий INBOX, и отменить это
     # уже нельзя.
     data = validate_restore_options(body.model_dump())
+    acc = svc.require_account(account_id)
+    from ..queue.jobs import restore_via_ftp
+    if restore_via_ftp(acc, data):
+        # Заливка через FTP Backup идёт учётной записью администратора Axigen —
+        # только администратору архива и только если изменения на сервере разрешены.
+        if user.get("role") != "admin":
+            raise ValidationError("Восстановление через FTP Backup Axigen доступно только администратору.",
+                                  hint="У ящика нет пароля для восстановления по IMAP — обратитесь к администратору.")
+        from ..axigen.actions import require_changes_allowed
+        from ..axigen.common import load_settings as _axigen_settings
+        require_changes_allowed(_axigen_settings(svc).require())
+        data["ftp_confirmed_by"] = user["username"]
     _mailbox_flood_guard(svc, user, JobType.RESTORE, account_id)
     mode = data["target_mode"]
     if mode == "original" and not body.dry_run:
@@ -2003,7 +2067,14 @@ def _schedule_target(svc, body: ScheduleBody) -> None:
         raise ValidationError("Выберите ящик для расписания.",
                               hint="Для копирования всех включённых ящиков выберите задание "
                                    "«Копирование всех ящиков по очереди».")
-    svc.require_account(body.account_id)
+    acc = svc.require_account(body.account_id)
+    if body.job_type == JobType.RESTORE and acc.auth_type == AuthType.AXIGEN_FTP:
+        from ..queue.jobs import restore_via_ftp
+        if restore_via_ftp(acc, dict(body.options or {})):
+            raise ValidationError(
+                "Восстановление через FTP Backup Axigen по расписанию не делается: оно меняет почтовый сервер и "
+                "запускается только кнопкой администратора.",
+                hint="Для расписания выберите «Как заливать: по IMAP» (у ящика должен быть пароль).")
 
 
 @router.post("/schedules")
@@ -2138,12 +2209,21 @@ def update_settings(request: Request, body: SettingsBody, user: dict = Depends(a
         # Расписания проверяем сразу: иначе кривое выражение обнаружилось бы
         # только в логах планировщика, а задание молча не запускалось бы.
         if full_key in ("employees.cron", "employees.account_schedule_cron", "retention.cron",
-                        "replica.cron", "notifications.summary_cron"):
+                        "replica.cron", "notifications.summary_cron", "axigen.sync_cron"):
             _validate_cron(str(coerced or ""))
         if coerced != svc.rt(*full_key.split(".", 1)) or full_key in SECRET_SETTINGS:
             new_values[full_key] = coerced
     if not new_values:
         return {"ok": True, "changed": []}
+    for secret, bound in SECRET_BOUND_TO.items():
+        if bound in new_values and secret not in new_values and svc.rt(*secret.split(".", 1)):
+            old_host = str(svc.rt(*bound.split(".", 1)) or "").strip().lower()
+            if old_host and str(new_values[bound] or "").strip().lower() != old_host:
+                raise ValidationError(
+                    f"Адрес сервера меняется ({old_host} → {new_values[bound] or 'пусто'}) — введите пароль заново "
+                    f"в том же сохранении.",
+                    hint="Сохранённый пароль не отправляется на новый адрес без подтверждения. Ничего не сохранено.")
+    _require_axigen_password(svc, new_values)
 
     snapshot = svc.db.raw_settings(new_values.keys())
     before_retention = _retention_policy(svc)

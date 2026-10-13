@@ -336,6 +336,7 @@ const NAV = [
   {id:'jobs', icon:'⚙️', title:'Очередь и задания', roles:'aom'},
   {id:'exports', icon:'📤', title:'Экспорт (PST)', roles:'am'},
   {id:'schedules', icon:'⏰', title:'Расписания', roles:'ao'},
+  {id:'axigen', icon:'📮', title:'Сервер Axigen', roles:'a', feature:'axigen'},
   {sep:true},
   {id:'logs', icon:'📋', title:'Логи', roles:'ao'},
   {id:'settings', icon:'🔧', title:'Настройки', roles:'a'},
@@ -350,7 +351,7 @@ function isOperator(){ return !!State.user && State.user.role === 'operator'; }
 /** Администратор или оператор — учётная запись архива, а не вход по ящику. */
 function isStaff(){ return isAdmin() || isOperator(); }
 function roleCode(){ return isAdmin()?'a':(isMailbox()?'m':'o'); }
-function navAllowed(item){ return !item.sep && item.roles.includes(roleCode()); }
+function navAllowed(item){ return !item.sep && item.roles.includes(roleCode()) && (!item.feature || !!((State.user&&State.user.features)||{})[item.feature]); }
 /** Сотрудник (вход по ящику) может отменять и повторять только свои задания:
  *  копирование по расписанию запускает не он, и снимать его ему нельзя.
  *  Оператор — только копирование и проверки (не «с нуля», не выгрузки). */
@@ -424,14 +425,7 @@ async function startApp(){
     </main>
   </div>`);
   root().appendChild(shell);
-  const nav=$('#nav');
-  NAV.forEach(item=>{
-    if(item.sep){ if(!isMailbox()) nav.appendChild(h('<div class="sep"></div>')); return; }
-    if(!navAllowed(item)) return;
-    const a=h(`<a href="#/${item.id}" data-view="${item.id}"><span class="ic">${item.icon}</span><span>${esc(item.title)}</span></a>`);
-    a.onclick=(e)=>{ e.preventDefault(); location.hash='#/'+item.id; };
-    nav.appendChild(a);
-  });
+  renderNav();
   if(isMailbox() && State.user.account_id){ State.mailAccount = State.user.account_id; }
   // Меню на узком экране: раньше боковая панель просто пропадала, и перейти
   // в другой раздел можно было только правкой адреса в строке браузера.
@@ -456,6 +450,20 @@ async function startApp(){
   route();
 }
 
+/** Пункты меню по роли и включённым разделам (перерисовывается, когда раздел включили в настройках). */
+function renderNav(){
+  const nav=$('#nav'); if(!nav) return;
+  nav.innerHTML='';
+  NAV.forEach(item=>{
+    if(item.sep){ if(!isMailbox()) nav.appendChild(h('<div class="sep"></div>')); return; }
+    if(!navAllowed(item)) return;
+    const a=h(`<a href="#/${item.id}" data-view="${item.id}"><span class="ic">${item.icon}</span><span>${esc(item.title)}</span></a>`);
+    a.onclick=(e)=>{ e.preventDefault(); location.hash='#/'+item.id; };
+    nav.appendChild(a);
+  });
+  if(State.view) setActiveNav(State.view);
+}
+
 function setActiveNav(view){
   $$('#nav a').forEach(a=>a.classList.toggle('active', a.dataset.view===view));
   const item=NAV.find(n=>n.id===view);
@@ -478,7 +486,7 @@ function route(){
   const c=h('<div class="view-host"><div class="empty"><div class="spinner"></div></div></div>');
   content.appendChild(c);
   State.routeSeq=(State.routeSeq||0)+1;
-  const map={dashboard:viewDashboard,analytics:viewAnalytics,mailanalytics:viewMailAnalytics,mail:viewMail,accounts:viewAccounts,employees:viewEmployees,jobs:viewJobs,exports:viewExports,schedules:viewSchedules,logs:viewLogs,settings:viewSettings,users:viewUsers,security:viewSecurity,audit:viewAudit};
+  const map={dashboard:viewDashboard,analytics:viewAnalytics,mailanalytics:viewMailAnalytics,mail:viewMail,accounts:viewAccounts,employees:viewEmployees,jobs:viewJobs,exports:viewExports,schedules:viewSchedules,axigen:viewAxigen,logs:viewLogs,settings:viewSettings,users:viewUsers,security:viewSecurity,audit:viewAudit};
   (map[view]||viewDashboard)(c).catch(toastErr);
 }
 
@@ -586,6 +594,14 @@ async function viewDashboard(c){
       <div class="section-title"><h3>🛰️ Копия вне сервера</h3></div>
       <div>${esc(s.replica_alert)}</div>
       ${isAdmin()?'<a class="btn small" href="#/settings" style="margin-top:10px">Открыть настройки копии</a>':'<div class="muted small" style="margin-top:6px">Сообщите администратору.</div>'}</div>`));
+  }
+  // Сервер Axigen требует внимания: недоступен, очередь растёт, лицензия кончается…
+  if((s.axigen_alerts||[]).length){
+    const bad=s.axigen_alerts.some(a=>a.level==='error');
+    c.appendChild(h(`<div class="card" style="margin-bottom:16px;border-color:var(--${bad?'danger':'warn'})">
+      <div class="section-title"><h3>📮 Сервер Axigen</h3></div>
+      <ul style="margin:0;padding-left:18px">${s.axigen_alerts.map(a=>`<li>${esc(a.text)}</li>`).join('')}</ul>
+      <a class="btn small" href="#/axigen" style="margin-top:10px">Открыть раздел «Сервер Axigen»</a></div>`));
   }
   // Плашка «требуют внимания»: без неё ящик, который давно не копируется или
   // остался без пароля, ничем себя не выдаёт — и это обнаруживается тогда,
@@ -945,8 +961,8 @@ async function employeeAccountTemplateModal(){
     <div class="kv"><b>Срок хранения</b><div class="spacer"></div>${esc(keep)}</div>
     <div class="kv"><b>Расписание копирования</b><div class="spacer"></div>${p.sequence_covers?'<span class="tag ok" title="В «Расписаниях» включено копирование всех ящиков по очереди — новый ящик попадёт в него">общее: все ящики по очереди</span>':(p.schedule_enabled?`<span class="tag ok">${esc(p.schedule_cron||'')}</span>`:'<span class="tag">не создаётся</span>')}</div>
     <div class="kv"><b>Заметка</b><div class="spacer"></div>${esc(p.notes||'—')}</div>
-    <div class="hint" style="margin-top:12px">Пароль шаблон не задаёт: копирование начнётся только после того,
-      как администратор впишет пароль в карточке ящика.</div>
+    <div class="kv"><b>Способ копирования</b><div class="spacer"></div>${p.use_axigen_ftp?'<span class="tag ok">через FTP Backup Axigen — без пароля</span>':(p.use_master?'<span class="tag ok">через администратора почты — без пароля</span>':'по паролю ящика')}</div>
+    <div class="hint" style="margin-top:12px">${(p.use_axigen_ftp||p.use_master)?'Пароль ящику не нужен: копирование начнётся сразу, если ящик включён.':'Пароль шаблон не задаёт: копирование начнётся только после того, как администратор впишет пароль в карточке ящика.'}</div>
     <div class="hint" style="margin-top:8px">Подстановки в шаблонах названия, логина и заметки: ${vars}</div>`,
     {wide:true, footer:'<button class="btn ghost" data-c>Закрыть</button><button class="btn primary" data-s>⚙️ Изменить шаблон</button>'});
   m.foot.querySelector('[data-c]').onclick=()=>m.close();
@@ -1116,6 +1132,9 @@ function loginCell(a){
   if(a.secret_broken || a.login_status==='secret_broken')
     return `<span class="tag err"${when}>пароль не читается</span>`;
   if(!a.has_password) return '<span class="tag warn">нет пароля</span>';
+  // ящик копирует администратор Axigen через FTP Backup — пароль сотрудника не нужен
+  if(a.auth_type==='axigen_ftp' && !['auth_error','conn_error'].includes(a.login_status))
+    return `<span class="tag ok" title="Копируется через FTP Backup Axigen — без пароля ящика${a.imap_login?'; пароль для IMAP задан':''}">📮 FTP Backup</span>`;
   switch(a.login_status){
     case 'ok': return `<span class="tag ok"${when}>✓ пароль верный</span>`;
     case 'auth_error': return `<span class="tag err"${when}>✗ неверный пароль</span>`;
@@ -1655,6 +1674,7 @@ function accountMenu(a){
     <button class="btn" data-a="quarantine">🧺 Прежние копии (карантин)${a.quarantines?` — ${a.quarantines}`:''}</button>
     <button class="btn" data-a="logout" title="Сотрудник, вошедший в интерфейс по паролю этого ящика, будет разлогинен">🚪 Завершить сеансы сотрудника</button>
     <button class="btn" data-a="hold" title="Пока действует удержание, письма ящика не удаляются по сроку хранения">🔒 Удержание архива${a.on_hold?' (до '+esc(holdDate(a.hold_until))+')':''}</button>
+    ${axFeature()?'<button class="btn" data-a="axigen" title="Учётная запись этого ящика на сервере Axigen: вход, квота, действия">📮 На сервере Axigen</button>':''}
     <button class="btn danger" data-a="del" ${a.on_hold?'disabled title="Архив удерживается — удалить ящик нельзя"':''}>🗑️ Удалить ящик</button>
     <button class="btn danger" data-a="purge" ${a.on_hold?'disabled title="Архив удерживается — удалить нельзя"':''}>🧹 Удалить ящик вместе с архивом писем</button>
   </div>`);
@@ -1671,6 +1691,7 @@ function accountMenu(a){
     else if(act==='rebuild') rebuildModal(a);
     else if(act==='quarantine') quarantineModal(a);
     else if(act==='hold') holdModal(a);
+    else if(act==='axigen') axigenForMailbox(a);
     else if(act==='purge') purgeModal(a);
     else if(act==='logout'){ try{ const r=await api(`/accounts/${a.id}/logout-sessions`,{method:'POST'}); toast('Готово', r.closed?`Завершено сеансов: ${r.closed}`:'Открытых сеансов не было'); }catch(e){toastErr(e);} }
     else if(act==='verify'){ try{await api(`/accounts/${a.id}/verify`,{method:'POST'}); toast('Запущено','Проверка целостности в очереди'); location.hash='#/jobs';}catch(e){toastErr(e);} }
@@ -2205,10 +2226,13 @@ async function accountModal(id){
       <div class="form-row"><label>Способ входа ${H('auth_type')}</label><select id="f-auth">
         <option value="password"${a.auth_type==='password'?' selected':''}>Логин и пароль</option>
         <option value="oauth2"${a.auth_type==='oauth2'?' selected':''}>OAuth2 (Gmail / Microsoft 365)</option>
-        <option value="master"${a.auth_type==='master'?' selected':''}>Через администратора почты (без пароля ящика)</option></select></div>
+        <option value="master"${a.auth_type==='master'?' selected':''}>Через администратора почты (без пароля ящика)</option>
+        ${(a.auth_type==='axigen_ftp'||((State.user||{}).features||{}).axigen)?`<option value="axigen_ftp"${a.auth_type==='axigen_ftp'?' selected':''}>Через FTP Backup Axigen (без пароля ящика)</option>`:''}</select></div>
     </div>
     <div class="form-row"><label>Логин ${H('username')}</label><input id="f-user" type="text" value="${esc(a.username)}" placeholder="user@example.ru"></div>
-    <div class="form-row" id="pwrow" style="display:${a.auth_type==='password'?'block':'none'}"><label>Пароль ${H('password')}</label><input id="f-pass" type="password" placeholder="${id?'оставьте пустым, чтобы не менять':'пароль или пароль приложения'}"></div>
+    <div class="hint" id="axftpHint" style="display:${a.auth_type==='axigen_ftp'?'block':'none'};margin-bottom:8px">Письма берёт администратор Axigen через службу FTP Backup («Настройки → Сервер Axigen») — пароль сотрудника не нужен. Логин — полный адрес. Пароль ниже необязателен: он нужен только для восстановления по IMAP и входа сотрудника в архив.</div>
+    <div class="form-row" id="pwrow" style="display:${(a.auth_type==='password'||a.auth_type==='axigen_ftp')?'block':'none'}"><label>Пароль ${H('password')}</label><input id="f-pass" type="password" placeholder="${id?'оставьте пустым, чтобы не менять':(a.auth_type==='axigen_ftp'?'необязательно':'пароль или пароль приложения')}"></div>
+    <div id="axBox"></div>
     <div id="oauthBox" style="display:${a.auth_type==='oauth2'?'block':'none'}">
       <div class="form-row"><label>OAuth2 Client ID ${H('oauth_client_id')}</label><input id="f-ocid" type="text" value="${esc(a.oauth_client_id||'')}"></div>
       <div class="form-row"><label>OAuth2 Client Secret ${H('oauth_client_secret')}</label><input id="f-ocs" type="password" placeholder="${id?'без изменений':''}"></div>
@@ -2230,7 +2254,8 @@ async function accountModal(id){
   const m=modal(id?'Редактирование ящика':'Новый почтовый ящик', body, {wide:true,
     footer:`<button class="btn ghost" data-c>Отмена</button><button class="btn" data-test>Проверить подключение</button><button class="btn primary" data-save>Сохранить</button>`});
   const g=(x)=>m.body.querySelector(x);
-  g('#f-auth').onchange=()=>{ const v=g('#f-auth').value; m.body.querySelector('#oauthBox').style.display=v==='oauth2'?'block':'none'; m.body.querySelector('#pwrow').style.display=v==='password'?'block':'none'; };
+  g('#f-auth').onchange=()=>{ const v=g('#f-auth').value; m.body.querySelector('#oauthBox').style.display=v==='oauth2'?'block':'none'; m.body.querySelector('#pwrow').style.display=(v==='password'||v==='axigen_ftp')?'block':'none'; m.body.querySelector('#axftpHint').style.display=v==='axigen_ftp'?'block':'none'; };
+  if(id && ((State.user||{}).features||{}).axigen) axigenMailboxInfo(id, g('#axBox'));
   const collect=()=>({name:g('#f-name').value,host:g('#f-host').value,port:parseInt(g('#f-port').value||'993'),username:g('#f-user').value,
      password:g('#f-pass').value,security:g('#f-sec').value,auth_type:g('#f-auth').value,enabled:g('#f-en').checked,
      folder_exclude:g('#f-exc').value.split(',').map(s=>s.trim()).filter(Boolean),
@@ -2402,6 +2427,10 @@ async function restoreModal(a){
     <div class="form-row" id="r-prefixrow"><label>Префикс папки ${H('target_prefix')}</label><input id="r-prefix" type="text" value="Восстановлено"></div>
     <div class="form-row" id="r-singlerow" style="display:none"><label>Имя папки</label><input id="r-single" type="text" value="Восстановлено"></div>
     <div class="form-row"><label>Только папки (пусто = все)</label><input id="r-folders" type="text" placeholder="INBOX"></div>
+    ${a.auth_type==='axigen_ftp'?`<div class="form-row"><label>Как заливать</label><select id="r-via">
+      <option value="ftp"${a.imap_login?'':' selected'}>Через FTP Backup Axigen — без пароля ящика (без отметок «прочитано» и «важное»)</option>
+      <option value="imap"${a.imap_login?' selected':''}${a.imap_login?'':' disabled'}>По IMAP с паролем ящика${a.imap_login?'':' — пароль не задан'}</option></select>
+      <div class="hint">Через FTP Backup письма заливает администратор Axigen: нужно «Разрешить изменения на сервере» в настройках Axigen. В конце MailArchiver проверяет, что сервер показывает залитые письма.</div></div>`:''}
     <div class="grid cols-2">
       <div class="form-row check"><span class="switch"><input type="checkbox" id="r-dup" checked><span class="track"></span></span><label>Пропускать дубли ${H('check_duplicates')}</label></div>
       <div class="form-row check"><span class="switch"><input type="checkbox" id="r-dry"><span class="track"></span></span><label>Пробный прогон ${H('dry_run')}</label></div>
@@ -2416,6 +2445,7 @@ async function restoreModal(a){
       check_duplicates:g('#r-dup').checked,dry_run:g('#r-dry').checked,
       folders:g('#r-folders').value.split(',').map(s=>s.trim()).filter(Boolean)};
     if(!body.folders.length) body.folders=null;
+    if(g('#r-via')) body.via=g('#r-via').value;
     // Пустой префикс/имя папки — это НЕ «в исходные папки»: раньше очистка
     // поля молча заливала архив прямо в рабочий INBOX. Сервер такое тоже
     // отклоняет, здесь — понятное сообщение до отправки.
@@ -2691,7 +2721,10 @@ const RESULT_LBL={summary:'Итог', final_status:'Статус итога', to
   not_mail:'Не письма (контакты, календарь…) — пропущено', outdated:'Старше срока хранения — не записано',
   lossy:'Перенесено с потерями', damaged_blocks:'Блоков файла с неверной контрольной суммой',
   target:'Куда (imap — сервер, local — локальная копия)', engine:'Способ разбора файла',
-  source:'Откуда файл (upload — загружен через интерфейс, server — каталог импорта на сервере)'};
+  source:'Откуда файл (upload — загружен через интерфейс, server — каталог импорта на сервере)',
+  domains:'Доменов прочитано', accounts:'Учётных записей', new:'Новых учётных записей', gone:'Удалено на сервере',
+  added:'Заведено ящиков в архиве', incomplete:'Прочитаны не полностью', commands:'Команд CLI',
+  messages_recognized:'Уже были в архиве — не записаны', other_files:'Файлов, не похожих на письма'};
 const RESULT_BYTES=new Set(['bytes','bytes_new','freed','size']);
 
 async function jobDetails(id){
@@ -2703,7 +2736,8 @@ async function jobDetails(id){
   const LISTS=new Set(['skipped_folders','items','skip_reasons','problems','rebuild_info','hosts_down','not_reached','final_status']);
   // Нули «частично / пропущено / не успели» ничего не говорят — не загромождаем ими итог.
   const HIDE_ZERO=new Set(['partial','skipped','left','messages_relinked','messages_outside_retention','messages_lost',
-                           'duplicates','not_mail','outdated','lossy','damaged_blocks']);
+                           'duplicates','not_mail','outdated','lossy','damaged_blocks','messages_recognized','other_files',
+                           'incomplete','added','gone']);
   const notReached=(j.result&&Array.isArray(j.result.not_reached))?j.result.not_reached:[];
   const resEntries=j.result?Object.entries(j.result).filter(([k,v])=>!LISTS.has(k) && !(HIDE_ZERO.has(k) && v===0)):[];
   const items=(j.result&&Array.isArray(j.result.items))?j.result.items:[];
@@ -3014,6 +3048,10 @@ const ENUM_OPTS = {
   'replica.target':[['dir','Сетевая папка или диск'],['rsync','Другой сервер по SSH (rsync)'],['s3','S3-хранилище']],
   'mailadmin.mode':[['sasl_plain','SASL PLAIN с authzid (стандарт)'],['separator','Логин с разделителем (ящик*админ)']],
   'employees.dismissed_action':[['final_backup_disable','Последняя копия и выключить копирование'],['keep','Продолжать копировать']],
+  'axigen.cli_tls':[['none','Без шифрования (только эта же машина)'],['tls','SSL-слушатель CLI']],
+  'axigen.ftp_tls':[['none','Без шифрования (только эта же машина)'],['implicit','TLS сразу (SSL-слушатель, implicit)'],['explicit','AUTH TLS на обычном порту (explicit)']],
+  'axigen.ftp_name_encoding':[['auto','Определять'],['utf7','UTF-7 (по умолчанию у Axigen)'],['utf8','UTF-8']],
+  'axigen.new_mailbox_auth':[['axigen_ftp','Через FTP Backup (без пароля)'],['password','По IMAP с паролем']],
 };
 // Параметры, которые имеют смысл не всегда: показываем только когда включено то,
 // от чего они зависят. Иначе в разделе «Сотрудники» рядом стоят путь к файлу и
@@ -3068,11 +3106,19 @@ const SETTING_DEPS = {
   'notifications.summary_enabled': v=>!!v['notifications.enabled'],
   'notifications.summary_cron':  v=>!!v['notifications.enabled'] && !!v['notifications.summary_enabled'],
   'employees.account_use_master':  v=>!!v['employees.create_accounts'],
+  'employees.account_use_axigen_ftp': v=>!!v['employees.create_accounts'],
   'mailadmin.host':      v=>!!v['mailadmin.enabled'],
   'mailadmin.user':      v=>!!v['mailadmin.enabled'],
   'mailadmin.password':  v=>!!v['mailadmin.enabled'],
   'mailadmin.mode':      v=>!!v['mailadmin.enabled'],
   'mailadmin.separator': v=>!!v['mailadmin.enabled'] && v['mailadmin.mode']==='separator',
+  'axigen.sync_cron':     v=>!!v['axigen.enabled'] && !!v['axigen.sync_enabled'],
+  'axigen.alert_queue':   v=>!!v['axigen.enabled'] && !!v['axigen.monitor_enabled'],
+  'axigen.alert_license_days': v=>!!v['axigen.enabled'] && !!v['axigen.monitor_enabled'],
+  'axigen.alert_quota_percent': v=>!!v['axigen.enabled'] && !!v['axigen.monitor_enabled'],
+  'axigen.cli_cert_sha256': v=>!!v['axigen.enabled'] && v['axigen.cli_tls']==='tls',
+  'axigen.ftp_cert_sha256': v=>!!v['axigen.enabled'] && v['axigen.ftp_tls']!=='none',
+  'axigen.tls_verify':      v=>!!v['axigen.enabled'] && (v['axigen.cli_tls']==='tls' || v['axigen.ftp_tls']!=='none'),
   'monitoring.metrics_token':    v=>!!v['monitoring.metrics_enabled'],
   'monitoring.metrics_allowed_ips': v=>!!v['monitoring.metrics_enabled'],
   'monitoring.per_account_metrics': v=>!!v['monitoring.metrics_enabled'],
@@ -3091,6 +3137,11 @@ async function viewSettings(c){
       let show=true; try{ show=test(cur); }catch(e){}
       row.style.display = show ? '' : 'none';
     }); };
+  // Раздел Axigen: всё, кроме переключателя, показываем только когда он включён.
+  data.sections.filter(sec=>sec.section==='axigen').forEach(sec=>sec.keys.forEach(k=>{
+    const full='axigen.'+k; if(k==='enabled' || SETTING_DEPS[full]) return;
+    SETTING_DEPS[full]=v=>!!v['axigen.enabled'];
+  }));
   data.sections.forEach(sec=>{
     const card=h(`<div class="card" style="margin-bottom:16px"><h3>${sec.icon||''} ${esc(sec.title)}</h3><div class="settings-grid"></div></div>`);
     const grid=card.querySelector('.settings-grid');
@@ -3132,6 +3183,7 @@ async function viewSettings(c){
     if(sec.section==='monitoring') monitoringCard(card, rows, set, data.secrets_set||{});
     if(sec.section==='mailadmin') mailadminCard(card, ()=>Object.keys(changed).some(k=>k.startsWith('mailadmin.')));
     if(sec.section==='search') searchCard(card);
+    if(sec.section==='axigen') axigenSettingsCard(card, ()=>Object.keys(changed).some(k=>k.startsWith('axigen.')));
   });
   applyDeps();
   // grid layout
@@ -3142,7 +3194,12 @@ async function viewSettings(c){
       const r=await api('/settings',{method:'PUT',body:{values:changed}});
       toast('Сохранено', `Изменено параметров: ${r.changed.length}`);
       if(r.notice) toast('Важно', r.notice, 'warn', 15000);
-      if(Object.keys(changed).some(k=>k.startsWith('storage.'))) route();
+      if('axigen.enabled' in changed && State.user){ State.user.features=Object.assign({}, State.user.features, {axigen:!!changed['axigen.enabled']}); State.bulkActions=null; renderNav(); }
+      if(Object.keys(changed).some(k=>k.startsWith('axigen.'))) State.bulkActions=null;
+      const storageChanged=Object.keys(changed).some(k=>k.startsWith('storage.'));
+      // сохранённое больше не «несохранённое»: кнопки проверки в карточках снова доступны
+      Object.keys(changed).forEach(k=>delete changed[k]);
+      if(storageChanged) route();
     }catch(e){toastErr(e);}
   };
 }
@@ -3736,7 +3793,7 @@ async function loadMailMessage(accId, pk){
 // ===================================================================
 const CHART_COLORS = ['#2f6fed','#1f9d55','#d98a00','#d64545','#2b8ca6','#7c5cff','#e0567f','#2bb0a6','#b0862e','#8e6bd8','#3aa0a0','#c76b3a'];
 const STATUS_LBL = {queued:'в очереди',running:'выполняется',success:'успешно',failed:'ошибка',cancelled:'отменено',partial:'частично'};
-const JOBLBL = {backup:'Резервное копирование',restore:'Восстановление',export:'Экспорт',import_pst:'Импорт PST',test:'Проверка подключения',retention:'Очистка (ретеншн)',verify:'Проверка целостности',analyze:'Глубокий анализ писем',sync_employees:'Синхронизация сотрудников',storage_convert:'Шифрование копии',check_logins:'Проверка паролей',replicate:'Копия вне сервера',db_snapshot:'Снимок базы',search_index:'Индексация поиска',dedup_report:'Отчёт об одинаковых вложениях',cleanup:'Удаление архивов и прежних копий',backup_all:'Копирование всех ящиков по очереди',quarantine_check:'Сравнение прежней копии с новой',quarantine_rescue:'Возврат писем из прежней копии',folders_check:'Проверка папок на сервере',search_reindex:'Переиндексация поиска'};
+const JOBLBL = {backup:'Резервное копирование',restore:'Восстановление',export:'Экспорт',import_pst:'Импорт PST',test:'Проверка подключения',retention:'Очистка (ретеншн)',verify:'Проверка целостности',analyze:'Глубокий анализ писем',sync_employees:'Синхронизация сотрудников',storage_convert:'Шифрование копии',check_logins:'Проверка паролей',replicate:'Копия вне сервера',db_snapshot:'Снимок базы',search_index:'Индексация поиска',dedup_report:'Отчёт об одинаковых вложениях',cleanup:'Удаление архивов и прежних копий',backup_all:'Копирование всех ящиков по очереди',quarantine_check:'Сравнение прежней копии с новой',quarantine_rescue:'Возврат писем из прежней копии',folders_check:'Проверка папок на сервере',search_reindex:'Переиндексация поиска',axigen_sync:'Сверка с сервером Axigen',axigen_action:'Действия на сервере Axigen'};
 function cvar(n,f){ const v=getComputedStyle(document.documentElement).getPropertyValue(n).trim(); return v||f; }
 function fmtNum(n){ return Number(n||0).toLocaleString('ru-RU'); }
 function trunc(s,n){ s=String(s==null?'':s); return s.length>n? s.slice(0,n-1)+'…':s; }
@@ -4215,3 +4272,513 @@ function renderDeep(wrap, dp, redraws){
 
 // ---------- Старт ----------
 boot();
+
+// ===================================================================
+//  Сервер Axigen
+// ===================================================================
+const Ax = { filter:'', query:'', sel:new Set(), logKind:'people', shown:200 };
+const AX_TABS = [['overview','📊 Обзор'],['accounts','👤 Учётные записи'],['queue','📨 Очередь'],['log','📜 Журнал команд'],['console','⌨️ Консоль'],['diag','🩺 Диагностика']];
+const AX_KIND = {read:'чтение', write:'изменение', console:'консоль', check:'проверка', monitor:'плановая проверка', error:'ошибка'};
+const AX_COPY = {axigen_ftp:'FTP Backup', password:'IMAP, пароль', master:'IMAP, администратор', oauth2:'OAuth2'};
+const AX_INACTIVE_DAYS = 90;
+
+/** «10.6.30|Linux|x86_64» → «10.6.30 · Linux · x86_64». */
+function axVersion(v){ return String(v||'').split('|').map(x=>x.trim()).filter(Boolean).join(' · '); }
+const AX_FIELD_LBL={licensetype:'Тип лицензии', type:'Тип лицензии', edition:'Редакция', expirationdate:'Действует до', expirydate:'Действует до', expires:'Действует до', validuntil:'Действует до', maxaccounts:'Учётных записей не больше', maxdomains:'Доменов не больше', maxmailboxes:'Ящиков не больше', totalsize:'всего', usedsize:'занято', accounts:'учётных записей', status:'состояние'};
+function axFieldLbl(k){ const key=String(k||'').toLowerCase().replace(/[\s_\-]+/g,''); return AX_FIELD_LBL[key]||k; }
+function axFeature(){ return !!(((State.user||{}).features||{}).axigen); }
+function axDaysSince(iso){ if(!iso) return null; const t=Date.parse(iso); return isNaN(t)?null:Math.floor((Date.now()-t)/86400000); }
+function axLoginTag(r){
+  if(r.deleted_at) return '<span class="tag err">удалена на сервере</span>';
+  if(r.login_blocked===true) return `<span class="tag warn" title="${esc(r.blocked_at?'Закрыт '+fmtDate(r.blocked_at)+(r.blocked_by?' ('+r.blocked_by+')':''):'Нет служб входа')}">🔒 вход закрыт</span>`;
+  if(r.login_blocked===false) return '<span class="tag ok">вход открыт</span>';
+  return '<span class="tag">неизвестно</span>';
+}
+function axQuotaCell(r){
+  if(r.used_bytes==null && !r.quota_kb) return '<span class="muted">—</span>';
+  const used=r.used_bytes!=null?fmtBytes(r.used_bytes):'?';
+  if(!r.quota_kb) return `${esc(used)} <span class="muted small">без квоты</span>`;
+  const pct=r.quota_percent; const cls=pct>=90?'err':(pct>=75?'warn':'ok');
+  return `<div class="small">${esc(used)} из ${esc(fmtBytes(r.quota_kb*1024))}${pct!=null?` <span class="tag ${cls}">${pct}%</span>`:''}</div>
+    ${pct!=null?`<div class="progress" style="height:5px;margin-top:3px"><span style="width:${Math.min(100,pct)}%"></span></div>`:''}`;
+}
+function axMailboxCell(r){
+  const b=r.mailbox;
+  if(!b) return '<span class="tag warn">нет в архиве</span>';
+  const how=AX_COPY[b.auth_type]||b.auth_type;
+  return `<b>${esc(b.name)}</b>${b.enabled?'':' <span class="tag">выключен</span>'}
+    <div class="small muted">${esc(how)}${b.same_server?'':' · другой сервер: '+esc(b.host)} · писем ${fmtNum(b.messages)} · ${b.last_backup_at?'копия '+esc(fmtDate(b.last_backup_at)):'копий не было'}</div>`;
+}
+function axMatches(r, f, q){
+  const pctLimit=90;
+  if(f==='nomailbox' && (r.mailbox || r.deleted_at)) return false;
+  if(f==='archived' && !r.mailbox) return false;
+  if(f==='blocked' && !(r.login_blocked===true && !r.deleted_at)) return false;
+  if(f==='quota' && !(r.quota_percent!=null && r.quota_percent>=pctLimit)) return false;
+  if(f==='inactive'){ const d=axDaysSince(r.last_login); if(r.deleted_at || d==null || d<AX_INACTIVE_DAYS) return false; }
+  if(f==='deleted' && !r.deleted_at) return false;
+  if(f==='errors' && !r.errors) return false;
+  if(!f && r.deleted_at && !r.mailbox) return false;      // удалённые без архива — только в своём отборе
+  q=(q||'').trim().toLowerCase();
+  if(!q) return true;
+  return [r.email, r.first_name, r.last_name, (r.aliases||[]).join(' '), r.mailbox&&r.mailbox.name].some(v=>String(v||'').toLowerCase().includes(q));
+}
+
+async function viewAxigen(c){
+  const tab=((location.hash.match(/[?&]tab=(\w+)/)||[])[1])||'overview';
+  const st=await api('/axigen/status');
+  c.innerHTML='';
+  const s=st.status||{};
+  const stateTag = !st.configured ? '<span class="tag warn">не настроен</span>'
+    : (s.checked_at ? (s.ok?`<span class="tag ok" title="Проверен ${esc(fmtDate(s.checked_at))}">● доступен</span>`:`<span class="tag err" title="${esc(s.error||'')}">● недоступен</span>`) : '<span class="tag">не проверялся</span>');
+  c.appendChild(h(`<div class="section-title"><h2 style="margin:0">Сервер Axigen</h2>
+    ${st.settings.host?`<span class="tag mono">${esc(st.settings.host)}</span>`:''} ${stateTag}
+    ${s.version?`<span class="tag" title="Версия Axigen">${esc(axVersion(s.version))}</span>`:''}
+    <div class="spacer"></div>
+    <button class="btn sm" id="axCheck" title="Проверить CLI и FTP Backup по сохранённым настройкам">🔌 Проверить подключение</button>
+    <button class="btn sm" id="axRefresh" title="Прочитать версию, лицензию, домены и очередь сейчас">🔄 Обновить состояние</button>
+    <button class="btn sm primary" id="axSync" ${st.sync_running?'disabled':''} title="Прочитать учётные записи сервера и сверить с архивом">${st.sync_running?'<span class="spinner"></span> Сверка идёт…':'🔁 Сверить учётные записи'}</button>
+    <a class="btn sm ghost" href="#/settings" title="Настройки → Сервер Axigen">⚙️</a></div>`));
+  if(!st.enabled){
+    c.appendChild(h(`<div class="card empty"><div class="big">📮</div><div>Работа с сервером Axigen выключена.</div>
+      <div class="small muted" style="margin:6px 0 12px">Включите её и заполните адрес и администратора в «Настройки → Сервер Axigen».</div>
+      <a class="btn primary" href="#/settings">Открыть настройки</a></div>`));
+    return;
+  }
+  const on=(sel, fn)=>{ const el=$(sel,c); if(el) el.onclick=fn; };
+  on('#axCheck', ()=>axigenCheckModal());
+  on('#axRefresh', async(ev)=>{ const b=ev.currentTarget; b.disabled=true; b.innerHTML='<span class="spinner"></span> Читаем…';
+    try{ const r=await api('/axigen/refresh',{method:'POST'}); toast(r.status.ok?'Состояние обновлено':'Сервер не ответил', r.status.ok?'':(r.status.error||''), r.status.ok?'success':'error', 7000); route(); }
+    catch(e){ toastErr(e); b.disabled=false; b.textContent='🔄 Обновить состояние'; } });
+  on('#axSync', async(ev)=>{ const b=ev.currentTarget; b.disabled=true;
+    try{ const r=await api('/axigen/sync',{method:'POST'}); toast(r.already?'Сверка уже идёт':'Сверка запущена', `Задание №${r.job_id}`); axWatchJob(r.job_id); route(); }
+    catch(e){ toastErr(e); b.disabled=false; } });
+  if(!st.configured){
+    c.appendChild(h(`<div class="hint warnbox">Не заданы адрес сервера, логин или пароль администратора Axigen — заполните «Настройки → Сервер Axigen» и сохраните.</div>`));
+  }
+  if((st.problems||[]).length){
+    const bad=st.problems.some(p=>p.level==='error');
+    c.appendChild(h(`<div class="card" style="margin-bottom:16px;border-color:var(--${bad?'danger':'warn'})">
+      <div class="section-title"><h3>⚠️ Требует внимания</h3></div>
+      <ul style="margin:0;padding-left:18px">${st.problems.map(p=>`<li${p.level==='error'?' style="color:var(--danger)"':''}>${esc(p.text)}</li>`).join('')}</ul></div>`));
+  }
+  c.appendChild(h(`<div class="tabs" role="tablist">${AX_TABS.map(([k,t])=>`<a href="#/axigen?tab=${k}" class="${k===tab?'active':''}" role="tab">${t}</a>`).join('')}</div>`));
+  const body=h('<div></div>'); c.appendChild(body);
+  const views={overview:axOverview, accounts:axAccounts, queue:axQueue, log:axLog, console:axConsole, diag:axDiag};
+  await (views[tab]||axOverview)(body, st);
+}
+
+/** Следить за заданием сверки и перерисовать раздел, когда оно закончится. */
+function axWatchJob(jobId){
+  let n=0;
+  const tick=async()=>{
+    n++;
+    try{ const j=await api(`/jobs/${jobId}`,{bg:true});
+      if(['success','partial','failed','cancelled'].includes(j.status)){
+        toast(j.status==='failed'?'Сверка не удалась':'Сверка закончена', (j.result&&j.result.summary)||j.error||'', j.status==='failed'?'error':'success', 8000);
+        if(State.view==='axigen') route(); return; }
+    }catch(e){ return; }
+    if(n<240) setTimeout(tick, 3000);
+  };
+  setTimeout(tick, 2500);
+}
+
+async function axOverview(box, st){
+  let data={accounts:[], orphans:[]};
+  try{ data=await api('/axigen/accounts'); }catch(e){}
+  const s=st.status||{}, live=data.accounts.filter(r=>!r.deleted_at);
+  const archived=live.filter(r=>r.mailbox).length, lic=s.license||{};
+  const days=lic.expires?Math.floor((Date.parse(lic.expires+'T00:00:00')-Date.now())/86400000):null;
+  const kpi=(label, value, sub, cls='')=>`<div class="kpi ${cls}"><div class="k-label">${label}</div><div class="k-value">${value}</div><div class="k-sub">${sub}</div></div>`;
+  box.appendChild(h(`<div class="grid cols-4" style="margin-bottom:16px">
+    ${kpi('👤 Учётных записей', fmtNum(live.length), `доменов: ${fmtNum(st.counts.domains)}${st.last_sync?'':' · сверки ещё не было'}`, 'accent')}
+    ${kpi('🗄️ В архиве', fmtNum(archived), live.length?`без копии: ${fmtNum(live.length-archived)}`:'—')}
+    ${kpi('🔒 Вход закрыт', fmtNum(st.counts.blocked), `удалены на сервере: ${fmtNum(st.counts.deleted)}`)}
+    ${kpi('📨 Очередь', s.queue!=null?fmtNum(s.queue):'—', lic.expires?`лицензия до ${esc(fmtDay(lic.expires+'T00:00:00'))}${days!=null?' ('+(days<0?'истекла':days+' дн.')+')':''}`:'лицензия: нет сведений')}
+  </div>`));
+  const grid=h('<div class="grid cols-2"></div>'); box.appendChild(grid);
+  const doms=(s.domains||[]).map(d=>`<tr><td><b>${esc(d.name)}</b></td><td class="small muted">${Object.entries(d.fields||{}).map(([k,v])=>esc(axFieldLbl(k))+': '+esc(v)).join(' · ')}</td></tr>`).join('');
+  const licRows=Object.entries(s.license_raw||{}).slice(0,12).map(([k,v])=>`<div class="kv"><span class="k">${esc(axFieldLbl(k))}</span><span>${esc(v)}</span></div>`).join('');
+  grid.appendChild(h(`<div class="card"><div class="section-title"><h3>🖥️ Сервер</h3><div class="spacer"></div><span class="small muted">${s.checked_at?'проверен '+esc(fmtDate(s.checked_at)):'не проверялся'}</span></div>
+    ${s.checked_at&&!s.ok?`<div class="hint warnbox">⚠️ ${esc(s.error||'нет ответа')}${s.hint?'<br><span class="small">'+esc(s.hint)+'</span>':''}</div>`:''}
+    <div class="kv"><span class="k">Версия</span><span>${esc(axVersion(s.version)||'—')}</span></div>
+    ${licRows||'<div class="muted small">Сведений о лицензии нет — нажмите «Обновить состояние».</div>'}
+    ${(s.warnings||[]).length?`<div class="hint" style="margin-top:8px">Не прочитано: ${esc(s.warnings.join('; '))}</div>`:''}
+    ${doms?`<h4 style="margin:14px 0 6px">Домены</h4><div class="table-wrap"><table class="tbl"><tbody>${doms}</tbody></table></div>`:''}</div>`));
+  const set=st.settings, ls=st.last_sync;
+  grid.appendChild(h(`<div class="card"><div class="section-title"><h3>🔁 Сверка и доступ</h3></div>
+    <div class="kv"><span class="k">Последняя сверка</span><span>${ls?`${esc(fmtDate(ls.finished_at))} — <span class="badge ${esc(ls.status)}">${esc(STATUS_LBL[ls.status]||ls.status)}</span> <a href="javascript:void(0)" data-job="${ls.job_id}" class="small">задание №${ls.job_id}</a><div class="small muted">${esc(ls.summary||'')}</div>`:'не было'}</span></div>
+    <div class="kv"><span class="k">По расписанию</span><span>${set.sync_enabled?`да, <span class="mono">${esc(set.sync_cron||'')}</span> (${esc(cronHuman(set.sync_cron||''))})`:'нет'}</span></div>
+    <div class="kv"><span class="k">Слежение за сервером</span><span>${set.monitor_enabled?'каждые 15 минут':'выключено'}</span></div>
+    <div class="kv"><span class="k">CLI</span><span>${esc(set.host)}:${set.cli_port} · ${set.cli_tls==='tls'?'SSL'+(set.cli_cert?' · сертификат по отпечатку':''):(set.loopback?'без шифрования (эта же машина)':(set.allow_plaintext?'<span class="tag err">без шифрования</span>':'<span class="tag warn">нужен SSL</span>'))}</span></div>
+    <div class="kv"><span class="k">FTP Backup</span><span>${esc(set.host)}:${set.ftp_port} · ${set.ftp_tls==='none'?(set.loopback?'без шифрования (эта же машина)':(set.allow_plaintext?'<span class="tag err">без шифрования</span>':'<span class="tag warn">нужен TLS</span>')):(set.ftp_tls==='implicit'?'TLS сразу':'AUTH TLS')+(set.ftp_cert?' · сертификат по отпечатку':'')}</span></div>
+    <div class="kv"><span class="k">Домены</span><span>${(set.domains||[]).length?esc(set.domains.join(', ')):'все'}</span></div>
+    <div class="kv"><span class="k">Изменения на сервере</span><span>${set.allow_changes?'<span class="tag warn">разрешены</span> (по кнопке, с проверкой и журналом)':'<span class="tag">только чтение</span>'}</span></div>
+    ${data.orphans.length?`<div class="hint warnbox" style="margin-top:10px">Ящиков архива этого сервера, которых нет среди учётных записей: <b>${fmtNum(data.orphans.length)}</b> — ${esc(data.orphans.slice(0,5).map(o=>o.name).join(', '))}${data.orphans.length>5?' …':''}. <a href="#/axigen?tab=accounts" data-orph>Показать</a></div>`:''}</div>`));
+  grid.querySelectorAll('[data-job]').forEach(a=>a.onclick=()=>jobDetails(parseInt(a.dataset.job,10)));
+  const orph=grid.querySelector('[data-orph]'); if(orph) orph.onclick=()=>{ Ax.filter='orphans'; };
+}
+
+async function axAccounts(box, st){
+  const data=await api('/axigen/accounts');
+  const rows=data.accounts;
+  const byEmail=new Map(rows.map(r=>[r.email, r]));
+  Ax.sel.forEach(e=>{ if(!byEmail.has(e)) Ax.sel.delete(e); });
+  const count=f=>rows.filter(r=>axMatches(r,f,'')).length;
+  const chips=[['', 'Все'],['nomailbox','Без копии в архиве'],['archived','Копируются'],['blocked','Вход закрыт'],['quota','У предела квоты'],
+    ['inactive',`Не входили ${AX_INACTIVE_DAYS}+ дн.`],['deleted','Удалены на сервере'],['errors','Прочитаны не полностью']];
+  const top=h(`<div>
+    <div class="btn-row" style="margin-bottom:10px;flex-wrap:wrap;gap:6px" data-chips>
+      ${chips.map(([f,t])=>`<button class="chip ${Ax.filter===f?'active':''}" data-f="${f}">${t} (${fmtNum(count(f))})</button>`).join('')}
+      <button class="chip ${Ax.filter==='orphans'?'active':''}" data-f="orphans" title="Ящики архива с адресом этого сервера, которых нет среди учётных записей">Нет на сервере (${fmtNum(data.orphans.length)})</button></div>
+    <div class="an-toolbar" style="margin-bottom:10px;flex-wrap:wrap">
+      <input type="text" id="axQ" placeholder="Поиск: адрес, ФИО, псевдоним" value="${esc(Ax.query)}" style="flex:1 1 260px;min-width:200px">
+      <button class="btn sm" id="axAdd" title="Завести в архиве ящики для отмеченных учётных записей (на сервере ничего не меняется)">📥 Завести ящики в архиве</button>
+      <button class="btn sm" id="axAct" title="Действие с ящиками отмеченных учётных записей: проверка, затем выполнение">🧰 Действие…</button>
+      ${st.settings.allow_changes?'<button class="btn sm" id="axNew">➕ Создать учётную запись</button>':''}
+      <button class="btn sm ghost" id="axXls" title="Учётные записи и их ящики в архиве — файлом Excel">📊 Excel</button>
+    </div>
+    <div class="small muted" id="axSelInfo" style="margin-bottom:6px"></div></div>`);
+  box.appendChild(top);
+  const wrap=h('<div class="card table-wrap"></div>'); box.appendChild(wrap);
+  const selInfo=$('#axSelInfo', top);
+  const visible=()=>Ax.filter==='orphans'?[]:rows.filter(r=>axMatches(r, Ax.filter, Ax.query));
+  const draw=()=>{
+    if(Ax.filter==='orphans'){
+      wrap.innerHTML=data.orphans.length?`<table class="tbl"><thead><tr><th>Ящик архива</th><th>Логин</th><th>Копирование</th><th></th></tr></thead><tbody>${data.orphans.map(o=>`<tr><td><b>${esc(o.name)}</b></td><td class="mono small">${esc(o.username)}</td><td>${o.enabled?'<span class="tag ok">включено</span>':'<span class="tag">выключено</span>'}</td><td><button class="btn sm" data-open="${o.id}">Открыть</button></td></tr>`).join('')}</tbody></table>
+        <div class="hint" style="margin:8px">Такого адреса нет среди учётных записей последней сверки: ящик удалён на сервере до первой сверки, логин записан иначе (псевдоним, другой регистр, без домена) или домен не входит в «Домены» настроек.</div>`:'<div class="empty">Все ящики архива этого сервера нашлись среди учётных записей.</div>';
+      wrap.querySelectorAll('[data-open]').forEach(b=>b.onclick=()=>accountModal(parseInt(b.dataset.open,10)));
+      selInfo.textContent=''; return;
+    }
+    const list=visible();
+    const shown=list.slice(0, Ax.shown);
+    const allSel=shown.length && shown.every(r=>Ax.sel.has(r.email));
+    wrap.innerHTML=list.length?`<table class="tbl"><thead><tr><th style="width:28px"><input type="checkbox" data-all ${allSel?'checked':''}></th><th>Учётная запись</th><th>Вход</th><th>Место на сервере</th><th>Последний вход</th><th>В архиве</th></tr></thead><tbody>
+      ${shown.map(r=>{ const d=axDaysSince(r.last_login);
+        return `<tr data-row="${esc(r.email)}" style="cursor:pointer">
+        <td data-cb><input type="checkbox" data-sel="${esc(r.email)}" ${Ax.sel.has(r.email)?'checked':''}></td>
+        <td><b>${esc(r.email)}</b>${r.errors?' <span class="tag warn" title="'+esc(r.errors)+'">не всё прочитано</span>':''}<div class="small muted">${esc([[r.first_name,r.last_name].filter(Boolean).join(' '), (r.aliases||[]).length?'псевдонимы: '+r.aliases.join(', '):''].filter(Boolean).join(' · ')||'—')}</div></td>
+        <td>${axLoginTag(r)}</td><td style="min-width:150px">${axQuotaCell(r)}</td>
+        <td class="small">${r.last_login?esc(fmtDay(r.last_login))+(d!=null&&d>=AX_INACTIVE_DAYS?` <span class="tag warn">${d} дн.</span>`:''):'<span class="muted">—</span>'}</td>
+        <td>${axMailboxCell(r)}</td></tr>`; }).join('')}</tbody></table>
+      ${list.length>shown.length?`<div style="padding:10px"><button class="btn sm" data-more>Показать ещё (${fmtNum(list.length-shown.length)})</button></div>`:''}`
+      : `<div class="empty">${rows.length?'Ничего не подходит под отбор.':'Учётных записей ещё нет — нажмите «Сверить учётные записи».'}</div>`;
+    const selected=[...Ax.sel].map(e=>byEmail.get(e)).filter(Boolean);
+    const noBox=selected.filter(r=>!r.mailbox && !r.deleted_at).length, withBox=selected.filter(r=>r.mailbox).length;
+    selInfo.innerHTML=selected.length?`Отмечено: <b>${fmtNum(selected.length)}</b> (с ящиком в архиве — ${fmtNum(withBox)}, без ящика — ${fmtNum(noBox)}) · <a href="javascript:void(0)" data-clear>снять отметки</a>`:'Отметьте учётные записи флажками, чтобы завести им ящики или выполнить действие.';
+    const cl=selInfo.querySelector('[data-clear]'); if(cl) cl.onclick=()=>{ Ax.sel.clear(); draw(); };
+    wrap.querySelectorAll('[data-sel]').forEach(cb=>cb.onchange=()=>{ cb.checked?Ax.sel.add(cb.dataset.sel):Ax.sel.delete(cb.dataset.sel); draw(); });
+    const all=wrap.querySelector('[data-all]'); if(all) all.onchange=()=>{ shown.forEach(r=>all.checked?Ax.sel.add(r.email):Ax.sel.delete(r.email)); draw(); };
+    wrap.querySelectorAll('[data-cb]').forEach(td=>td.onclick=e=>e.stopPropagation());
+    wrap.querySelectorAll('tr[data-row]').forEach(tr=>tr.onclick=()=>axigenAccountModal(byEmail.get(tr.dataset.row), st));
+    const more=wrap.querySelector('[data-more]'); if(more) more.onclick=()=>{ Ax.shown+=200; draw(); };
+  };
+  top.querySelectorAll('[data-chips] .chip').forEach(b=>b.onclick=()=>{ Ax.filter=b.dataset.f; Ax.shown=200; top.querySelectorAll('[data-chips] .chip').forEach(x=>x.classList.toggle('active', x===b)); draw(); });
+  let qt=null; $('#axQ', top).oninput=e=>{ clearTimeout(qt); qt=setTimeout(()=>{ Ax.query=e.target.value; Ax.shown=200; draw(); }, 200); };
+  $('#axAdd', top).onclick=()=>{
+    const list=[...Ax.sel].map(e=>byEmail.get(e)).filter(r=>r && !r.mailbox && !r.deleted_at);
+    if(!list.length) return toast('Нечего заводить', 'Отметьте учётные записи без ящика в архиве (отбор «Без копии в архиве»).', 'warn');
+    axigenAddMailboxes(list.map(r=>r.email));
+  };
+  $('#axAct', top).onclick=()=>{
+    const ids=[...Ax.sel].map(e=>byEmail.get(e)).filter(r=>r && r.mailbox).map(r=>r.mailbox.id);
+    if(!ids.length) return toast('Нет ящиков', 'Действия выполняются с ящиками архива — отметьте учётные записи, у которых есть ящик.', 'warn');
+    axigenActionPicker(ids);
+  };
+  const nb=$('#axNew', top); if(nb) nb.onclick=()=>axigenCreateModal();
+  $('#axXls', top).onclick=()=>{ location.href='/api/axigen/accounts/export?format=xlsx'; };
+  draw();
+}
+
+/** Выбор группового действия Axigen для ящиков (дальше — обычное окно проверки и запуска). */
+async function axigenActionPicker(ids){
+  let meta;
+  try{ meta=await api('/accounts/bulk/actions'); State.bulkActions=meta; }catch(e){ return toastErr(e); }
+  const acts=(meta.actions||[]).filter(a=>a.group==='axigen');
+  const m=modal(`Действие с ящиками: ${fmtNum(ids.length)}`, `<p class="muted" style="margin-top:0">Сначала будет проверка: что сделается с каждым ящиком и что пропустится — без изменений, пока вы не нажмёте «Выполнить».</p>
+    <div class="btn-row" style="flex-direction:column;align-items:stretch;gap:8px">${acts.map(a=>`<button class="btn${a.danger>=2?' danger':''}" data-k="${esc(a.key)}" title="${esc(a.desc||'')}">${a.icon||''} ${esc(a.label)}</button>`).join('')}</div>`);
+  m.body.querySelectorAll('[data-k]').forEach(b=>b.onclick=()=>{ m.close(); bulkDialog(b.dataset.k, ids, {}, {onDone:()=>{}}); });
+}
+
+async function axigenAddMailboxes(emails){
+  const m=modal('Завести ящики в архиве', `<p class="muted" style="margin-top:0">Ящики заводятся только в MailArchiver — на сервере Axigen ничего не меняется.</p>
+    <div class="form-row"><label>Как копировать</label><select id="axAuth"><option value="axigen_ftp">Через FTP Backup Axigen — без паролей сотрудников</option><option value="password">По IMAP с паролем (пароль нужно будет вписать)</option></select></div>
+    <div class="form-row check"><span class="switch"><input type="checkbox" id="axEn" checked><span class="track"></span></span><label>Сразу включить копирование</label></div>
+    <div data-pv><div class="empty"><span class="spinner"></span></div></div>`,
+    {wide:true, footer:'<button class="btn ghost" data-c>Отмена</button><button class="btn primary" data-go disabled>Завести</button>'});
+  const g=x=>m.body.querySelector(x), go=m.foot.querySelector('[data-go]');
+  const body=preview=>({emails, auth:g('#axAuth').value, enable:g('#axEn').checked, preview});
+  const pv=async()=>{ try{ const r=await api('/axigen/mailboxes',{method:'POST',body:body(true)});
+      g('[data-pv]').innerHTML=`<div class="table-wrap" style="max-height:300px;overflow:auto"><table class="tbl"><tbody>${r.items.map(i=>`<tr><td class="mono small">${esc(i.email)}</td><td><span class="tag ${i.status==='ok'?'ok':''}">${i.status==='ok'?'будет заведён':'пропуск'}</span></td><td class="small">${esc(i.text)}</td></tr>`).join('')}</tbody></table></div>`;
+      go.disabled=!r.would_create; go.textContent=r.would_create?`Завести ${fmtNum(r.would_create)}`:'Нечего заводить';
+    }catch(e){ g('[data-pv]').innerHTML=`<div class="hint warnbox">${esc(e.message)}</div>`; } };
+  g('#axAuth').onchange=pv; g('#axEn').onchange=pv;
+  m.foot.querySelector('[data-c]').onclick=m.close;
+  go.onclick=async()=>{ go.disabled=true; try{ const r=await api('/axigen/mailboxes',{method:'POST',body:body(false)}); toast('Готово', `Заведено ящиков: ${r.created}`); m.close(); Ax.sel.clear(); route(); }catch(e){ toastErr(e); go.disabled=false; } };
+  pv();
+}
+
+/** Карточка учётной записи сервера: что знает сверка, ящик в архиве и действия. */
+function axigenAccountModal(r, st){
+  if(!r) return;
+  const allow=!!(st&&st.settings&&st.settings.allow_changes);
+  const b=r.mailbox;
+  const reg=Object.entries((r.info||{}).registry||{}).map(([k,v])=>`<div class="kv"><span class="k">${esc(k)}</span><span>${esc(v)}</span></div>`).join('');
+  const kv=(k,v)=>`<div class="kv"><span class="k">${k}</span><span>${v}</span></div>`;
+  const acts=b?[
+    ['axigen_block','🔒 Заблокировать вход', r.login_blocked!==true],
+    ['axigen_unblock','🔓 Разблокировать вход', r.login_blocked===true],
+    ['axigen_password','🔑 Сменить пароль на случайный', true],
+    ['axigen_purge','🧹 Удалить старые письма с сервера', b.auth_type==='axigen_ftp'],
+    ['axigen_delete','🗑️ Удалить учётную запись', r.login_blocked===true],
+    ['axigen_use_ftp', b.auth_type==='axigen_ftp'?'↩️ Копировать по IMAP с паролем':'📮 Копировать через FTP Backup', true],
+  ]:[];
+  const m=modal(`Учётная запись ${r.email}`, `
+    <div class="grid cols-2">
+      <div>
+        <h4 style="margin:0 0 6px">На сервере Axigen</h4>
+        ${kv('ФИО', esc([r.first_name,r.last_name].filter(Boolean).join(' ')||'—'))}
+        ${kv('Псевдонимы', esc((r.aliases||[]).join(', ')||'—'))}
+        ${kv('Вход', axLoginTag(r))}
+        ${kv('Службы', esc(r.services==null?'неизвестно':(r.services.join(', ')||'нет ни одной')))}
+        ${r.saved_services?kv('До блокировки', esc(r.saved_services.join(', '))):''}
+        ${kv('Место', axQuotaCell(r))}
+        ${kv('Писем / папок', `${r.messages!=null?fmtNum(r.messages):'?'} / ${r.folders!=null?fmtNum(r.folders):'?'}`)}
+        ${kv('Последний вход', r.last_login?esc(fmtDate(r.last_login)):'—')}
+        ${kv('Сверка', `впервые ${esc(fmtDate(r.first_seen))}, последняя ${esc(fmtDate(r.last_seen))}`)}
+        ${r.deleted_at?kv('Удалена на сервере', esc(fmtDate(r.deleted_at))):''}
+        ${r.errors?`<div class="hint warnbox">Не прочитано при сверке: ${esc(r.errors)}</div>`:''}
+        ${reg?`<details style="margin-top:8px"><summary class="small">Регистрационные сведения</summary>${reg}</details>`:''}
+      </div>
+      <div>
+        <h4 style="margin:0 0 6px">В архиве</h4>
+        ${b?`${kv('Ящик', `<b>${esc(b.name)}</b>${b.enabled?'':' <span class="tag">выключен</span>'}`)}
+          ${kv('Копируется', esc(AX_COPY[b.auth_type]||b.auth_type)+(b.same_server?'':' · <span class="tag warn">другой сервер: '+esc(b.host)+'</span>'))}
+          ${kv('Последняя копия', b.last_backup_at?esc(fmtDate(b.last_backup_at)):'не было')}
+          ${kv('Писем в архиве', `${fmtNum(b.messages)} (${esc(fmtBytes(b.bytes))})`)}
+          ${b.hold_until?kv('Удержание', esc(holdDate(b.hold_until))):''}
+          <div class="btn-row" style="margin-top:8px"><button class="btn sm" data-open>✏️ Ящик</button><button class="btn sm" data-mail>📧 Письма</button><button class="btn sm" data-backup ${b.enabled?'':'disabled'}>💾 Копия сейчас</button></div>`
+        : `<div class="hint warnbox">Этой учётной записи нет в архиве — её письма не копируются.</div>
+           ${r.deleted_at?'':'<button class="btn sm primary" data-addbox>📥 Завести ящик в архиве</button>'}`}
+        ${b?`<h4 style="margin:16px 0 6px">Действия</h4>
+          <div class="btn-row" style="flex-direction:column;align-items:stretch;gap:6px">${acts.filter(a=>a[2]).map(([k,t])=>`<button class="btn sm${k==='axigen_delete'||k==='axigen_purge'?' danger':''}" data-act="${k}">${t}</button>`).join('')}</div>
+          <div class="small muted" style="margin-top:6px">${allow?'Каждое действие сначала показывает проверку и ничего не меняет, пока вы не подтвердите.':'Изменения на сервере не разрешены — включите «Разрешить изменения на сервере» в настройках Axigen.'}</div>`:''}
+      </div></div>`,
+    {wide:true, footer:`<button class="btn ghost" data-c>Закрыть</button>${r.deleted_at?'':'<button class="btn" data-reload>🔄 Перечитать с сервера</button>'}${allow&&!r.deleted_at?'<button class="btn" data-pw>🔑 Задать пароль…</button>':''}`});
+  const q=x=>m.body.querySelector(x), f=x=>m.foot.querySelector(x);
+  f('[data-c]').onclick=m.close;
+  if(q('[data-open]')) q('[data-open]').onclick=()=>{ m.close(); accountModal(b.id); };
+  if(q('[data-mail]')) q('[data-mail]').onclick=()=>{ m.close(); State.mailAccount=b.id; location.hash='#/mail'; };
+  if(q('[data-backup]')) q('[data-backup]').onclick=()=>backupNow(b.id, b.name);
+  if(q('[data-addbox]')) q('[data-addbox]').onclick=()=>{ m.close(); axigenAddMailboxes([r.email]); };
+  m.body.querySelectorAll('[data-act]').forEach(btn=>btn.onclick=()=>{ m.close(); bulkDialog(btn.dataset.act, [b.id], btn.dataset.act==='axigen_use_ftp'?{to:b.auth_type==='axigen_ftp'?'password':'axigen_ftp'}:{}, {onDone:()=>{ if(State.view==='axigen') setTimeout(route, 400); }}); });
+  if(f('[data-pw]')) f('[data-pw]').onclick=()=>{ m.close(); axigenPasswordModal(r.email); };
+  if(f('[data-reload]')) f('[data-reload]').onclick=async(ev)=>{ const btn=ev.currentTarget; btn.disabled=true; btn.innerHTML='<span class="spinner"></span>';
+    try{ const res=await api('/axigen/accounts/reload',{method:'POST',body:{email:r.email}}); m.close(); toast('Перечитано', r.email);
+      const fresh=Object.assign({}, r, res.account||{}); axigenAccountModal(fresh, st); if(State.view==='axigen') route(); }
+    catch(e){ toastErr(e); btn.disabled=false; btn.textContent='🔄 Перечитать с сервера'; } };
+}
+
+function axShowPasswordOnce(title, email, password){
+  modal(title, `<p class="small">Новый пароль учётной записи <b>${esc(email)}</b>. Он показывается <b>один раз</b> и нигде не сохраняется (кроме карточки ящика, который копируется по IMAP) — передайте его сотруднику.</p>
+    <input type="text" class="mono" readonly value="${esc(password)}" style="width:100%" onclick="this.select()">`);
+}
+
+function axigenPasswordModal(email){
+  const m=modal(`Пароль: ${email}`, `
+    <div class="form-row check"><span class="switch"><input type="checkbox" id="axGen" checked><span class="track"></span></span><label>Случайный пароль (покажется один раз)</label></div>
+    <div class="form-row" id="axPwRow" style="display:none"><label>Новый пароль</label><input type="password" id="axPw" autocomplete="new-password" placeholder="не короче 6 знаков, без пробелов и кавычек"></div>
+    <div class="hint">Если ящик этой учётной записи копируется по IMAP, новый пароль сразу сохранится и в его карточке — копирование не прервётся.</div>`,
+    {footer:'<button class="btn ghost" data-c>Отмена</button><button class="btn danger" data-go>Задать пароль</button>'});
+  const g=x=>m.body.querySelector(x);
+  g('#axGen').onchange=()=>{ g('#axPwRow').style.display=g('#axGen').checked?'none':'block'; };
+  m.foot.querySelector('[data-c]').onclick=m.close;
+  m.foot.querySelector('[data-go]').onclick=async(ev)=>{ const b=ev.currentTarget; b.disabled=true;
+    try{ const r=await api('/axigen/accounts/password',{method:'POST',body:{email, generate:g('#axGen').checked, password:g('#axPw').value}});
+      m.close(); toast('Пароль изменён', r.saved_in_mailbox?'Сохранён и в карточке ящика.':'');
+      if(r.password) axShowPasswordOnce('Новый пароль', email, r.password); }
+    catch(e){ toastErr(e); b.disabled=false; } };
+}
+
+function axigenCreateModal(){
+  const m=modal('Новая учётная запись на сервере Axigen', `
+    <div class="form-row"><label>Адрес</label><input type="email" id="axE" placeholder="ivanov@company.ru"></div>
+    <div class="grid cols-2"><div class="form-row"><label>Имя</label><input type="text" id="axF"></div><div class="form-row"><label>Фамилия</label><input type="text" id="axL"></div></div>
+    <div class="form-row check"><span class="switch"><input type="checkbox" id="axGen" checked><span class="track"></span></span><label>Случайный пароль (покажется один раз)</label></div>
+    <div class="form-row" id="axPwRow" style="display:none"><label>Пароль</label><input type="password" id="axPw" autocomplete="new-password"></div>
+    <div class="form-row check"><span class="switch"><input type="checkbox" id="axArch" checked><span class="track"></span></span><label>Сразу завести ящик в архиве</label></div>`,
+    {footer:'<button class="btn ghost" data-c>Отмена</button><button class="btn primary" data-go>Создать</button>'});
+  const g=x=>m.body.querySelector(x);
+  g('#axGen').onchange=()=>{ g('#axPwRow').style.display=g('#axGen').checked?'none':'block'; };
+  m.foot.querySelector('[data-c]').onclick=m.close;
+  m.foot.querySelector('[data-go]').onclick=async(ev)=>{ const b=ev.currentTarget; b.disabled=true;
+    const email=g('#axE').value.trim();
+    try{ const r=await api('/axigen/accounts/create',{method:'POST',body:{email, first_name:g('#axF').value, last_name:g('#axL').value, generate:g('#axGen').checked, password:g('#axPw').value, add_to_archive:g('#axArch').checked}});
+      m.close(); toast('Учётная запись создана', r.email + (r.mailbox&&r.mailbox.status==='ok'?' · ящик в архиве заведён':''));
+      if(r.password) axShowPasswordOnce('Пароль новой учётной записи', r.email, r.password);
+      if(State.view==='axigen') route(); }
+    catch(e){ toastErr(e); b.disabled=false; } };
+}
+
+async function axQueue(box){
+  box.innerHTML='<div class="card"><div class="section-title"><h3>📨 Очередь писем сервера</h3><div class="spacer"></div><button class="btn sm" data-r>🔄 Обновить</button></div><div data-q><div class="empty"><span class="spinner"></span></div></div><div class="small muted" style="margin-top:6px">Только просмотр. Повторить отправку или удалить письмо из очереди — в WebAdmin Axigen.</div></div>';
+  const q=box.querySelector('[data-q]');
+  const load=async()=>{ q.innerHTML='<div class="empty"><span class="spinner"></span></div>';
+    try{ const r=await api('/axigen/queue');
+      if(!r.rows.length){ q.innerHTML=`<div class="empty">${r.count?'Писем в очереди: '+fmtNum(r.count):'Очередь пуста'}</div>${r.raw?'<pre class="mono small" style="white-space:pre-wrap">'+esc(r.raw)+'</pre>':''}`; return; }
+      q.innerHTML=`<div class="small muted" style="margin-bottom:6px">Писем: <b>${fmtNum(r.count)}</b>${r.truncated?' (показаны первые '+fmtNum(r.rows.length)+')':''}</div>
+        <div class="table-wrap"><table class="tbl"><thead><tr>${r.columns.map(c=>`<th>${esc(c)}</th>`).join('')}</tr></thead><tbody>${r.rows.map(row=>`<tr>${r.keys.map(k=>`<td class="small">${esc(row[k]||'')}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
+    }catch(e){ q.innerHTML=`<div class="hint warnbox">${esc(e.message)}</div>`; } };
+  box.querySelector('[data-r]').onclick=load;
+  load();
+}
+
+async function axLog(box){
+  const kinds=[['people','Действия людей'],['','Всё'],['write','Изменения на сервере'],['console','Консоль'],['check','Проверки подключения'],['monitor','Плановые проверки'],['error','Ошибки']];
+  box.innerHTML=`<div class="btn-row" style="margin-bottom:10px;gap:6px;flex-wrap:wrap" data-chips>${kinds.map(([k,t])=>`<button class="chip ${Ax.logKind===k?'active':''}" data-k="${k}">${t}</button>`).join('')}</div>
+    <div class="card table-wrap" data-list></div>
+    <div class="small muted" style="margin-top:6px">Каждая сессия CLI записывается целиком: что отправлено серверу и что он ответил. Пароли в журнал не попадают.</div>`;
+  const list=box.querySelector('[data-list]');
+  let items=[];
+  const render=()=>{ list.innerHTML=items.length?`<table class="tbl"><thead><tr><th>Когда</th><th>Кто</th><th>Вид</th><th>Что</th><th>Команд</th><th>Итог</th></tr></thead><tbody>${items.map(i=>`<tr data-id="${i.id}" style="cursor:pointer"><td class="small nowrap">${esc(fmtDate(i.ts))}</td><td class="small">${esc(i.username||'')}</td><td><span class="tag">${esc(AX_KIND[i.kind]||i.kind)}</span></td><td class="small">${esc(i.summary||'')}</td><td class="small">${fmtNum(i.commands)}</td><td>${i.ok?'<span class="tag ok">успешно</span>':'<span class="tag err">ошибка</span>'}</td></tr>`).join('')}</tbody></table>
+      ${items.length%100===0?'<div style="padding:10px"><button class="btn sm" data-more>Показать раньше</button></div>':''}`:'<div class="empty">Записей нет.</div>';
+    list.querySelectorAll('tr[data-id]').forEach(tr=>tr.onclick=()=>axLogItem(parseInt(tr.dataset.id,10)));
+    const more=list.querySelector('[data-more]'); if(more) more.onclick=()=>load(items[items.length-1].id);
+  };
+  const load=async(before=0)=>{ try{ const r=await api(`/axigen/log?kind=${encodeURIComponent(Ax.logKind)}&before=${before}&limit=100`); items=before?items.concat(r.items):r.items; render(); }catch(e){ list.innerHTML=`<div class="hint warnbox">${esc(e.message)}</div>`; } };
+  box.querySelectorAll('[data-chips] .chip').forEach(b=>b.onclick=()=>{ Ax.logKind=b.dataset.k; box.querySelectorAll('[data-chips] .chip').forEach(x=>x.classList.toggle('active', x===b)); load(); });
+  load();
+}
+
+async function axLogItem(id){
+  try{ const i=await api(`/axigen/log/${id}`);
+    const m=modal(`Сессия CLI: ${i.summary||''}`, `<div class="small muted" style="margin-bottom:8px">${esc(fmtDate(i.ts))} · ${esc(i.username||'')} · ${esc(AX_KIND[i.kind]||i.kind)} · команд: ${fmtNum(i.commands)} · ${i.ok?'успешно':'ошибка'}</div>
+      <pre class="mono small" style="white-space:pre-wrap;max-height:65vh;overflow:auto;background:var(--bg-soft);padding:10px;border-radius:6px">${esc(i.transcript||'')}</pre>`,
+      {wide:true, footer:'<button class="btn ghost" data-dl>⬇️ Скачать</button><button class="btn primary" data-c>Закрыть</button>'});
+    m.foot.querySelector('[data-c]').onclick=m.close;
+    m.foot.querySelector('[data-dl]').onclick=()=>axDownloadText(`axigen_session_${id}.txt`, i.transcript||'');
+  }catch(e){ toastErr(e); }
+}
+
+function axDownloadText(name, text){
+  const url=URL.createObjectURL(new Blob([text], {type:'text/plain;charset=utf-8'}));
+  const a=document.createElement('a'); a.href=url; a.download=name; document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(url), 2000);
+}
+
+async function axConsole(box){
+  const samples=['LIST Domains','SHOW LicenseInfo','UPDATE Domain name '+((State.axDomain)||'company.ru')+'\nLIST Accounts','ENTER QUEUE\nLIST','GET VERSION'];
+  box.innerHTML=`<div class="card">
+    <div class="section-title"><h3>⌨️ Консоль CLI — только чтение</h3></div>
+    <div class="small muted" style="margin-bottom:8px">Команды выполняются одной сессией по порядку (по одной в строке). Разрешено только читать: LIST, SHOW, GET, SEARCH, LOOKUP, HELP и переход в контекст (UPDATE Domain/Account/Group/List, CONFIG, ENTER QUEUE, BACK). Изменения — кнопками MailArchiver или в WebAdmin.</div>
+    <div class="btn-row" style="gap:6px;flex-wrap:wrap;margin-bottom:8px">${samples.map((s,i)=>`<button class="chip" data-s="${i}">${esc(s.split('\n').join(' → '))}</button>`).join('')}</div>
+    <textarea id="axCmd" class="mono" rows="5" style="width:100%" placeholder="LIST Domains"></textarea>
+    <div class="btn-row" style="margin-top:8px"><button class="btn primary" data-run>▶️ Выполнить</button></div>
+    <div data-out style="margin-top:12px"></div></div>`;
+  const ta=box.querySelector('#axCmd'), out=box.querySelector('[data-out]');
+  box.querySelectorAll('[data-s]').forEach(b=>b.onclick=()=>{ ta.value=samples[parseInt(b.dataset.s,10)]; ta.focus(); });
+  ta.onkeydown=e=>{ if(e.key==='Enter' && (e.ctrlKey||e.metaKey)){ e.preventDefault(); box.querySelector('[data-run]').click(); } };
+  box.querySelector('[data-run]').onclick=async(ev)=>{
+    const cmds=ta.value.split('\n').map(s=>s.trim()).filter(Boolean);
+    if(!cmds.length) return;
+    const b=ev.currentTarget; b.disabled=true; out.innerHTML='<div class="empty"><span class="spinner"></span></div>';
+    try{ const r=await api('/axigen/console',{method:'POST',body:{commands:cmds}});
+      out.innerHTML=r.replies.map(x=>`<div style="margin-bottom:10px"><div class="mono small"><b>&lt;${esc(x.prompt||'')}&gt; ${esc(x.command)}</b> ${x.ok===false?'<span class="tag err">'+esc(x.status||'ошибка')+'</span>':(x.ok?'<span class="tag ok">+OK</span>':'')}</div>
+        ${x.text?`<pre class="mono small" style="white-space:pre-wrap;max-height:50vh;overflow:auto;background:var(--bg-soft);padding:8px;border-radius:6px;margin:4px 0 0">${esc(x.text)}</pre>`:''}</div>`).join('');
+    }catch(e){ out.innerHTML=`<div class="hint warnbox">${esc(e.message)}${e.data&&e.data.hint?'<br><span class="small">'+esc(e.data.hint)+'</span>':''}</div>`; }
+    finally{ b.disabled=false; }
+  };
+}
+
+async function axDiag(box){
+  box.innerHTML=`<div class="card"><div class="section-title"><h3>🩺 Диагностика</h3></div>
+    <div class="small muted" style="margin-bottom:8px">Сырые ответы сервера на команды, которыми пользуется MailArchiver: версия, лицензия, домены, учётная запись (папки, псевдонимы, квота, службы), ограничения домена, очередь. Если сверка читает что-то не так — пришлите этот отчёт разработчикам (паролей в нём нет).</div>
+    <div class="btn-row" style="gap:8px"><input type="email" id="axDE" placeholder="адрес учётной записи (пусто — первая из первого домена)" style="flex:1;min-width:260px"><button class="btn primary" data-run>Собрать</button></div>
+    <div data-out style="margin-top:12px"></div></div>`;
+  const out=box.querySelector('[data-out]');
+  box.querySelector('[data-run]').onclick=async(ev)=>{ const b=ev.currentTarget; b.disabled=true; out.innerHTML='<div class="empty"><span class="spinner"></span> Опрашиваем сервер…</div>';
+    try{ const r=await api('/axigen/diagnostics?email='+encodeURIComponent(box.querySelector('#axDE').value.trim()));
+      const text=r.sections.map(s=>`### ${s.title}\n> ${s.command}\n${s.text}\n${s.ok===false?'-ERR ':'+OK '}${s.status||''}\n`).join('\n');
+      out.innerHTML=`<div class="btn-row" style="margin-bottom:8px"><button class="btn sm" data-dl>⬇️ Скачать отчёт</button></div>`+r.sections.map(s=>`<details open style="margin-bottom:8px"><summary><b>${esc(s.title)}</b> <span class="mono small">${esc(s.command)}</span> ${s.ok===false?'<span class="tag err">'+esc(s.status||'ошибка')+'</span>':'<span class="tag ok">+OK</span>'}</summary>
+        <pre class="mono small" style="white-space:pre-wrap;max-height:40vh;overflow:auto;background:var(--bg-soft);padding:8px;border-radius:6px">${esc(s.text||'(пусто)')}</pre></details>`).join('');
+      out.querySelector('[data-dl]').onclick=()=>axDownloadText('axigen_diagnostics.txt', text);
+    }catch(e){ out.innerHTML=`<div class="hint warnbox">${esc(e.message)}${e.data&&e.data.hint?'<br><span class="small">'+esc(e.data.hint)+'</span>':''}</div>`; }
+    finally{ b.disabled=false; } };
+}
+
+/** Проверка подключения: CLI и FTP Backup, сертификаты, «доверять этому сертификату». */
+async function axigenCheckModal(){
+  const m=modal('Проверка подключения к Axigen', '<div class="empty"><span class="spinner"></span> Подключаемся к CLI и FTP Backup…</div>', {wide:true});
+  let r;
+  try{ r=await api('/axigen/check',{method:'POST'}); }catch(e){ m.body.innerHTML=`<div class="hint warnbox">${esc(e.message)}</div>`; return; }
+  if(r.error){ m.body.innerHTML=`<div class="hint warnbox">${esc(r.error)}${r.hint?'<br><span class="small">'+esc(r.hint)+'</span>':''}</div>`; return; }
+  const part=(title, x, which, extra)=>`<div class="card" style="margin-bottom:12px;border-color:var(--${x.ok?'success':'danger'})">
+    <div class="section-title"><h3>${title}</h3><div class="spacer"></div>${x.ok?'<span class="tag ok">✓ работает</span>':'<span class="tag err">✗ не работает</span>'}</div>
+    ${x.ok?'':`<div class="hint warnbox">${esc(x.error||'')}${x.hint?'<br><span class="small">'+esc(x.hint)+'</span>':''}</div>`}
+    ${x.fingerprint?`<div class="kv"><span class="k">Сертификат (SHA-256)</span><span class="mono small" style="word-break:break-all">${esc(x.fingerprint)}</span></div>
+      ${(x.cert_problem||!x.ok)?`<div class="small muted">Сверьте отпечаток с сертификатом на сервере Axigen (например <span class="mono">openssl x509 -noout -fingerprint -sha256 -in файл.pem</span>). Совпал — доверяйте.</div><div class="btn-row" style="margin-top:6px"><button class="btn sm primary" data-trust="${which}" data-fp="${esc(x.fingerprint)}">🔐 Доверять этому сертификату</button></div>`:''}`:''}
+    ${extra||''}</div>`;
+  const cli=r.cli||{}, ftp=r.ftp||{}, lic=cli.license||{};
+  const cliExtra=cli.ok?`<div class="kv"><span class="k">Версия</span><span>${esc(axVersion(cli.version)||'—')}</span></div>
+    <div class="kv"><span class="k">Лицензия</span><span>${lic.expires?'до '+esc(fmtDay(lic.expires+'T00:00:00')):'срок не найден'}${lic.type?' · '+esc(lic.type):''}${lic.accounts_limit?' · учётных записей до '+fmtNum(lic.accounts_limit):''}</span></div>
+    <div class="kv"><span class="k">Домены</span><span>${esc((cli.domains||[]).map(d=>d.name).join(', ')||'—')}</span></div>
+    <div class="kv"><span class="k">Очередь</span><span>${cli.queue!=null?fmtNum(cli.queue)+' писем':'—'}</span></div>
+    ${(cli.warnings||[]).length?`<div class="hint">Не прочитано: ${esc(cli.warnings.join('; '))}</div>`:''}`:'';
+  const ftpExtra=ftp.ok?`<div class="kv"><span class="k">Шифрование</span><span>${esc(ftp.encryption||'')}</span></div>
+    <div class="kv"><span class="k">Корень</span><span class="small">${esc((ftp.root||[]).join(', ')||'пусто')}</span></div>
+    <div class="kv"><span class="k">Список каталогов</span><span>${ftp.mlsd?'MLSD':'LIST'}</span></div>`:'';
+  m.body.innerHTML=part('⌨️ CLI', cli, 'cli', cliExtra)+(ftp.skipped?'':part('📦 FTP Backup', ftp, 'ftp', ftpExtra))
+    +`<div class="small muted">Изменения на сервере: ${r.changes_allowed?'<b>разрешены</b>':'не разрешены (только чтение)'}. Журнал этой проверки — «Сервер Axigen → Журнал команд».</div>`;
+  m.body.querySelectorAll('[data-trust]').forEach(b=>b.onclick=async()=>{
+    const password=await axTrustDialog(b.dataset.trust, b.dataset.fp);
+    if(!password) return;
+    try{ await api('/axigen/trust',{method:'POST',body:{which:b.dataset.trust, fingerprint:b.dataset.fp, password}}); toast('Сертификат сохранён', 'Проверяем подключение заново'); m.close(); axigenCheckModal(); }
+    catch(e){ toastErr(e); } });
+}
+
+/** «Доверять сертификату?» — с повторным вводом пароля (он уйдёт только серверу с этим сертификатом). */
+function axTrustDialog(which, fp){
+  return new Promise(res=>{
+    let done=false; const answer=v=>{ if(done) return; done=true; res(v); };
+    const m=modal('Доверять сертификату?', `<p>Отпечаток <span class="mono small">${esc(fp)}</span> будет сохранён: соединение с другим сертификатом MailArchiver отвергнет. Убедитесь, что отпечаток совпадает с сертификатом на сервере Axigen.</p>
+      <div class="form-row"><label>${which==='ftp'?'Пароль для FTP Backup (как в настройках)':'Пароль администратора Axigen'}</label><input type="password" id="axTrustPw" autocomplete="off"></div>
+      <div class="hint">Пароль вводится заново: сохранённый пароль не уходит серверу с другим сертификатом без подтверждения того, кто его знает.</div>`,
+      {onClose:()=>answer(null), footer:`<button class="btn ghost" data-c>Отмена</button><button class="btn primary" data-ok>Доверять</button>`});
+    const inp=m.body.querySelector('#axTrustPw');
+    const ok=()=>{ if(!inp.value){ toast('Введите пароль','','warn'); inp.focus(); return; } answer(inp.value); m.close(); };
+    m.foot.querySelector('[data-c]').onclick=()=>m.close();
+    m.foot.querySelector('[data-ok]').onclick=ok;
+    inp.addEventListener('keydown',e=>{ if(e.key==='Enter'){ e.preventDefault(); ok(); } });
+  });
+}
+
+/** Блок в «Настройки → Сервер Axigen». */
+function axigenSettingsCard(card, unsaved){
+  const box=h(`<div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border)">
+    <h4 style="margin:0 0 8px">🔌 Проверка</h4>
+    <div class="small muted">Сохраните настройки и проверьте подключение к CLI и FTP Backup. Если Axigen на другой машине, нужны SSL-слушатели CLI и FTP Backup на сетевом адресе (WebAdmin → Services → Listeners) — без шифрования пароль администратора по сети не отправляется.</div>
+    <div class="btn-row" style="margin-top:8px"><button class="btn sm primary" data-check>Проверить подключение</button><a class="btn sm" href="#/axigen">Открыть раздел «Сервер Axigen»</a></div></div>`);
+  card.appendChild(box);
+  box.querySelector('[data-check]').onclick=()=>{ if(unsaved()) return toast('Сначала сохраните настройки','Проверка идёт по сохранённым настройкам.','warn'); axigenCheckModal(); };
+}
+
+/** Сведения сервера Axigen в карточке ящика. */
+async function axigenMailboxInfo(id, box){
+  try{
+    const r=await api(`/axigen/mailbox/${id}`,{bg:true});
+    if(!r.enabled || !box) return;
+    const row=r.row;
+    if(!row){ if(r.same_server) box.innerHTML='<div class="hint" style="margin-bottom:8px">📮 Этого адреса нет в последней сверке с Axigen.</div>'; return; }
+    box.innerHTML=`<div class="hint" style="margin-bottom:8px">📮 <b>На сервере Axigen:</b> ${axLoginTag(row)} · ${row.used_bytes!=null?'занято '+esc(fmtBytes(row.used_bytes)):'место неизвестно'}${row.quota_kb?' из '+esc(fmtBytes(row.quota_kb*1024)):''}${row.last_login?' · последний вход '+esc(fmtDay(row.last_login)):''}${r.ftp_path?` · <span class="small">каталог FTP: <span class="mono">${esc(r.ftp_path)}</span>, взято файлов ${fmtNum(r.ftp.files)}</span>`:''}</div>`;
+  }catch(e){}
+}
+
+/** Из меню ящика: учётная запись Axigen этого ящика (по последней сверке). */
+async function axigenForMailbox(a){
+  try{
+    const [r, st]=await Promise.all([api(`/axigen/mailbox/${a.id}`), api('/axigen/status')]);
+    if(!r.row) return modal(`Ящик ${a.name}`, `<div class="hint warnbox">Учётной записи «${esc(a.username)}» нет в последней сверке с Axigen${r.same_server?'':' — и ящик копируется не с этого сервера'}.</div><div class="small muted">Запустите сверку в разделе «Сервер Axigen» или проверьте логин ящика.</div>`);
+    const data=await api('/axigen/accounts');
+    const row=(data.accounts||[]).find(x=>x.email===r.row.email) || r.row;
+    axigenAccountModal(row, st);
+  }catch(e){ toastErr(e); }
+}

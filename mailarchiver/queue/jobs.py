@@ -21,7 +21,7 @@ from ..imap.restore import RestoreEngine
 from ..export import resolve_engine
 from ..export.base import zip_directory, zip_files
 from ..logging_setup import get_logger
-from ..models import JobStatus, JobType
+from ..models import AuthType, JobStatus, JobType
 from ..analytics import invalidate_mail_analytics_cache
 from ..util import human_size, safe_filename
 from ..version import __version__
@@ -210,7 +210,7 @@ def _rebuild_full(ctx: JobContext, acc) -> Dict[str, int]:
     """
     svc = ctx.services
     ctx.event("INFO", "Проверяем подключение к ящику перед стиранием копии…")
-    probe = probe_account(acc, svc.connect_options())
+    probe = probe_any(svc, acc)      # тем же путём, каким ящик копируется (IMAP или FTP Backup Axigen)
     if not probe.get("ok"):
         raise ValidationError(
             f"Копию не стираем: ящик недоступен — {probe.get('error') or 'нет связи с сервером'}.",
@@ -342,6 +342,13 @@ def _require_credentials(acc, db=None) -> None:
             raise ValidationError(f"У ящика «{acc.name}» не указан адрес IMAP-сервера.",
                                   hint="Укажите сервер в карточке ящика.")
         return
+    if acc.auth_type == AuthType.AXIGEN_FTP:
+        # Пароль ящика не нужен: письма берёт администратор Axigen через FTP Backup.
+        if "@" not in (acc.username or ""):
+            raise ValidationError(f"У ящика «{acc.name}» логин «{acc.username}» — не адрес почты: каталог ящика "
+                                  f"на FTP Backup Axigen ищется по адресу.",
+                                  hint="Укажите в карточке ящика полный адрес, например ivanov@company.ru.")
+        return
     if not acc.password:
         _note_login(db, acc, "no_password", "Пароль не задан.")
         raise ValidationError(f"У ящика «{acc.name}» не задан пароль — на сервер не подключаемся.",
@@ -467,18 +474,31 @@ def _backup_account(ctx: JobContext, acc, *, rebuild: str = "",
         elif rebuild == "full":
             rebuild_info = _rebuild_full_once(ctx, acc, emit)
 
-        engine = BackupEngine(
-            ctx.db, svc.store, svc.connect_options(),
-            skip_larger_than_mb=int(svc.rt("backup", "skip_larger_than_mb") or 0),
-            download_flags=bool(svc.rt("backup", "download_flags")),
-            global_exclude=svc.rt("backup", "folder_exclude") or [],
-            global_include=svc.rt("backup", "folder_include") or [],
-            unreadable_grace_runs=int(svc.rt("backup", "unreadable_folder_grace_runs") or 0),
-            # Письма старше срока хранения ящика не скачиваем: ночная очистка
-            # всё равно удалила бы их, а ящик со сроком «3 дня» иначе при первом
-            # копировании (и после «с нуля») тянул бы всю многолетнюю историю.
-            retention_days=effective_retention_days(svc, acc),
-        )
+        if acc.auth_type == AuthType.AXIGEN_FTP:
+            # Ящик сервера Axigen без пароля: письма берутся через службу FTP Backup.
+            from ..axigen.common import load_settings as _axigen_settings
+            from ..axigen.ftpbackup import FtpBackupEngine
+            engine = FtpBackupEngine(
+                ctx.db, svc.store, _axigen_settings(svc).require(),
+                skip_larger_than_mb=int(svc.rt("backup", "skip_larger_than_mb") or 0),
+                global_exclude=svc.rt("backup", "folder_exclude") or [],
+                global_include=svc.rt("backup", "folder_include") or [],
+                unreadable_grace_runs=int(svc.rt("backup", "unreadable_folder_grace_runs") or 0),
+                retention_days=effective_retention_days(svc, acc),
+            )
+        else:
+            engine = BackupEngine(
+                ctx.db, svc.store, svc.connect_options(),
+                skip_larger_than_mb=int(svc.rt("backup", "skip_larger_than_mb") or 0),
+                download_flags=bool(svc.rt("backup", "download_flags")),
+                global_exclude=svc.rt("backup", "folder_exclude") or [],
+                global_include=svc.rt("backup", "folder_include") or [],
+                unreadable_grace_runs=int(svc.rt("backup", "unreadable_folder_grace_runs") or 0),
+                # Письма старше срока хранения ящика не скачиваем: ночная очистка
+                # всё равно удалила бы их, а ящик со сроком «3 дня» иначе при первом
+                # копировании (и после «с нуля») тянул бы всю многолетнюю историю.
+                retention_days=effective_retention_days(svc, acc),
+            )
         res = engine.run(acc, progress_cb=progress, cancel_cb=ctx.is_cancelled, event_cb=emit)
     except JobCancelled:
         ctx.db.finish_run(run_id, JobStatus.CANCELLED, detail=ctx.stop_reason())
@@ -534,6 +554,11 @@ def _backup_account(ctx: JobContext, acc, *, rebuild: str = "",
     if res.messages_relinked:
         summary += (f" Сервер сменил нумерацию писем (UIDVALIDITY): узнано в архиве писем — "
                     f"{res.messages_relinked}, повторно они не скачивались.")
+    if res.messages_recognized:
+        summary += (f" Уже были в архиве (узнаны по содержимому, в том числе скопированные раньше по IMAP): "
+                    f"{res.messages_recognized} — второй раз не записаны.")
+    if res.other_files:
+        summary += f" Файлов на сервере, не похожих на письма (служебные): {res.other_files}."
     if res.messages_outside_retention:
         summary += (f" Писем старше срока хранения ящика ({effective_retention_days(svc, acc)} дн.) "
                     f"не скачано: {res.messages_outside_retention}.")
@@ -579,6 +604,7 @@ def _backup_account(ctx: JobContext, acc, *, rebuild: str = "",
             "known_unreadable_folders": res.known_unreadable_folders,
             "messages_failed": res.messages_failed, "messages_vanished": res.messages_vanished,
             "messages_relinked": res.messages_relinked,
+            "messages_recognized": res.messages_recognized, "other_files": res.other_files,
             "messages_outside_retention": res.messages_outside_retention,
             "reconnects": res.reconnects,
             "rebuild": rebuild or "", **({"rebuild_info": rebuild_info} if rebuild_info else {})}
@@ -587,6 +613,22 @@ def _backup_account(ctx: JobContext, acc, *, rebuild: str = "",
 # ---------------------------------------------------------------------------
 #  RESTORE
 # ---------------------------------------------------------------------------
+def restore_via_ftp(acc, params: Dict) -> bool:
+    """Восстанавливать ли через FTP Backup Axigen (а не по IMAP).
+
+    Ящик, который копируется через FTP Backup: по умолчанию — да, если у него нет
+    пароля (по IMAP войти нечем); явный выбор ``via`` («imap»/«ftp») важнее.
+    """
+    if acc.auth_type != AuthType.AXIGEN_FTP:
+        return False
+    via = str(params.get("via") or "auto").lower()
+    if via == "ftp":
+        return True
+    if via == "imap":
+        return False
+    return not acc.password
+
+
 def handle_restore(ctx: JobContext) -> Dict:
     svc = ctx.services
     acc = svc.require_account(ctx.account_id)
@@ -594,7 +636,25 @@ def handle_restore(ctx: JobContext) -> Dict:
     ctx.event("INFO", f"Старт восстановления ящика «{acc.name}» (режим: {p.get('target_mode','original')}).")
     restore_id = ctx.db.create_restore(acc.id, p, ctx.job_id)
 
-    engine = RestoreEngine(ctx.db, svc.store, svc.connect_options())
+    if restore_via_ftp(acc, p):
+        # Ящик Axigen без пароля: письма заливаются через службу FTP Backup.
+        from ..axigen.actions import require_changes_allowed
+        from ..axigen.common import load_settings as _axigen_settings
+        from ..axigen.ftprestore import FtpRestoreEngine
+        try:
+            st = _axigen_settings(svc).require()
+            require_changes_allowed(st)
+            if not p.get("ftp_confirmed_by"):
+                raise ValidationError(
+                    "Восстановление через FTP Backup Axigen меняет почтовый сервер и запускается только кнопкой "
+                    "администратора — по расписанию оно не выполняется.",
+                    hint="Запустите восстановление из меню ящика или выберите для расписания восстановление по IMAP.")
+        except MailArchiverError as exc:
+            ctx.db.update_restore(restore_id, status=JobStatus.FAILED, error=exc.message[:500])
+            raise
+        engine = FtpRestoreEngine(ctx.db, svc.store, st)
+    else:
+        engine = RestoreEngine(ctx.db, svc.store, svc.connect_options())
     try:
         res = engine.run(
             acc,
@@ -985,11 +1045,19 @@ def handle_import_pst(ctx: JobContext) -> Dict:
 # ---------------------------------------------------------------------------
 #  TEST CONNECTION
 # ---------------------------------------------------------------------------
+def probe_any(svc, acc) -> Dict:
+    """Проверка подключения ящика тем способом, которым он копируется."""
+    if acc.auth_type == AuthType.AXIGEN_FTP:
+        from ..axigen.ftpbackup import probe as axigen_probe
+        return axigen_probe(svc, acc)
+    return probe_account(acc, svc.connect_options())
+
+
 def handle_test(ctx: JobContext) -> Dict:
     svc = ctx.services
     acc = svc.require_account(ctx.account_id)
     ctx.event("INFO", f"Проверка подключения к «{acc.name}»…")
-    res = probe_account(acc, svc.connect_options())
+    res = probe_any(svc, acc)
     if res["ok"]:
         ctx.event("INFO", f"Успех. Папок: {len(res['folders'])}.")
         return {"final_status": JobStatus.SUCCESS, "summary": f"Подключение успешно, папок: {len(res['folders'])}.",
@@ -1436,10 +1504,14 @@ def handle_check_logins(ctx: JobContext) -> Dict:
     counts = {"ok": 0, "auth_error": 0, "conn_error": 0, "no_password": 0, "secret_broken": 0}
     bad: List[str] = []
     to_check = []
+    ftp_only = 0
     for acc in accounts:
         if acc.secret_broken:
             svc.db.set_login_status(acc.id, "secret_broken", "Пароль не расшифровывается текущим ключом.")
             counts["secret_broken"] += 1
+        elif acc.auth_type == AuthType.AXIGEN_FTP and not acc.password:
+            # копируется через FTP Backup Axigen, пароля нет и не нужно — проверять нечего
+            ftp_only += 1
         elif not account_has_credentials(acc):
             svc.db.set_login_status(acc.id, "no_password", "Пароль не задан.")
             counts["no_password"] += 1
@@ -1487,7 +1559,9 @@ def handle_check_logins(ctx: JobContext) -> Dict:
                 break
     summary = (f"Проверено ящиков: {total}. Пароль верный: {counts['ok']}, неверный: {counts['auth_error']}, "
                f"без пароля: {counts['no_password']}, нет связи с сервером: {counts['conn_error']}"
-               + (f", пароль не читается: {counts['secret_broken']}" if counts["secret_broken"] else "") + ".")
+               + (f", пароль не читается: {counts['secret_broken']}" if counts["secret_broken"] else "")
+               + (f", копируются через FTP Backup Axigen без пароля (не проверялись): {ftp_only}" if ftp_only else "")
+               + ".")
     ctx.event("INFO" if not counts["auth_error"] else "WARNING", summary)
     svc.db.add_audit("system", "check_logins", summary[:500])
     status = JobStatus.SUCCESS if not (counts["auth_error"] or counts["conn_error"]) else JobStatus.PARTIAL
@@ -1636,6 +1710,9 @@ def handle_folders_check(ctx: JobContext) -> Dict:
         ctx.progress(n, max(total, 1), f"{n + 1}/{total} «{acc.name}»")
         base = {"id": acc.id, "name": acc.name}
         problem = credential_problem(acc)
+        if not problem and acc.auth_type == AuthType.AXIGEN_FTP and not acc.password:
+            problem = ("копируется через FTP Backup Axigen без пароля — папки по IMAP не проверить (нечитаемые "
+                       "папки видны в журнале копирования)")
         host = (acc.host or "").strip().lower()
         if problem:
             counts["skipped"] += 1
@@ -1761,6 +1838,11 @@ _SEQ_STATE = "backup_all_state_"
 #: Отдельный ключ, а не поле состояния: состояние чужих незаконченных проходов
 #: чистится при старте каждого прохода, и повтор не должен от этого зависеть.
 _SEQ_RETRY = "backup_all_retry_at_"
+
+
+def _axigen_jobs():
+    from ..axigen import jobs as axigen_jobs
+    return axigen_jobs
 
 
 def is_global_pass(job) -> bool:
@@ -2456,4 +2538,6 @@ HANDLERS: Dict[str, Callable[[JobContext], Dict]] = {
     JobType.QUARANTINE_RESCUE: handle_quarantine,
     JobType.FOLDERS_CHECK: handle_folders_check,
     JobType.SEARCH_REINDEX: handle_search_reindex,
+    JobType.AXIGEN_SYNC: lambda ctx: _axigen_jobs().handle_sync(ctx),
+    JobType.AXIGEN_ACTION: lambda ctx: _axigen_jobs().handle_action(ctx),
 }

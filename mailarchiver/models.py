@@ -31,10 +31,13 @@ class JobType:
     QUARANTINE_RESCUE = "quarantine_rescue"  # вернуть в архив письма, которые есть только в прежней копии
     FOLDERS_CHECK = "folders_check"      # проверить папки на сервере у многих ящиков
     SEARCH_REINDEX = "search_reindex"    # переиндексировать поиск по письмам выбранных ящиков
+    AXIGEN_SYNC = "axigen_sync"          # сверка учётных записей сервера Axigen с архивом
+    AXIGEN_ACTION = "axigen_action"      # изменения на сервере Axigen для выбранных ящиков
 
     ALL = [BACKUP, RESTORE, EXPORT, IMPORT_PST, TEST, RETENTION, VERIFY, ANALYZE, SYNC_EMPLOYEES,
            STORAGE_CONVERT, CHECK_LOGINS, REPLICATE, DB_SNAPSHOT, SEARCH_INDEX, DEDUP_REPORT, CLEANUP,
-           BACKUP_ALL, QUARANTINE_CHECK, QUARANTINE_RESCUE, FOLDERS_CHECK, SEARCH_REINDEX]
+           BACKUP_ALL, QUARANTINE_CHECK, QUARANTINE_RESCUE, FOLDERS_CHECK, SEARCH_REINDEX, AXIGEN_SYNC,
+           AXIGEN_ACTION]
     LABELS = {
         BACKUP: "Резервное копирование",
         RESTORE: "Восстановление",
@@ -57,7 +60,16 @@ class JobType:
         QUARANTINE_RESCUE: "Возврат писем из прежней копии",
         FOLDERS_CHECK: "Проверка папок на сервере",
         SEARCH_REINDEX: "Переиндексация поиска",
+        AXIGEN_SYNC: "Сверка с сервером Axigen",
+        AXIGEN_ACTION: "Действия на сервере Axigen",
     }
+    #: Задания, которые после перезапуска службы не продолжаются сами: они меняют
+    #: почтовый сервер по кнопке администратора, а за время простоя состояние могли
+    #: поменять вручную (например, открыть вход в WebAdmin) — повторять вслепую нельзя.
+    NOT_RESUMABLE = frozenset({AXIGEN_ACTION})
+    NOT_RESUMED_TEXT = ("Задание прервано перезапуском службы и само не продолжается: оно меняет почтовый сервер. "
+                        "Что успело выполниться — в событиях задания; для остальных ящиков запустите действие "
+                        "заново.")
 
 
 class JobStatus:
@@ -84,17 +96,33 @@ class AuthType:
     PASSWORD = "password"      # логин/пароль (LOGIN/PLAIN)
     OAUTH2 = "oauth2"          # XOAUTH2 (Gmail, Microsoft 365)
     MASTER = "master"          # вход учётной записью администратора почты (пароль ящика не нужен)
+    #: копирование через службу FTP Backup сервера Axigen (входит администратор Axigen);
+    #: пароль ящика, если задан, нужен только операциям по IMAP (восстановление на сервер)
+    AXIGEN_FTP = "axigen_ftp"
 
-    ALL = [PASSWORD, OAUTH2, MASTER]
+    ALL = [PASSWORD, OAUTH2, MASTER, AXIGEN_FTP]
+    LABELS = {PASSWORD: "логин и пароль", OAUTH2: "OAuth2", MASTER: "через администратора почты",
+              AXIGEN_FTP: "через FTP Backup Axigen"}
 
 
 def account_has_credentials(acc) -> bool:
     """Есть ли у ящика чем войти на сервер (пароль, токен OAuth2 или вход администратора)."""
     if acc.auth_type == AuthType.OAUTH2:
         return bool(acc.oauth_refresh_token)
-    if acc.auth_type == AuthType.MASTER:
+    if acc.auth_type in (AuthType.MASTER, AuthType.AXIGEN_FTP):
         return True
     return bool(acc.password)
+
+
+def imap_login_possible(acc) -> bool:
+    """Можно ли войти в ящик по IMAP (восстановление, проверка папок и пароля).
+
+    У ящика, который копируется через FTP Backup Axigen, вход по IMAP возможен,
+    только если ему задан пароль.
+    """
+    if acc.auth_type == AuthType.AXIGEN_FTP:
+        return bool(acc.password)
+    return account_has_credentials(acc)
 
 
 class Security:
@@ -190,6 +218,8 @@ class Account:
             "folder_include": self.folder_include,
             "folder_exclude": self.folder_exclude,
             "has_password": account_has_credentials(self),
+            # можно ли войти в ящик по IMAP (у ящика FTP Backup Axigen — только если задан пароль)
+            "imap_login": imap_login_possible(self),
             # Не секреты: без них форма ящика OAuth2 отправляла пустые значения,
             # и любое сохранение молча ломало копирование Gmail/M365.
             "oauth_client_id": self.oauth_client_id,

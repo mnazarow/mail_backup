@@ -22,6 +22,8 @@ MailArchiver сообщает о своём состоянии тремя спо
   прежде чем удалять копии); прежняя копия старше 30 дней упоминается отдельно;
 - состояние копии вне сервера и снимков базы;
 - неудачные входы в веб-интерфейс за неделю.
+- если включён раздел «Сервер Axigen» — состояние сервера Axigen: доступность, очередь, лицензия,
+  учётные записи, которые не копируются, и сколько проблем требует внимания.
 
 Настройки: «Уведомления → Еженедельная сводка» и «Когда присылать сводку» (cron). Сводка приходит,
 только если настроена отправка почты (SMTP) и уведомления включены. В карточке «Уведомления» есть
@@ -84,6 +86,11 @@ curl -s -H "Authorization: Bearer ВАШ_ТОКЕН" https://mail-archive.compan
 | `mailarchiver_account_login_ok{…}` | Итог последней проверки входа в ящик (1 — пароль верный) |
 | `mailarchiver_account_messages{…}`, `mailarchiver_account_bytes{…}` | Писем и объём архива ящика |
 | `mailarchiver_account_quarantines{…}` | Прежних копий у ящика (только у ящиков, где они есть) |
+| `mailarchiver_axigen_up` | Только если включён раздел «Сервер Axigen»: 1 — последняя проверка сервера удалась |
+| `mailarchiver_axigen_queue_messages` | Писем в очереди Axigen |
+| `mailarchiver_axigen_license_days_left` | Дней до окончания лицензии Axigen |
+| `mailarchiver_axigen_accounts{state}` | Учётные записи Axigen по последней сверке: `total`, `blocked`, `deleted` |
+| `mailarchiver_axigen_problems{problem}` | 1 — на сервере Axigen есть проблема: `unreachable`, `queue`, `license`, `quota`, `unarchived`, `gone`, `blocked_imap`, `tls_unverified` ([19-axigen.md](19-axigen.md), раздел 19.9) |
 
 Метрики по каждому ящику (`mailarchiver_account_*`) можно выключить параметром «Метрики по
 каждому ящику», если нужны только общие цифры. Тяжёлые показатели (размеры, диск) кэшируются на

@@ -59,7 +59,7 @@ GROUPS: List[Tuple[str, str]] = [
 ]
 
 AUTH_LABELS = {AuthType.PASSWORD: "по паролю ящика", AuthType.MASTER: "через администратора почты",
-               AuthType.OAUTH2: "OAuth2"}
+               AuthType.OAUTH2: "OAuth2", AuthType.AXIGEN_FTP: "через FTP Backup Axigen"}
 
 
 def retention_label(days: Optional[int]) -> str:
@@ -1522,6 +1522,13 @@ class RestoreAction(Handler):
             return problem
         if ctx.busy(acc.id, (JobType.RESTORE,)):
             return "восстановление уже идёт или стоит в очереди"
+        from .queue.jobs import restore_via_ftp
+        if restore_via_ftp(acc, ctx.data["opts"]):
+            from .axigen.common import load_settings as _axigen_settings
+            st = _axigen_settings(ctx.svc)
+            if not (st.enabled and st.allow_changes):
+                return ("ящик без пароля копируется через FTP Backup Axigen, а изменения на сервере Axigen не "
+                        "разрешены — восстановить его нечем")
         return ""
 
     def plan(self, ctx, acc):
@@ -1532,7 +1539,10 @@ class RestoreAction(Handler):
                 + f" на {acc.host}")
 
     def apply(self, ctx, acc):
+        from .queue.jobs import restore_via_ftp
         opts = dict(ctx.data["opts"])
+        if restore_via_ftp(acc, opts):
+            opts["ftp_confirmed_by"] = ctx.username     # действие запустил администратор после проверки
         job_id = ctx.enqueue(JobType.RESTORE, acc.id, opts)
         if opts["target_mode"] == "original" and not opts["dry_run"]:
             ctx.db.add_audit(ctx.username, "restore_original", f"account={acc.id} — групповое действие")
@@ -1833,9 +1843,27 @@ HANDLERS: Dict[str, Handler] = {h.key: h for h in (
 )}
 
 
+# Действия с сервером Axigen (группа «Сервер Axigen») — в своём модуле.
+from .axigen.bulk_actions import register as _register_axigen  # noqa: E402
+
+_register_axigen(HANDLERS, GROUPS)
+
+
+def _visible(handler: Handler, svc) -> bool:
+    check = getattr(handler, "visible", None)
+    if check is None:
+        return True
+    try:
+        return bool(check(svc))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def describe_actions(svc) -> Dict[str, Any]:
-    return {"groups": [{"key": k, "label": t} for k, t in GROUPS],
-            "actions": [h.describe(svc) for h in HANDLERS.values()],
+    actions = [h.describe(svc) for h in HANDLERS.values() if _visible(h, svc)]
+    used = {a["group"] for a in actions}
+    return {"groups": [{"key": k, "label": t} for k, t in GROUPS if k in used or k != "axigen"],
+            "actions": actions,
             "create_defaults": create_defaults(svc)}
 
 

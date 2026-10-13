@@ -242,6 +242,12 @@ def render_prometheus(svc, *, per_account: bool = True) -> str:
                "Писем, которые есть только в прежних копиях (нет в архиве)", "gauge", [({}, q["unique"])])
     out.metric("mailarchiver_quarantine_oldest_age_seconds", "Возраст самой старой прежней копии, секунд", "gauge",
                [({}, max(0.0, time.time() - q["oldest_created_at"]))] if q["oldest_created_at"] else [])
+    try:
+        from .axigen.monitor import metrics as axigen_metrics
+        for name, help_text, kind, samples in axigen_metrics(svc):
+            out.metric(name, help_text, kind, samples)
+    except Exception:  # noqa: BLE001 — метрики Axigen не должны ломать остальные
+        pass
     if per_account:
         rows = acc["accounts"]
 
@@ -374,6 +380,14 @@ def weekly_summary(svc, days: int = 7, *, fresh: bool = True, security: bool = T
     if data["encryption"]["blocked"]:
         problems += 1
         lines.append("⛔ Шифрование включено, а ключа нет — новые письма не сохраняются!")
+    try:
+        from .axigen.monitor import problems as axigen_problems, summary_lines as axigen_summary
+        ax_lines = axigen_summary(svc)
+        if ax_lines:
+            lines.extend(ax_lines)
+            problems += len(axigen_problems(svc))
+    except Exception:  # noqa: BLE001 — сводка уходит и без раздела Axigen
+        pass
     if security and sec is not None and (sec["pw"] or sec["otp"] or sec["imap"]):
         lines.append(f"Безопасность за неделю: неудачных входов {sec['pw']}, неверных кодов 2FA {sec['otp']}, "
                      f"неудачных проверок паролей ящиков {sec['imap']}.")

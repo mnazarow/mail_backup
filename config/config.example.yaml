@@ -123,6 +123,7 @@ employees:
   account_schedule_enabled: false
   account_schedule_cron: "0 2 * * *"
   account_use_master: false  # новые ящики — вход через администратора почты (см. mailadmin)
+  account_use_axigen_ftp: false  # новые ящики — копирование через FTP Backup Axigen (см. axigen)
   dismiss_from_file: true    # отмечать уволенных по колонкам «Работает»/«Уволен»/«Дата увольнения»
   dismiss_missing_days: 0    # уволен, если нет в выгрузке N дней (0 — не считать)
   dismissed_action: "final_backup_disable"   # final_backup_disable | keep
@@ -173,3 +174,34 @@ mailadmin:                   # вход в ящики через админис�
   password: ""               # лучше задать в интерфейсе: там он хранится зашифрованным
   mode: "sasl_plain"         # sasl_plain | separator
   separator: "*"
+
+axigen:                      # сервер Axigen: CLI и FTP Backup (docs/ru/19-axigen.md)
+  enabled: false
+  host: ""                   # имя или IP сервера Axigen, напр. "10.0.0.5"
+  admin_user: "admin"        # администратор Axigen (лучше отдельный, только для архива)
+  admin_password: ""         # лучше задать в интерфейсе: там он хранится зашифрованным
+  cli_port: 7000
+  cli_tls: "none"            # none | tls — к другой машине только tls (SSL-слушатель CLI)
+  ftp_port: 21
+  ftp_tls: "none"            # none | explicit (AUTH TLS) | implicit (SSL-слушатель FTP Backup)
+  tls_verify: true
+  cli_cert_sha256: ""        # отпечаток самоподписанного сертификата — задаётся кнопкой «Доверять»
+  ftp_cert_sha256: ""
+  allow_plaintext: false     # разрешить пароль администратора по сети без шифрования (не рекомендуется)
+  ftp_user: ""               # пусто — администратор CLI
+  ftp_password: ""
+  imap_host: ""              # как поле «Сервер» у ящиков этого сервера, напр. "mx.example.ru"
+  domains: []                # пусто — все домены сервера
+  allow_changes: false       # разрешить изменения на сервере (только по кнопке, с проверкой)
+  ftp_account_path: ""       # пусто — каталог ящика ищется сам; иначе напр. "domains/{domain}/{local}"
+  ftp_name_encoding: "auto"  # auto | utf7 | utf8 — кодировка имён папок в FTP Backup
+  ftp_exclude_folders: ["Calendar", "Contacts", "Tasks", "Notes", "Journal", "Календарь", "Контакты", "Задачи", "Заметки", "Дневник"]   # не почта
+  timeout_s: 60
+  sync_enabled: false        # сверять учётные записи по расписанию
+  sync_cron: "40 4 * * *"
+  sync_add_new: false        # заводить ящики в архиве для новых учётных записей
+  new_mailbox_auth: "axigen_ftp"   # axigen_ftp | password — как копировать заведённые ящики
+  monitor_enabled: true      # следить за состоянием сервера (каждые 15 минут)
+  alert_queue: 500           # предупреждать об очереди от N писем
+  alert_license_days: 30     # предупреждать о лицензии за N дней
+  alert_quota_percent: 90    # предупреждать о заполнении ящика от N %

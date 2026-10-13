@@ -34,7 +34,8 @@ log = get_logger("db")
 #: (шифруются в :meth:`Database.set_setting`, расшифровываются в
 #: :meth:`Database.get_setting`).
 _ENCRYPTED_SETTINGS = {"notifications.smtp_password", "employees.source_url_password",
-                       "replica.s3_secret_key", "monitoring.metrics_token", "mailadmin.password"}
+                       "replica.s3_secret_key", "monitoring.metrics_token", "mailadmin.password",
+                       "axigen.admin_password", "axigen.ftp_password"}
 
 
 #: Выборка сотрудника вместе с названием и состоянием привязанного ящика:
@@ -188,6 +189,9 @@ class Database:
             # Отпечатки вложений для отчёта «Одинаковые вложения» (таблица и триггер удаления).
             from .dedup import ensure_schema as _ensure_dedup_schema
             _ensure_dedup_schema(conn)
+            # Сервер Axigen: снимок учётных записей, файлы FTP Backup, журнал команд.
+            from .axigen.store import ensure_schema as _ensure_axigen_schema
+            _ensure_axigen_schema(conn)
         self._encrypt_plain_settings()
 
     def _encrypt_plain_settings(self) -> None:
@@ -1705,13 +1709,16 @@ class Database:
         Раньше задание с одной попыткой (экспорт, очистка) после обновления
         службы объявлялось проваленным.
         """
-        rows = self.query("SELECT id, restarts, cancel_requested FROM jobs WHERE status=?",
+        rows = self.query("SELECT id, type, restarts, cancel_requested FROM jobs WHERE status=?",
                           (models.JobStatus.RUNNING,))
         count = 0
         for r in rows:
             restarts = int(r["restarts"] or 0) + 1
             if r["cancel_requested"]:
                 self.finish_job(r["id"], models.JobStatus.CANCELLED, error="Отменено пользователем")
+            elif r["type"] in models.JobType.NOT_RESUMABLE:
+                self.add_job_event(r["id"], "ERROR", models.JobType.NOT_RESUMED_TEXT)
+                self.finish_job(r["id"], models.JobStatus.FAILED, error=models.JobType.NOT_RESUMED_TEXT)
             elif restarts > self.MAX_JOB_RESTARTS:
                 self.finish_job(r["id"], models.JobStatus.FAILED,
                                 error=f"Задание прерывалось перезапуском службы {restarts} раз подряд — "

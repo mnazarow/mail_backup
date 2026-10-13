@@ -152,6 +152,40 @@ DEFAULTS: Dict[str, Any] = {
         "mode": "sasl_plain",         # sasl_plain (AUTHENTICATE PLAIN с authzid) | separator (ящик*админ)
         "separator": "*",             # разделитель для режима separator (Dovecot: auth_master_user_separator)
     },
+    "axigen": {
+        # Работа с почтовым сервером Axigen: учётные записи, копирование ящиков без
+        # паролей через службу FTP Backup, изменения на сервере по кнопке, мониторинг.
+        "enabled": False,
+        "host": "",                   # адрес сервера Axigen (CLI и FTP Backup)
+        "cli_port": 7000,              # порт CLI (по умолчанию 7000)
+        "cli_tls": "none",            # none | tls — CLI через SSL-слушатель (нужно, если сервер в другой сети)
+        "admin_user": "admin",        # администратор Axigen (можно отдельного, с ограниченными правами)
+        "admin_password": "",         # пароль (хранится в БД зашифрованным)
+        "tls_verify": True,            # проверять сертификат сервера по цепочке доверия
+        "cli_cert_sha256": "",        # отпечаток сертификата CLI, которому доверять (вместо цепочки)
+        "imap_host": "",              # адрес IMAP этого сервера — как у ящиков (для сверки и новых ящиков)
+        "domains": [],                 # с какими доменами работать (пусто — со всеми)
+        "allow_changes": False,        # разрешить изменения на сервере (блокировка, пароли, очистка, удаление)
+        "ftp_port": 21,                # порт службы FTP Backup
+        "ftp_tls": "none",            # none | explicit (AUTH TLS) | implicit (SSL-слушатель)
+        "ftp_cert_sha256": "",        # отпечаток сертификата FTP Backup, которому доверять
+        "ftp_user": "",               # пусто — тот же администратор, что для CLI
+        "ftp_password": "",           # пусто — тот же пароль (хранится в БД зашифрованным)
+        "ftp_account_path": "",       # шаблон пути к ящику на FTP; пусто — найти самому
+        "ftp_name_encoding": "auto",  # auto | utf7 | utf8 — как служба пишет имена папок
+        "ftp_exclude_folders": ["Calendar", "Contacts", "Tasks", "Notes", "Journal",
+                                "Календарь", "Контакты", "Задачи", "Заметки", "Дневник"],
+        "timeout_s": 60,               # таймаут операций с сервером, секунды
+        "allow_plaintext": False,      # разрешить вход без шифрования к другой машине (пароль виден в сети)
+        "sync_enabled": False,         # сверять учётные записи с архивом по расписанию
+        "sync_cron": "40 4 * * *",    # когда сверять (минуты часы день месяц день_недели)
+        "sync_add_new": False,         # заводить в архиве ящики для новых учётных записей
+        "new_mailbox_auth": "axigen_ftp",  # как копировать новые ящики: axigen_ftp | password
+        "monitor_enabled": True,       # проверять сервер каждые 15 минут и сообщать о проблемах
+        "alert_queue": 500,            # предупреждать, если в очереди писем не меньше (0 — нет)
+        "alert_license_days": 30,      # предупреждать за N дней до конца лицензии (0 — нет)
+        "alert_quota_percent": 90,     # предупреждать, если ящик заполнен на N % квоты (0 — нет)
+    },
     "monitoring": {
         "metrics_enabled": False,      # отдавать метрики по адресу /metrics (Prometheus, Zabbix)
         "metrics_token": "",          # токен доступа (Authorization: Bearer …); хранится в БД зашифрованным
@@ -216,6 +250,7 @@ DEFAULTS: Dict[str, Any] = {
         "account_schedule_enabled": False,  # заводить расписание копирования новому ящику
         "account_schedule_cron": "0 2 * * *",  # расписание копирования (минуты часы день месяц день_недели)
         "account_use_master": False,   # заводить ящики с входом через администратора почты (без паролей)
+        "account_use_axigen_ftp": False,  # заводить ящики с копированием через FTP Backup Axigen (без паролей)
         # --- уволенные сотрудники ---
         "dismiss_from_file": True,     # отмечать уволенными тех, кто помечен так в выгрузке
         "dismiss_missing_days": 0,     # уволен, если не встречается в выгрузке N дней (0 — не считать)
@@ -269,6 +304,13 @@ VALUE_RANGES: Dict[str, tuple] = {
     "employees.account_retention_days": (-1, 36500),
     "employees.dismiss_missing_days": (0, 3650),
     "employees.dismissed_keep_years": (0, 100),
+    # axigen
+    "axigen.cli_port": (1, 65535),
+    "axigen.ftp_port": (1, 65535),
+    "axigen.timeout_s": (5, 3600),
+    "axigen.alert_queue": (0, 10_000_000),
+    "axigen.alert_license_days": (0, 3650),
+    "axigen.alert_quota_percent": (0, 100),
     # replica
     "search.body_max_kb": (1, 1024),
     "replica.db_snapshot_keep": (0, 365),
@@ -315,6 +357,10 @@ VALUE_CHOICES: Dict[str, tuple] = {
     "replica.target": ("dir", "rsync", "s3"),
     "mailadmin.mode": ("sasl_plain", "separator"),
     "employees.dismissed_action": ("final_backup_disable", "keep"),
+    "axigen.cli_tls": ("none", "tls"),
+    "axigen.ftp_tls": ("none", "explicit", "implicit"),
+    "axigen.ftp_name_encoding": ("auto", "utf7", "utf8"),
+    "axigen.new_mailbox_auth": ("axigen_ftp", "password"),
 }
 
 #: Параметры, которые задаются ТОЛЬКО в config.yaml: они нужны до запуска
@@ -430,6 +476,30 @@ def coerce_setting(full_key: str, value):
         raise ValueError("Префикс S3 не должен начинаться с «/» или содержать «..».")
     if full_key == "mailadmin.separator" and (not out or len(out) > 4 or any(c.isspace() for c in out)):
         raise ValueError("Разделитель — 1–4 символа без пробелов, например «*».")
+    if full_key in ("axigen.host", "axigen.imap_host") and out:
+        if "://" in out or "/" in out or any(c.isspace() for c in out) or not re.match(r"^[A-Za-z0-9.\-:\[\]]+$", out):
+            raise ValueError(f"Параметр «{full_key}»: нужен адрес сервера без «https://» и пути, например "
+                             f"mx.company.ru или 10.0.0.5.")
+    if full_key in ("axigen.cli_cert_sha256", "axigen.ftp_cert_sha256") and out:
+        digits = re.sub(r"[^0-9a-f]", "", out.lower())
+        if len(digits) != 64:
+            raise ValueError("Отпечаток сертификата — 64 шестнадцатеричных знака SHA-256 (двоеточия можно).")
+        out = ":".join(digits[i:i + 2] for i in range(0, 64, 2)).upper()
+    if full_key == "axigen.domains":
+        bad = [d for d in out if not re.match(r"^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$", d)]
+        if bad:
+            raise ValueError(f"Не похоже на домен: {', '.join(bad[:3])}.")
+        out = [d.lower() for d in out]
+    if full_key == "axigen.ftp_account_path" and out:
+        if ".." in out.split("/") or not ("{local}" in out or "{email}" in out or "{name}" in out):
+            raise ValueError("Шаблон пути к ящику — например domains/{domain}/{local}: нужен {local} (или {email}), "
+                             "без «..».")
+        try:
+            out.format(domain="d", local="l", email="e", name="n")
+        except (KeyError, IndexError, ValueError):
+            raise ValueError("В шаблоне пути можно использовать только {domain}, {local}, {email}.") from None
+    if full_key == "axigen.ftp_exclude_folders":
+        out = [x for x in out if x]
     if full_key == "monitoring.metrics_allowed_ips":
         import ipaddress
         for item in out:

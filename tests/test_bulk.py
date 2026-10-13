@@ -340,7 +340,16 @@ def test_describe_and_run_do_not_touch_other_accounts(services):
     res = bulk.run(services, user, "enable", [a], preview=True)
     assert res["counts"]["ok"] == 1 and not services.db.get_account(a).enabled
     desc = bulk.describe_actions(services)
-    assert len(desc["actions"]) == len(bulk.HANDLERS)
+    # действия Axigen видны, только когда раздел «Сервер Axigen» включён
+    visible = [h for h in bulk.HANDLERS.values() if bulk._visible(h, services)]
+    assert len(desc["actions"]) == len(visible)
+    assert not any(a["group"] == "axigen" for a in desc["actions"])
+    assert not any(g["key"] == "axigen" for g in desc["groups"])
+    services.db.set_settings_many({"axigen.enabled": True})
+    services.apply_runtime_settings()
+    shown = bulk.describe_actions(services)
+    assert len(shown["actions"]) == len(bulk.HANDLERS)
+    assert any(g["key"] == "axigen" for g in shown["groups"])
 
 
 def test_copy_settings_from_template_mailbox(admin):

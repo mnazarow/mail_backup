@@ -44,7 +44,8 @@ LOCAL_JOB_TYPES = (JobType.BACKUP, JobType.RETENTION, JobType.STORAGE_CONVERT, J
 #: Задания, которые не запускаются параллельно сами с собой.
 SINGLETON_JOB_TYPES = (JobType.SYNC_EMPLOYEES, JobType.CHECK_LOGINS, JobType.REPLICATE,
                        JobType.DB_SNAPSHOT, JobType.SEARCH_INDEX, JobType.DEDUP_REPORT,
-                       JobType.BACKUP_ALL, JobType.SEARCH_REINDEX, JobType.FOLDERS_CHECK)
+                       JobType.BACKUP_ALL, JobType.SEARCH_REINDEX, JobType.FOLDERS_CHECK,
+                       JobType.AXIGEN_SYNC, JobType.AXIGEN_ACTION)
 #: О каких заданиях не слать уведомления (служебные, по кнопке).
 _QUIET_TYPES = (JobType.TEST, JobType.CHECK_LOGINS, JobType.SEARCH_INDEX, JobType.DEDUP_REPORT,
                 JobType.QUARANTINE_CHECK, JobType.FOLDERS_CHECK, JobType.SEARCH_REINDEX)
@@ -316,6 +317,11 @@ class QueueManager:
             log.info("Задание #%s (%s) завершено: %s", job_id, job_type, final)
             self._after_final(job, final, result.get("summary") or "", result.get("hint"), result)
         except JobCancelled as exc:
+            if self._shutting_down.is_set() and not self.db.is_cancel_requested(job_id) \
+                    and job_type in JobType.NOT_RESUMABLE:
+                self.db.add_job_event(job_id, "ERROR", JobType.NOT_RESUMED_TEXT)
+                self.db.finish_job(job_id, JobStatus.FAILED, error=JobType.NOT_RESUMED_TEXT)
+                return
             if self._shutting_down.is_set() and not self.db.is_cancel_requested(job_id):
                 # Не отмена пользователем, а остановка службы: задание вернётся
                 # в очередь (без траты попытки) и продолжится после запуска.
@@ -343,10 +349,12 @@ class QueueManager:
         if self.db.is_cancel_requested(job_id):
             self.db.finish_job(job_id, JobStatus.CANCELLED, error="Отменено пользователем")
             return
-        if self._shutting_down.is_set():
+        if self._shutting_down.is_set() and job.get("type") not in JobType.NOT_RESUMABLE:
             with self._lock:
                 self._to_requeue[job_id] = {"refund": True}
             return
+        if job.get("type") in JobType.NOT_RESUMABLE:
+            retryable = False            # меняет сервер — сам не повторяется
         if retryable and attempts < max_attempts:
             # Пауза растёт в retry_backoff раз с каждой попыткой (2 → 4 → 8 с …).
             try:
