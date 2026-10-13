@@ -43,6 +43,7 @@ router = APIRouter(prefix="/api")
 
 # Максимальный размер загружаемого .pst. Отдельной настройки для него нет,
 # поэтому держим лимит константой: без него один запрос мог бы забить диск.
+# Файл больше предела импортируется из каталога импорта на сервере (см. import_pst).
 MAX_PST_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024   # 2 ГБ
 
 # Максимальный размер загружаемого списка сотрудников. Выгрузка кадровой
@@ -1354,8 +1355,33 @@ def clear_account_retired(request: Request, account_id: int, user: dict = Depend
     return {"ok": True, "cleared": cleared}
 
 
+@router.get("/import-files")
+def list_import_files(request: Request, user: dict = Depends(auth_mod.require_user)):
+    """Файлы .pst/.ost в каталоге импорта на сервере — для окна «Импорт .pst».
+
+    Так импортируются файлы больше предела загрузки: администратор кладёт файл
+    в каталог сам, а здесь выбирает его по имени.
+    """
+    from ..pstimport import inbox
+    svc = svc_dep(request)
+    # Права те же, что у самого импорта: оператору точка закрыта списком
+    # OPERATOR_ROUTES, сотруднику (вход по ящику) — здесь.
+    _require_not_mailbox(user, "Импорт .pst")
+    directory = svc.cfg.import_dir
+    # Почему каталог недоступен, окну нужно знать точно: ссылке на неподключённый диск
+    # не поможет «mkdir», закрытому каталогу — «подключите диск» (problem — вид причины,
+    # reason — она же словами, link_target — куда ведёт каталог, если он ссылка).
+    kind, reason = inbox.problem(svc.cfg)
+    return {"directory": directory,
+            "link_target": os.path.realpath(directory) if os.path.islink(directory) else "",
+            "files": [] if kind else inbox.list_files(directory),
+            "available": not kind, "problem": kind, "reason": reason,
+            "user": inbox.service_user(), "max_upload_bytes": MAX_PST_UPLOAD_BYTES}
+
+
 @router.post("/accounts/{account_id}/import-pst")
-def import_pst(request: Request, account_id: int, file: UploadFile = File(...),
+def import_pst(request: Request, account_id: int, file: Optional[UploadFile] = File(None),
+               server_file: str = Form(""),
                target_prefix: str = Form("Импорт PST"), no_prefix: str = Form(""),
                target: str = Form("imap"), skip_existing: str = Form("1"),
                engine: str = Form("builtin"), ansi_codepage: str = Form("cp1251"),
@@ -1363,11 +1389,16 @@ def import_pst(request: Request, account_id: int, file: UploadFile = File(...),
     """Импорт .pst в ящик: ``target`` — ``imap`` (на почтовый сервер) или ``local``
     (в локальную копию); ``engine`` — ``builtin`` (встроенный разбор) или ``readpst``.
 
+    Файл — один из двух: загруженный (``file``) или уже лежащий в каталоге импорта
+    на сервере (``server_file`` — имя из списка ``GET /api/import-files``). Второй
+    способ — для файлов больше предела загрузки; такой файл не копируется и после
+    импорта остаётся на месте.
+
     Папки создаются внутри ``target_prefix``. Без общей папки (под своими именами)
     — только с явным ``no_prefix=1``: пустое поле формы FastAPI заменяет значением
     по умолчанию, и «пустой префикс» одним полем передать нельзя — да и не стоит:
     очищенное по ошибке поле не должно заливать архив прямо в рабочие папки."""
-    from ..pstimport import importer
+    from ..pstimport import importer, inbox
     svc = svc_dep(request)
     # Разбор присланного файла — тяжёлая работа над чужими данными, а импорт
     # ещё и пишет в ящик: это не то, что стоит открывать каждому сотруднику.
@@ -1388,41 +1419,75 @@ def import_pst(request: Request, account_id: int, file: UploadFile = File(...),
     else:
         prefix = importer.clean_prefix(target_prefix) or importer.DEFAULT_PREFIX
     skip = str(skip_existing).strip().lower() not in off
-    # имя файла приходит от клиента: берём только базовое имя и чистим его,
-    # иначе «../../» в имени увело бы запись за пределы каталога временных файлов
-    origin_name = os.path.basename(file.filename or "")
-    if not origin_name.lower().endswith(".pst"):
-        raise ValidationError("Ожидается файл .pst", hint="Выберите файл с расширением .pst")
-    fname = safe_filename(origin_name, default="import.pst")
-    # uuid в имени: почти все файлы называются «Outlook.pst», и вторая загрузка
-    # в тот же ящик затирала первую (первое задание импортировало чужой файл).
-    dest = os.path.join(svc.cfg.tmp_dir, f"import_{account_id}_{uuid.uuid4().hex}_{fname}")
-    written = 0
-    try:
-        with open(dest, "wb") as fh:
-            while True:
-                chunk = file.file.read(1024 * 1024)
-                if not chunk:
-                    break
-                written += len(chunk)
-                if written > MAX_PST_UPLOAD_BYTES:
-                    raise ValidationError(
-                        f"Файл слишком большой: допустимо не более {human_size(MAX_PST_UPLOAD_BYTES)}.",
-                        hint="Разделите архив .pst на части и импортируйте их по очереди.")
-                fh.write(chunk)
-    except BaseException:
-        # частично записанный файл не должен оставаться на диске
+    # Поле файла без выбранного файла браузер присылает частью с пустым именем —
+    # это «файл не выбран», а не загрузка.
+    uploaded = file is not None and bool(file.filename)
+    server_name = server_file if isinstance(server_file, str) else ""
+    if uploaded and server_name:
+        raise ValidationError("Файл указан дважды: и загруженный, и с сервера.",
+                              hint="Выберите что-то одно: загрузить файл с компьютера или взять файл из "
+                                   "каталога импорта на сервере.")
+    if not uploaded and not server_name:
+        raise ValidationError("Файл для импорта не выбран.",
+                              hint="Выберите файл .pst или .ost на своём компьютере либо файл из каталога "
+                                   "импорта на сервере.")
+    if server_name:
+        kind, reason = inbox.problem(svc.cfg)
+        if kind:
+            raise ValidationError(f"Взять файл с сервера сейчас нельзя. {reason}.",
+                                  hint="Что с этим делать, написано в окне импорта под списком «Файл на "
+                                       "сервере». Загрузка файла с компьютера при этом работает.")
+        # Имя пришло из браузера: путь по нему строит только inbox.locate — он пускает
+        # лишь обычный файл, лежащий прямо в каталоге импорта. Файл не копируется.
+        dest, info = inbox.locate(svc.cfg.import_dir, server_name)
+        origin_name = os.path.basename(dest)
+        # Пути в параметрах задания нет намеренно: прежние версии после импорта удаляли
+        # файл по pst_path, и после отката на них «Повторить» стёрло бы файл администратора.
+        # Приметы файла — чтобы под тем же именем не импортировался уже другой файл.
+        job_file = {"source": "server", "server_file": origin_name, "fingerprint": inbox.fingerprint(info)}
+        source = "server"
+    else:
+        # имя файла приходит от клиента: берём только базовое имя и чистим его,
+        # иначе «../../» в имени увело бы запись за пределы каталога временных файлов
+        origin_name = os.path.basename(file.filename or "")
+        if not origin_name.lower().endswith(inbox.EXTENSIONS):
+            raise ValidationError("Ожидается файл .pst или .ost",
+                                  hint="Выберите файл данных Outlook с расширением .pst или .ost")
+        fname = safe_filename(origin_name, default="import" + origin_name[-4:].lower())
+        # uuid в имени: почти все файлы называются «Outlook.pst», и вторая загрузка
+        # в тот же ящик затирала первую (первое задание импортировало чужой файл).
+        dest = os.path.join(svc.cfg.tmp_dir, f"import_{account_id}_{uuid.uuid4().hex}_{fname}")
+        source = "upload"
+        written = 0
         try:
-            os.unlink(dest)
-        except OSError:
-            pass
-        raise
+            with open(dest, "wb") as fh:
+                while True:
+                    chunk = file.file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > MAX_PST_UPLOAD_BYTES:
+                        raise ValidationError(
+                            f"Файл слишком большой: через интерфейс загружается не более "
+                            f"{human_size(MAX_PST_UPLOAD_BYTES)}.",
+                            hint=f"Положите файл в каталог импорта на сервере ({svc.cfg.import_dir}) и выберите "
+                                 f"в окне импорта «Взять с сервера» — так импортируется файл любого размера.")
+                    fh.write(chunk)
+        except BaseException:
+            # частично записанный файл не должен оставаться на диске
+            try:
+                os.unlink(dest)
+            except OSError:
+                pass
+            raise
+        job_file = {"source": "upload", "pst_path": dest}
     jid = svc.queue.enqueue(JobType.IMPORT_PST, account_id,
-                            {"pst_path": dest, "target": target, "target_prefix": prefix,
-                             "skip_existing": skip, "engine": engine, "ansi_codepage": ansi_codepage},
+                            dict(job_file, target=target, target_prefix=prefix, skip_existing=skip,
+                                 engine=engine, ansi_codepage=ansi_codepage),
                             created_by=user["username"])
     svc.db.add_audit(user["username"], "import_pst",
-                     f"{acc.name}: {origin_name}, "
+                     f"{acc.name}: {origin_name} "
+                     + ("(из каталога импорта на сервере), " if source == "server" else "(загружен через интерфейс), ")
                      + ("в локальную копию" if target == "local" else "на сервер")
                      + (f", префикс «{prefix}»" if prefix else ", без префикса"))
     return {"ok": True, "job_id": jid}

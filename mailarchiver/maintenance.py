@@ -71,13 +71,18 @@ def clean_tmp(svc, older_than_s: float) -> int:
     except OSError:
         return 0
     keep = _referenced_tmp_paths(svc)
+    # Каталог импорта — не временный: файлы в нём положил администратор, и служба их
+    # не удаляет, даже если каталог временных файлов настроен рядом или выше. Беречь
+    # нужно только то, что лежит прямо в нём (и его самого): см. inbox.protected.
+    from .pstimport import inbox
+    import_dir = getattr(svc.cfg, "import_dir", "")
     now = time.time()
     removed = 0
     for name in names:
         if not name.startswith(TMP_PREFIXES):
             continue
         path = os.path.abspath(os.path.join(tmp, name))
-        if path in keep:
+        if path in keep or inbox.protected(import_dir, path):
             continue
         try:
             age = now - os.lstat(path).st_mtime

@@ -769,6 +769,79 @@ def _unlink_quiet(path: str) -> None:
 # ---------------------------------------------------------------------------
 #  IMPORT PST -> на IMAP-сервер или в локальную копию ящика
 # ---------------------------------------------------------------------------
+def _import_server_file(svc, params: Dict):
+    """Файл задания «с сервера»: путь и его ``lstat`` на начало импорта.
+
+    В параметрах такого задания пути нет — только имя (``server_file``) и приметы
+    файла (``fingerprint``): путь строится заново при каждом запуске. Прежние версии
+    после импорта удаляли файл по ``pst_path`` — после отката на них повтор задания
+    с путём стёр бы файл администратора, а без пути оно просто не находит файл.
+
+    Сообщения здесь — без путей на сервере: журнал задания виден и сотруднику,
+    вошедшему по своему ящику.
+    """
+    from ..pstimport import inbox
+    kind, _reason = inbox.problem(svc.cfg)
+    if kind:
+        raise ValidationError(
+            "Импорт файлов с сервера отключён: каталог импорта пересекается с каталогом временных файлов службы."
+            if kind == "overlap" else "Каталог импорта на сервере сейчас недоступен.",
+            hint="Причину и что с ней делать показывает окно «Импорт .pst» → «Взять с сервера». Когда каталог "
+                 "снова станет доступен, нажмите «Повторить» у задания.")
+    # Задания, поставленные до появления server_file, хранили путь: из него нужно только имя.
+    name = params.get("server_file") or os.path.basename(str(params.get("pst_path") or ""))
+    # Имя проверяется заново: между постановкой задания и запуском (или «Повторить»
+    # через месяц) файл могли убрать, переименовать или подменить ссылкой.
+    path, info = inbox.locate(svc.cfg.import_dir, name, disclose=False)
+    differences = inbox.changed(params.get("fingerprint"), info)
+    if differences:
+        # Тот же файл, что выбирали, или уже другой (либо ещё не докопированный) — по имени
+        # не узнать: почти все они «Outlook.pst». Чужой архив в ящик заливать нельзя.
+        raise ValidationError(
+            f"Файл «{inbox.shown(os.path.basename(path))}» в каталоге импорта изменился после постановки "
+            f"задания — запустите импорт заново.",
+            hint=f"Изменилось: {'; '.join(differences)}. Задание берёт только тот файл, который был выбран: так "
+                 f"под прежним именем не импортируется другой архив и не читается файл, который ещё копируют. "
+                 f"Если файл копируется на сервер — дождитесь конца, затем запустите импорт заново: "
+                 f"«Импорт .pst» → «Взять с сервера».")
+    return path, info
+
+
+def _changed_in_place(path: str, seen) -> bool:
+    """Меняли ли файл на месте, пока шёл импорт, — так выглядит незаконченное копирование.
+
+    Файл, который убрали или заменили другим, не в счёт: читался прежний, открытый.
+    """
+    try:
+        now = os.lstat(path)
+    except OSError:
+        return False
+    return ((now.st_dev, now.st_ino) == (seen.st_dev, seen.st_ino)
+            and (now.st_size, now.st_mtime_ns) != (seen.st_size, seen.st_mtime_ns))
+
+
+def _unparsed_server_file(exc: ValidationError, path: str, seen) -> ValidationError:
+    """Та же ошибка разбора, но с подсказкой для файла из каталога импорта.
+
+    Обычная подсказка («повреждён… загрузите заново») здесь сбивает с толку: чаще
+    всего файл просто ещё копировали на сервер, когда запустили импорт.
+    """
+    from ..pstimport import PstUnsupportedError
+    if _changed_in_place(path, seen):
+        first = "Файл менялся, пока шёл импорт, — похоже, его ещё копируют на сервер. Дождитесь конца копирования"
+    else:
+        first = ("Возможно, файл ещё копировали на сервер, когда начался импорт, или он скопирован не целиком: "
+                 "дождитесь конца копирования (сверьте размер с исходным файлом)")
+    check = ("проверьте, что это файл данных Outlook (.pst или .ost)"
+             if isinstance(exc.__cause__, PstUnsupportedError) else
+             "проверьте исходный файл средством восстановления Outlook (scanpst.exe) и положите в каталог "
+             "импорта исправленный")
+    return ValidationError(
+        exc.message,
+        hint=f"{first} и запустите импорт заново: «Импорт .pst» → «Взять с сервера». Если файл скопирован "
+             f"целиком — {check}; если он открывается в Outlook, попробуйте способ разбора «readpst».")
+
+
 def handle_import_pst(ctx: JobContext) -> Dict:
     """Импорт .pst на IMAP-сервер или в локальную копию ящика.
 
@@ -781,22 +854,37 @@ def handle_import_pst(ctx: JobContext) -> Dict:
     связи не проваливает остаток импорта: движок переподключается и продолжает
     с того же письма.
 
-    Загруженный файл удаляется, когда импорт дошёл до конца или отменён. Если
-    импорт остановился из-за почтового сервера (не удалось войти, сервер
-    перестал отвечать, кончилась квота ящика), файл остаётся во временном
+    Загруженный файл (``pst_path``) удаляется, когда импорт дошёл до конца или
+    отменён. Если импорт остановился из-за почтового сервера (не удалось войти,
+    сервер перестал отвечать, кончилась квота ящика), файл остаётся во временном
     каталоге — задание можно «Повторить», не загружая файл заново. Брошенный
     файл уберёт обслуживание через 48 часов или ближайший перезапуск службы.
+
+    Файл из каталога импорта на сервере (``source: "server"``, имя в
+    ``server_file``) положил администратор: служба его не удаляет и не меняет
+    никогда, чем бы импорт ни кончился. Такое задание можно «Повторить», пока на
+    месте тот самый файл, что был выбран (``fingerprint``); другой файл под тем же
+    именем — новый импорт.
     """
     from ..errors import ImapError
     from ..imap.restore import MAX_MESSAGE_EVENTS
     from ..pstimport import importer
     svc = ctx.services
     p = ctx.params
-    pst_path = p.get("pst_path")
-    if not pst_path or not os.path.isfile(pst_path):
-        raise ValidationError("Файл .pst для импорта не найден.",
-                              hint="Загрузите файл заново: загруженный файл хранится, пока идёт импорт, а после "
-                                   "остановки из-за почтового сервера — до 48 часов или до перезапуска службы.")
+    # Откуда файл, решает только признак в параметрах (у заданий прежних версий его нет —
+    # это загрузки). По пути судить нельзя: каталог импорта бывает ссылкой на диск, где
+    # лежат и данные службы, и тогда «в каталоге импорта» оказывалась каждая загрузка —
+    # задание падало, а загруженный файл оставался на диске навсегда.
+    from_server = str(p.get("source") or "") == "server"
+    seen = None
+    if from_server:
+        pst_path, seen = _import_server_file(svc, p)
+    else:
+        pst_path = p.get("pst_path")
+        if not pst_path or not os.path.isfile(pst_path):
+            raise ValidationError("Файл .pst для импорта не найден.",
+                                  hint="Загрузите файл заново: загруженный файл хранится, пока идёт импорт, а после "
+                                       "остановки из-за почтового сервера — до 48 часов или до перезапуска службы.")
     target = p.get("target") or "imap"
     engine = p.get("engine") or "builtin"
     # префикс мог прийти пустым намеренно: «в папки с теми же именами, что в файле»
@@ -819,22 +907,58 @@ def handle_import_pst(ctx: JobContext) -> Dict:
             # пригодится — исправят причину и нажмут «Повторить».
             keep_file = True
             raise
+        except ValidationError as exc:
+            # Файл не разобрался (так run_import сообщает об ошибках чтения из _MESSAGE_ERRORS):
+            # у файла с сервера причина чаще всего — незаконченное копирование.
+            if from_server and isinstance(exc.__cause__, importer._MESSAGE_ERRORS):
+                raise _unparsed_server_file(exc, pst_path, seen) from exc.__cause__
+            raise
+        except OSError as exc:
+            # Не читается сам файл с сервера (сбой диска, сети): в сообщении ОС — полный путь,
+            # а журнал задания виден и сотруднику.
+            if from_server and exc.filename == pst_path:
+                from ..config import os_error_text
+                raise ValidationError(f"Файл «{os.path.basename(pst_path)}» в каталоге импорта не читается: "
+                                      f"{os_error_text(exc)}.",
+                                      hint="Проверьте диск с каталогом импорта и права на файл, затем нажмите "
+                                           "«Повторить» у задания.") from exc
+            raise
+        except MailArchiverError as exc:
+            # readpst называет в своём выводе полный путь к файлу — в журнале задания ему не место
+            if isinstance(exc.message, str) and pst_path in exc.message:
+                exc.message = exc.message.replace(pst_path, f"«{os.path.basename(pst_path)}»")
+            raise
         keep_file = res.keep_file
         summary = importer.summarize(res)
         if res.stopped:
-            if keep_file:
+            if from_server:
+                summary += " Файл остаётся в каталоге импорта на сервере — нажмите «Повторить» у задания."
+            elif keep_file:
                 summary += (" Загруженный файл сохранён (до 48 часов или до перезапуска службы) — нажмите "
                             "«Повторить» у задания.")
             ctx.event("ERROR", summary)
+        unsteady = from_server and _changed_in_place(pst_path, seen)
+        if unsteady:
+            # Импорт «удался», но читался файл, который в это время дописывали.
+            note = ("Файл в каталоге импорта менялся, пока шёл импорт (возможно, его ещё копировали на сервер) — "
+                    "письма могли попасть не все. Когда копирование закончится, запустите импорт заново: уже "
+                    "перенесённые письма второй раз не запишутся.")
+            summary += " " + note
+            ctx.event("WARNING", note)
+        if from_server:
+            # без пути и без советов администратору: журнал задания читает и сотрудник (вход по ящику)
+            ctx.event("INFO", f"Файл «{os.path.basename(pst_path)}» взят из каталога импорта на сервере и "
+                              f"остаётся там.")
         ctx.progress(res.total, res.total, "Готово")
         if res.incomplete:
             status = JobStatus.PARTIAL if res.imported or res.duplicates else JobStatus.FAILED
         else:
-            status = JobStatus.SUCCESS
+            status = JobStatus.PARTIAL if unsteady else JobStatus.SUCCESS
         out = {"final_status": status, "summary": summary, "imported": res.imported,
                "errors": res.errors, "messages_total": res.total, "duplicates": res.duplicates,
                "not_mail": res.not_mail, "outdated": res.outdated, "lossy": res.lossy,
                "damaged_blocks": res.damaged, "target": res.target, "engine": res.engine,
+               "source": "server" if from_server else "upload",
                "problems": res.error_details[:50]}
         if status == JobStatus.FAILED:
             out["error_result"] = summary
@@ -844,7 +968,9 @@ def handle_import_pst(ctx: JobContext) -> Dict:
         # бы в каталоге временных файлов. Но если задание прервано остановкой
         # службы, оно вернётся в очередь — тогда файл ещё понадобится.
         queue = getattr(svc, "queue", None)
-        if keep_file:
+        if from_server:
+            pass          # файл администратора: не удаляем и время изменения не трогаем
+        elif keep_file:
             try:
                 os.utime(pst_path, None)      # 48 часов обслуживание отсчитывает от этой минуты
             except OSError:

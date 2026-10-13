@@ -753,10 +753,13 @@ class _FakeHeap:
     def __init__(self, allocs):
         self.allocs = allocs
 
-    def get(self, hid):
+    def get(self, hid, accept=None):
         if hid not in self.allocs:
             raise rd.PstReadError("нет в куче")
         return self.allocs[hid]
+
+    def vote(self, hids):
+        pass
 
 
 def test_crafted_structures_cannot_blow_up_memory_or_crash():

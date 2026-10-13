@@ -11,21 +11,29 @@
 сорвалось обновление с архива с правами 0700/0600, воспроизводится честно.
 
 Тесты требуют Linux и root (скрипты меняют владельцев файлов и запускают службу
-от другого пользователя); в остальных случаях они пропускаются.
+от другого пользователя); в остальных случаях они пропускаются. Там, где пропуск
+недопустим (CI), задайте ``MA_REQUIRE_SCRIPT_TESTS=1``: если условий нет, модуль
+не «пройдёт» пропусками, а откажет уже при сборе тестов.
 """
 from __future__ import annotations
 
+import base64
 import grp
+import hashlib
 import os
 import pwd
+import re
 import shutil
 import socket
 import stat
 import subprocess
 import sys
+import sysconfig
 import tarfile
 import tempfile
-import textwrap
+import threading
+import time
+import zipfile
 
 import pytest
 
@@ -54,13 +62,34 @@ def _python_for(user: str):
     return None
 
 
-USER, GROUP = _service_user()
-_READY = (sys.platform == "linux" and hasattr(os, "geteuid") and os.geteuid() == 0
-          and USER and shutil.which("bash") and shutil.which("runuser"))
-PYTHON = _python_for(USER) if _READY else None
+def _missing_prerequisites(user) -> list:
+    """Чего не хватает, чтобы запускать скрипты в песочнице (пусто — всё есть)."""
+    missing = []
+    if sys.platform != "linux":
+        missing.append("Linux")
+    if not (hasattr(os, "geteuid") and os.geteuid() == 0):
+        missing.append("права root")
+    if not user:
+        missing.append("пользователь nobody")
+    missing += [tool for tool in ("bash", "runuser") if not shutil.which(tool)]
+    return missing
 
-needs_root = pytest.mark.skipif(not (_READY and PYTHON),
-                                reason="нужны Linux, root, runuser и пользователь nobody")
+
+USER, GROUP = _service_user()
+_MISSING = _missing_prerequisites(USER)
+PYTHON = None if _MISSING else _python_for(USER)
+if not _MISSING and not PYTHON:
+    _MISSING.append("Python с модулем venv, доступный пользователю %s" % USER)
+
+# В CI пропуск всех тестов выглядел бы как успех. С MA_REQUIRE_SCRIPT_TESTS=1
+# отсутствие условий — отказ при сборе тестов, с названием того, чего не хватает.
+if _MISSING and os.environ.get("MA_REQUIRE_SCRIPT_TESTS") == "1":
+    raise RuntimeError("MA_REQUIRE_SCRIPT_TESTS=1: тесты скриптов установки обязаны выполняться, "
+                       "но здесь это невозможно — не хватает: %s." % ", ".join(_MISSING))
+
+needs_root = pytest.mark.skipif(bool(_MISSING),
+                                reason="нужны Linux, root, runuser и пользователь nobody (не хватает: %s)"
+                                       % ", ".join(_MISSING))
 
 
 # ---------------------------------------------------------------------------
@@ -73,7 +102,7 @@ import grp, os, pwd, shlex, signal, sys, time
 STATE = os.environ["FAKE_SYSTEMD_STATE"]
 UNIT = os.environ.get("MA_UNIT_FILE", "/etc/systemd/system/mailarchiver.service")
 JOURNAL = os.path.join(STATE, "journal")
-NAMES = {200: "200/CHDIR", 203: "203/EXEC", 217: "217/USER"}
+NAMES = {200: "200/CHDIR", 203: "203/EXEC", 217: "217/USER", 226: "226/NAMESPACE"}
 
 
 def log(text):
@@ -103,17 +132,37 @@ def forget(*names):
 
 
 def unit():
+    """Unit и дополнения из <unit>.d/*.conf — в том же порядке, что у systemd (по имени файла)."""
     conf = {"Environment": []}
-    with open(UNIT, encoding="utf-8") as fh:
-        for line in fh:
+    paths = [UNIT]
+    try:
+        paths += [os.path.join(UNIT + ".d", name) for name in sorted(os.listdir(UNIT + ".d"))
+                  if name.endswith(".conf")]
+    except OSError:
+        pass
+    for path in paths:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                lines = fh.read().splitlines()
+        except OSError:
+            if path == UNIT:
+                raise
+            continue                              # дополнение-ссылка в никуда: systemd его пропускает
+        for line in lines:
             line = line.strip()
             if "=" in line and not line.startswith("#"):
                 key, value = line.split("=", 1)
                 if key == "Environment":
-                    conf["Environment"].append(value)
+                    conf["Environment"] = conf["Environment"] + [value] if value else []
                 else:
                     conf[key] = value
     return conf
+
+
+def needs_namespace(conf):
+    """Настройки, для которых systemd создаёт пространство имён монтирования."""
+    return (conf.get("ProtectProc", "default") not in ("", "default")
+            or conf.get("PrivateDevices", "no").lower() in ("true", "yes", "on", "1"))
 
 
 def alive():
@@ -163,6 +212,24 @@ def start():
         def say(text):
             os.write(2, (time.strftime("%b %d %H:%M:%S") + " host systemd[1]: mailarchiver.service: "
                          + text + "\n").encode())
+        # Каталога из ReadWritePaths нет (в том числе ссылка в никуда — диск с
+        # данными не подключён): systemd не может собрать окружение службы.
+        # Текст — как в журнале настоящего сервера.
+        # FAKE_SYSTEMD_STYLE: old — systemd до 246 (RHEL 8, Debian 10) пути не
+        # называет; unit-root — путь изнутри собираемого окружения.
+        style = os.environ.get("FAKE_SYSTEMD_STYLE", "")
+        for path in conf.get("ReadWritePaths", "").split():
+            if not path.startswith("-") and not os.path.isdir(path):
+                target = os.readlink(path) if os.path.islink(path) else path
+                if style == "old":
+                    say("Failed to set up mount namespacing: No such file or directory")
+                elif style == "unit-root":
+                    say("Failed to set up mount namespacing: /run/systemd/unit-root%s: No such file or directory"
+                        % target)
+                else:
+                    say("Failed to set up mount namespacing: /.%s: No such file or directory" % target)
+                say("Failed at step NAMESPACE spawning %s: No such file or directory" % argv[0])
+                os._exit(226)
         try:
             user = pwd.getpwnam(conf.get("User", "root"))
             gid = grp.getgrnam(conf["Group"]).gr_gid if conf.get("Group") else user.pw_gid
@@ -172,6 +239,11 @@ def start():
         except (KeyError, OSError) as exc:
             say("Failed at step USER spawning %s: %s" % (argv[0], exc))
             os._exit(217)
+        # контейнер без вложенности: пространство имён монтирования создать нельзя
+        if os.environ.get("FAKE_NAMESPACE_FAIL") == "1" and needs_namespace(conf):
+            say("Failed to set up mount namespacing: /run/systemd/unit-root/proc: Permission denied")
+            say("Failed at step NAMESPACE spawning %s: Permission denied" % argv[0])
+            os._exit(226)
         try:
             os.chdir(conf.get("WorkingDirectory", "/"))
         except OSError as exc:
@@ -289,29 +361,93 @@ print("\n".join(lines[-count:]))
 
 # Подделка pip: «устанавливает» пакет копированием, как настоящий pip, — файлы
 # создаются заново с правами по umask, права исходников не переносятся.
+# Без сети («--no-index --find-links КАТАЛОГ … mailarchiver==X») пакет берётся
+# из файла .whl (это zip-архив); собрать его из исходников без индекса нельзя,
+# как и настоящему pip: для сборки тот скачивает setuptools.
+# «--dry-run» ничего не устанавливает; FAKE_PIP_NO_DRY_RUN — pip старше 22.2,
+# который этого параметра не знает; FAKE_PIP_DRY_RUN_FAIL — пакеты не подошли.
+# «config list» показывает индекс из FAKE_PIP_INDEX_URL (как pip.conf).
 FAKE_PIP = r'''#!@PYTHON@
-import os, shutil, sys
+import os, shutil, sys, zipfile
 SITE = "@SITE@"
 args = sys.argv[1:]
 with open("@CALLS@", "a", encoding="utf-8") as fh:
     fh.write(" ".join(args) + "\n")
+if [a for a in args if not a.startswith("-")][:2] == ["config", "list"]:
+    if os.environ.get("FAKE_PIP_INDEX_URL"):
+        print("global.index-url='%s'" % os.environ["FAKE_PIP_INDEX_URL"])
+    sys.exit(0)
 if args[:1] != ["install"]:
     sys.exit(0)
-dirs = [a for a in args[1:] if os.path.isdir(a)]
-if not dirs:
+
+
+def fail(text):
+    sys.stderr.write("ERROR: %s\n" % text)
+    sys.exit(1)
+
+
+dry_run = "--dry-run" in args
+if dry_run and os.environ.get("FAKE_PIP_NO_DRY_RUN"):
+    sys.stderr.write("\nUsage:\n  pip install [options] <requirement specifier> ...\n\nno such option: --dry-run\n")
+    sys.exit(2)
+if dry_run and os.environ.get("FAKE_PIP_DRY_RUN_FAIL"):
+    fail("Could not find a version that satisfies the requirement cryptography>=44.0 (from versions: none)\n"
+         "ERROR: No matching distribution found for cryptography>=44.0")
+
+no_index, links, targets, i = False, [], [], 1
+while i < len(args):
+    arg = args[i]
+    if arg in ("--find-links", "-f", "-r", "--requirement"):
+        i += 1
+        if arg in ("--find-links", "-f"):
+            links.append(args[i])
+    elif arg == "--no-index":
+        no_index = True
+    elif not arg.startswith("-"):
+        targets.append(arg)
+    i += 1
+source = wheel = None
+for target in targets:
+    if os.path.isdir(target):
+        if no_index:
+            fail("Could not find a version that satisfies the requirement setuptools>=68 (from versions: none)")
+        source = target
+    elif target.startswith("mailarchiver=="):
+        version = target.split("==", 1)[1]
+        found = [os.path.join(link, name) for link in links if no_index and os.path.isdir(link)
+                 for name in sorted(os.listdir(link))
+                 if name.startswith("mailarchiver-%s-" % version) and name.endswith(".whl")]
+        if not found:
+            fail("Could not find a version that satisfies the requirement %s (from versions: none)\n"
+                 "ERROR: No matching distribution found for %s" % (target, target))
+        wheel = found[0]
+if dry_run or (not source and not wheel):
     sys.exit(0)
 if os.environ.get("FAKE_PIP_SLEEP"):
     import time
     time.sleep(float(os.environ["FAKE_PIP_SLEEP"]))
-src, dst = os.path.join(dirs[0], "mailarchiver"), os.path.join(SITE, "mailarchiver")
+if os.environ.get("FAKE_PIP_RUN"):
+    import subprocess
+    subprocess.run(["sh", "-c", os.environ.pop("FAKE_PIP_RUN")], check=False)
+dst = os.path.join(SITE, "mailarchiver")
 shutil.rmtree(dst, ignore_errors=True)
-for base, _dirs, files in os.walk(src):
-    rel = os.path.relpath(base, src)
-    target = dst if rel == "." else os.path.join(dst, rel)
-    os.makedirs(target, exist_ok=True)
-    for name in files:
-        if name.endswith(".py"):
-            shutil.copyfile(os.path.join(base, name), os.path.join(target, name))
+if wheel:
+    with zipfile.ZipFile(wheel) as archive:
+        for name in archive.namelist():
+            if name.startswith("mailarchiver/") and name.endswith(".py"):
+                path = os.path.join(SITE, name)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "wb") as fh:
+                    fh.write(archive.read(name))
+else:
+    src = os.path.join(source, "mailarchiver")
+    for base, _dirs, files in os.walk(src):
+        rel = os.path.relpath(base, src)
+        target = dst if rel == "." else os.path.join(dst, rel)
+        os.makedirs(target, exist_ok=True)
+        for name in files:
+            if name.endswith(".py"):
+                shutil.copyfile(os.path.join(base, name), os.path.join(target, name))
 entry = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "mailarchiver")
 with open(entry, "w", encoding="utf-8") as fh:
     fh.write("#!%s\nimport sys\nfrom mailarchiver.__main__ import main\nsys.exit(main())\n"
@@ -323,6 +459,8 @@ os.chmod(entry, 0o755)
 # сети и кладёт в него поддельный pip; всё остальное выполняет настоящий Python.
 FAKE_PYTHON3 = r'''#!/bin/sh
 if [ "$1" = "-m" ] && [ "$2" = "venv" ]; then
+  # FAKE_REAL_VENV=1 — настоящее окружение с настоящим pip (тест установки без сети)
+  if [ -n "$FAKE_REAL_VENV" ]; then exec "@PYTHON@" -m venv "$3"; fi
   exec "@PYTHON@" "@MAKE_VENV@" "$3"
 fi
 exec "@PYTHON@" "$@"
@@ -361,7 +499,7 @@ class Config:
             m = re.search(r'^\s+%s:\s*"?([^"\n#]*?)"?\s*(?:#.*)?$' % key, text, re.M)
             return m.group(1).strip() if m and m.group(1).strip() else default
         self.server = {"host": val("host", "127.0.0.1"), "port": int(val("port", "8493"))}
-        self.data_dir = val("data_dir", "/var/lib/mailarchiver")
+        self.data_dir = os.path.abspath(val("data_dir", "/var/lib/mailarchiver"))    # как у настоящей программы
         self.db_path = os.path.join(self.data_dir, "mailarchiver.db")
         self.warnings = []
 
@@ -380,8 +518,17 @@ def main(argv=None):
     parser.add_argument("-c", "--config")
     parser.add_argument("command")
     args = parser.parse_args(argv)
-    cfg = load_config(args.config or os.environ.get("MAILARCHIVER_CONFIG"))
+    try:
+        cfg = load_config(args.config or os.environ.get("MAILARCHIVER_CONFIG"))
+    except Exception as exc:
+        print("ОШИБКА конфигурации: %s" % exc, file=sys.stderr)
+        return 1
     if args.command == "check-config":
+        # Как настоящая программа: ссылка в никуда или файл на месте каталога данных —
+        # ошибка; каталога просто нет — только замечание (код 0).
+        if os.path.lexists(cfg.data_dir) and not os.path.isdir(cfg.data_dir):
+            print("ОШИБКА: Каталог данных %s — ссылка в никуда или не каталог." % cfg.data_dir, file=sys.stderr)
+            return 1
         print("MailArchiver", __version__)
         print("Веб-интерфейс      : http://%s:%s" % (cfg.server["host"], cfg.server["port"]))
         print("Конфигурация корректна ✓")
@@ -394,7 +541,7 @@ def main(argv=None):
     except OSError:
         kind, rest = "", ""
     version, _, param = rest.partition(":")
-    if version != __version__:
+    if version not in (__version__, "*"):
         kind = ""
     with open(os.path.join(cfg.data_dir, "cwd"), "w", encoding="utf-8") as fh:
         fh.write(os.getcwd())
@@ -443,6 +590,62 @@ paths:
   data_dir: "@DATA@"
 '''
 
+PYPROJECT = '''[project]
+name = "mailarchiver"
+version = "@VERSION@"
+requires-python = "@REQUIRES@"
+'''
+
+# Подделка df: свободное место задаёт тест (FAKE_DF_FREE_KB), иначе — настоящий df.
+FAKE_DF = '''#!/bin/sh
+if [ -n "$FAKE_DF_FREE_KB" ]; then
+  echo "Filesystem 1024-blocks Used Available Capacity Mounted on"
+  echo "fake 99999999 0 $FAKE_DF_FREE_KB 0% /"
+  exit 0
+fi
+exec @DF@ "$@"
+'''
+
+# Подделка systemd-detect-virt: тип контейнера задаёт тест (FAKE_VIRT), иначе «не контейнер».
+FAKE_DETECT_VIRT = '''#!/bin/sh
+if [ -n "$FAKE_VIRT" ]; then echo "$FAKE_VIRT"; exit 0; fi
+echo none
+exit 1
+'''
+
+
+def build_wheel(directory: str, name: str, version: str, files: dict, *, requires: tuple = (),
+                script: str = "") -> str:
+    """Настоящий пакет .whl (его принимает и настоящий pip): файлы, METADATA, WHEEL, RECORD."""
+    os.makedirs(directory, exist_ok=True)
+    info = "%s-%s.dist-info/" % (name, version)
+    files = dict(files)
+    files[info + "METADATA"] = "Metadata-Version: 2.1\nName: %s\nVersion: %s\n%s" % (
+        name, version, "".join("Requires-Dist: %s\n" % item for item in requires))
+    files[info + "WHEEL"] = "Wheel-Version: 1.0\nGenerator: tests\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
+    if script:
+        files[info + "entry_points.txt"] = "[console_scripts]\n%s\n" % script
+    record = []
+    for rel, text in files.items():
+        data = text.encode("utf-8")
+        digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
+        record.append("%s,sha256=%s,%d" % (rel, digest, len(data)))
+    files[info + "RECORD"] = "\n".join(record + [info + "RECORD,,"]) + "\n"
+    path = os.path.join(directory, "%s-%s-py3-none-any.whl" % (name, version))
+    with zipfile.ZipFile(path, "w") as archive:
+        for rel, text in files.items():
+            archive.writestr(rel, text)
+    os.chmod(path, 0o644)
+    return path
+
+
+def make_wheel(directory: str, version: str, *, requires: tuple = ()) -> str:
+    """Пакет учебной службы; с отметкой «установлено из пакета», которой нет в исходниках."""
+    files = {"mailarchiver/" + rel: text.replace("@VERSION@", version) for rel, text in MINI.items()}
+    files["mailarchiver/from_wheel.py"] = "ORIGIN = 'wheel'\n"
+    return build_wheel(directory, "mailarchiver", version, files, requires=requires,
+                       script="mailarchiver = mailarchiver.__main__:main")
+
 
 def _write(path: str, text: str, mode: int = 0o644) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -455,6 +658,35 @@ def _free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         return sock.getsockname()[1]
+
+
+_INDEX = {}
+
+
+def _index_url() -> str:
+    """Адрес «индекса пакетов» для проверки связи: маленький сервер в этом же процессе.
+
+    Скрипт обновления перед установкой из сети опрашивает индекс (MA_INDEX_URL);
+    настоящий PyPI в тестах трогать нельзя.
+    """
+    if not _INDEX:
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        class Index(BaseHTTPRequestHandler):
+            def do_HEAD(self):
+                _INDEX["hits"] = _INDEX.get("hits", 0) + 1
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            do_GET = do_HEAD
+
+            def log_message(self, *a):
+                pass
+        server = HTTPServer(("127.0.0.1", 0), Index)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        _INDEX["url"] = "http://127.0.0.1:%d/simple/" % server.server_address[1]
+    return _INDEX["url"]
 
 
 def _restrict(tree: str) -> None:
@@ -481,6 +713,7 @@ class Sandbox:
         self.state = os.path.join(base, "state")
         self.bin = os.path.join(base, "bin")
         self.unit = os.path.join(base, "unit", "mailarchiver.service")
+        self.dropin = os.path.join(self.unit + ".d", "50-relax-sandbox.conf")
         self.wrapper = os.path.join(base, "usrbin", "mailarchiver")
         self.db = os.path.join(self.data, "mailarchiver.db")
         for path in (self.config_dir, self.state, self.bin, os.path.dirname(self.unit),
@@ -498,8 +731,16 @@ class Sandbox:
         _write(os.path.join(self.bin, "python3"),
                FAKE_PYTHON3.replace("@PYTHON@", PYTHON).replace("@MAKE_VENV@", make_venv), 0o755)
         # менеджеры пакетов ничего не ставят: тест не должен менять машину
-        for name in ("apt-get", "dnf", "yum", "zypper", "pacman"):
-            _write(os.path.join(self.bin, name), "#!/bin/sh\nexit 0\n", 0o755)
+        # (userdel — на случай uninstall.sh: пользователь службы здесь — системный nobody)
+        for name in ("apt-get", "dnf", "yum", "zypper", "pacman", "userdel"):
+            _write(os.path.join(self.bin, name),
+                   '#!/bin/sh\necho "%s $*" >> "$FAKE_SYSTEMD_STATE/pkg_calls"\nexit ${FAKE_PKG_EXIT:-0}\n' % name,
+                   0o755)
+        _write(os.path.join(self.bin, "df"), FAKE_DF.replace("@DF@", shutil.which("df") or "/bin/df"), 0o755)
+        _write(os.path.join(self.bin, "systemd-detect-virt"), FAKE_DETECT_VIRT, 0o755)
+        # свой «/etc/fstab»: настоящий тесты менять не могут, а от его содержимого зависеть не должны
+        self.fstab_file = os.path.join(self.state, "fstab")
+        self.fstab()
         _write(os.path.join(self.config_dir, "config.yaml"),
                CONFIG.replace("@HOST@", host).replace("@PORT@", str(self.port)).replace("@DATA@", self.data))
 
@@ -513,9 +754,17 @@ class Sandbox:
             "MA_DATA_DIR": self.data, "MA_USER": USER, "MA_GROUP": GROUP,
             "MA_UNIT_FILE": self.unit, "MA_CLI_WRAPPER": self.wrapper,
             "MA_HOST": self.host, "MA_PORT": str(self.port),
+            "MA_FSTAB": self.fstab_file, "MA_INDEX_URL": _index_url(),
         }
         env.update(extra)
         return {key: value for key, value in env.items() if value is not None}
+
+    def fstab(self, *mountpoints: str) -> None:
+        """Содержимое «/etc/fstab»: корень (он подключён) и перечисленные точки монтирования."""
+        lines = ["# тестовый fstab", "UUID=0000-0000 / ext4 defaults 0 1", "UUID=0000-0001 none swap sw 0 0"]
+        lines += ["UUID=1111-%04d %s ext4 defaults,nofail 0 2" % (i, path.replace(" ", "\\040"))
+                  for i, path in enumerate(mountpoints)]
+        _write(self.fstab_file, "\n".join(lines) + "\n")
 
     def start(self, script: str, src: str, **extra: str):
         """Запустить скрипт в фоне, в своей группе процессов (для сигналов)."""
@@ -530,10 +779,10 @@ class Sandbox:
         except OSError:
             return 0
 
-    def run(self, script: str, src: str, timeout: int = 120, **extra: str):
+    def run(self, script: str, src: str, timeout: int = 120, args: tuple = (), **extra: str):
         # как в документации: из каталога с исходниками новой версии
-        return subprocess.run(["bash", os.path.join(src, "scripts", script)], env=self.env(**extra), cwd=src,
-                              stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
+        return subprocess.run(["bash", os.path.join(src, "scripts", script), *args], env=self.env(**extra),
+                              cwd=src, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
 
     def systemctl(self, *args: str):
         return subprocess.run([os.path.join(self.bin, "systemctl"), *args], env=self.env(),
@@ -546,8 +795,16 @@ class Sandbox:
             pass
 
     # -- исходники ---------------------------------------------------------
-    def sources(self, version: str, name: str, *, broken_import: bool = False) -> str:
-        """Каталог с исходниками: настоящие скрипты и unit, учебный пакет."""
+    def sources(self, version: str, name: str, *, broken_import: bool = False, rejects_config: bool = False,
+                syntax_error: bool = False, requires_python: str = ">=3.8,<4", wheels: bool = False,
+                requirements: str = "# пусто\n", needs_library: bool = False) -> str:
+        """Каталог с исходниками: настоящие скрипты и unit, учебный пакет.
+
+        ``rejects_config`` — эта версия не принимает действующую конфигурацию;
+        ``syntax_error`` — в ней есть модуль, который Python окружения не разберёт;
+        ``wheels`` — рядом лежит каталог wheels с пакетом приложения (автономный архив);
+        ``needs_library`` — чтение конфигурации требует библиотеки, которой в окружении ещё нет.
+        """
         src = os.path.join(self.base, name, "mail_backup")
         for rel in ("scripts", "systemd"):
             shutil.copytree(os.path.join(ROOT, rel), os.path.join(src, rel),
@@ -556,15 +813,33 @@ class Sandbox:
             _write(os.path.join(src, "mailarchiver", rel), text.replace("@VERSION@", version))
         if broken_import:
             _write(os.path.join(src, "mailarchiver", "web", "app.py"), "import no_such_module_in_tests\n")
+        if rejects_config:
+            with open(os.path.join(src, "mailarchiver", "config.py"), "a", encoding="utf-8") as fh:
+                fh.write("\n\ndef load_config(path=None, create_dirs=True):\n"
+                         "    raise ValueError('параметр server.legacy_mode больше не поддерживается')\n")
+        if needs_library:
+            with open(os.path.join(src, "mailarchiver", "config.py"), "a", encoding="utf-8") as fh:
+                fh.write("\n\ndef load_config(path=None, create_dirs=True):\n"
+                         "    import library_added_in_new_version\n")
+        if syntax_error:
+            _write(os.path.join(src, "mailarchiver", "web", "future.py"), "def broken(:\n    pass\n")
+        if wheels:
+            make_wheel(os.path.join(src, "wheels"), version)
         _write(os.path.join(src, "VERSION"), version + "\n")
-        _write(os.path.join(src, "requirements.txt"), "# пусто\n")
+        _write(os.path.join(src, "pyproject.toml"),
+               PYPROJECT.replace("@VERSION@", version).replace("@REQUIRES@", requires_python))
+        _write(os.path.join(src, "requirements.txt"), requirements)
         _write(os.path.join(src, "config", "config.example.yaml"),
                CONFIG.replace("@HOST@", "127.0.0.1").replace("@PORT@", "8493")
                .replace("@DATA@", "/var/lib/mailarchiver"))
         return src
 
-    def install_old(self) -> None:
-        """Работающая установка прежней версии — исходное состояние для update.sh."""
+    def install_old(self, *, old_unit: bool = False) -> None:
+        """Работающая установка прежней версии — исходное состояние для update.sh.
+
+        ``old_unit`` — unit прежней версии ещё без ProtectProc и PrivateDevices
+        (такой запускается и там, где пространство имён создать нельзя).
+        """
         src = self.sources(OLD, "src_old")
         shutil.copytree(src, self.app_dir)
         subprocess.run([PYTHON, self.make_venv, self.venv], check=True, capture_output=True, cwd="/",
@@ -581,6 +856,9 @@ class Sandbox:
                            ("@GROUP@", GROUP), ("@DATADIR@", self.data),
                            ("@CONFIG@", os.path.join(self.config_dir, "config.yaml"))):
             unit = unit.replace(key, value)
+        if old_unit:
+            unit = "".join(line for line in unit.splitlines(True)
+                           if not line.startswith(("ProtectProc=", "PrivateDevices=")))
         _write(self.unit, unit)
         self.systemctl("start", "mailarchiver")
         assert self.wait_version() == OLD, self.journal()
@@ -598,6 +876,20 @@ class Sandbox:
 
     def active(self) -> bool:
         return self.systemctl("is-active", "--quiet", "mailarchiver").returncode == 0
+
+    def substate(self) -> str:
+        return self.systemctl("show", "mailarchiver", "-p", "SubState", "--value").stdout.strip()
+
+    def wait_crashed(self, timeout: float = 15.0) -> bool:
+        """Дождаться, пока служба упадёт (systemd ждёт перезапуска).
+
+        Сразу после start/restart спрашивать нельзя: подделка, как и systemd,
+        возвращается, едва процесс запущен, — упасть он может мгновением позже.
+        """
+        end = time.time() + timeout
+        while time.time() < end and self.substate() != "auto-restart":
+            time.sleep(0.05)
+        return self.substate() == "auto-restart"
 
     def healthy(self) -> bool:
         import urllib.request
@@ -625,6 +917,48 @@ class Sandbox:
     def db_text(self) -> str:
         with open(self.db, encoding="utf-8") as fh:
             return fh.read()
+
+    def forget_calls(self) -> None:
+        """Дальше в журналах вызовов (systemctl, pip, менеджеры пакетов) — только то, что сделает скрипт."""
+        for name in ("calls", "pip_calls", "pkg_calls"):
+            open(os.path.join(self.state, name), "w").close()
+
+    def calls(self, name: str = "calls") -> list:
+        """Вызовы поддельного systemctl (pip — name="pip_calls", apt и прочие — "pkg_calls") по строкам."""
+        try:
+            with open(os.path.join(self.state, name), encoding="utf-8") as fh:
+                return fh.read().splitlines()
+        except OSError:
+            return []
+
+    def changed_state(self) -> list:
+        """Вызовы systemctl, которые меняют состояние службы."""
+        return [c for c in self.calls() if c.split()[:1] and c.split()[0] in
+                ("stop", "start", "restart", "daemon-reload", "enable", "disable", "reset-failed")]
+
+    def site_file(self, rel: str) -> str:
+        """Путь файла установленного пакета в окружении."""
+        site = subprocess.run([os.path.join(self.venv, "bin", "python"), "-I", "-B", "-c",
+                               "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
+                              capture_output=True, text=True, cwd="/",
+                              env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin"}).stdout.strip()
+        return os.path.join(site, "mailarchiver", rel)
+
+    def snapshot(self, *extra: str) -> dict:
+        """Всё, что есть в каталогах «сервера» (и в extra): права, владелец, размер, время изменения."""
+        found = {}
+        for top in (self.install_dir, self.config_dir, self.data, os.path.dirname(self.unit),
+                    os.path.dirname(self.wrapper), *extra):
+            for base, dirs, files in os.walk(top):
+                for name in dirs + files:
+                    path = os.path.join(base, name)
+                    if path == os.path.join(self.data, "health_hits"):
+                        continue                      # эту отметку ставит сама служба на каждый опрос /health
+                    st = os.lstat(path)
+                    found[path] = (stat.S_IFMT(st.st_mode), stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid,
+                                   st.st_size if stat.S_ISREG(st.st_mode) else 0,
+                                   st.st_mtime_ns if stat.S_ISREG(st.st_mode) else 0)
+        return found
 
     def as_user(self, *cmd: str) -> int:
         return subprocess.run(["runuser", "-u", USER, "--", *cmd], capture_output=True,
@@ -760,11 +1094,35 @@ def test_update_takes_settings_from_unit_file(sandbox):
 
 
 @needs_root
+def test_reinstall_takes_settings_from_unit_file(sandbox):
+    """Установка поверх (её советует update.sh, когда испорчено окружение) без MA_* не теряет
+    нестандартные каталоги и пользователя: они берутся из unit-файла прежней установки."""
+    sandbox.install_old()
+    before = sandbox.db_text()
+    proc = sandbox.run("install.sh", sandbox.sources(NEW, "src_new"), MA_INSTALL_DIR=None, MA_CONFIG_DIR=None,
+                       MA_DATA_DIR=None, MA_USER=None, MA_GROUP=None)
+    assert proc.returncode == 0, _report(proc)
+    assert sandbox.wait_version() == NEW
+    with open(sandbox.unit, encoding="utf-8") as fh:
+        unit = fh.read()
+    assert "User=%s\n" % USER in unit and "ReadWritePaths=%s\n" % sandbox.data in unit
+    assert "WorkingDirectory=%s\n" % sandbox.app_dir in unit
+    assert "Environment=MAILARCHIVER_CONFIG=%s\n" % os.path.join(sandbox.config_dir, "config.yaml") in unit
+    assert not os.path.exists("/var/lib/mailarchiver") or os.path.samefile("/var/lib/mailarchiver", sandbox.data)
+    assert sandbox.db_text().startswith(before)
+
+
+@needs_root
 @pytest.mark.parametrize("signum, group", [(15, False), (2, True), (1, False)])
 def test_update_interrupted_by_signal_rolls_back(sandbox, signum, group):
     """Ctrl-C, kill и обрыв сессии посреди обновления: откат, а не полуобновлённая установка."""
     import signal
-    import time
+    # Игнорируемый сигнал наследуется, и bash не может поставить на него ловушку:
+    # под nohup (SIGHUP) или у фонового задания без управления заданиями (SIGINT)
+    # проверять нечего — скрипт сигнала просто не получит.
+    if signal.getsignal(signum) == signal.SIG_IGN:
+        pytest.skip("сигнал %d игнорируется у самого теста (nohup или фоновый запуск): "
+                    "скрипт унаследует это и ловушку поставить не сможет" % signum)
     sandbox.install_old()
     proc = sandbox.start("update.sh", sandbox.sources(NEW, "src_new"), FAKE_PIP_SLEEP="2")
     calls = os.path.join(sandbox.state, "pip_calls")
@@ -855,6 +1213,110 @@ def test_update_keeps_newest_backups(sandbox):
     assert not [n for n in left if n.startswith("db_")], left
 
 
+def _move_data_to_storage(sandbox) -> str:
+    """Каталог данных — ссылка на каталог «другого диска». → каталог, где «смонтирован» диск."""
+    sandbox.stop()
+    mount = os.path.join(sandbox.base, "storage")
+    os.makedirs(mount)
+    os.rename(sandbox.data, os.path.join(mount, "mailarchiver"))
+    os.symlink(os.path.join(mount, "mailarchiver"), sandbox.data)
+    sandbox.systemctl("start", "mailarchiver")
+    assert sandbox.wait_version() == OLD, sandbox.journal()      # через ссылку служба работает
+    return mount
+
+
+@needs_root
+@pytest.mark.parametrize("args", [("--check",), ()])
+def test_update_refuses_when_data_disk_is_not_mounted(sandbox, args):
+    """Каталог данных — ссылка на диск, который не подключён: отказ до остановки службы.
+
+    Так сорвалось обновление 10.10.2026: проверки проходили («[ -d ]» для ссылки
+    в никуда ложно — и проверка каталога данных молча пропускалась), отказывал
+    уже пробный импорт, а после отката прежняя версия не поднималась с
+    «status=226/NAMESPACE … No such file or directory».
+    """
+    sandbox.install_old()
+    mount = _move_data_to_storage(sandbox)
+    sandbox.stop()
+    os.rename(mount, mount + ".unmounted")                       # диск «отключился»
+    sandbox.systemctl("start", "mailarchiver")
+    assert sandbox.wait_crashed() and "No such file or directory" in sandbox.journal()
+    src = sandbox.sources(NEW, "src_new")
+    proc = sandbox.run("update.sh", src, args=args)
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, _report(proc)
+    assert "ссылка на %s" % os.path.join(mount, "mailarchiver") in out, _report(proc)
+    assert "не подключён диск" in out and "mount -a" in out, _report(proc)
+    assert "Служба не работает уже сейчас, до обновления" in out, _report(proc)
+    # ничего не тронуто
+    assert "Останавливаю" not in out and "Откат" not in out, _report(proc)
+    with open(os.path.join(sandbox.app_dir, "VERSION"), encoding="utf-8") as fh:
+        assert fh.read().strip() == OLD
+    assert not os.path.exists(os.path.join(sandbox.install_dir, "backups"))
+    # диск вернули — служба поднимается, обновление проходит, база на месте
+    os.rename(mount + ".unmounted", mount)
+    sandbox.systemctl("start", "mailarchiver")
+    assert sandbox.wait_version() == OLD
+    proc = sandbox.run("update.sh", src)
+    assert proc.returncode == 0, _report(proc)
+    assert sandbox.wait_version() == NEW
+    with open(os.path.join(mount, "mailarchiver", "mailarchiver.db"), encoding="utf-8") as fh:
+        assert "opened-by-" + NEW in fh.read()
+
+
+@needs_root
+@pytest.mark.parametrize("style", ["", "unit-root"])
+def test_rollback_names_missing_data_directory(sandbox, style):
+    """Диск с данными пропал посреди обновления: откат называет каталог, а не советует про контейнеры.
+
+    Путь в журнале systemd бывает записан и как «/./каталог», и изнутри собираемого
+    окружения — «/run/systemd/unit-root/каталог»; назван должен быть сам каталог.
+    """
+    sandbox.install_old()
+    mount = _move_data_to_storage(sandbox)
+    proc = sandbox.run("update.sh", sandbox.sources(NEW, "src_new"), FAKE_SYSTEMD_STYLE=style,
+                       FAKE_PIP_RUN='mv "%s" "%s.unmounted"' % (mount, mount))
+    os.rename(mount + ".unmounted", mount)
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, _report(proc)
+    assert "ссылка на %s" % os.path.join(mount, "mailarchiver") in out, _report(proc)
+    assert "Откат" in out and "служба НЕ поднялась" in out, _report(proc)
+    assert "status=226/NAMESPACE" in out, _report(proc)
+    # назван именно тот каталог, что в журнале systemd («/./…» приведено к обычному пути)
+    assert "systemd не нашёл каталог %s — " % os.path.join(mount, "mailarchiver") in out, _report(proc)
+    assert "не подключён диск" in out, _report(proc)
+    assert "MA_RELAX_SANDBOX" not in out and "контейнер" not in out, _report(proc)
+    # файлы возвращены: с диском на месте прежняя версия работает
+    sandbox.systemctl("restart", "mailarchiver")
+    assert sandbox.wait_version() == OLD
+
+
+@needs_root
+def test_rollback_says_service_was_down_before_update(sandbox):
+    """Служба падала ещё до обновления — после отката это сказано прямо."""
+    sandbox.install_old()
+    sandbox.behaviour("crash:*")                    # падает любая версия
+    sandbox.systemctl("restart", "mailarchiver")
+    assert sandbox.wait_crashed(), sandbox.journal()
+    proc = sandbox.run("update.sh", sandbox.sources(NEW, "src_new"))
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, _report(proc)
+    assert "Служба не работает уже сейчас, до обновления" in out, _report(proc)
+    assert "Application startup failed" in out
+    assert "служба НЕ поднялась" in out and "До обновления служба тоже не работала" in out, _report(proc)
+
+
+@needs_root
+def test_install_refuses_dangling_data_directory(sandbox):
+    os.symlink(os.path.join(sandbox.base, "no-such-disk", "mailarchiver"), sandbox.data)
+    proc = sandbox.run("install.sh", sandbox.sources(NEW, "src_new"))
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, _report(proc)
+    assert "ссылка на" in out and "не подключён диск" in out, _report(proc)
+    assert not os.path.exists(sandbox.install_dir)          # ничего не установлено
+    assert os.path.islink(sandbox.data)
+
+
 @needs_root
 def test_update_detects_broken_import_before_start(sandbox):
     sandbox.install_old()
@@ -934,6 +1396,1330 @@ def test_update_installs_package_before_requirements(sandbox):
 
 
 # ---------------------------------------------------------------------------
+#  update.sh --check: проверка без остановки службы и без изменений на диске
+# ---------------------------------------------------------------------------
+def _pip_changes(sandbox) -> list:
+    """Вызовы pip, которые что-то меняют (вопрос о версии, чтение настроек и пробная установка — не меняют)."""
+    harmless = ("--version", "--disable-pip-version-check config list", "install --dry-run ")
+    return [call for call in sandbox.calls("pip_calls") if not call.startswith(harmless)]
+
+
+def _untouched(sandbox, before, proc, *trees) -> None:
+    """Скрипт ничего не остановил, не установил и не изменил на диске."""
+    out = proc.stdout + proc.stderr
+    assert "Откат" not in out and "Останавливаю" not in out and "прервано" not in out, _report(proc)
+    assert sandbox.changed_state() == [], sandbox.calls()
+    assert _pip_changes(sandbox) == [] and sandbox.calls("pkg_calls") == []
+    after = sandbox.snapshot(*trees)
+    assert after == before, sorted(set(after.items()) ^ set(before.items()))
+    assert not os.path.exists(os.path.join(sandbox.install_dir, "backups"))
+
+
+def _marks(proc, sign: str) -> list:
+    """Строки вывода, отмеченные знаком (✓, ⚠ или ✗) сразу после названия скрипта."""
+    return [line for line in (proc.stdout + proc.stderr).splitlines()
+            if line.startswith("[MailArchiver ") and "] %s " % sign in line[:40]]
+
+
+@needs_root
+def test_check_mode_reports_and_changes_nothing(sandbox):
+    """Проверка проходит по всем пунктам, но служба не останавливается и на диске ничего не меняется."""
+    sandbox.install_old()
+    src = sandbox.sources(NEW, "src_new")
+    sandbox.forget_calls()
+    pid = sandbox.systemctl("show", "mailarchiver", "-p", "MainPID", "--value").stdout.strip()
+    # служба когда-то падала и была перезапущена, но сейчас отвечает — это не «не работает»
+    _write(os.path.join(sandbox.state, "nrestarts"), "2")
+    before = sandbox.snapshot(src)
+    proc = sandbox.run("update.sh", src, args=("--check",))
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 0, _report(proc)
+    rsync = shutil.which("rsync", path=sandbox.env()["PATH"])
+    for wanted in ("Текущая версия: %s → новая версия: %s" % (OLD, NEW),
+                   "Пользователь службы %s" % USER,
+                   "Места для копии текущей установки хватает",
+                   "Места для копии базы хватает",
+                   "подходит новой версии (нужен >=3.8,<4)",
+                   "файлов .py) подходят Python окружения",
+                   "Новая версия принимает конфигурацию " + os.path.join(sandbox.config_dir, "config.yaml"),
+                   "отвечает по адресу проверки: http://127.0.0.1:%d/health" % sandbox.port,
+                   "библиотеки будут загружены из сети",
+                   "Индекс пакетов отвечает: " + _index_url(),
+                   # какой из двух способов копирования выбран — по тому, есть ли rsync
+                   "rsync найден — файлы будут обновлены им." if rsync
+                   else "rsync не найден — файлы будут скопированы командой cp",
+                   "Проверка пройдена — можно обновлять"):
+        assert wanted in out, (wanted, _report(proc))
+    assert ("rsync найден" in out) != ("rsync не найден" in out), _report(proc)
+    assert "--force" not in out, _report(proc)
+    assert not _marks(proc, "✗") and not _marks(proc, "⚠"), _report(proc)
+    assert "226/NAMESPACE" not in out                       # не контейнер — совета про него нет
+    _untouched(sandbox, before, proc, src)
+    # та же служба, тот же процесс
+    assert sandbox.systemctl("show", "mailarchiver", "-p", "MainPID", "--value").stdout.strip() == pid
+    assert sandbox.wait_version() == OLD
+
+
+@needs_root
+def test_check_mode_fails_on_what_would_break_the_update(sandbox):
+    """Конфигурацию не принимает новая версия, модуль не разбирается, Python не тот — отказ до изменений."""
+    sandbox.install_old()
+    rejecting = sandbox.sources(NEW, "src_rejecting", rejects_config=True)
+    unparsable = sandbox.sources(NEW, "src_unparsable", syntax_error=True)
+    too_new = sandbox.sources(NEW, "src_too_new", requires_python=">=3.99")
+    sandbox.forget_calls()
+    trees = (rejecting, unparsable, too_new)
+    before = sandbox.snapshot(*trees)
+
+    proc = sandbox.run("update.sh", rejecting, args=("--check",))
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, _report(proc)
+    assert "не принимает конфигурацию" in out and "server.legacy_mode больше не поддерживается" in out, _report(proc)
+    # знаков ✗ столько же, сколько отказов (и ещё один — в итоговой строке)
+    assert "Проверка не пройдена: ошибок — 1" in out and len(_marks(proc, "✗")) == 2, _report(proc)
+    _untouched(sandbox, before, proc, *trees)
+
+    proc = sandbox.run("update.sh", unparsable, args=("--check",))
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, _report(proc)
+    assert "не подходит Python окружения" in out and "mailarchiver/web/future.py:1" in out, _report(proc)
+    assert "принимает конфигурацию" in out                  # остальные проверки выполнены
+    _untouched(sandbox, before, proc, *trees)
+
+    proc = sandbox.run("update.sh", too_new, args=("--check",))
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, _report(proc)
+    assert "не подходит новой версии: ей нужен Python >=3.99" in out and "install.sh" in out, _report(proc)
+    _untouched(sandbox, before, proc, *trees)
+    assert sandbox.wait_version() == OLD
+
+
+@needs_root
+@pytest.mark.parametrize("flaw", ["rejects_config", "syntax_error", "requires_python"])
+def test_update_runs_the_same_checks_before_stopping_the_service(sandbox, flaw):
+    """Обычное обновление начинается с той же проверки: негодная версия не останавливает службу."""
+    sandbox.install_old()
+    options = {"requires_python": ">=3.99"} if flaw == "requires_python" else {flaw: True}
+    src = sandbox.sources(NEW, "src_new", **options)
+    sandbox.forget_calls()
+    before = sandbox.snapshot(src)
+    proc = sandbox.run("update.sh", src)
+    assert proc.returncode != 0, _report(proc)
+    assert "Проверка не пройдена" in proc.stderr and "Ничего не изменено" in proc.stderr, _report(proc)
+    _untouched(sandbox, before, proc, src)
+    assert sandbox.wait_version() == OLD
+
+
+@needs_root
+def test_check_mode_warnings_do_not_fail(sandbox):
+    """Та же или более старая версия, молчащий адрес проверки, контейнер — предупреждения, код 0."""
+    sandbox.install_old()
+    same = sandbox.sources(OLD, "src_same")
+    older = sandbox.sources("1.1.10", "src_older")
+    newer = sandbox.sources("1.10.0", "src_newer")           # 1.10.0 новее 1.2.0 — сравнение по числам
+    sandbox.forget_calls()
+    trees = (same, older, newer)
+    before = sandbox.snapshot(*trees)
+
+    proc = sandbox.run("update.sh", same, args=("--check",))
+    assert proc.returncode == 0 and "Версия не меняется (%s → %s)" % (OLD, OLD) in proc.stdout, _report(proc)
+    assert "предупреждений — 1" in proc.stdout and len(_marks(proc, "⚠")) == 1, _report(proc)
+
+    proc = sandbox.run("update.sh", older, args=("--check",))
+    assert proc.returncode == 0 and "Понижение версии: установлена %s, в исходниках 1.1.10" % OLD in proc.stdout, \
+        _report(proc)
+
+    proc = sandbox.run("update.sh", newer, args=("--check",), FAKE_VIRT="lxc",
+                       MA_HEALTH_URL="http://127.0.0.1:9/health")
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 0, _report(proc)
+    assert "Текущая версия: %s → новая версия: 1.10.0" % OLD in out and "Понижение" not in out, _report(proc)
+    assert "адрес проверки не отвечает: http://127.0.0.1:9/health" in out and "MA_HEALTH_URL=" in out, _report(proc)
+    assert "контейнер (lxc)" in out and "226/NAMESPACE" in out and "MA_RELAX_SANDBOX=1" in out, _report(proc)
+    assert not _marks(proc, "✗"), _report(proc)
+    _untouched(sandbox, before, proc, *trees)
+
+
+@needs_root
+def test_check_mode_free_space(sandbox):
+    """Нет места для копии установки — отказ; не хватает только на копию базы — предупреждение."""
+    sandbox.install_old()
+    with open(sandbox.db, "ab") as fh:                       # база на 60 МБ
+        for _ in range(60):
+            fh.write(os.urandom(1 << 20))
+    src = sandbox.sources(NEW, "src_new")
+    sandbox.forget_calls()
+    before = sandbox.snapshot(src)
+    used = subprocess.run(["du", "-sk", sandbox.app_dir, sandbox.venv], capture_output=True, text=True, check=True)
+    need = sum(int(line.split()[0]) for line in used.stdout.splitlines())
+
+    # на копию установки (и запас 50 МБ) хватает, на копию базы после неё — уже нет
+    proc = sandbox.run("update.sh", src, args=("--check",), FAKE_DF_FREE_KB=str(need + 51200 + 2048))
+    assert proc.returncode == 0, _report(proc)
+    assert "Для копии базы (60 МБ) места не хватит" in proc.stdout and "без копии базы" in proc.stdout, _report(proc)
+    assert "Места для копии текущей установки хватает" in proc.stdout and not _marks(proc, "✗"), _report(proc)
+    _untouched(sandbox, before, proc, src)
+
+    proc = sandbox.run("update.sh", src, args=("--check",), FAKE_DF_FREE_KB=str(need + 51200 - 1024))
+    assert proc.returncode != 0 and "Мало места" in proc.stderr and "Освободите место" in proc.stderr, _report(proc)
+    _untouched(sandbox, before, proc, src)
+
+    # то же — отказ обычного обновления, до остановки службы
+    proc = sandbox.run("update.sh", src, FAKE_DF_FREE_KB="1000")
+    assert proc.returncode != 0 and "Мало места" in proc.stderr, _report(proc)
+    _untouched(sandbox, before, proc, src)
+    assert sandbox.wait_version() == OLD
+
+
+@needs_root
+def test_usage_and_unknown_arguments(sandbox):
+    """Справка и опечатка в параметре — не «прерванное обновление»: без отката и без единого действия."""
+    sandbox.install_old()
+    src = sandbox.sources(NEW, "src_new")
+    sandbox.forget_calls()
+    before = sandbox.snapshot(src)
+    for script in ("update.sh", "install.sh"):
+        proc = sandbox.run(script, src, args=("--chek",))
+        assert proc.returncode == 2, _report(proc)
+        assert "Неизвестный параметр: --chek" in proc.stderr and "Использование:" in proc.stderr, _report(proc)
+        assert proc.stdout == ""
+        _untouched(sandbox, before, proc, src)
+        for flag in ("-h", "--help"):
+            proc = sandbox.run(script, src, args=(flag,))
+            assert proc.returncode == 0 and proc.stderr == "", _report(proc)
+            for wanted in ("Использование:", "MA_RELAX_SANDBOX", "MA_WHEELS", "MA_HEALTH_URL", "MA_INSTALL_DIR",
+                           "MA_INDEX_URL",
+                           # переменные пишут после sudo: перед ним они до скрипта не доходят
+                           "Задаются ПОСЛЕ sudo", "sudo MA_", "bash scripts/" + script):
+                assert wanted in proc.stdout, (script, wanted)
+            assert "MA_CHECK_ONLY" not in proc.stdout and "MA_FSTAB" not in proc.stdout, script
+            _untouched(sandbox, before, proc, src)
+    # --check и --force есть только у update.sh; install.sh их не «проглатывает» молча
+    usage = sandbox.run("update.sh", src, args=("--help",)).stdout
+    assert "--check" in usage and "--force" in usage and "[--check] [--force]" in usage
+    proc = sandbox.run("install.sh", src, args=("--force",))
+    assert proc.returncode == 2 and "Неизвестный параметр: --force" in proc.stderr, _report(proc)
+    _untouched(sandbox, before, proc, src)
+    proc = sandbox.run("install.sh", src, args=("--check",))
+    assert proc.returncode == 2 and "Неизвестный параметр: --check" in proc.stderr, _report(proc)
+    _untouched(sandbox, before, proc, src)
+    assert sandbox.wait_version() == OLD
+
+
+# ---------------------------------------------------------------------------
+#  MA_RELAX_SANDBOX=1: ослабленная защита службы для контейнеров
+# ---------------------------------------------------------------------------
+def _dropin_keys(text: str) -> dict:
+    keys, section = {}, ""
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("["):
+            section = line
+        elif line and not line.startswith("#"):
+            assert section == "[Service]", line
+            key, value = line.split("=", 1)
+            keys[key] = value
+    return keys
+
+
+@needs_root
+def test_update_in_container_without_namespaces_names_the_remedy(sandbox):
+    """status=226/NAMESPACE: откат и точный совет — повторить с MA_RELAX_SANDBOX=1."""
+    sandbox.install_old(old_unit=True)
+    src = sandbox.sources(NEW, "src_new")
+    proc = sandbox.run("update.sh", src, FAKE_NAMESPACE_FAIL="1")
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, _report(proc)
+    assert "status=226/NAMESPACE" in out and "Failed to set up mount namespacing" in out, _report(proc)
+    assert "sudo MA_RELAX_SANDBOX=1 bash scripts/update.sh" in out and "nesting" in out, _report(proc)
+    assert sandbox.dropin in out and "непривилегированного пользователя " + USER in out, _report(proc)
+    assert "Откат" in out and "Служба работает" in out, _report(proc)
+    # без явной просьбы защита не ослабляется
+    assert not os.path.exists(os.path.dirname(sandbox.dropin))
+    assert sandbox.wait_version() == OLD
+    assert "opened-by-" + NEW not in sandbox.db_text()
+
+
+@needs_root
+def test_update_with_relaxed_sandbox(sandbox):
+    sandbox.install_old(old_unit=True)
+    src = sandbox.sources(NEW, "src_new")
+    sandbox.forget_calls()
+    proc = sandbox.run("update.sh", src, FAKE_NAMESPACE_FAIL="1", MA_RELAX_SANDBOX="1")
+    assert proc.returncode == 0, _report(proc)
+    assert "защита службы ослаблена дополнением " + sandbox.dropin in proc.stdout, _report(proc)
+    assert sandbox.wait_version() == NEW
+    assert stat.S_IMODE(os.stat(sandbox.dropin).st_mode) == 0o644
+    assert stat.S_IMODE(os.stat(os.path.dirname(sandbox.dropin)).st_mode) == 0o755
+    assert os.stat(sandbox.dropin).st_uid == 0
+    with open(sandbox.dropin, encoding="utf-8") as fh:
+        text = fh.read()
+    keys = _dropin_keys(text)
+    assert keys["ProtectProc"] == "default" and keys["PrivateDevices"] == "no" and keys["ReadWritePaths"] == ""
+    assert text.startswith("# ") and "MA_RELAX_SANDBOX=1" in text and "daemon-reload" in text
+    assert 'rm "%s"' % sandbox.dropin in text and USER in text
+    # systemd перечитал настройки после появления дополнения и до запуска службы
+    calls = sandbox.calls()
+    assert "daemon-reload" in calls and calls.index("daemon-reload") < calls.index("start mailarchiver"), calls
+    # сам unit остался полным: ослабление — отдельным файлом
+    with open(sandbox.unit, encoding="utf-8") as fh:
+        assert "ProtectProc=invisible" in fh.read()
+
+    # следующее обновление — уже без переменной: файл не трогается, о нём напоминают
+    stamp = os.stat(sandbox.dropin).st_mtime_ns
+    proc = sandbox.run("update.sh", sandbox.sources("9.9.10", "src_next"), FAKE_NAMESPACE_FAIL="1")
+    assert proc.returncode == 0, _report(proc)
+    assert "Служба работает с ослабленной защитой: действует дополнение " + sandbox.dropin in proc.stdout, \
+        _report(proc)
+    assert os.stat(sandbox.dropin).st_mtime_ns == stamp
+    assert sandbox.wait_version() == "9.9.10"
+
+
+@needs_root
+def test_rollback_removes_only_its_own_dropin(sandbox):
+    """Дополнение, созданное неудачным запуском, откат убирает; существовавшее до него — нет."""
+    sandbox.install_old(old_unit=True)
+    src = sandbox.sources(NEW, "src_new")
+    sandbox.behaviour("crash:" + NEW)
+    sandbox.forget_calls()
+    proc = sandbox.run("update.sh", src, MA_RELAX_SANDBOX="1")
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0 and "Откат" in out, _report(proc)
+    assert "защита службы ослаблена дополнением" in out and "созданное этим запуском, убрано" in out, _report(proc)
+    assert not os.path.exists(sandbox.dropin) and not os.path.exists(os.path.dirname(sandbox.dropin))
+    # после удаления файла systemd перечитал настройки, и только потом служба запущена снова
+    calls = sandbox.calls()
+    assert calls.count("daemon-reload") == 2, calls
+    last = len(calls) - 1 - calls[::-1].index("daemon-reload")
+    assert "restart mailarchiver" in calls[last:], calls
+    assert sandbox.wait_version() == OLD
+
+    # дополнение уже было (его правил администратор) — остаётся как есть и при MA_RELAX_SANDBOX=1
+    mine = "# правка администратора\n[Service]\nProtectProc=default\nPrivateDevices=no\n"
+    _write(sandbox.dropin, mine, 0o600)
+    proc = sandbox.run("update.sh", src, MA_RELAX_SANDBOX="1")
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0 and "Откат" in out, _report(proc)
+    assert "уже включена: %s — файл оставлен как есть" % sandbox.dropin in out, _report(proc)
+    assert "убрано" not in out
+    with open(sandbox.dropin, encoding="utf-8") as fh:
+        assert fh.read() == mine
+    assert stat.S_IMODE(os.stat(sandbox.dropin).st_mode) == 0o600
+    assert sandbox.wait_version() == OLD
+
+
+@needs_root
+def test_relaxed_sandbox_that_does_not_help_is_reported(sandbox):
+    """Дополнение действует, а служба всё равно падает с 226 — совет «повторите с MA_RELAX_SANDBOX» неуместен."""
+    sandbox.install_old(old_unit=True)
+    _write(sandbox.dropin, "[Service]\nProtectProc=default\n")       # PrivateDevices не отключён
+    proc = sandbox.run("update.sh", sandbox.sources(NEW, "src_new"), FAKE_NAMESPACE_FAIL="1")
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0 and "status=226/NAMESPACE" in out, _report(proc)
+    assert "Ослабленная защита уже включена (%s)" % sandbox.dropin in out, _report(proc)
+    assert "Повторите с MA_RELAX_SANDBOX=1" not in out, _report(proc)
+    assert os.path.exists(sandbox.dropin)
+    assert sandbox.wait_version() == OLD
+
+
+@needs_root
+def test_unknown_relax_value_does_not_loosen_anything(sandbox):
+    sandbox.install_old()
+    src = sandbox.sources(NEW, "src_new")
+    # о непонятом значении сказано уже на проверке; совета «повторите с MA_RELAX_SANDBOX=1»
+    # для контейнера при этом нет — переменную и так задали, только неверно
+    proc = sandbox.run("update.sh", src, args=("--check",), MA_RELAX_SANDBOX="yes", FAKE_VIRT="lxc")
+    assert proc.returncode == 0, _report(proc)
+    assert "MA_RELAX_SANDBOX=yes: значение не понято, защита службы меняться не будет." in proc.stdout, \
+        _report(proc)
+    assert "задайте MA_RELAX_SANDBOX=1" in proc.stdout and len(_marks(proc, "⚠")) == 1, _report(proc)
+    assert "Сервер — контейнер" not in proc.stdout and "повторите обновление" not in proc.stdout, _report(proc)
+    proc = sandbox.run("update.sh", src, MA_RELAX_SANDBOX="yes")
+    assert proc.returncode == 0, _report(proc)
+    assert "MA_RELAX_SANDBOX=yes: значение не понято" in proc.stdout, _report(proc)
+    assert not os.path.exists(os.path.dirname(sandbox.dropin))
+
+
+@needs_root
+def test_signal_while_creating_dropin_directory_leaves_nothing(sandbox):
+    """Сигнал между созданием каталога <unit>.d и записью дополнения: откат не оставляет пустой каталог."""
+    sandbox.install_old(old_unit=True)
+    src = sandbox.sources(NEW, "src_new")
+    # «chmod» каталога дополнения прерывает скрипт: каталог уже создан, файла в нём ещё нет
+    _write(os.path.join(sandbox.bin, "chmod"),
+           '#!/bin/sh\ncase "$*" in *mailarchiver.service.d) kill -TERM "$PPID" ;; esac\nexec %s "$@"\n'
+           % shutil.which("chmod"), 0o755)
+    proc = sandbox.run("update.sh", src, MA_RELAX_SANDBOX="1")
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 143 and "Откат" in out and "Служба работает" in out, _report(proc)
+    assert "защита службы ослаблена" not in out, _report(proc)          # до записи файла дело не дошло
+    assert not os.path.exists(os.path.dirname(sandbox.dropin))
+    assert sandbox.wait_version() == OLD
+
+
+@needs_root
+def test_existing_dropin_path_that_is_a_link_is_left_alone(sandbox):
+    """По пути дополнения лежит ссылка (так его отключают: ссылка на /dev/null) — её не трогают.
+
+    Раньше скрипт писал «сквозь» ссылку (и менял права на том, куда она ведёт), а
+    при откате удалял саму ссылку. Здесь ссылка ведёт в никуда — как и /dev/null,
+    это не обычный файл, — чтобы ошибка в скрипте не испортила машину с тестами.
+    """
+    sandbox.install_old(old_unit=True)
+    src = sandbox.sources(NEW, "src_new")
+    target = os.path.join(sandbox.base, "masked")
+    os.makedirs(os.path.dirname(sandbox.dropin))
+    os.symlink(target, sandbox.dropin)
+    sandbox.forget_calls()
+    before = sandbox.snapshot(src)
+    proc = sandbox.run("update.sh", src, args=("--check",), MA_RELAX_SANDBOX="1")
+    assert proc.returncode == 0, _report(proc)
+    assert "по пути дополнения %s уже что-то лежит" % sandbox.dropin in proc.stdout, _report(proc)
+    assert "ослаблена НЕ будет" in proc.stdout and len(_marks(proc, "⚠")) == 1, _report(proc)
+    _untouched(sandbox, before, proc, src)
+
+    sandbox.behaviour("crash:" + NEW)
+    proc = sandbox.run("update.sh", src, MA_RELAX_SANDBOX="1")
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0 and "Откат" in out, _report(proc)
+    assert ("MA_RELAX_SANDBOX=1: по пути дополнения %s уже лежит ссылка на %s — оставлено как есть, "
+            "защита службы НЕ ослаблена." % (sandbox.dropin, target)) in out, _report(proc)
+    assert "убрано" not in out and "защита службы ослаблена дополнением" not in out, _report(proc)
+    assert os.path.islink(sandbox.dropin) and os.readlink(sandbox.dropin) == target
+    assert not os.path.lexists(target)                       # «сквозь» ссылку ничего не записано
+    assert sandbox.wait_version() == OLD
+
+    # ссылка на действующий файл — это действующее дополнение: о нём напоминают, но не трогают
+    conf = os.path.join(sandbox.base, "relax.conf")
+    _write(conf, "[Service]\nProtectProc=default\nPrivateDevices=no\n", 0o600)
+    os.remove(sandbox.dropin)
+    os.symlink(conf, sandbox.dropin)
+    sandbox.behaviour("")
+    proc = sandbox.run("update.sh", src, FAKE_NAMESPACE_FAIL="1")
+    assert proc.returncode == 0, _report(proc)
+    assert "действует дополнение %s (ссылка на %s)" % (sandbox.dropin, conf) in proc.stdout, _report(proc)
+    assert os.path.islink(sandbox.dropin) and stat.S_IMODE(os.stat(conf).st_mode) == 0o600
+    assert sandbox.wait_version() == NEW
+
+
+# настройки шаблона, которые к защите не относятся
+UNIT_PLAIN = {"Type", "User", "Group", "Environment", "WorkingDirectory", "ExecStart", "Restart", "RestartSec",
+              "TimeoutStopSec"}
+# настройки, которым пространства имён не нужны: это лимиты cgroup, фильтр системных
+# вызовов (seccomp) или флаги процесса — они работают и в контейнере без вложенности,
+# поэтому дополнение их не трогает
+UNIT_NO_NAMESPACE = {"MemoryMax", "MemoryHigh", "LimitNOFILE", "TasksMax", "NoNewPrivileges",
+                     "RestrictSUIDSGID", "LockPersonality", "RestrictRealtime", "RemoveIPC",
+                     "RestrictAddressFamilies", "UMask"}
+
+
+def test_relax_dropin_covers_unit_template(tmp_path):
+    """Каждая настройка шаблона unit либо заведомо не требует пространства имён, либо отключается дополнением.
+
+    Новая строка в systemd/mailarchiver.service заставит решить, к какой группе она относится:
+    иначе в контейнере без вложенности служба снова упадёт с 226/NAMESPACE и при MA_RELAX_SANDBOX=1.
+    """
+    if not shutil.which("bash"):
+        pytest.skip("нет bash")
+    unit = tmp_path / "systemd" / "mailarchiver.service"
+    script = ('set -Eeuo pipefail; LOG_PREFIX=t; RED=; GRN=; YLW=; BLU=; NC=; APP_NAME=mailarchiver; '
+              'APP_USER=svc; UNIT_FILE="$1"; . "$2"; export MA_RELAX_SANDBOX=1; apply_relax_sandbox; '
+              'echo "created=$RELAX_CREATED"')
+    proc = subprocess.run(["bash", "-c", script, "_", str(unit), os.path.join(ROOT, "scripts", "common.sh")],
+                          capture_output=True, text=True)
+    assert proc.returncode == 0 and "created=1" in proc.stdout, _report(proc)
+    dropin = tmp_path / "systemd" / "mailarchiver.service.d" / "50-relax-sandbox.conf"
+    relaxed = _dropin_keys(dropin.read_text(encoding="utf-8"))
+
+    template, section = {}, ""
+    with open(os.path.join(ROOT, "systemd", "mailarchiver.service"), encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line.startswith("["):
+                section = line
+            elif section == "[Service]" and line and not line.startswith("#"):
+                key, value = line.split("=", 1)
+                template[key] = value
+    assert {"ProtectProc", "PrivateDevices", "ProtectSystem", "ReadWritePaths"} <= set(template)   # разбор верен
+    undecided = set(template) - UNIT_PLAIN - UNIT_NO_NAMESPACE - set(relaxed)
+    assert not undecided, "в шаблоне unit есть настройки, которые дополнение не отключает: %s" % sorted(undecided)
+    assert not set(relaxed) & (UNIT_PLAIN | UNIT_NO_NAMESPACE)
+    # в дополнении нет строк, которых нет в шаблоне, и каждая действительно отключает настройку
+    assert set(relaxed) <= set(template), set(relaxed) - set(template)
+    off = {"ProtectProc": "default", "ReadWritePaths": ""}
+    for key, value in relaxed.items():
+        assert value == off.get(key, "no"), (key, value)
+        assert template[key] != value, key
+
+
+# ---------------------------------------------------------------------------
+#  Обновление без доступа в интернет (каталог wheels)
+# ---------------------------------------------------------------------------
+def _installs(sandbox) -> list:
+    """Вызовы «pip install», которые действительно устанавливают (без пробных — --dry-run)."""
+    return [call for call in sandbox.calls("pip_calls")
+            if call.startswith("install") and "--dry-run" not in call]
+
+
+@needs_root
+def test_update_offline_from_wheels_directory(sandbox):
+    """Каталог wheels рядом с исходниками: pip не ходит в сеть, приложение ставится из своего пакета."""
+    sandbox.install_old()
+    src = sandbox.sources(NEW, "src_new", wheels=True)
+    wheels = os.path.join(src, "wheels")
+    # пакет под другой Python и другую архитектуру: проверка о нём предупредит
+    open(os.path.join(wheels, "otherdep-1.0-cp27-cp27mu-manylinux1_i686.whl"), "w").close()
+    open(os.path.join(wheels, "puredep-2.0-py2.py3-none-any.whl"), "w").close()
+    sandbox.forget_calls()
+    before = sandbox.snapshot(src)
+
+    # pip старше 22.2 пробную установку не умеет — остаётся оценка по именам файлов
+    proc = sandbox.run("update.sh", src, args=("--check",), FAKE_PIP_NO_DRY_RUN="1")
+    assert proc.returncode == 0, _report(proc)
+    assert "Обновление без сети: пакеты (3 шт.) будут взяты из " + wheels in proc.stdout, _report(proc)
+    misfit = [line for line in proc.stdout.splitlines() if "нет пакетов под этот Python" in line]
+    assert len(misfit) == 1 and misfit[0].rstrip().endswith("для: otherdep."), _report(proc)
+    assert re.search(r"под этот Python \(cp3\d+ \w+\)", misfit[0]), misfit      # названо, под что нужны пакеты
+    assert "не умеет пробную установку" in proc.stdout and len(_marks(proc, "⚠")) == 1, _report(proc)
+    _untouched(sandbox, before, proc, src)
+    # современный pip отвечает точно: лишний пакет под другой Python установке не мешает
+    proc = sandbox.run("update.sh", src, args=("--check",))
+    assert proc.returncode == 0 and "pip проверил пробной установкой" in proc.stdout, _report(proc)
+    assert not _marks(proc, "⚠") and "нет пакетов под этот Python" not in proc.stdout, _report(proc)
+    _untouched(sandbox, before, proc, src)
+
+    sandbox.forget_calls()
+    proc = sandbox.run("update.sh", src)
+    assert proc.returncode == 0, _report(proc)
+    assert "Обновление без сети: пакеты берутся из " + wheels in proc.stdout, _report(proc)
+    installs = _installs(sandbox)
+    # ни одного обращения к сети: ни обновления pip, ни сборки из исходников
+    assert installs and all("--no-index --find-links %s " % wheels in call for call in installs), installs
+    assert not [call for call in installs if "--upgrade pip" in call or sandbox.app_dir + " " in call + " "], installs
+    package = next(i for i, call in enumerate(installs) if "mailarchiver==" + NEW in call)
+    assert "--no-deps" in installs[package] and "--force-reinstall" in installs[package], installs
+    reqs = next(i for i, call in enumerate(installs) if "-r %s/requirements.txt" % sandbox.app_dir in call)
+    assert package < reqs and "--no-deps" not in installs[reqs], installs
+    assert sandbox.calls("pip_calls")[-1] == "check"
+    assert sandbox.calls("pkg_calls") == []                  # и менеджер пакетов без сети не вызывается
+    assert "Индекс пакетов" not in proc.stdout               # и индекс не опрашивается
+    # установлен именно пакет из каталога, а не копия исходников
+    assert os.path.exists(sandbox.site_file("from_wheel.py"))
+    assert not os.path.exists(os.path.join(sandbox.app_dir, "mailarchiver", "from_wheel.py"))
+    assert not os.path.exists(os.path.join(sandbox.app_dir, "wheels"))     # пакеты в установку не копируются
+    assert sandbox.wait_version() == NEW
+
+
+@needs_root
+def test_update_offline_refuses_unusable_wheels_before_touching_anything(sandbox):
+    """Нет пакета приложения нужной версии, MA_WHEELS указывает в никуда или в пустой каталог."""
+    sandbox.install_old()
+    src = sandbox.sources(NEW, "src_new")
+    stale = os.path.join(sandbox.base, "stale")
+    make_wheel(stale, "9.9.8")                                # пакет есть, но другой версии
+    empty = os.path.join(sandbox.base, "empty")
+    os.makedirs(empty)
+    nowhere = os.path.join(sandbox.base, "no-such-dir")
+    sandbox.forget_calls()
+    before = sandbox.snapshot(src, stale, empty)
+    for wheels, message in ((stale, "нет пакета приложения mailarchiver-%s-*.whl" % NEW),
+                            (empty, "В каталоге MA_WHEELS=%s нет ни одного пакета .whl" % empty),
+                            (nowhere, "Каталог пакетов MA_WHEELS=%s не найден" % nowhere)):
+        for args in (("--check",), ()):
+            proc = sandbox.run("update.sh", src, args=args, MA_WHEELS=wheels)
+            assert proc.returncode != 0, _report(proc)
+            assert message in proc.stderr and "Проверка не пройдена" in proc.stderr, _report(proc)
+            _untouched(sandbox, before, proc, src, stale, empty)
+    assert sandbox.wait_version() == OLD
+
+
+@needs_root
+def test_update_offline_rolls_back_when_pip_cannot_install(sandbox):
+    """Пакет пропал уже после проверки (или pip его не принял) — обычный откат с понятной причиной."""
+    sandbox.install_old()
+    src = sandbox.sources(NEW, "src_new", wheels=True)
+    # настоящий pip отказался бы так же, если бы пакет не подошёл этому Python
+    os.rename(os.path.join(src, "wheels", "mailarchiver-%s-py3-none-any.whl" % NEW),
+              os.path.join(src, "wheels", "mailarchiver-%s-py3-none-any.whl.part" % NEW))
+    open(os.path.join(src, "wheels", "mailarchiver-%s-broken.whl" % NEW), "w").close()   # не zip
+    proc = sandbox.run("update.sh", src)
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, _report(proc)
+    assert "Не удалось установить пакет mailarchiver %s из %s" % (NEW, os.path.join(src, "wheels")) in out, \
+        _report(proc)
+    assert "Откат" in out and "Служба работает" in out, _report(proc)
+    assert sandbox.wait_version() == OLD
+    assert "opened-by-" + NEW not in sandbox.db_text()
+
+
+# ---------------------------------------------------------------------------
+#  Каталог данных: неподключённый диск, ссылки, права
+# ---------------------------------------------------------------------------
+def _mount_advice(mount: str) -> str:
+    return 'файловая система %s из /etc/fstab не подключена: mount "%s"' % (mount, mount)
+
+
+def _unmount_data(sandbox) -> str:
+    """Диск с данными «отключился»: на месте каталога данных — пустая точка монтирования (root, 0755).
+
+    → каталог, куда убраны настоящие данные.
+    """
+    sandbox.stop()
+    aside = sandbox.data + ".disk"
+    os.rename(sandbox.data, aside)
+    os.mkdir(sandbox.data, 0o755)
+    sandbox.fstab(sandbox.data)
+    return aside
+
+
+@needs_root
+def test_update_refuses_data_dir_that_is_an_unmounted_mount_point(sandbox):
+    """Каталог данных — точка монтирования без диска (пустой каталог root:root).
+
+    Прежний совет «chown … && chmod 750» вёл к беде: обновление проходило, и новая
+    версия заводила пустую базу на месте точки монтирования. Теперь названа
+    файловая система, совета про права нет, и после «починки» прав — тоже отказ.
+    """
+    sandbox.install_old()
+    aside = _unmount_data(sandbox)
+    src = sandbox.sources(NEW, "src_new")
+    sandbox.forget_calls()
+    before = sandbox.snapshot(src)
+    proc = sandbox.run("update.sh", src, args=("--check",))
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, _report(proc)
+    assert _mount_advice(sandbox.data) in out, _report(proc)
+    assert "chown" not in out and "chmod" not in out and "install -d" not in out, _report(proc)
+    # один отказ (и итоговая строка): ни «нет базы», ни «конфигурация не принята» следом
+    assert len(_marks(proc, "✗")) == 2 and "нет базы" not in out, _report(proc)
+    assert "Конфигурация новой версией не проверялась" in out, _report(proc)
+    _untouched(sandbox, before, proc, src)
+
+    # администратор «починил» права — каталог пуст и доступен, но диск по-прежнему не подключён
+    os.chown(sandbox.data, pwd.getpwnam(USER).pw_uid, grp.getgrnam(GROUP).gr_gid)
+    os.chmod(sandbox.data, 0o750)
+    before = sandbox.snapshot(src)
+    for args in (("--check",), (), ("--force",)):
+        proc = sandbox.run("update.sh", src, args=args)
+        out = proc.stdout + proc.stderr
+        assert proc.returncode != 0, (args, _report(proc))
+        assert _mount_advice(sandbox.data) in out and "каталог пуст" in out, (args, _report(proc))
+        assert "chown" not in out and "понижен" not in out, (args, _report(proc))
+        _untouched(sandbox, before, proc, src)
+    assert os.listdir(sandbox.data) == []                    # новая база на месте точки монтирования не заведена
+
+    # диск подключили — обновление проходит на настоящих данных
+    os.rmdir(sandbox.data)
+    os.rename(aside, sandbox.data)
+    sandbox.fstab()
+    proc = sandbox.run("update.sh", src)
+    assert proc.returncode == 0, _report(proc)
+    assert sandbox.wait_version() == NEW
+    assert sandbox.db_text().startswith("created-by-" + OLD)
+
+
+@needs_root
+@pytest.mark.parametrize("shape", ["missing", "empty mount point"])
+def test_update_never_advises_creating_data_dir_on_a_share_outside_fstab(sandbox, shape):
+    """Данные на ресурсе, который подключают не через /etc/fstab (unit .mount, autofs, вручную).
+
+    Ресурс не подключён: каталога данных нет или на его месте пустая закрытая точка
+    монтирования. Совет «install -d …» или «chown …» тут вреден: служба, которую systemd
+    перезапускает каждые 5 секунд, поднялась бы на пустом каталоге с новой базой.
+    """
+    sandbox.install_old()
+    sandbox.stop()
+    aside = sandbox.data + ".share"
+    os.rename(sandbox.data, aside)
+    if shape == "empty mount point":
+        os.mkdir(sandbox.data, 0o700)                      # root:root, пусто
+    sandbox.fstab()                                         # в fstab ресурса нет
+    src = sandbox.sources(NEW, "src_new")
+    sandbox.forget_calls()
+    before = sandbox.snapshot(src)
+    for args in (("--check",), ()):
+        proc = sandbox.run("update.sh", src, args=args)
+        out = proc.stdout + proc.stderr
+        assert proc.returncode != 0, (args, _report(proc))
+        assert "install -d" not in out and "chown" not in out and "chmod" not in out, (args, _report(proc))
+        assert "mount -a" in out and "данные были" in out, (args, _report(proc))
+        assert ("Каталог не создавайте" if shape == "missing" else "Владельца и права не меняйте") in out, \
+            (args, _report(proc))
+        _untouched(sandbox, before, proc, src)
+    # ресурс подключили — обновление проходит на настоящих данных
+    if shape == "empty mount point":
+        os.rmdir(sandbox.data)
+    os.rename(aside, sandbox.data)
+    proc = sandbox.run("update.sh", src)
+    assert proc.returncode == 0, _report(proc)
+    assert sandbox.wait_version() == NEW and sandbox.db_text().startswith("created-by-" + OLD)
+
+
+@needs_root
+def test_install_still_offers_to_create_a_missing_data_dir(sandbox):
+    """Новой установке совет создать каталог данных по-прежнему нужен (здесь он к месту)."""
+    os.makedirs(os.path.dirname(sandbox.data), exist_ok=True)
+    sandbox.fstab()
+    run = subprocess.run(["bash", "-c", 'SCRIPT_NAME=install.sh; LOG_PREFIX=t; APP_USER=nobody; APP_GROUP=x; '
+                          'DATA_DIR="$1"; DATA_DIR_FROM=""; APP_NAME=mailarchiver; . "$2"; '
+                          'check_data_dir', "_", os.path.join(sandbox.base, "no-such-data"),
+                          os.path.join(ROOT, "scripts", "common.sh")],
+                         capture_output=True, text=True, env=sandbox.env())
+    assert run.returncode == 1 and "install -d" in run.stderr, run.stderr
+
+
+@needs_root
+def test_update_names_unmounted_filesystem_above_the_data_directory(sandbox):
+    """Точка монтирования — выше каталога данных: ссылка в никуда, каталога нет, каталог под ней не пуст."""
+    sandbox.install_old()
+    mount = _move_data_to_storage(sandbox)                   # data → <mount>/mailarchiver
+    real = os.path.join(mount, "mailarchiver")
+    sandbox.stop()
+    os.rename(mount, mount + ".disk")
+    os.mkdir(mount)                                          # пустая точка монтирования
+    sandbox.fstab(mount)
+    src = sandbox.sources(NEW, "src_new")
+    sandbox.forget_calls()
+    before = sandbox.snapshot(src)
+
+    proc = sandbox.run("update.sh", src, args=("--check",))  # ссылка в никуда
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0 and _mount_advice(mount) in out, _report(proc)
+    assert "Каталог данных %s (%s) лежит на неподключённом диске" % (sandbox.data, real) in out, _report(proc)
+    assert "mount -a" not in out and "chown" not in out and "install -d" not in out, _report(proc)
+    _untouched(sandbox, before, proc, src)
+
+    proc = sandbox.run("update.sh", src, args=("--check",), MA_DATA_DIR=real)     # каталога просто нет
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0 and _mount_advice(mount) in out, _report(proc)
+    assert "сейчас каталога нет" in out and "install -d" not in out, _report(proc)
+    _untouched(sandbox, before, proc, src)
+
+    # Под точкой монтирования уже лежат данные (служба успела поработать без диска):
+    # это предупреждение, а не отказ, — возможно, строка в fstab просто устарела.
+    shutil.copytree(os.path.join(mount + ".disk", "mailarchiver"), real)
+    subprocess.run(["chown", "-R", "%s:%s" % (USER, GROUP), real], check=True)
+    os.chmod(real, 0o750)
+    proc = sandbox.run("update.sh", src, args=("--check",))
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 0, _report(proc)
+    assert "лежит под точкой монтирования %s из /etc/fstab, а она сейчас не подключена" % mount in out, _report(proc)
+    assert 'mount "%s"' % mount in out and len(_marks(proc, "⚠")) == 1 and not _marks(proc, "✗"), _report(proc)
+
+    # строки в fstab нет (диск подключают иначе) — и замечаний нет
+    sandbox.fstab()
+    proc = sandbox.run("update.sh", src, args=("--check",))
+    assert proc.returncode == 0 and not _marks(proc, "⚠"), _report(proc)
+
+
+@needs_root
+def test_mounted_filesystem_from_fstab_is_not_reported(sandbox):
+    """Настоящее монтирование: объявленная в fstab и подключённая файловая система замечаний не вызывает."""
+    sandbox.install_old()
+    sandbox.stop()
+    aside = sandbox.data + ".disk"
+    os.rename(sandbox.data, aside)
+    os.mkdir(sandbox.data, 0o755)
+    sandbox.fstab(sandbox.data)
+    src = sandbox.sources(NEW, "src_new")
+    if subprocess.run(["mount", "-t", "tmpfs", "-o", "mode=0750", "tmpfs", sandbox.data],
+                      capture_output=True).returncode != 0:
+        pytest.skip("монтировать здесь нельзя (нет права CAP_SYS_ADMIN)")
+    try:
+        # диск подключён, но пуст: от fstab замечаний нет, о базе — есть
+        subprocess.run(["chown", "%s:%s" % (USER, GROUP), sandbox.data], check=True)
+        proc = sandbox.run("update.sh", src, args=("--check",))
+        out = proc.stdout + proc.stderr
+        assert proc.returncode != 0 and "нет базы" in out and "не подключена" not in out, _report(proc)
+        shutil.copy2(os.path.join(aside, "mailarchiver.db"), sandbox.db)
+        subprocess.run(["chown", "%s:%s" % (USER, GROUP), sandbox.db], check=True)
+        proc = sandbox.run("update.sh", src, args=("--check",))
+        assert proc.returncode == 0 and not _marks(proc, "⚠") and not _marks(proc, "✗"), _report(proc)
+    finally:
+        subprocess.run(["umount", "-l", sandbox.data], capture_output=True)
+    # диск отключили — та же проверка называет его
+    proc = sandbox.run("update.sh", src, args=("--check",))
+    assert proc.returncode != 0 and _mount_advice(sandbox.data) in proc.stdout + proc.stderr, _report(proc)
+
+
+@needs_root
+def test_update_refuses_when_data_directory_has_no_database(sandbox):
+    """Нет файла базы — отказ (не тот каталог?); намеренно пустой каталог пропускает только --force."""
+    sandbox.install_old()
+    sandbox.stop()
+    for name in os.listdir(sandbox.data):
+        os.remove(os.path.join(sandbox.data, name))
+    src = sandbox.sources(NEW, "src_new")
+    sandbox.forget_calls()
+    before = sandbox.snapshot(src)
+    text = ("В каталоге данных нет базы (%s): служба ещё ни разу не запускалась или это не тот каталог "
+            "(диск не подключён?)." % sandbox.db)
+    for args in (("--check",), ()):
+        proc = sandbox.run("update.sh", src, args=args)
+        out = proc.stdout + proc.stderr
+        assert proc.returncode != 0, (args, _report(proc))
+        assert text in proc.stderr and "sudo bash scripts/update.sh --force" in proc.stderr, (args, _report(proc))
+        assert "без её копии" not in out, _report(proc)      # об одной беде — одно сообщение
+        assert len(_marks(proc, "✗")) == 2, _report(proc)
+        _untouched(sandbox, before, proc, src)
+
+    proc = sandbox.run("update.sh", src, args=("--check", "--force"))
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 0, _report(proc)
+    assert "--force: отказ понижен до предупреждения — " + text in proc.stdout, _report(proc)
+    assert "--force: отказов, пониженных до предупреждений, — 1" in proc.stdout, _report(proc)
+    assert not _marks(proc, "✗") and len(_marks(proc, "⚠")) == 1, _report(proc)
+    _untouched(sandbox, before, proc, src)
+
+    proc = sandbox.run("update.sh", src, args=("--force",))
+    assert proc.returncode == 0, _report(proc)
+    assert sandbox.wait_version() == NEW
+    assert sandbox.db_text() == "opened-by-%s\n" % NEW
+
+
+def _set_unit_paths(sandbox, value: str) -> None:
+    with open(sandbox.unit, encoding="utf-8") as fh:
+        unit = fh.read()
+    unit, count = re.subn(r"(?m)^ReadWritePaths=.*$", "ReadWritePaths=" + value.replace("\\", r"\\"), unit)
+    assert count == 1
+    _write(sandbox.unit, unit)
+
+
+@needs_root
+def test_update_finds_data_directory_despite_unit_file_quirks(sandbox):
+    """ReadWritePaths со знаком «-» и с несколькими путями; каталог данных берётся из конфигурации."""
+    sandbox.install_old()
+    src = sandbox.sources(NEW, "src_new")
+    config = os.path.join(sandbox.config_dir, "config.yaml")
+    accessible = "каталоги над установкой, конфигурация и каталог данных доступны"
+
+    # «-» перед путём (нет каталога — не ошибка): раньше каталогом данных считался «-/…»
+    _set_unit_paths(sandbox, "-" + sandbox.data)
+    proc = sandbox.run("update.sh", src, args=("--check",), MA_DATA_DIR=None)
+    assert proc.returncode == 0 and accessible in proc.stdout, _report(proc)
+    assert "Каталог данных:" not in proc.stdout and not _marks(proc, "⚠"), _report(proc)
+
+    # несколько путей, каталог данных — не первый: верный называет конфигурация установленной версии
+    spool = os.path.join(sandbox.base, "spool")
+    os.makedirs(spool)
+    _set_unit_paths(sandbox, "+%s -%s" % (spool, sandbox.data))
+    proc = sandbox.run("update.sh", src, args=("--check",), MA_DATA_DIR=None)
+    assert proc.returncode == 0 and accessible in proc.stdout, _report(proc)
+    assert ("Каталог данных: %s — из конфигурации %s (в unit-файле первым в ReadWritePaths указан %s)."
+            % (sandbox.data, config, spool)) in proc.stdout, _report(proc)
+    assert "Места для копии базы хватает" in proc.stdout, _report(proc)
+
+    # Установленная версия ответить не может (старая: у load_config нет параметра create_dirs) —
+    # остаётся unit-файл; знак и «/» на конце убраны. Путь к базе неизвестен — предупреждение, как раньше.
+    _set_unit_paths(sandbox, "-%s/" % sandbox.data)
+    installed = sandbox.site_file("config.py")
+    with open(installed, encoding="utf-8") as fh:
+        original = fh.read()
+    _write(installed, original + "\n\ndef load_config(path=None):\n    return Config(path)\n")
+    proc = sandbox.run("update.sh", src, args=("--check",), MA_DATA_DIR=None)
+    assert proc.returncode == 0 and accessible in proc.stdout, _report(proc)
+    assert "Файл базы не найден (путь узнать не удалось" in proc.stdout and "нет базы" not in proc.stdout, \
+        _report(proc)
+    assert not _marks(proc, "✗"), _report(proc)
+    _write(installed, original)
+
+    # и обновление с таким unit проходит; новый unit — уже по шаблону
+    proc = sandbox.run("update.sh", src, MA_DATA_DIR=None)
+    assert proc.returncode == 0, _report(proc)
+    assert sandbox.wait_version() == NEW
+    with open(sandbox.unit, encoding="utf-8") as fh:
+        assert "ReadWritePaths=%s\n" % sandbox.data in fh.read()
+
+
+@needs_root
+def test_relative_data_dir_in_config_is_read_the_way_the_service_reads_it(sandbox):
+    """paths.data_dir: "data" — служба считает путь от своего рабочего каталога; так же должен и скрипт.
+
+    Иначе каталог данных и база искались бы от корня («/data/…»), и работающая
+    установка получала бы отказ «в каталоге данных нет базы».
+    """
+    sandbox.install_old()
+    sandbox.stop()
+    inside = os.path.join(sandbox.app_dir, "data")
+    os.rename(sandbox.data, inside)
+    config = os.path.join(sandbox.config_dir, "config.yaml")
+    with open(config, encoding="utf-8") as fh:
+        text = fh.read()
+    _write(config, text.replace('"%s"' % sandbox.data, '"data"'))
+    _set_unit_paths(sandbox, inside)
+    sandbox.systemctl("start", "mailarchiver")
+    assert sandbox.wait_version() == OLD, sandbox.journal()
+    src = sandbox.sources(NEW, "src_new")
+    proc = sandbox.run("update.sh", src, args=("--check",), MA_DATA_DIR=None)
+    assert proc.returncode == 0 and "Места для копии базы хватает" in proc.stdout, _report(proc)
+    assert not _marks(proc, "✗") and not _marks(proc, "⚠"), _report(proc)
+    # unit-файл называет другой каталог — каталог данных всё равно найден: по конфигурации
+    _set_unit_paths(sandbox, os.path.join(sandbox.base, "elsewhere"))
+    proc = sandbox.run("update.sh", src, args=("--check",), MA_DATA_DIR=None)
+    assert proc.returncode == 0 and "Каталог данных: %s — из конфигурации" % inside in proc.stdout, _report(proc)
+    # и обновление проходит: копия базы снята с настоящего файла, новый unit называет настоящий каталог
+    proc = sandbox.run("update.sh", src, MA_DATA_DIR=None, MA_KEEP_DB_BACKUP="1")
+    assert proc.returncode == 0 and "Копия базы данных" in proc.stdout, _report(proc)
+    assert sandbox.wait_version() == NEW
+    with open(sandbox.unit, encoding="utf-8") as fh:
+        assert "ReadWritePaths=%s\n" % inside in fh.read()
+    with open(os.path.join(inside, "mailarchiver.db"), encoding="utf-8") as fh:
+        assert "opened-by-" + NEW in fh.read()
+
+
+@needs_root
+def test_dangling_link_with_trailing_slash_and_through_other_links(sandbox):
+    """MA_DATA_DIR с «/» на конце, ссылка относительная и ведёт через другую ссылку: названа конечная цель."""
+    sandbox.install_old()
+    sandbox.stop()
+    os.rename(sandbox.data, sandbox.data + ".disk")
+    final = os.path.join(sandbox.base, "nowhere", "mailarchiver")
+    os.symlink(final, os.path.join(sandbox.base, "hop"))
+    os.symlink("hop", sandbox.data)                          # относительная: data → hop → (нет)
+    src = sandbox.sources(NEW, "src_new")
+    sandbox.forget_calls()
+    before = sandbox.snapshot(src)
+    proc = sandbox.run("update.sh", src, args=("--check",), MA_DATA_DIR=sandbox.data + "/")
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, _report(proc)
+    assert ("Каталог данных %s — ссылка на %s (в самой ссылке записано: hop), а такого каталога сейчас нет."
+            % (sandbox.data, final)) in out, _report(proc)
+    assert "Нет каталога данных" not in out, _report(proc)
+    # Отказ один. Настоящая программа (и учебная) на таком каталоге не проходит и check-config —
+    # но второго ✗ «исправьте конфигурацию» быть не должно: конфигурация ни при чём.
+    assert "Конфигурация новой версией не проверялась" in out, _report(proc)
+    assert "не принимает конфигурацию" not in out and "нет базы" not in out, _report(proc)
+    assert len(_marks(proc, "✗")) == 2 and not _marks(proc, "⚠"), _report(proc)
+    _untouched(sandbox, before, proc, src)
+    # install.sh с тем же путём отказывает так же — до любых действий
+    proc = sandbox.run("install.sh", src, MA_DATA_DIR=sandbox.data + "/", MA_INSTALL_DIR=sandbox.install_dir + "2")
+    assert proc.returncode != 0 and "ссылка на %s (в самой ссылке записано: hop)" % final in proc.stderr, \
+        _report(proc)
+    assert not os.path.exists(sandbox.install_dir + "2")
+
+
+@needs_root
+def test_data_directory_access_messages(sandbox):
+    """Закрытый каталог данных: названо, что закрыто, и чем исправить — по обе стороны ссылки."""
+    sandbox.install_old()
+    sandbox.stop()
+    src = sandbox.sources(NEW, "src_new")
+    owner = "%s:%s" % (USER, GROUP)
+    uid, gid = pwd.getpwnam(USER).pw_uid, grp.getgrnam(GROUP).gr_gid
+
+    def check(**extra):
+        proc = sandbox.run("update.sh", src, args=("--check",), **extra)
+        assert proc.returncode != 0 and len(_marks(proc, "✗")) == 2, _report(proc)
+        return proc.stdout + proc.stderr
+
+    # сам каталог данных root:root 0700 — путь назван один раз, совет есть
+    os.chown(sandbox.data, 0, 0)
+    os.chmod(sandbox.data, 0o700)
+    out = check()
+    assert "не может войти в каталог данных %s.\n" % sandbox.data in out, out
+    assert 'Исправьте: chown %s "%s" && chmod 750 "%s"' % (owner, sandbox.data, sandbox.data) in out, out
+    assert "(%s)" % sandbox.data not in out, out
+    os.chmod(sandbox.data, 0o755)                            # войти может, писать — нет
+    out = check()
+    assert "не может писать в каталог данных %s.\n" % sandbox.data in out and "chown " + owner in out, out
+    os.chown(sandbox.data, uid, gid)
+    os.chmod(sandbox.data, 0o750)
+
+    # закрыт каталог, в котором лежит ссылка на каталог данных
+    private = os.path.join(sandbox.base, "private")
+    os.mkdir(private, 0o700)
+    link = os.path.join(private, "data")
+    os.symlink(sandbox.data, link)
+    out = check(MA_DATA_DIR=link)
+    assert "не может войти в каталог данных %s (%s).\n" % (link, sandbox.data) in out, out
+    assert "Закрыт каталог %s (права drwx------ root:" % private in out, out
+    assert 'Исправьте: chmod o+x "%s"' % private in out and "chown" not in out, out
+
+    # закрыт каталог на стороне цели ссылки
+    os.chmod(private, 0o755)
+    vault = os.path.join(sandbox.base, "vault")
+    os.mkdir(vault, 0o700)
+    os.rename(sandbox.data, os.path.join(vault, "mail"))
+    os.symlink(os.path.join(vault, "mail"), sandbox.data)
+    out = check()
+    assert "не может войти в каталог данных %s (%s).\n" % (sandbox.data, os.path.join(vault, "mail")) in out, out
+    assert "Закрыт каталог %s " % vault in out and 'chmod o+x "%s"' % vault in out, out
+
+    # закрыта сама цель ссылки — чинить нужно её
+    os.chmod(vault, 0o755)
+    os.chown(os.path.join(vault, "mail"), 0, 0)
+    out = check()
+    assert 'Исправьте: chown %s "%s" && chmod 750 "%s"' % (owner, os.path.join(vault, "mail"),
+                                                             os.path.join(vault, "mail")) in out, out
+
+    # каталога нет: откуда взят путь — сказано, а про ReadWritePaths (unit-файла может и не быть) — нет
+    absent = os.path.join(sandbox.base, "absent")
+    os.remove(sandbox.unit)
+    out = check(MA_DATA_DIR=absent)
+    assert "Нет каталога данных %s: без него служба не запустится." % absent in out, out
+    assert "Путь взят из переменной MA_DATA_DIR." in out and "ReadWritePaths" not in out, out
+    # обновление: служба уже установлена — каталог создавать не советуем (см. диск вне fstab)
+    assert "install -d" not in out and "Каталог не создавайте" in out, out
+
+
+@needs_root
+@pytest.mark.parametrize("linked", [False, True])
+def test_update_leaves_owner_of_import_files_alone(sandbox, linked):
+    """Чужие файлы в каталоге данных возвращаются службе — кроме содержимого import/ (их кладёт администратор)."""
+    sandbox.install_old()
+    real = os.path.join(_move_data_to_storage(sandbox), "mailarchiver") if linked else sandbox.data
+    _write(os.path.join(real, "import", "2024", "archive.pst"), "x")
+    _write(os.path.join(real, "exports", "made-by-root.zip"), "x")
+    uid = pwd.getpwnam(USER).pw_uid
+    assert os.stat(os.path.join(real, "import")).st_uid == 0
+    proc = sandbox.run("update.sh", sandbox.sources(NEW, "src_new"))
+    assert proc.returncode == 0, _report(proc)
+    assert sandbox.wait_version() == NEW
+    assert os.stat(os.path.join(real, "import")).st_uid == uid               # сам каталог — за службой
+    assert os.stat(os.path.join(real, "import", "2024")).st_uid == 0
+    assert os.stat(os.path.join(real, "import", "2024", "archive.pst")).st_uid == 0
+    assert os.stat(os.path.join(real, "exports", "made-by-root.zip")).st_uid == uid
+    assert os.stat(os.path.join(real, "exports")).st_uid == uid
+    assert os.lstat(sandbox.data).st_uid == (0 if linked else uid)          # саму ссылку не трогают
+
+
+# ---------------------------------------------------------------------------
+#  status=226/NAMESPACE: что говорит журнал
+# ---------------------------------------------------------------------------
+def _namespace_hint(sandbox, journal: str, **extra: str) -> str:
+    """Совет service_namespace_hint для данного текста журнала (common.sh, без установки и systemd)."""
+    script = ('set -Eeuo pipefail; LOG_PREFIX="[t]"; RED=; GRN=; YLW=; BLU=; NC=; APP_NAME=mailarchiver; '
+              'APP_USER="$MA_USER"; APP_GROUP="$MA_GROUP"; UNIT_FILE="$MA_UNIT_FILE"; DATA_DIR="$MA_DATA_DIR"; '
+              'SCRIPT_NAME=update.sh; . "$1"; service_namespace_hint "$2"')
+    proc = subprocess.run(["bash", "-c", script, "_", os.path.join(ROOT, "scripts", "common.sh"), journal],
+                          env=sandbox.env(**extra), capture_output=True, text=True, cwd="/")
+    assert proc.returncode == 0, _report(proc)
+    return proc.stdout + proc.stderr
+
+
+@needs_root
+def test_namespace_hint_follows_the_reason_in_the_journal(sandbox):
+    """Причина отказа 226 — по тексту systemd; совет про MA_RELAX_SANDBOX — контейнеру или при «Permission denied»."""
+    os.makedirs(sandbox.data)
+    _write(sandbox.db, "x")
+    subprocess.run(["chown", "-R", "%s:%s" % (USER, GROUP), sandbox.data], check=True)
+    head = "окт 10 12:00:00 host systemd[1]: mailarchiver.service: "
+
+    def journal(first, reason):
+        lines = [head + "Failed to set up mount namespacing: " + first] if first else []
+        return "\n".join(lines + [head + "Failed at step NAMESPACE spawning /opt/venv/bin/mailarchiver: " + reason])
+
+    gone = os.path.join(sandbox.base, "gone", "spool")
+    # путь назван: с «/./» и изнутри собираемого окружения
+    for shown in ("/." + gone + "/", "/run/systemd/unit-root" + gone):
+        out = _namespace_hint(sandbox, journal(shown + ": No such file or directory", "No such file or directory"))
+        assert "systemd не нашёл каталог %s — " % gone in out, out
+        assert "Каталог данных %s на месте: сравните каталоги из ReadWritePaths" % sandbox.data in out, out
+        assert "MA_RELAX_SANDBOX" not in out and "контейнер" not in out, out
+    # …и он лежит на файловой системе, которая не подключена
+    sandbox.fstab(os.path.dirname(gone))
+    out = _namespace_hint(sandbox, journal("/." + gone + ": No such file or directory", "No such file or directory"))
+    assert "Ф" + _mount_advice(os.path.dirname(gone))[1:] in out, out
+    sandbox.fstab()
+
+    # systemd до 246 пути не называет: это по-прежнему «нет каталога», а не «контейнер»
+    old = journal("No such file or directory", "No such file or directory")
+    for text in (old, journal("", "No such file or directory")):
+        out = _namespace_hint(sandbox, text)
+        assert "systemd не нашёл один из каталогов, нужных службе (ReadWritePaths)" in out, out
+        assert "сравните каталоги из ReadWritePaths (systemctl cat mailarchiver)" in out, out
+        assert "MA_RELAX_SANDBOX" not in out and "контейнер" not in out and "nesting" not in out, out
+    assert "MA_RELAX_SANDBOX=1" in _namespace_hint(sandbox, old, FAKE_VIRT="lxc")     # в контейнере — возможно и это
+
+    # «Permission denied» — пространство имён создать не дали: совет про контейнер, где бы ни запускали
+    out = _namespace_hint(sandbox, journal("/run/systemd/unit-root/proc: Permission denied", "Permission denied"))
+    assert "sudo MA_RELAX_SANDBOX=1 bash scripts/update.sh" in out and "nesting" in out, out
+    assert "systemd не нашёл" not in out, out
+
+    # иная причина: называются обе возможности; совет про MA_RELAX_SANDBOX — только контейнеру
+    other = journal("Invalid argument", "Invalid argument")
+    out = _namespace_hint(sandbox, other)
+    assert "Причин у такого отказа обычно две" in out and "ReadWritePaths" in out, out
+    assert "MA_RELAX_SANDBOX" not in out, out
+    out = _namespace_hint(sandbox, other, FAKE_VIRT="lxc")
+    assert "Этот сервер — контейнер (lxc)" in out and "MA_RELAX_SANDBOX=1" in out, out
+
+    # «нет» каталога, который на самом деле есть (/dev внутри окружения), — не пропавший каталог
+    out = _namespace_hint(sandbox, journal("/run/systemd/unit-root/dev: No such file or directory",
+                                           "No such file or directory"))
+    assert "systemd не нашёл" not in out and "Причин у такого отказа обычно две" in out, out
+
+    # каталог данных — ссылка в никуда: об этом и сказано, какой бы ни была строка журнала
+    shutil.rmtree(sandbox.data)
+    os.symlink(os.path.join(sandbox.base, "no-disk", "mail"), sandbox.data)
+    for text in (old, other):
+        out = _namespace_hint(sandbox, text)
+        assert "ссылка на %s" % os.path.join(sandbox.base, "no-disk", "mail") in out, out
+        assert "MA_RELAX_SANDBOX" not in out, out
+
+
+@needs_root
+def test_old_systemd_message_without_path_is_not_taken_for_a_container(sandbox):
+    """systemd до 246 (RHEL 8, Debian 10): «Failed to set up mount namespacing: No such file or directory».
+
+    Пути в строке нет. На обычном сервере (не в контейнере) совет «повторите с
+    MA_RELAX_SANDBOX=1» был бы ложным следом: не хватает каталога.
+    """
+    sandbox.install_old()
+    # администратор добавил службе ещё один каталог (своим дополнением), а его нет
+    _write(os.path.join(sandbox.unit + ".d", "10-paths.conf"),
+           "[Service]\nReadWritePaths=%s %s\n" % (sandbox.data, os.path.join(sandbox.base, "spool")))
+    sandbox.systemctl("restart", "mailarchiver")
+    assert sandbox.wait_crashed(), sandbox.journal()
+    proc = sandbox.run("update.sh", sandbox.sources(NEW, "src_new"), FAKE_SYSTEMD_STYLE="old")
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0 and "status=226/NAMESPACE" in out, _report(proc)
+    assert "Failed to set up mount namespacing: No such file or directory" in out, _report(proc)
+    assert "systemd не нашёл один из каталогов, нужных службе (ReadWritePaths)" in out, _report(proc)
+    assert "Каталог данных %s на месте: сравните каталоги из ReadWritePaths" % sandbox.data in out, _report(proc)
+    assert "MA_RELAX_SANDBOX" not in out and "nesting" not in out and "контейнер" not in out, _report(proc)
+    assert "Откат" in out and "До обновления служба тоже не работала" in out, _report(proc)
+
+
+# ---------------------------------------------------------------------------
+#  Состояние службы до обновления
+# ---------------------------------------------------------------------------
+@needs_root
+def test_rollback_does_not_blame_a_service_the_admin_had_stopped(sandbox):
+    """Службу остановил администратор — исправную. «До обновления она тоже не работала» здесь неправда."""
+    sandbox.install_old()
+    sandbox.stop()
+    sandbox.behaviour("crash:*")
+    proc = sandbox.run("update.sh", sandbox.sources(NEW, "src_new"))
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0 and "служба НЕ поднялась" in out, _report(proc)
+    assert "Служба не работает уже сейчас" not in out, _report(proc)
+    assert "До обновления служба тоже не работала" not in out, _report(proc)
+
+
+@needs_root
+def test_check_notices_crash_loop_between_restarts(sandbox):
+    """Служба в цикле перезапусков числится active/running, пока идёт попытка запуска, — её выдаёт счётчик."""
+    sandbox.install_old()
+    sandbox.behaviour("hang:*")                              # запускается, но веб-интерфейс не поднимает
+    sandbox.systemctl("restart", "mailarchiver")
+    _write(os.path.join(sandbox.state, "nrestarts"), "3")
+    assert sandbox.active()
+    src = sandbox.sources(NEW, "src_new")
+    proc = sandbox.run("update.sh", src, args=("--check",))
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 0, _report(proc)
+    assert ("Служба не работает уже сейчас, до обновления (состояние active/running, но systemd перезапускал её "
+            "уже 3 раз(а), а адрес проверки http://127.0.0.1:%d/health не отвечает)." % sandbox.port) in out, \
+        _report(proc)
+    # одно предупреждение, а не два об одном и том же
+    assert "Служба работает, но адрес проверки не отвечает" not in out and len(_marks(proc, "⚠")) == 1, \
+        _report(proc)
+    # тот же счётчик у службы, которая отвечает, — не повод (см. test_check_mode_reports_and_changes_nothing)
+
+
+# ---------------------------------------------------------------------------
+#  Проверка перед обновлением: --check, --force и что именно проверяется
+# ---------------------------------------------------------------------------
+@needs_root
+def test_check_mode_is_requested_only_by_the_flag(sandbox):
+    """Переменной MA_CHECK_ONLY больше нет: с «MA_CHECK_ONLY=1 sudo …» sudo её отбрасывал, и шло обновление.
+
+    Проверяется, что переменная не читается вовсе. Обновление при этом случиться не
+    может: «свободного места» заведомо мало, и скрипт остановится на проверке.
+    """
+    sandbox.install_old()
+    src = sandbox.sources(NEW, "src_new")
+    sandbox.forget_calls()
+    before = sandbox.snapshot(src)
+    proc = sandbox.run("update.sh", src, MA_CHECK_ONLY="1", FAKE_DF_FREE_KB="1000")
+    assert proc.returncode != 0 and "Мало места" in proc.stderr, _report(proc)
+    assert proc.stdout.splitlines()[0] == "[MailArchiver update] Проверка перед обновлением…", _report(proc)
+    assert "служба не останавливается" not in proc.stdout, _report(proc)
+    _untouched(sandbox, before, proc, src)
+    proc = sandbox.run("update.sh", src, args=("--check",), FAKE_DF_FREE_KB="1000")
+    assert proc.stdout.splitlines()[0].endswith(
+        "Проверка перед обновлением (служба не останавливается, на диске ничего не меняется)…"), _report(proc)
+    for name in sorted(os.listdir(os.path.join(ROOT, "scripts"))):
+        if name.endswith(".sh"):
+            with open(os.path.join(ROOT, "scripts", name), encoding="utf-8") as fh:
+                assert "MA_CHECK_ONLY" not in fh.read(), name
+
+
+@needs_root
+def test_force_downgrades_only_what_is_checked_again_after_installation(sandbox):
+    sandbox.install_old()
+    rejecting = sandbox.sources(NEW, "src_rejecting", rejects_config=True)
+    unparsable = sandbox.sources(NEW, "src_unparsable", syntax_error=True)
+    too_new = sandbox.sources(NEW, "src_too_new", requires_python=">=3.99")
+    sandbox.forget_calls()
+    trees = (rejecting, unparsable, too_new)
+    before = sandbox.snapshot(*trees)
+    for src, text in ((rejecting, "Новая версия не принимает конфигурацию"),
+                      (unparsable, "Часть модулей новой версии не подходит Python окружения"),
+                      (too_new, "не подходит новой версии: ей нужен Python >=3.99")):
+        proc = sandbox.run("update.sh", src, args=("--check", "--force"))
+        out = proc.stdout + proc.stderr
+        assert proc.returncode == 0, _report(proc)
+        marked = [line for line in _marks(proc, "⚠") if "--force: отказ понижен до предупреждения — " in line]
+        assert len(marked) == 1 and text in marked[0], _report(proc)
+        assert "--force: отказов, пониженных до предупреждений, — 1" in out and not _marks(proc, "✗"), _report(proc)
+        assert "Проверка пройдена, предупреждений — 1 (отмечены знаком ⚠). Обновление: sudo bash " \
+               "scripts/update.sh --force" in out, _report(proc)
+        _untouched(sandbox, before, proc, *trees)
+
+    # то, что после установки не перепроверяется, --force не обходит
+    proc = sandbox.run("update.sh", too_new, args=("--force",), FAKE_DF_FREE_KB="1000")
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0 and "Мало места" in out and "ошибок — 1, предупреждений — 1" in out, _report(proc)
+    assert len(_marks(proc, "✗")) == 2, _report(proc)
+    _untouched(sandbox, before, proc, *trees)
+    proc = sandbox.run("update.sh", too_new, args=("--check", "--force"), MA_USER="no-such-user-for-tests")
+    assert proc.returncode != 0 and "нет пользователя службы" in proc.stderr, _report(proc)
+    _untouched(sandbox, before, proc, *trees)
+
+    # настоящее обновление с --force: конфигурация проверяется снова — уже установленной версией — и откат
+    proc = sandbox.run("update.sh", rejecting, args=("--force",))
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, _report(proc)
+    assert "Новая версия не приняла конфигурацию" in out and "Откат" in out and "Служба работает" in out, \
+        _report(proc)
+    assert sandbox.wait_version() == OLD
+
+
+@needs_root
+def test_check_config_that_could_not_run_is_not_a_rejected_configuration(sandbox):
+    """Новой версии нужна библиотека, которой ещё нет: check-config из исходников не состоялся — это не ✗."""
+    sandbox.install_old()
+    src = sandbox.sources(NEW, "src_new", needs_library=True)
+    sandbox.forget_calls()
+    before = sandbox.snapshot(src)
+    proc = sandbox.run("update.sh", src, args=("--check",))
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 0, _report(proc)
+    assert "Проверить конфигурацию новой версией до установки не удалось" in out, _report(proc)
+    assert "No module named 'library_added_in_new_version'" in out, _report(proc)
+    assert "не принимает конфигурацию" not in out, _report(proc)
+    assert not _marks(proc, "✗") and len(_marks(proc, "⚠")) == 1, _report(proc)
+    _untouched(sandbox, before, proc, src)
+
+
+@needs_root
+def test_requires_python_is_read_from_the_project_table_only(sandbox):
+    sandbox.install_old()
+    src = sandbox.sources(NEW, "src_new")
+    pyproject = os.path.join(src, "pyproject.toml")
+    project = '[project]\nname = "mailarchiver"\nversion = "%s"\n' % NEW
+    _write(pyproject, '[tool.checker]\nrequires-python = ">=3.99"\n\n' + project
+           + 'requires-python = ">=3.8"   # наш\n\n[tool.other]\nrequires-python = ">=4.5"\n')
+    proc = sandbox.run("update.sh", src, args=("--check",))
+    assert proc.returncode == 0 and "подходит новой версии (нужен >=3.8)" in proc.stdout, _report(proc)
+    _write(pyproject, project + '\n[tool.checker]\nrequires-python = ">=3.99"\n')
+    proc = sandbox.run("update.sh", src, args=("--check",))
+    assert proc.returncode == 0 and "нет requires-python" in proc.stdout, _report(proc)
+    assert "3.99" not in proc.stdout + proc.stderr, _report(proc)
+
+
+@needs_root
+def test_update_refuses_sources_inside_the_installation(sandbox):
+    """Исходники распакованы внутрь каталога установки: rsync --delete стёр бы их посреди копирования."""
+    sandbox.install_old()
+    inside = os.path.join(sandbox.app_dir, "new", "mail_backup")
+    shutil.copytree(sandbox.sources(NEW, "src_new"), inside)
+    sandbox.forget_calls()
+    before = sandbox.snapshot()
+    for args in (("--check",), (), ("--force",)):
+        proc = sandbox.run("update.sh", inside, args=args)
+        assert proc.returncode != 0, (args, _report(proc))
+        assert "Новые исходники (%s) лежат внутри каталога установки %s" % (inside, sandbox.app_dir) \
+            in proc.stderr, (args, _report(proc))
+        assert "Распакуйте архив новой версии в другой каталог" in proc.stderr, _report(proc)
+        _untouched(sandbox, before, proc)
+    assert sandbox.wait_version() == OLD
+
+
+@needs_root
+def test_update_refuses_when_pip_of_the_environment_does_not_start(sandbox):
+    """Файл pip на месте и исполняемый, но его интерпретатора больше нет (Python в системе обновили)."""
+    sandbox.install_old()
+    src = sandbox.sources(NEW, "src_new")
+    pip = os.path.join(sandbox.venv, "bin", "pip")
+    with open(pip, encoding="utf-8") as fh:
+        body = fh.read().split("\n", 1)[1]
+    _write(pip, "#!/usr/bin/python-removed-by-upgrade\n" + body, 0o755)
+    sandbox.forget_calls()
+    before = sandbox.snapshot(src)
+    for args in (("--check",), ()):
+        proc = sandbox.run("update.sh", src, args=args)
+        assert proc.returncode != 0, _report(proc)
+        assert "pip окружения не запускается (%s --version)" % pip in proc.stderr, _report(proc)
+        assert "sudo bash scripts/install.sh" in proc.stderr, _report(proc)
+        _untouched(sandbox, before, proc, src)
+    assert sandbox.wait_version() == OLD
+
+
+@needs_root
+def test_check_warns_when_package_index_does_not_answer(sandbox):
+    """Обновление из сети, а индекс пакетов недоступен: предупреждение заранее, а не отказ pip после остановки."""
+    sandbox.install_old()
+    src = sandbox.sources(NEW, "src_new")
+    sandbox.forget_calls()
+    before = sandbox.snapshot(src)
+    started = time.time()
+    proc = sandbox.run("update.sh", src, args=("--check",), MA_INDEX_URL="http://user:secret@127.0.0.1:9/simple/")
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 0, _report(proc)
+    assert "Индекс пакетов http://127.0.0.1:9/simple/ не отвечает" in out, _report(proc)
+    assert "secret" not in out, _report(proc)                # пароль из адреса в вывод не попадает
+    assert "make_offline_bundle.sh" in out and "MA_INDEX_URL=" in out, _report(proc)
+    assert len(_marks(proc, "⚠")) == 1 and not _marks(proc, "✗"), _report(proc)
+    assert time.time() - started < 30
+    _untouched(sandbox, before, proc, src)
+
+    # адрес из настроек pip (pip.conf), если переменная не задана
+    hits = _INDEX.get("hits", 0)
+    proc = sandbox.run("update.sh", src, args=("--check",), MA_INDEX_URL=None, FAKE_PIP_INDEX_URL=_index_url())
+    assert proc.returncode == 0 and "Индекс пакетов отвечает: " + _index_url() in proc.stdout, _report(proc)
+    assert _INDEX.get("hits", 0) > hits and not _marks(proc, "⚠"), _report(proc)
+    assert "--disable-pip-version-check config list" in sandbox.calls("pip_calls")
+    _untouched(sandbox, before, proc, src)
+
+    # обновление без сети индекс не опрашивает
+    offline = sandbox.sources(NEW, "src_offline", wheels=True)
+    proc = sandbox.run("update.sh", offline, args=("--check",), MA_INDEX_URL="http://127.0.0.1:9/simple/")
+    assert proc.returncode == 0 and "Индекс пакетов" not in proc.stdout + proc.stderr, _report(proc)
+    assert not _marks(proc, "⚠"), _report(proc)
+
+
+@needs_root
+def test_offline_wheels_are_verified_by_pip_dry_run(sandbox):
+    """Пакеты, которые pip не установит (архив под другой Python), — отказ на проверке, а не после остановки."""
+    sandbox.install_old()
+    src = sandbox.sources(NEW, "src_new", wheels=True)
+    wheels = os.path.join(src, "wheels")
+    sandbox.forget_calls()
+    before = sandbox.snapshot(src)
+    proc = sandbox.run("update.sh", src, args=("--check",))
+    assert proc.returncode == 0, _report(proc)
+    assert "pip проверил пробной установкой, что в нём есть всё нужное" in proc.stdout, _report(proc)
+    dry = [call for call in sandbox.calls("pip_calls") if call.startswith("install --dry-run ")]
+    assert len(dry) == 1 and "--no-index --find-links %s " % wheels in dry[0], dry
+    assert dry[0].endswith("-r %s/requirements.txt mailarchiver==%s" % (src, NEW)), dry
+    _untouched(sandbox, before, proc, src)
+
+    for args in (("--check",), (), ("--force",)):
+        proc = sandbox.run("update.sh", src, args=args, FAKE_PIP_DRY_RUN_FAIL="1")
+        assert proc.returncode != 0, (args, _report(proc))
+        assert "Обновление без сети не пройдёт: pip не может установить пакеты из " + wheels in proc.stderr, \
+            (args, _report(proc))
+        assert "No matching distribution found for cryptography>=44.0" in proc.stderr, _report(proc)
+        assert "bash scripts/make_offline_bundle.sh" in proc.stderr, _report(proc)
+        assert "понижен" not in proc.stdout, _report(proc)   # --force этого не обходит
+        _untouched(sandbox, before, proc, src)
+    assert sandbox.wait_version() == OLD
+
+
+# ---------------------------------------------------------------------------
 #  install.sh
 # ---------------------------------------------------------------------------
 @needs_root
@@ -964,6 +2750,433 @@ def test_install_shows_reason_when_service_does_not_start(sandbox):
     assert not sandbox.active()
 
 
+@needs_root
+def test_install_in_container_without_namespaces(sandbox):
+    """226/NAMESPACE при установке: совет называет install.sh; с MA_RELAX_SANDBOX=1 служба запускается."""
+    src = sandbox.sources(NEW, "src_new")
+    proc = sandbox.run("install.sh", src, FAKE_NAMESPACE_FAIL="1")
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, _report(proc)
+    assert "status=226/NAMESPACE" in out and "sudo MA_RELAX_SANDBOX=1 bash scripts/install.sh" in out, _report(proc)
+    assert not os.path.exists(sandbox.install_dir) and not os.path.exists(sandbox.unit)
+    assert not os.path.exists(os.path.dirname(sandbox.dropin))
+
+    proc = sandbox.run("install.sh", src, FAKE_NAMESPACE_FAIL="1", MA_RELAX_SANDBOX="1")
+    assert proc.returncode == 0, _report(proc)
+    assert "защита службы ослаблена дополнением " + sandbox.dropin in proc.stdout, _report(proc)
+    assert stat.S_IMODE(os.stat(sandbox.dropin).st_mode) == 0o644
+    assert _dropin_keys(open(sandbox.dropin, encoding="utf-8").read())["PrivateDevices"] == "no"
+    assert sandbox.wait_version() == NEW
+
+
+@needs_root
+def test_install_rollback_removes_created_dropin(sandbox):
+    os.makedirs(sandbox.data)
+    subprocess.run(["chown", "%s:%s" % (USER, GROUP), sandbox.data], check=True)
+    sandbox.behaviour("crash:" + NEW)
+    proc = sandbox.run("install.sh", sandbox.sources(NEW, "src_new"), MA_RELAX_SANDBOX="1")
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, _report(proc)
+    assert "защита службы ослаблена дополнением" in out and "созданное этим запуском, убрано" in out, _report(proc)
+    assert not os.path.exists(os.path.dirname(sandbox.dropin))
+    assert not os.path.exists(sandbox.unit) and not os.path.exists(sandbox.install_dir)
+    calls = sandbox.calls()
+    assert calls[-1] == "daemon-reload", calls              # после удаления unit и дополнения
+
+
+@needs_root
+def test_install_offline_with_ma_wheels(sandbox):
+    """Установка без сети: каталог пакетов задан MA_WHEELS (здесь — относительным путём)."""
+    src = sandbox.sources(NEW, "src_new")
+    wheels = os.path.join(sandbox.base, "pkgs")
+    make_wheel(wheels, NEW)
+    proc = sandbox.run("install.sh", src, MA_WHEELS=os.path.join("..", "..", "pkgs"))
+    assert proc.returncode == 0, _report(proc)
+    assert "Установка без сети: пакеты (1 шт.) будут взяты из " + wheels in proc.stdout, _report(proc)
+    # python3 с venv и ensurepip уже есть: на сервере без интернета менеджер пакетов только ждал бы репозитории
+    assert "python3 с модулями venv и ensurepip уже есть — менеджер пакетов не вызывается" in proc.stdout, \
+        _report(proc)
+    assert sandbox.calls("pkg_calls") == [], sandbox.calls("pkg_calls")
+    installs = _installs(sandbox)
+    assert installs and all("--no-index --find-links %s " % wheels in call for call in installs), installs
+    assert not [call for call in installs if "--upgrade pip" in call or "setuptools" in call], installs
+    package = next(i for i, call in enumerate(installs) if "mailarchiver==" + NEW in call)
+    reqs = next(i for i, call in enumerate(installs) if "-r %s/requirements.txt" % sandbox.app_dir in call)
+    assert reqs < package and "--no-deps" in installs[package], installs
+    assert os.path.exists(sandbox.site_file("from_wheel.py"))
+    assert not os.path.exists(os.path.join(sandbox.app_dir, "mailarchiver", "from_wheel.py"))
+    assert sandbox.wait_version() == NEW
+
+
+@needs_root
+def test_install_offline_refuses_unusable_wheels_before_touching_anything(sandbox):
+    src = sandbox.sources(NEW, "src_new")
+    stale = os.path.join(sandbox.base, "stale")
+    make_wheel(stale, "9.9.8")
+    nowhere = os.path.join(sandbox.base, "no-such-dir")
+    for wheels, message in ((nowhere, "Каталог пакетов MA_WHEELS=%s не найден" % nowhere),
+                            (stale, "нет пакета приложения mailarchiver-%s-*.whl" % NEW)):
+        proc = sandbox.run("install.sh", src, MA_WHEELS=wheels)
+        assert proc.returncode != 0 and message in proc.stderr, _report(proc)
+        assert "откат" not in (proc.stdout + proc.stderr).lower(), _report(proc)
+        # ничего не создано и не вызвано: ни каталогов, ни пользователя, ни пакетов, ни службы
+        for path in (sandbox.install_dir, sandbox.data, sandbox.unit, sandbox.wrapper):
+            assert not os.path.exists(path), path
+        assert sandbox.calls() == [] and sandbox.calls("pip_calls") == [] and sandbox.calls("pkg_calls") == []
+
+
+@needs_root
+def test_install_offline_survives_unreachable_package_repository(sandbox):
+    """Репозиторий дистрибутива недоступен: при установке из сети это отказ, без сети к нему и не обращаются."""
+    online = sandbox.sources(NEW, "src_online")
+    proc = sandbox.run("install.sh", online, FAKE_PKG_EXIT="100")
+    assert proc.returncode != 0 and "Не удалось установить пакеты через apt" in proc.stderr, _report(proc)
+    assert not os.path.exists(sandbox.install_dir)
+    assert [call for call in sandbox.calls("pkg_calls") if call.startswith("apt-get update")]
+
+    sandbox.forget_calls()
+    offline = sandbox.sources(NEW, "src_offline", wheels=True)
+    proc = sandbox.run("install.sh", offline, FAKE_PKG_EXIT="100")
+    assert proc.returncode == 0, _report(proc)
+    assert "менеджер пакетов не вызывается" in proc.stdout and "Не удалось установить пакеты" not in proc.stdout, \
+        _report(proc)
+    assert sandbox.calls("pkg_calls") == [], sandbox.calls("pkg_calls")
+    assert os.path.exists(sandbox.site_file("from_wheel.py"))
+    assert sandbox.wait_version() == NEW
+
+
+@needs_root
+def test_offline_install_and_update_with_real_pip(sandbox):
+    """Те же команды — настоящему pip: окружение создаёт python -m venv, пакеты берутся из каталога, сети нет.
+
+    Подделка pip проверяет, что скрипты вызывают; этот тест — что настоящий pip принимает именно такие
+    параметры (--no-index --find-links … --no-deps --upgrade --force-reinstall mailarchiver==X) и
+    ставит библиотеки из requirements.txt, не обращаясь к индексу.
+    """
+    if subprocess.run([PYTHON, "-c", "import ensurepip, venv"], capture_output=True).returncode != 0:
+        pytest.skip("нет ensurepip: настоящий pip в окружение не поставить")
+    env = {"FAKE_REAL_VENV": "1", "PIP_CONFIG_FILE": os.devnull, "PIP_NO_CACHE_DIR": "1",
+           "PIP_DISABLE_PIP_VERSION_CHECK": "1"}
+    # библиотеки, которые проверяет check_package: имя пакета → имя модуля
+    libs = {"fastapi": "fastapi", "uvicorn": "uvicorn", "jinja2": "jinja2", "PyYAML": "yaml",
+            "APScheduler": "apscheduler", "IMAPClient": "imapclient", "cryptography": "cryptography"}
+    requirements = "".join("%s>=1\n" % name for name in libs)
+
+    src = sandbox.sources(OLD, "src_first", wheels=True, requirements=requirements)
+    for name, module in libs.items():
+        build_wheel(os.path.join(src, "wheels"), name.lower(), "1.0", {module + ".py": ""})
+    proc = sandbox.run("install.sh", src, **env)
+    assert proc.returncode == 0, _report(proc)
+    pip = subprocess.run([os.path.join(sandbox.venv, "bin", "pip"), "--version"], capture_output=True, text=True)
+    assert pip.returncode == 0 and pip.stdout.startswith("pip "), pip.stdout       # не подделка
+    assert sandbox.calls("pip_calls") == []
+    assert os.path.exists(sandbox.site_file("from_wheel.py"))
+    assert sandbox.wait_version() == OLD
+
+    # Новая версия требует ещё одну библиотеку. В каталоге — только то, чего в окружении нет:
+    # уже установленные библиотеки pip не ищет.
+    newer = sandbox.sources(NEW, "src_second", requirements=requirements + "newlib>=2,<3\n")
+    wheels = os.path.join(newer, "wheels")
+    make_wheel(wheels, NEW, requires=tuple("%s>=1" % name for name in libs) + ("newlib>=2,<3",))
+    build_wheel(wheels, "newlib", "2.1", {"newlib.py": "VALUE = 2\n"})
+    # Проверка: настоящий pip принимает и параметры пробной установки (--dry-run), а она
+    # ничего не ставит и не оставляет на диске — ни в окружении, ни рядом.
+    before = sandbox.snapshot(newer)
+    proc = sandbox.run("update.sh", newer, args=("--check",), **env)
+    assert proc.returncode == 0, _report(proc)
+    assert "Обновление без сети" in proc.stdout and "pip проверил пробной установкой" in proc.stdout, _report(proc)
+    after = sandbox.snapshot(newer)
+    assert after == before, sorted(set(after.items()) ^ set(before.items()))
+    proc = sandbox.run("update.sh", newer, **env)
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 0, _report(proc)
+    assert "несогласованных библиотеках" not in out, _report(proc)            # pip check доволен
+    assert sandbox.wait_version() == NEW
+    assert os.path.exists(os.path.join(os.path.dirname(os.path.dirname(sandbox.site_file("x"))), "newlib.py"))
+
+    # Нет пакета библиотеки — pip говорит об этом уже на проверке (пробной установкой):
+    # служба не останавливается, откатывать нечего.
+    broken = sandbox.sources("9.9.10", "src_third", requirements=requirements + "absentlib>=1\n")
+    make_wheel(os.path.join(broken, "wheels"), "9.9.10")
+    for args in (("--check",), ()):
+        proc = sandbox.run("update.sh", broken, args=args, **env)
+        out = proc.stdout + proc.stderr
+        assert proc.returncode != 0, _report(proc)
+        assert "Обновление без сети не пройдёт" in out, _report(proc)
+        assert "No matching distribution found for absentlib" in out, _report(proc)
+        assert "Откат" not in out and "Останавливаю" not in out, _report(proc)
+    assert sandbox.wait_version() == NEW
+
+
+@needs_root
+def test_install_refuses_data_dir_on_unmounted_filesystem(sandbox):
+    """Каталог данных — точка монтирования без диска: отказ до любых действий, владелец каталога не меняется."""
+    os.mkdir(sandbox.data, 0o755)
+    sandbox.fstab(sandbox.data)
+    proc = sandbox.run("install.sh", sandbox.sources(NEW, "src_new"))
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, _report(proc)
+    assert _mount_advice(sandbox.data) in out and "chown" not in out and "install -d" not in out, _report(proc)
+    for path in (sandbox.install_dir, sandbox.unit, sandbox.wrapper):
+        assert not os.path.exists(path), path
+    assert os.stat(sandbox.data).st_uid == 0 and os.listdir(sandbox.data) == []
+    assert stat.S_IMODE(os.stat(sandbox.data).st_mode) == 0o755
+    assert sandbox.calls() == [] and sandbox.calls("pkg_calls") == []
+
+
+@needs_root
+@pytest.mark.parametrize("linked", [False, True])
+def test_install_leaves_owner_of_import_files_alone(sandbox, linked):
+    """Каталог данных уже есть (в том числе ссылкой на другой диск): он отдаётся службе, кроме содержимого import/."""
+    real = sandbox.data
+    if linked:
+        real = os.path.join(sandbox.base, "storage", "mailarchiver")
+        os.makedirs(real)
+        os.symlink(real, sandbox.data)
+    _write(os.path.join(real, "import", "old-mail.pst"), "x")
+    _write(os.path.join(real, "made-by-root"), "x")
+    proc = sandbox.run("install.sh", sandbox.sources(NEW, "src_new"))
+    assert proc.returncode == 0, _report(proc)
+    uid = pwd.getpwnam(USER).pw_uid
+    assert os.stat(real).st_uid == uid and os.stat(os.path.join(real, "import")).st_uid == uid
+    assert os.stat(os.path.join(real, "made-by-root")).st_uid == uid
+    assert os.stat(os.path.join(real, "import", "old-mail.pst")).st_uid == 0
+    assert os.lstat(sandbox.data).st_uid == (0 if linked else uid)
+    assert sandbox.wait_version() == NEW
+
+
+@needs_root
+def test_install_into_existing_directory_rolls_back_what_it_created(sandbox):
+    """Каталог установки был заранее (создан вручную, точка монтирования): откат убирает всё своё.
+
+    Раньше для такого каталога откат не делал ничего: оставались unit службы в
+    цикле перезапусков, команда mailarchiver и дополнение с ослабленной защитой.
+    """
+    os.makedirs(os.path.join(sandbox.install_dir, "lost+found"))
+    os.makedirs(sandbox.data)
+    subprocess.run(["chown", "%s:%s" % (USER, GROUP), sandbox.data], check=True)
+    sandbox.behaviour("crash:" + NEW)
+    src = sandbox.sources(NEW, "src_new")
+    proc = sandbox.run("install.sh", src, MA_RELAX_SANDBOX="1")
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0 and "Application startup failed" in out, _report(proc)
+    assert "откат частичной установки" in out and "созданное этим запуском, убрано" in out, _report(proc)
+    assert "Каталог %s был до установки и оставлен на месте" % sandbox.install_dir in out, _report(proc)
+    for path in (sandbox.unit, sandbox.dropin, os.path.dirname(sandbox.dropin), sandbox.wrapper,
+                 sandbox.app_dir, sandbox.venv):
+        assert not os.path.exists(path), path
+    assert os.listdir(sandbox.install_dir) == ["lost+found"]     # чужое — на месте
+    calls = sandbox.calls()
+    assert "stop mailarchiver" in calls and "disable mailarchiver" in calls and calls[-1] == "daemon-reload", calls
+    assert not sandbox.active() and sandbox.substate() == "dead"  # не осталась в цикле перезапусков
+    assert os.path.exists(os.path.join(sandbox.data, "behaviour"))
+    # повторная установка не спотыкается о остатки
+    sandbox.behaviour("")
+    proc = sandbox.run("install.sh", src)
+    assert proc.returncode == 0 and "Обнаружена существующая установка" not in proc.stdout, _report(proc)
+    assert sandbox.wait_version() == NEW
+
+
+@needs_root
+def test_install_does_not_remove_what_was_there_before(sandbox):
+    """Откат в существующем каталоге не трогает то, чего установка не создавала: unit, команду, окружение."""
+    os.makedirs(sandbox.venv)
+    _write(os.path.join(sandbox.venv, "note"), "прежнее окружение\n")
+    _write(sandbox.unit, "[Service]\nExecStart=/bin/true\n")
+    _write(sandbox.wrapper, "#!/bin/sh\n# другая программа\n", 0o755)
+    _write(sandbox.dropin, "[Service]\nProtectProc=default\nPrivateDevices=no\n")
+    os.makedirs(sandbox.data)
+    subprocess.run(["chown", "%s:%s" % (USER, GROUP), sandbox.data], check=True)
+    sandbox.behaviour("crash:" + NEW)
+    proc = sandbox.run("install.sh", sandbox.sources(NEW, "src_new"), MA_RELAX_SANDBOX="1")
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0 and "откат частичной установки" in out, _report(proc)
+    assert "убрано" not in out, _report(proc)
+    assert not os.path.exists(sandbox.app_dir)
+    for path in (sandbox.venv, sandbox.unit, sandbox.wrapper, sandbox.dropin):
+        assert os.path.exists(path), path
+    with open(sandbox.dropin, encoding="utf-8") as fh:
+        assert fh.read() == "[Service]\nProtectProc=default\nPrivateDevices=no\n"
+    assert "disable mailarchiver" not in sandbox.calls()
+
+
+# ---------------------------------------------------------------------------
+#  uninstall.sh
+# ---------------------------------------------------------------------------
+@needs_root
+def test_uninstall_removes_unit_dropin_and_command(sandbox):
+    """Удаление после установки с MA_RELAX_SANDBOX=1: unit, дополнение, команда и код — данные остаются."""
+    src = sandbox.sources(NEW, "src_new")
+    proc = sandbox.run("install.sh", src, FAKE_NAMESPACE_FAIL="1", MA_RELAX_SANDBOX="1")
+    assert proc.returncode == 0 and os.path.exists(sandbox.dropin), _report(proc)
+    assert sandbox.wait_version() == NEW
+    sandbox.forget_calls()
+    proc = sandbox.run("uninstall.sh", src)
+    assert proc.returncode == 0, _report(proc)
+    assert proc.stderr == "", _report(proc)                  # ни одного «Ошибка на строке…»
+    assert "Дополнение с ослабленной защитой удалено: " + sandbox.dropin in proc.stdout, _report(proc)
+    for path in (sandbox.unit, sandbox.dropin, os.path.dirname(sandbox.dropin), sandbox.wrapper,
+                 sandbox.install_dir):
+        assert not os.path.exists(path), path
+    assert not sandbox.active()
+    calls = sandbox.calls()
+    assert "stop mailarchiver" in calls and "daemon-reload" in calls, calls
+    # без --purge данные, конфигурация и пользователь службы остаются
+    assert os.path.exists(sandbox.db) and os.path.exists(os.path.join(sandbox.config_dir, "config.yaml"))
+    assert sandbox.calls("pkg_calls") == []                  # userdel не вызывался
+
+
+@needs_root
+def test_uninstall_keeps_what_is_not_ours(sandbox):
+    """Правки администратора в <unit>.d и чужая программа с именем mailarchiver остаются на месте."""
+    src = sandbox.sources(NEW, "src_new")
+    _write(sandbox.unit, "[Service]\nExecStart=/bin/true\n")
+    _write(sandbox.dropin, "[Service]\nProtectProc=default\n")
+    override = os.path.join(os.path.dirname(sandbox.dropin), "override.conf")
+    _write(override, "[Service]\nMemoryMax=8G\n")
+    _write(sandbox.wrapper, "#!/bin/sh\n# другая программа\n", 0o755)
+    os.makedirs(sandbox.app_dir)
+    proc = sandbox.run("uninstall.sh", src)
+    assert proc.returncode == 0, _report(proc)
+    assert not os.path.exists(sandbox.unit) and not os.path.exists(sandbox.dropin)
+    assert not os.path.exists(sandbox.install_dir)
+    assert os.path.exists(override) and "остались ваши дополнения" in proc.stdout, _report(proc)
+    assert os.path.exists(sandbox.wrapper)
+    assert "daemon-reload" in sandbox.calls()
+
+
+@needs_root
+def test_uninstall_rejects_unknown_arguments(sandbox):
+    """«uninstall.sh --check» (по привычке от update.sh) не должен ничего удалять."""
+    sandbox.install_old()
+    src = sandbox.sources(NEW, "src_new")
+    sandbox.forget_calls()
+    before = sandbox.snapshot(src)
+    for args in (("--check",), ("--purge", "--yes"), ("purge",)):
+        proc = sandbox.run("uninstall.sh", src, args=args)
+        assert proc.returncode == 2, (args, _report(proc))
+        assert "Неизвестный параметр: " + args[-1] in proc.stderr and "Использование:" in proc.stderr, _report(proc)
+        assert proc.stdout == ""
+        _untouched(sandbox, before, proc, src)
+    for flag in ("-h", "--help"):
+        proc = sandbox.run("uninstall.sh", src, args=(flag,))
+        assert proc.returncode == 0 and proc.stderr == "", _report(proc)
+        for wanted in ("Использование:", "--purge", "--remove-user", "MA_DATA_DIR", "sudo MA_"):
+            assert wanted in proc.stdout, wanted
+        _untouched(sandbox, before, proc, src)
+    assert sandbox.wait_version() == OLD
+
+
+@needs_root
+def test_uninstall_purge_follows_data_directory_link(sandbox):
+    """--purge с каталогом данных-ссылкой: удаляются и каталог на «другом диске», и ссылка — оба названы."""
+    sandbox.install_old()
+    mount = _move_data_to_storage(sandbox)
+    real = os.path.join(mount, "mailarchiver")
+    proc = sandbox.run("uninstall.sh", sandbox.sources(NEW, "src_new"), args=("--purge",),
+                       MA_DATA_DIR=sandbox.data + "/")
+    assert proc.returncode == 0 and proc.stderr == "", _report(proc)
+    assert "Каталог данных удалён: каталог %s и ссылка на него %s." % (real, sandbox.data) in proc.stdout, \
+        _report(proc)
+    assert "Каталог конфигурации удалён: %s." % sandbox.config_dir in proc.stdout, _report(proc)
+    assert not os.path.lexists(sandbox.data) and not os.path.exists(real) and os.path.isdir(mount)
+    assert not os.path.exists(sandbox.config_dir) and not os.path.exists(sandbox.install_dir)
+    assert "userdel " + USER in sandbox.calls("pkg_calls")
+
+
+@needs_root
+def test_uninstall_purge_with_unmounted_data_disk(sandbox):
+    """Диск с данными не подключён: удаляется только ссылка, и прямо сказано, что данные остались."""
+    sandbox.install_old()
+    mount = _move_data_to_storage(sandbox)
+    real = os.path.join(mount, "mailarchiver")
+    sandbox.stop()
+    os.rename(mount, mount + ".unmounted")
+    proc = sandbox.run("uninstall.sh", sandbox.sources(NEW, "src_new"), args=("--purge",))
+    # удалено не всё: код 1, и пользователь службы остаётся — данные на том диске принадлежат ему
+    assert proc.returncode == 1, _report(proc)
+    assert ("Каталог данных %s — ссылка на %s, а такого каталога сейчас нет (диск не подключён?): "
+            "удалена только ссылка." % (sandbox.data, real)) in proc.stderr, _report(proc)
+    assert "НЕ удалено" in proc.stderr and 'rm -rf "%s"' % real in proc.stderr, _report(proc)
+    assert "удалено не всё" in proc.stdout, _report(proc)
+    assert "Данные и конфигурация удалены" not in proc.stdout, _report(proc)
+    assert "userdel " + USER not in sandbox.calls("pkg_calls")
+    assert not os.path.lexists(sandbox.data)
+    assert os.path.exists(os.path.join(mount + ".unmounted", "mailarchiver", "mailarchiver.db"))
+    assert not os.path.exists(sandbox.config_dir)
+
+
+@needs_root
+def test_uninstall_purge_refuses_directory_near_the_root(sandbox):
+    """Каталог данных ведёт в каталог верхнего уровня (или в корень): rm -rf по такому пути — не удаление данных."""
+    try:
+        top = tempfile.mkdtemp(prefix="ma-purge-test-", dir="/")
+    except OSError as exc:
+        pytest.skip("в корне нельзя создать каталог: %s" % exc)
+    try:
+        _write(os.path.join(top, "keep"), "x")
+        os.symlink(top, sandbox.data)
+        os.makedirs(sandbox.app_dir)
+        src = sandbox.sources(NEW, "src_new")
+        proc = sandbox.run("uninstall.sh", src, args=("--purge",))
+        assert proc.returncode == 1, _report(proc)
+        assert ("Каталог данных НЕ удалён: %s ведёт в %s — это каталог верхнего уровня (%s)"
+                % (sandbox.data, top, top)) in proc.stderr, _report(proc)
+        assert os.path.exists(os.path.join(top, "keep")) and os.path.islink(sandbox.data)
+        assert "удалено не всё" in proc.stdout, _report(proc)
+        # остальное удалено; пользователь службы оставлен — его файлы на месте
+        assert not os.path.exists(sandbox.config_dir) and not os.path.exists(sandbox.install_dir)
+        assert sandbox.calls("pkg_calls") == []
+        # тот же каталог, заданный прямо
+        os.remove(sandbox.data)
+        proc = sandbox.run("uninstall.sh", src, args=("--purge",), MA_DATA_DIR=top + "/")
+        assert proc.returncode == 1, _report(proc)
+        assert "Каталог данных НЕ удалён: %s — это каталог верхнего уровня" % top in proc.stderr, _report(proc)
+        assert os.path.exists(os.path.join(top, "keep"))
+    finally:
+        shutil.rmtree(top, ignore_errors=True)
+
+
+@needs_root
+def test_uninstall_question_shows_what_will_really_be_deleted(sandbox):
+    """Вопрос перед удалением данных (запуск в терминале) называет каталог, на который ведёт ссылка."""
+    import pty
+    sandbox.install_old()
+    mount = _move_data_to_storage(sandbox)
+    real = os.path.join(mount, "mailarchiver")
+    src = sandbox.sources(NEW, "src_new")
+    os.symlink("/", os.path.join(sandbox.base, "to-root"))
+
+    def ask(answer: bytes, **extra):
+        master, slave = pty.openpty()
+        try:
+            proc = subprocess.Popen(["bash", os.path.join(src, "scripts", "uninstall.sh")],
+                                    env=sandbox.env(**extra), cwd=src, stdin=slave, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True)
+            os.write(master, answer)
+            out, _ = proc.communicate(timeout=60)
+        finally:
+            os.close(master)
+            os.close(slave)
+        return proc.returncode, out
+
+    # ответ «нет» — ничего из данных не удаляется; корень удалять и не предлагается
+    code, out = ask(b"n\n", MA_CONFIG_DIR=os.path.join(sandbox.base, "to-root"))
+    assert code == 0, out
+    assert "Данные:       %s — ссылка: будут удалены каталог %s и сама ссылка" % (sandbox.data, real) in out, out
+    assert "Конфигурация: %s НЕ будет удалён: это корень файловой системы" \
+        % os.path.join(sandbox.base, "to-root") in out, out
+    assert "Данные сохранены: " + sandbox.data in out, out
+    assert os.path.islink(sandbox.data) and os.path.exists(os.path.join(real, "mailarchiver.db"))
+    assert os.path.exists(os.path.join(sandbox.config_dir, "config.yaml"))
+    # ответ «да» — удаляется именно то, что было названо
+    code, out = ask(b"y\n")
+    assert code == 0, out
+    assert "Каталог данных удалён: каталог %s и ссылка на него %s." % (real, sandbox.data) in out, out
+    assert not os.path.lexists(sandbox.data) and not os.path.exists(real)
+    assert not os.path.exists(sandbox.config_dir)
+
+
 # ---------------------------------------------------------------------------
 #  Архив выпуска
 # ---------------------------------------------------------------------------
@@ -991,19 +3204,22 @@ def _release_tree(tmp_path, version="7.7.7"):
         "docs/manual.docx": "x", "mailarchiver-1.0.0.tar.gz": "x", "mailarchiver-7.7.7.tar.gz.part": "x",
         "secret.key": "x", "config/config.yaml": "x", "exports/a.pst": "x", "data/mailarchiver.db": "x",
         "mailarchiver/__pycache__/x.pyc": "x",
+        # пакеты прежней автономной сборки: в архив они попадают только через --wheels
+        "wheels/leftover-1.0-py3-none-any.whl": "x",
     }
     for rel, text in files.items():
         path = src / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8")
-    shutil.copy(os.path.join(ROOT, "scripts", "make_release.py"), src / "scripts" / "make_release.py")
+    for name in ("make_release.py", "make_offline_bundle.sh"):
+        shutil.copy(os.path.join(ROOT, "scripts", name), src / "scripts" / name)
     os.chmod(src / "scripts" / "update.sh", 0o755)
     return src
 
 
-def _build_release(src, out):
+def _build_release(src, out, *args):
     out.mkdir(exist_ok=True)
-    return subprocess.run([sys.executable, str(src / "scripts" / "make_release.py"), str(out)],
+    return subprocess.run([sys.executable, str(src / "scripts" / "make_release.py"), *args, str(out)],
                           capture_output=True, text=True)
 
 
@@ -1027,7 +3243,7 @@ def test_release_archive_is_readable_by_everyone(tmp_path):
                    "systemd/mailarchiver.service"):
         assert "mail_backup/" + wanted in names, wanted
     for forbidden in ("exports", "__pycache__", ".docx", ".tar.gz", "secret.key", "config/config.yaml",
-                      "mail_backup/data/"):
+                      "mail_backup/data/", "wheels", ".whl"):
         assert not [n for n in names if forbidden in n], forbidden
     for member in members:
         assert member.name == "mail_backup" or member.name.startswith("mail_backup/"), member.name
@@ -1074,12 +3290,275 @@ def test_release_from_git_checkout(tmp_path):
         names = set(tar.getnames())
     assert "mail_backup/mailarchiver/new_module.py" in names and "mail_backup/.gitignore" in names
     assert "mail_backup/ignored.txt" not in names
-    assert not [n for n in names if n.endswith((".docx", ".tar.gz", ".pyc", "secret.key"))]
+    assert not [n for n in names if n.endswith((".docx", ".tar.gz", ".pyc", "secret.key", ".whl"))]
+
+
+def _wheel_dir(tmp_path, *names):
+    """Каталог с «пакетами» (пустыми zip) и закрытыми правами — как после сборки с umask 077."""
+    folder = tmp_path / "pkgs"
+    folder.mkdir(mode=0o700)
+    for name in names:
+        with zipfile.ZipFile(folder / name, "w"):
+            pass
+        os.chmod(folder / name, 0o600)
+    return folder
+
+
+def test_release_with_wheels_for_offline_install(tmp_path):
+    """--wheels: пакеты входят в архив (0644, root), а имя архива говорит, для какого Python и платформы."""
+    src = _release_tree(tmp_path)
+    wheels = _wheel_dir(tmp_path, "mailarchiver-7.7.7-py3-none-any.whl",
+                        "mailarchiver-7.7.6-py3-none-any.whl",              # остался от прежней сборки
+                        "PyYAML-6.0.3-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+                        "cryptography-44.0.0-cp39-abi3-manylinux_2_28_x86_64.whl",
+                        "jinja2-3.1.6-py3-none-any.whl")
+    (wheels / "notes.txt").write_text("x", encoding="utf-8")
+    proc = _build_release(src, tmp_path / "out", "--wheels", str(wheels))
+    assert proc.returncode == 0, _report(proc)
+    # cp312 — по пакету, собранному под конкретный Python (cp39-abi3 годится для любого);
+    # linux_x86_64 — по платформенным пакетам, без версии glibc
+    archive = tmp_path / "out" / "mailarchiver-7.7.7-offline-cp312-linux_x86_64.tar.gz"
+    assert os.listdir(tmp_path / "out") == [archive.name], os.listdir(tmp_path / "out")
+    assert str(archive) in proc.stdout
+    with tarfile.open(archive) as tar:
+        members = {m.name: m for m in tar.getmembers()}
+    packed = sorted(n.split("/")[-1] for n in members if n.startswith("mail_backup/wheels/"))
+    assert packed == ["PyYAML-6.0.3-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+                      "cryptography-44.0.0-cp39-abi3-manylinux_2_28_x86_64.whl",
+                      "jinja2-3.1.6-py3-none-any.whl", "mailarchiver-7.7.7-py3-none-any.whl"], packed
+    assert members["mail_backup/wheels"].isdir() and members["mail_backup/wheels"].mode == 0o755
+    for name, member in members.items():
+        assert member.uid == 0 and member.gid == 0, name
+        if name.endswith(".whl"):
+            assert member.mode == 0o644 and member.isfile(), (name, oct(member.mode))
+    # остальное — как в обычном архиве
+    for wanted in ("VERSION", "scripts/install.sh", "scripts/common.sh", "mailarchiver/__init__.py"):
+        assert "mail_backup/" + wanted in members, wanted
+    assert not [n for n in members if "leftover" in n or "secret.key" in n or "notes.txt" in n or "7.7.6" in n]
+    # «=»-форма параметра и каталог архива по умолчанию (корень проекта)
+    proc = subprocess.run([sys.executable, str(src / "scripts" / "make_release.py"), "--wheels=%s" % wheels],
+                          capture_output=True, text=True)
+    assert proc.returncode == 0 and (src / archive.name).exists(), _report(proc)
+
+
+def test_release_with_pure_python_wheels_is_named_after_the_interpreter(tmp_path):
+    """Нет ни одного платформенного пакета — метки берутся у интерпретатора, которым собирали."""
+    src = _release_tree(tmp_path)
+    wheels = _wheel_dir(tmp_path, "mailarchiver-7.7.7-py3-none-any.whl", "jinja2-3.1.6-py3-none-any.whl")
+    proc = _build_release(src, tmp_path / "out", "--wheels", str(wheels))
+    assert proc.returncode == 0, _report(proc)
+    platform = sysconfig.get_platform().replace("-", "_").replace(".", "_")
+    expected = "mailarchiver-7.7.7-offline-cp%d%d-%s.tar.gz" % (sys.version_info[0], sys.version_info[1], platform)
+    assert os.listdir(tmp_path / "out") == [expected]
+
+
+def test_release_refuses_unusable_wheels_and_bad_arguments(tmp_path):
+    src = _release_tree(tmp_path)
+    out = tmp_path / "out"
+    wheels = _wheel_dir(tmp_path, "mailarchiver-7.7.6-py3-none-any.whl", "jinja2-3.1.6-py3-none-any.whl")
+    proc = _build_release(src, out, "--wheels", str(wheels))
+    assert proc.returncode != 0 and "нет пакета приложения mailarchiver-7.7.7-*.whl" in proc.stderr, _report(proc)
+    os.rename(wheels / "mailarchiver-7.7.6-py3-none-any.whl", wheels / "mailarchiver-7.7.7-py3-none-any.whl")
+    (wheels / "uvloop-0.21.0.tar.gz").write_text("x", encoding="utf-8")     # так выглядит pip download без пакета
+    proc = _build_release(src, out, "--wheels", str(wheels))
+    assert proc.returncode != 0 and "uvloop-0.21.0.tar.gz" in proc.stderr and "pip wheel" in proc.stderr, \
+        _report(proc)
+    proc = _build_release(src, out, "--wheels", str(tmp_path / "no-such-dir"))
+    assert proc.returncode != 0 and "не найден" in proc.stderr, _report(proc)
+    for args in (["--wheels"], ["--weels", "x"], ["a", "b"]):
+        proc = subprocess.run([sys.executable, str(src / "scripts" / "make_release.py"), *args],
+                              capture_output=True, text=True)
+        assert proc.returncode == 2 and "Использование:" in proc.stderr, (args, _report(proc))
+    assert not os.listdir(out)                                # ни архива, ни обрывка .part
+    assert not [n for n in os.listdir(src) if n.endswith((".tar.gz", ".part"))
+                and n != "mailarchiver-1.0.0.tar.gz" and n != "mailarchiver-7.7.7.tar.gz.part"]
+
+
+# Подделки для make_offline_bundle.sh: интерпретатор, у которого «-m pip» выполняет
+# подделка pip (сети в тестах нет), а всё остальное — настоящий Python.
+BUNDLE_PYTHON = '#!/bin/sh\nif [ "$1" = "-m" ] && [ "$2" = "pip" ]; then\n  shift 2\n' \
+                '  exec "@PYTHON@" "@PIP@" "$@"\nfi\nexec "@PYTHON@" "$@"\n'
+BUNDLE_PIP = r"""
+import os, sys, zipfile
+args = sys.argv[1:]
+with open(os.environ["BUNDLE_PIP_CALLS"], "a", encoding="utf-8") as fh:
+    fh.write(" ".join(args) + "\n")
+if os.environ.get("BUNDLE_NO_PIP"):
+    sys.exit("No module named pip")
+if args[:1] != ["wheel"]:
+    sys.exit(0)
+out = args[args.index("-w") + 1]
+
+
+def wheel(name):
+    with zipfile.ZipFile(os.path.join(out, name), "w"):
+        pass
+
+
+if "-r" in args:
+    wheel("PyYAML-6.0.3-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl")
+    if os.environ.get("BUNDLE_PIP_FAIL"):                    # часть пакетов уже получена — и отказ
+        sys.exit("ERROR: No matching distribution found for uvloop>=0.21")
+    wheel("jinja2-3.1.6-py3-none-any.whl")
+else:
+    src = [a for a in args[1:] if os.path.isdir(a) and a != out][0]
+    # пакет собирается из распакованного архива выпуска, а не из рабочего каталога
+    if os.path.exists(os.path.join(src, "secret.key")) or not os.path.exists(os.path.join(src, "pyproject.toml")):
+        sys.exit("не тот каталог: %s" % src)
+    with open(os.path.join(src, "VERSION"), encoding="utf-8") as fh:
+        wheel("mailarchiver-%s-py3-none-any.whl" % fh.read().strip())
+"""
+
+
+def _bundle(tmp_path, src, *args, **extra):
+    tools = tmp_path / "tools"
+    tools.mkdir(exist_ok=True)
+    (tools / "pip.py").write_text(BUNDLE_PIP, encoding="utf-8")
+    python = tools / "python3"
+    python.write_text(BUNDLE_PYTHON.replace("@PYTHON@", sys.executable).replace("@PIP@", str(tools / "pip.py")),
+                      encoding="utf-8")
+    os.chmod(python, 0o755)
+    (tmp_path / "tmp").mkdir(exist_ok=True)
+    env = dict(os.environ, TMPDIR=str(tmp_path / "tmp"), BUNDLE_PIP_CALLS=str(tmp_path / "pip_calls"),
+               MA_PYTHON=str(python), **extra)
+    return subprocess.run(["bash", str(src / "scripts" / "make_offline_bundle.sh"), *args],
+                          capture_output=True, text=True, env=env, cwd=str(tmp_path))
+
+
+def _tree(path) -> list:
+    return sorted(os.path.relpath(os.path.join(base, name), path)
+                  for base, dirs, files in os.walk(path) for name in dirs + files)
+
+
+@pytest.mark.skipif(not shutil.which("bash"), reason="нет bash")
+def test_offline_bundle_script(tmp_path):
+    """make_offline_bundle.sh: пакет приложения, пакеты библиотек и архив с именем по Python и платформе."""
+    src = _release_tree(tmp_path)
+    before = _tree(src)
+    proc = _bundle(tmp_path, src, str(tmp_path / "out"))
+    assert proc.returncode == 0, _report(proc)
+    name = "mailarchiver-7.7.7-offline-cp312-linux_x86_64.tar.gz"
+    assert os.listdir(tmp_path / "out") == [name]
+    with tarfile.open(tmp_path / "out" / name) as tar:
+        names = set(tar.getnames())
+    for wheel in ("mailarchiver-7.7.7-py3-none-any.whl", "jinja2-3.1.6-py3-none-any.whl",
+                  "PyYAML-6.0.3-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"):
+        assert "mail_backup/wheels/" + wheel in names, wheel
+    assert "mail_backup/scripts/update.sh" in names and not [n for n in names if "leftover" in n]
+    # для чего собран архив и что с ним делать на сервере
+    for wanted in ("Архив собирается для: Python %d.%d" % sys.version_info[:2], name,
+                   "sudo bash scripts/update.sh --check", "sudo bash scripts/install.sh", "MA_WHEELS="):
+        assert wanted in proc.stdout, (wanted, _report(proc))
+    calls = (tmp_path / "pip_calls").read_text(encoding="utf-8").splitlines()
+    assert calls[0] == "--version" and len(calls) == 3, calls
+    assert calls[1].startswith("wheel ") and "--no-deps" in calls[1] and " -w " in calls[1], calls
+    assert calls[2].startswith("wheel -r ") and "requirements.txt" in calls[2] and "--only-binary" not in calls[2]
+    assert "--no-deps" not in calls[2], calls                # библиотеки — вместе с тем, что нужно им самим
+    # каталог проекта не тронут, временные файлы убраны
+    assert _tree(src) == before
+    assert os.listdir(tmp_path / "tmp") == []
+
+    # --only-binary и свой каталог для пакетов
+    keep = tmp_path / "keep"
+    proc = _bundle(tmp_path, src, "--only-binary", "--wheels-dir", str(keep), str(tmp_path / "out2"))
+    assert proc.returncode == 0, _report(proc)
+    assert "--only-binary=:all:" in (tmp_path / "pip_calls").read_text(encoding="utf-8").splitlines()[-1]
+    assert len([n for n in os.listdir(keep) if n.endswith(".whl")]) == 3
+    assert os.listdir(tmp_path / "out2") == [name]
+    # непустой каталог пакетов: прежние пакеты попали бы в архив
+    proc = _bundle(tmp_path, src, "--wheels-dir", str(keep), str(tmp_path / "out3"))
+    assert proc.returncode != 0 and "не пуст" in proc.stderr, _report(proc)
+    assert not (tmp_path / "out3").exists() or not os.listdir(tmp_path / "out3")
+    assert os.listdir(tmp_path / "tmp") == []
+
+
+@pytest.mark.skipif(not shutil.which("bash"), reason="нет bash")
+def test_offline_bundle_script_refuses_without_pip(tmp_path):
+    src = _release_tree(tmp_path)
+    before = _tree(src)
+    proc = _bundle(tmp_path, src, str(tmp_path / "out"), BUNDLE_NO_PIP="1")
+    assert proc.returncode != 0 and "нет pip" in proc.stderr, _report(proc)
+    assert not (tmp_path / "out").exists() and _tree(src) == before
+    assert (tmp_path / "pip_calls").read_text(encoding="utf-8").splitlines() == ["--version"]
+    # опечатка в параметре и справка
+    proc = _bundle(tmp_path, src, "--only-binaries")
+    assert proc.returncode == 2 and "Неизвестный параметр: --only-binaries" in proc.stderr, _report(proc)
+    proc = _bundle(tmp_path, src, "--help")
+    assert proc.returncode == 0 and "--only-binary" in proc.stdout and "--python" in proc.stdout, _report(proc)
+    assert _tree(src) == before
+
+
+def test_release_skips_wheels_kept_elsewhere_in_the_project(tmp_path):
+    """Пакеты .whl в проекте вне wheels/ (например «--wheels-dir wheelhouse») в архив не попадают дважды."""
+    src = _release_tree(tmp_path)
+    house = src / "wheelhouse"
+    house.mkdir()
+    for name in ("mailarchiver-7.7.7-py3-none-any.whl", "jinja2-3.1.6-py3-none-any.whl"):
+        with zipfile.ZipFile(house / name, "w"):
+            pass
+    (src / "docs" / "stray-1.0-py3-none-any.whl").write_text("x", encoding="utf-8")
+    proc = _build_release(src, tmp_path / "out")
+    assert proc.returncode == 0, _report(proc)
+    with tarfile.open(tmp_path / "out" / "mailarchiver-7.7.7.tar.gz") as tar:
+        names = tar.getnames()
+    assert not [n for n in names if n.endswith(".whl") or "wheelhouse" in n], names
+    assert "mail_backup/docs/ru/01.md" in names
+    # с --wheels из этого же каталога пакеты входят — один раз, в wheels/
+    proc = _build_release(src, tmp_path / "out2", "--wheels", str(house))
+    assert proc.returncode == 0, _report(proc)
+    (archive,) = os.listdir(tmp_path / "out2")
+    with tarfile.open(tmp_path / "out2" / archive) as tar:
+        names = tar.getnames()
+    assert sorted(n for n in names if n.endswith(".whl")) == [
+        "mail_backup/wheels/jinja2-3.1.6-py3-none-any.whl",
+        "mail_backup/wheels/mailarchiver-7.7.7-py3-none-any.whl"], names
+    assert not [n for n in names if "wheelhouse" in n], names
+
+
+@pytest.mark.skipif(not shutil.which("bash"), reason="нет bash")
+def test_offline_bundle_failure_does_not_leave_partial_wheels_directory(tmp_path):
+    """Сборка сорвалась на полпути: каталог --wheels-dir не остаётся с обрывками (следующий запуск отказал бы)."""
+    src = _release_tree(tmp_path)
+    keep = tmp_path / "keep"
+    # каталог создан скриптом — убирается целиком
+    proc = _bundle(tmp_path, src, "--wheels-dir", str(keep), str(tmp_path / "out"), BUNDLE_PIP_FAIL="1")
+    assert proc.returncode != 0 and "Не удалось получить пакеты библиотек" in proc.stderr, _report(proc)
+    assert not keep.exists()
+    # каталог был (пустой) — остаётся, но снова пустым
+    keep.mkdir()
+    proc = _bundle(tmp_path, src, "--wheels-dir", str(keep), str(tmp_path / "out"), BUNDLE_PIP_FAIL="1")
+    assert proc.returncode != 0, _report(proc)
+    assert keep.is_dir() and os.listdir(keep) == []
+    assert os.listdir(tmp_path / "tmp") == []
+    # и повторный запуск проходит
+    proc = _bundle(tmp_path, src, "--wheels-dir", str(keep), str(tmp_path / "out"))
+    assert proc.returncode == 0, _report(proc)
+    assert len([n for n in os.listdir(keep) if n.endswith(".whl")]) == 3
+    # чужое содержимое непустого каталога при отказе не трогается
+    proc = _bundle(tmp_path, src, "--wheels-dir", str(keep), str(tmp_path / "out3"), BUNDLE_PIP_FAIL="1")
+    assert proc.returncode != 0 and "не пуст" in proc.stderr, _report(proc)
+    assert len(os.listdir(keep)) == 3
+
+
+def test_required_script_tests_fail_at_collection_without_prerequisites():
+    """MA_REQUIRE_SCRIPT_TESTS=1: нет условий для песочницы — модуль не «проходит» пропусками, а отказывает."""
+    # с таким PATH не найти ни bash, ни runuser — как на машине, где тесты скриптов выполнить нельзя
+    env = dict(os.environ, PATH=os.devnull, MA_REQUIRE_SCRIPT_TESTS="1")
+    command = [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "--collect-only", "-q",
+               os.path.abspath(__file__)]
+    proc = subprocess.run(command, capture_output=True, text=True, env=env, cwd=ROOT)
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, _report(proc)
+    assert "MA_REQUIRE_SCRIPT_TESTS=1: тесты скриптов установки обязаны выполняться" in out, _report(proc)
+    assert "bash" in out and "runuser" in out, _report(proc)
+    # без переменной те же условия — обычный пропуск
+    del env["MA_REQUIRE_SCRIPT_TESTS"]
+    proc = subprocess.run(command, capture_output=True, text=True, env=env, cwd=ROOT)
+    assert proc.returncode == 0, _report(proc)
 
 
 def test_unit_template_placeholders_are_known():
     """Все подстановки unit-файла заполняются скриптами (иначе в unit попадёт «@ИМЯ@»)."""
-    import re
     with open(os.path.join(ROOT, "systemd", "mailarchiver.service"), encoding="utf-8") as fh:
         placeholders = set(re.findall(r"@[A-Z]+@", fh.read()))
     with open(os.path.join(ROOT, "scripts", "common.sh"), encoding="utf-8") as fh:

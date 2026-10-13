@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import os
+import shlex
 import sys
 
 from .config import load_config
@@ -253,6 +254,21 @@ def _replica_values(cfg, args) -> dict:
     return values
 
 
+def _data_dir_must_be_usable(cfg) -> None:
+    """Команды восстановления пишут в каталог данных сами (каталогов они не создавали).
+
+    Ссылка в никуда — диск с данными не подключён — давала здесь «File exists» без
+    объяснений; отвечаем тем же, чем запуск службы. Отказ в правах не трогаем: его
+    назовёт сама операция, а совет про пользователя службы тут не к месту.
+    """
+    from .errors import ConfigError
+    problem = cfg.dir_problem(cfg.data_dir, "Каталог данных")
+    if problem and problem.kind != "denied":
+        hint = ("Если данные лежат на отдельном диске — проверьте, что он подключён (findmnt, mount -a), "
+                "и повторите команду." if problem.kind == "dangling" else cfg.dir_hint(problem.kind, cfg.data_dir))
+        raise ConfigError(problem + ".", hint=hint)
+
+
 def cmd_replica_pull(args) -> int:
     """Скачать копию вне сервера в каталог данных (восстановление после аварии)."""
     from types import SimpleNamespace
@@ -260,6 +276,8 @@ def cmd_replica_pull(args) -> int:
     cfg = load_config(args.config, create_dirs=False)
     values = _replica_values(cfg, args)
     dest = os.path.abspath(args.to or cfg.data_dir)
+    if dest == cfg.data_dir:
+        _data_dir_must_be_usable(cfg)
     target = build_target(SimpleNamespace(cfg=cfg), values)
     print(f"Копия: {target.describe()}")
     print(f"Куда:  {dest}" + (" (только снимки базы)" if args.only_db else ""))
@@ -283,6 +301,7 @@ def cmd_restore_snapshot(args) -> int:
     from .replica import snapshots
     from .storage import crypto
     cfg = load_config(args.config, create_dirs=False)
+    _data_dir_must_be_usable(cfg)
     path = args.snapshot
     if os.path.sep not in path and not os.path.exists(path):
         candidate = os.path.join(snapshots.snapshot_dir(cfg), path)
@@ -345,8 +364,56 @@ def cmd_check_config(args) -> int:
     print(f"Веб-интерфейс      : http://{cfg.server['host']}:{cfg.server['port']}")
     for warning in cfg.warnings:
         print(f"Предупреждение: {warning}")
-    print("Конфигурация корректна ✓" + (" (есть предупреждения)" if cfg.warnings else ""))
+    # Каталоги не создаём, но смотрим: со ссылкой в никуда (диск с данными не
+    # подключён) служба не запустится, как бы верна ни была сама конфигурация.
+    problems = cfg.dir_problems()
+    # Отказ в правах — не ошибка конфигурации: каталог данных закрыт для всех, кроме
+    # службы, а проверку часто запускает другой пользователь. Раньше он получал
+    # несколько «нет прав», совет подключить диск и код 1 при исправной службе.
+    denied = [p for p in problems if getattr(p, "kind", "") == "denied"]
+    errors = [p for p in problems if getattr(p, "kind", "") != "denied"]
+    if denied:
+        print(f"Предупреждение: {_denied_note(cfg, denied, args.config)}")
+    if errors:
+        for problem in errors:
+            print(f"ОШИБКА: {problem}.", file=sys.stderr)
+        for hint in dict.fromkeys(cfg.dir_hint(getattr(p, "kind", "")) for p in errors):
+            print(f"Подсказка: {hint}", file=sys.stderr)
+        return 1
+    if not denied and not os.path.exists(cfg.data_dir):
+        # Не «будет создан при запуске»: служба, установленная скриптом, без этого каталога не
+        # запустится вовсе (он указан в ReadWritePaths unit-файла — status=226/NAMESPACE), а
+        # каталог, которого нет, чаще всего означает неподключённый диск с данными.
+        print(f"Замечание: каталога данных {cfg.data_dir} нет. Новую установку его создаёт install.sh; "
+              f"служба, уже установленная скриптом, без него не запустится. Если данные лежат на "
+              f"отдельном диске — проверьте, что он подключён (findmnt, mount -a).")
+    print("Конфигурация корректна ✓" + (" (есть предупреждения)" if cfg.warnings or denied else ""))
     return 0
+
+
+def _denied_note(cfg, denied: list, config_arg) -> str:
+    """Одной строкой: каталог закрыт тому, кто запустил проверку, — и что это значит для службы."""
+    from .config import current_user
+    user = current_user()
+    owner = ""
+    try:
+        import pwd
+        owner = pwd.getpwuid(os.stat(cfg.data_dir).st_uid).pw_name
+    except (ImportError, KeyError, OSError, ValueError):
+        pass
+    text = str(denied[0])
+    if len(denied) > 1:
+        text += f" (и ещё каталогов: {len(denied) - 1})"
+    text += f". Проверку запустил пользователь «{user}»: каталоги проверены с его правами, а запуску важны права службы. "
+    if owner and owner == user:
+        text += (f"Этот пользователь — владелец каталога данных: если служба работает от его имени, с закрытым "
+                 f"каталогом она не запустится (вернуть: sudo chown -R {user}: {shlex.quote(cfg.data_dir)}).")
+    else:
+        command = "mailarchiver" + (f" -c {shlex.quote(config_arg)}" if config_arg else "") + " check-config"
+        text += ("Если она работает от другого пользователя, это не ошибка; проверить от её имени: "
+                 f"sudo -u {owner or 'ПОЛЬЗОВАТЕЛЬ_СЛУЖБЫ'} {command}"
+                 + (f" (каталог данных принадлежит пользователю «{owner}»)." if owner else "."))
+    return text
 
 
 def cmd_version(args) -> int:
@@ -423,7 +490,8 @@ def main(argv=None) -> int:
             print(f"Подсказка: {exc.hint}", file=sys.stderr)
         return 1
     except OSError as exc:
-        print(f"ОШИБКА: {exc.strerror or exc}: {exc.filename or ''}".rstrip(": "), file=sys.stderr)
+        from .config import os_error_text
+        print(f"ОШИБКА: {os_error_text(exc)}: {exc.filename or ''}".rstrip(": "), file=sys.stderr)
         return 1
     except (KeyboardInterrupt, EOFError):
         print("\nПрервано.", file=sys.stderr)

@@ -2431,11 +2431,25 @@ async function restoreModal(a){
 }
 
 // ---------- Импорт PST ----------
+/** Имя или путь для команды на сервере — как shlex.quote: без кавычек путь с пробелом
+ *  или кавычкой из подсказки, вставленный в терминал, сделал бы не то, что написано. */
+function shq(s){ s=String(s==null?'':s); return /^[A-Za-z0-9_@%+=:,.\/-]+$/.test(s) ? s : "'"+s.replace(/'/g,"'\\''")+"'"; }
+/** Текст без точки в конце: к сообщению сервера точку ставит сама фраза (иначе выходило «..»). */
+function noDot(s){ return String(s==null?'':s).replace(/[.\s]+$/,''); }
+
 function importModal(a){
   const H=(k)=>helpIcon(fieldHelp('import',k));
   const m=modal(`Импорт .pst: ${a.name}`, `
-    <p class="muted small">Письма из файла Outlook (.pst) переносятся в ящик — на почтовый сервер или сразу в локальную копию. Файл разбирает сам MailArchiver: внешние программы не нужны. Переносятся папки, письма с вложениями, флаги («прочитано», «отвечено», «помечено») и даты получения; контакты, календарь и задачи пропускаются.</p>
-    <div class="form-row"><label>Файл .pst</label><input id="i-file" type="file" accept=".pst"></div>
+    <p class="muted small">Письма из файла Outlook (.pst или .ost) переносятся в ящик — на почтовый сервер или сразу в локальную копию. Файл разбирает сам MailArchiver: внешние программы не нужны. Переносятся папки, письма с вложениями, флаги («прочитано», «отвечено», «помечено») и даты получения; контакты, календарь и задачи пропускаются.</p>
+    <div class="form-row"><label>Откуда взять файл ${H('source')}</label><select id="i-src">
+      <option value="upload">Загрузить с компьютера</option>
+      <option value="server">Взять с сервера (файл уже лежит в каталоге импорта)</option></select></div>
+    <div class="form-row" id="i-uprow"><label>Файл .pst или .ost</label><input id="i-file" type="file" accept=".pst,.ost">
+      <div class="hint" id="i-uphint"></div></div>
+    <div id="i-srvrow" style="display:none">
+      <div class="form-row"><label>Файл на сервере</label><select id="i-sfile"><option value="">загружается список…</option></select></div>
+      <div class="hint" id="i-srvhint" style="margin-bottom:15px"></div>
+    </div>
     <div class="form-row"><label>Куда импортировать ${H('target')}</label><select id="i-target">
       <option value="imap">На почтовый сервер (IMAP)</option>
       <option value="local">В локальную копию ящика (архив)</option></select></div>
@@ -2456,30 +2470,136 @@ function importModal(a){
     {footer:`<button class="btn ghost" data-c>Отмена</button><button class="btn primary" data-go>Загрузить и импортировать</button>`});
   const g=x=>m.body.querySelector(x);
   g('#i-target').onchange=()=>{ g('#i-localhint').style.display=g('#i-target').value==='local'?'block':'none'; };
+  const goBtn=m.foot.querySelector('[data-go]');
+  const fromServer=()=>g('#i-src').value==='server';
+  // Имя выбранного файла — прямо на кнопке: видно, что именно уйдёт в импорт (длинное — сокращается).
+  const goText=()=>!fromServer() ? 'Загрузить и импортировать'
+    : chosen ? `Импортировать «${chosen.length>30 ? chosen.slice(0,29)+'…' : chosen}»` : 'Импортировать';
+  const showGo=()=>{ if(goBtn.disabled) return; goBtn.textContent=goText(); goBtn.title=(fromServer()&&chosen)?`Файл на сервере: ${chosen}`:''; };
+  // Каталог импорта на сервере: файл больше предела загрузки кладут туда сами и выбирают по имени.
+  let srv=null;
+  // Предел загрузки, пока сервер не назвал свой (то же число — MAX_PST_UPLOAD_BYTES в api.py).
+  // Раньше при неудачном запросе списка пропадали и подсказка о пределе, и проверка размера.
+  let maxUpload=2*1024**3;
+  // Что выбрал пользователь. Хранится отдельно от списка: список перечитывается (в том
+  // числе после ошибки), и выбранным молча оказывался первый файл — уже не тот, что выбирали.
+  let chosen='', lost='', loadSeq=0;
+  const sel=g('#i-sfile'), code=x=>`<code>${esc(x)}</code>`;
+  const showUploadLimit=()=>{ g('#i-uphint').textContent=`Через браузер загружается файл не больше ${fmtBytes(maxUpload)}. Файл крупнее положите на сервер и выберите «Взять с сервера».`; };
+  const SANDBOX=' Учтите: служба под systemd не видит каталоги <code>/home</code>, <code>/root</code> и <code>/tmp</code> (в её unit-файле ProtectHome=true и PrivateTmp=true) — что бы ни лежало там и какие бы права ни стояли, для службы там пусто или закрыто. Держите файлы в другом месте, например в <code>/srv</code> или <code>/mnt</code>.';
+  // Совет под причину, по которой каталог импорта недоступен: причину (problem, reason) называет сервер.
+  const unavailableHtml=(owner)=>{
+    const dir=srv.directory||'', real=srv.link_target||'';      // куда ведёт каталог импорта, если он ссылка
+    const who=owner?` ${code(owner)}`:'', chown=owner?` && sudo chown ${shq(owner)}: ${shq(dir)}`:'';
+    let advice='';
+    if(srv.problem==='dangling') advice='Если каталог лежит на отдельном диске — подключите диск (<code>findmnt</code>, <code>sudo mount -a</code>).'+SANDBOX;
+    else if(srv.problem==='missing') advice=`Создайте его на сервере: ${code(`sudo mkdir -p ${shq(dir)}${chown}`)}.`;
+    else if(srv.problem==='not_dir') advice=`На месте каталога лежит файл: уберите или переименуйте его и создайте каталог: ${code(`sudo mkdir ${shq(dir)}${chown}`)}.`;
+    else if(srv.problem==='closed') advice= !owner ? 'Проверьте права на каталог.'
+      : real ? `Каталог импорта — ссылка на ${code(real)}. Дайте пользователю службы право читать этот каталог, например: ${code(`sudo setfacl -m u:${shq(owner)}:rx ${shq(real)}`)}. Отдавать его целиком (<code>chown</code>) стоит, только если он нужен одному импорту.`
+      : `Отдайте каталог пользователю службы: ${code(`sudo chown ${shq(owner)}: ${shq(dir)}`)}.`;
+    else if(srv.problem==='denied') advice=`Каждый каталог на пути к нему должен пускать пользователя службы${who}. Права по всему пути покажет ${code(`namei -l ${shq(real||dir)}`)}.`+(real?SANDBOX:'');
+    else if(srv.problem==='overlap') advice= real
+      ? `Сейчас каталог импорта — ссылка на ${code(real)}, а там лежат и файлы самой службы. Направьте ссылку на отдельный каталог, где будут только файлы .pst и .ost: ${code(`sudo mkdir -p ${shq(real+'/pst-import')}${owner?` && sudo chown ${shq(owner)}: ${shq(real+'/pst-import')}`:''} && sudo ln -sfn ${shq(real+'/pst-import')} ${shq(dir)}`)}.`+SANDBOX
+      : 'Параметр <code>export.tmp_dir</code> в config.yaml направляет временные файлы службы в каталог импорта: задайте для них другой каталог (или уберите параметр) и перезапустите службу.';
+    else if(srv.problem==='loop') advice='Пересоздайте ссылку так, чтобы она вела на настоящий каталог: куда ведёт каждая, покажет <code>ls -l</code>.'+SANDBOX;
+    else advice=`Проверьте на сервере, что каталог существует и открыт пользователю службы${who}.`;
+    return `${esc(noDot(srv.reason)||`Служба не может прочитать каталог импорта ${dir}`)}. ${advice} Затем нажмите «Обновить список».`;
+  };
+  const renderServerFiles=(error)=>{
+    const hint=g('#i-srvhint');
+    const refresh=' <button class="btn small" type="button" data-refresh>Обновить список</button>';
+    // у root доступ есть к любому файлу — про chown подсказывать незачем
+    const owner=(srv && srv.user && srv.user!=='root') ? srv.user : '';
+    if(!srv){
+      sel.innerHTML='<option value="">список не получен</option>';
+      hint.innerHTML=`Не удалось получить список файлов на сервере${error?': '+esc(noDot(error)):''}. Загрузить файл с компьютера можно и без него.${refresh}`;
+    }else if(srv.available===false){
+      // каталог создан не службой (командой от root), это ссылка на отключённый диск и т. п.
+      sel.innerHTML='<option value="">каталог импорта недоступен</option>';
+      hint.innerHTML=unavailableHtml(owner)+refresh;
+    }else{
+      const files=srv.files||[], dir=srv.directory||'';
+      const locked=files.filter(f=>f.readable===false);
+      // Первой идёт пустая строка: файл выбирает человек, а не порядок в списке.
+      sel.innerHTML=files.length
+        ? '<option value="">— выберите файл —</option>'+files.map(f=>`<option value="${esc(f.name)}" ${f.readable===false?'disabled':''}>${esc(f.name)} — ${esc(fmtBytes(f.size))}, изменён ${esc(fmtDate(f.modified))}${f.readable===false?' — нет доступа у службы':''}</option>`).join('')
+        : '<option value="">в каталоге импорта нет файлов .pst и .ost</option>';
+      if(chosen && !files.some(f=>f.name===chosen && f.readable!==false)){ lost=chosen; chosen=''; }
+      sel.value=chosen;
+      hint.innerHTML=(lost ? `<span data-lost style="color:var(--danger)">Файла «${esc(lost)}», который был выбран, в каталоге импорта больше нет (его убрали, переименовали или закрыли для службы) — выберите файл заново.</span> ` : '')
+        + (files.length
+          ? `Файлы лежат на сервере в каталоге импорта ${code(dir)}. Дождитесь, пока файл скопируется на сервер целиком, — и только потом запускайте импорт.`
+          : `В каталоге импорта на сервере пока нет файлов .pst и .ost. Скопируйте файл на сервер (например, командой <code>scp</code>), положите его в каталог ${code(dir)}${owner?` и отдайте его пользователю службы: ${code(`sudo chown ${shq(owner)}: ${shq(dir+'/файл.pst')}`)}`:''} — затем нажмите «Обновить список».`)
+        + (locked.length && owner ? ` Файл с пометкой «нет доступа» служба прочитать не может — выполните на сервере: ${code(`sudo chown ${shq(owner)}: ${shq(dir+'/'+locked[0].name)}`)}${locked.length>1?' (и так же для остальных)':''}.` : '')
+        + ' После импорта файл остаётся на месте — удалите его сами, когда он больше не нужен.' + refresh;
+    }
+    const again=hint.querySelector('[data-refresh]'); if(again) again.onclick=loadServerFiles;
+    showUploadLimit(); showGo();
+  };
+  sel.onchange=sel.oninput=()=>{ chosen=sel.value; lost=''; const note=g('#i-srvhint [data-lost]'); if(note) note.remove(); showGo(); };
+  async function loadServerFiles(){
+    const seq=++loadSeq;
+    let data=null, error='';
+    try{ data=await api('/import-files'); }catch(e){ error=(e&&e.message)||String(e); }
+    // Список обновляет только последний запрос: ответ на более ранний мог прийти позже
+    // и вернуть в окно уже устаревший набор файлов.
+    if(seq!==loadSeq) return;
+    srv=data;
+    if(srv && srv.max_upload_bytes) maxUpload=srv.max_upload_bytes;
+    renderServerFiles(error);
+  }
+  g('#i-src').onchange=()=>{
+    g('#i-uprow').style.display=fromServer()?'none':'block';
+    g('#i-srvrow').style.display=fromServer()?'block':'none';
+    showGo();
+  };
+  showUploadLimit();
+  loadServerFiles();
   m.foot.querySelector('[data-c]').onclick=m.close;
-  m.foot.querySelector('[data-go]').onclick=async()=>{
-    const f=g('#i-file').files[0]; if(!f) return toast('Выберите файл','','warn');
+  goBtn.onclick=async()=>{
+    const server=fromServer();
+    let f=null, serverFile='';
+    if(server){
+      serverFile=chosen=sel.value;
+      if(!serverFile){
+        // сам файл не выбирается никогда: что импортировать, решает только пользователь
+        if(!srv) return toast('Список файлов на сервере не получен', 'Нажмите «Обновить список» под полем «Файл на сервере».', 'warn', 7000);
+        if(srv.available===false) return toast('Каталог импорта на сервере недоступен', 'Причина и что с ней делать — под полем «Файл на сервере».', 'warn', 7000);
+        if(!(srv.files||[]).length) return toast('В каталоге импорта нет файлов', 'Скопируйте файл .pst или .ost в каталог импорта на сервере и нажмите «Обновить список».', 'warn', 7000);
+        return toast('Файл на сервере не выбран', 'Выберите файл в списке «Файл на сервере».', 'warn', 7000);
+      }
+    }else{
+      f=g('#i-file').files[0]; if(!f) return toast('Выберите файл','','warn');
+      // Не ждать загрузки гигабайтов ради отказа: предел известен заранее.
+      if(f.size>maxUpload) return toast('Файл слишком большой', `Через браузер загружается не больше ${fmtBytes(maxUpload)}. Положите файл в каталог импорта на сервере и выберите «Взять с сервера».`, 'warn', 9000);
+    }
+    const fileName=server?serverFile:f.name;
     const target=g('#i-target').value, prefix=g('#i-prefix').value.trim();
     if(!prefix){
       // Пустой префикс — письма лягут прямо в рабочие папки ящика («Входящие» из
       // файла — во «Входящие» сотрудника или архива). Отменить это нельзя.
       const okGo=await confirmDlg('Импортировать без префикса?',
-        `Папки из файла будут созданы ${target==='local'?'в архиве ящика':'в ящике'} «${a.name}» под своими именами, а письма папок с совпадающими именами смешаются с ${target==='local'?'уже сохранёнными':'текущей почтой'}. Отменить это нельзя.`);
+        `Папки из файла «${fileName}» будут созданы ${target==='local'?'в архиве ящика':'в ящике'} «${a.name}» под своими именами, а письма папок с совпадающими именами смешаются с ${target==='local'?'уже сохранёнными':'текущей почтой'}. Отменить это нельзя.`);
       if(!okGo) return;
     }
-    const fd=new FormData(); fd.append('file', f);
+    // Файл с сервера передаётся именем: сам файл никуда не копируется.
+    const fd=new FormData(); if(server) fd.append('server_file', serverFile); else fd.append('file', f);
     // «Без префикса» — отдельным полем: пустое значение сервер принял бы за «не указано».
     if(prefix) fd.append('target_prefix', prefix); else fd.append('no_prefix', '1');
     fd.append('target', target); fd.append('skip_existing', g('#i-skip').checked?'1':'0');
     fd.append('engine', g('#i-engine').value); fd.append('ansi_codepage', g('#i-cp').value);
-    const btn=m.foot.querySelector('[data-go]');
-    btn.disabled=true; btn.innerHTML='<span class="spinner"></span> Загрузка…';
+    goBtn.disabled=true; goBtn.innerHTML=`<span class="spinner"></span> ${server?'Запуск…':'Загрузка…'}`;
     try{
-      await api(`/accounts/${a.id}/import-pst`,{method:'POST',body:fd}); toast('Импорт запущен'); m.close(); location.hash='#/jobs';
+      await api(`/accounts/${a.id}/import-pst`,{method:'POST',body:fd});
+      toast('Импорт запущен', `${server?'Файл с сервера':'Файл'}: «${fileName}»`); m.close(); location.hash='#/jobs';
     }catch(e){
       // Без возврата кнопки диалог после ошибки приходилось закрывать и
       // открывать заново — кнопка оставалась серой со спиннером.
-      toastErr(e); btn.disabled=false; btn.textContent='Загрузить и импортировать';
+      toastErr(e); goBtn.disabled=false; showGo();
+      // файл на сервере могли убрать или переименовать — список стоит перечитать
+      // (выбор при этом остаётся прежним или сбрасывается на пустую строку)
+      if(server) loadServerFiles();
     }
   };
 }
@@ -2570,7 +2690,8 @@ const RESULT_LBL={summary:'Итог', final_status:'Статус итога', to
   imported:'Импортировано писем', messages_total:'Писем и других элементов в файле', duplicates:'Уже были — пропущено',
   not_mail:'Не письма (контакты, календарь…) — пропущено', outdated:'Старше срока хранения — не записано',
   lossy:'Перенесено с потерями', damaged_blocks:'Блоков файла с неверной контрольной суммой',
-  target:'Куда (imap — сервер, local — локальная копия)', engine:'Способ разбора файла'};
+  target:'Куда (imap — сервер, local — локальная копия)', engine:'Способ разбора файла',
+  source:'Откуда файл (upload — загружен через интерфейс, server — каталог импорта на сервере)'};
 const RESULT_BYTES=new Set(['bytes','bytes_new','freed','size']);
 
 async function jobDetails(id){

@@ -3,6 +3,17 @@
 
     python scripts/make_release.py            # архив в корень проекта
     python scripts/make_release.py /tmp/out   # архив в другой каталог
+    python scripts/make_release.py --wheels КАТАЛОГ [/tmp/out]
+                                              # архив для установки без интернета
+
+С ``--wheels`` в архив, в каталог ``mail_backup/wheels/``, добавляются пакеты
+``.whl`` из указанного каталога (библиотеки и само приложение), а архив получает
+имя ``mailarchiver-<версия>-offline-<python>-<платформа>.tar.gz``: такие пакеты
+годятся только для своей версии Python и архитектуры. install.sh и update.sh,
+найдя каталог ``wheels``, ставят всё из него и в сеть не ходят. Каталог обычно
+готовит ``scripts/make_offline_bundle.sh`` — он же вызывает этот скрипт.
+Без ``--wheels`` каталог ``wheels/`` из корня проекта в архив не попадает, как и
+файлы ``.whl``, лежащие в проекте где-либо ещё.
 
 Архив собирается не командой ``tar``, а здесь, потому что права и владельцы в
 нём не должны зависеть от машины сборки. Архив 1.9.0 был собран из каталога,
@@ -27,20 +38,27 @@ import os
 import re
 import subprocess
 import sys
+import sysconfig
 import tarfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOP = "mail_backup"
+WHEELS = "wheels"          # каталог пакетов в автономном архиве (его ищут install.sh и update.sh)
 
 # каталоги, которые не входят в выпуск, где бы ни лежали
 SKIP_DIRS = {".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "venv", ".venv",
              ".idea", ".vscode", "node_modules"}
 # каталоги верхнего уровня: рабочие данные, остатки сборки и рабочие снимки экрана
 # (tests/data и подобное — не они)
-SKIP_TOP_DIRS = {"exports", "data", "tmp", "build", "dist", "Claude outputs"}
+# (wheels — пакеты для установки без сети: в архив они попадают только через --wheels)
+SKIP_TOP_DIRS = {"exports", "data", "tmp", "build", "dist", "wheels", "Claude outputs"}
 # файлы по маске имени
+# (*.whl — пакеты для установки без сети, где бы в проекте они ни лежали: каталог,
+# названный не wheels/ — например «--wheels-dir wheelhouse», — попадал в архив
+# второй раз. Пакеты, заданные через --wheels, добавляются отдельно.)
 SKIP_FILES = ("*.tar.gz", "*.part", "*.docx", "*.pyc", "*.pyo", "*.pst", "*.ost", "*.mbox", "*.db",
-              "*.db-wal", "*.db-shm", "*.db-journal", "*.log", "secret.key", "storage.key", ".DS_Store")
+              "*.db-wal", "*.db-shm", "*.db-journal", "*.log", "*.whl", "secret.key", "storage.key",
+              ".DS_Store")
 # файлы по пути от корня проекта
 SKIP_PATHS = {"config/config.yaml"}
 # без этих файлов архив не годится для установки
@@ -131,7 +149,74 @@ def _versions() -> dict[str, str]:
     return found
 
 
-def build(out_dir: str) -> str:
+def wheel_files(wheels_dir: str, version: str) -> list[str]:
+    """Имена пакетов ``.whl`` из каталога — то, что войдёт в автономный архив.
+
+    Отказ, если каталог для установки без сети не годится: нет пакета самого
+    приложения нужной версии или в каталоге лежат архивы исходников (их pip без
+    сети, как правило, собрать не может — для сборки он скачивает setuptools).
+    """
+    if not os.path.isdir(wheels_dir):
+        raise SystemExit(f"Каталог с пакетами не найден: {wheels_dir}")
+    names = sorted(os.listdir(wheels_dir))
+    sdists = [n for n in names if n.endswith((".tar.gz", ".tar.bz2", ".zip"))]
+    if sdists:
+        raise SystemExit("В каталоге пакетов есть архивы исходников: %s.\nБез сети pip их не соберёт. "
+                         "Получите готовые пакеты: pip wheel -r requirements.txt -w КАТАЛОГ" % ", ".join(sdists))
+    wheels = [n for n in names if n.endswith(".whl") and os.path.isfile(os.path.join(wheels_dir, n))
+              and not os.path.islink(os.path.join(wheels_dir, n))]
+    # пакеты приложения других версий (остались от прежней сборки) в архиве не нужны
+    stale = [n for n in wheels if n.startswith("mailarchiver-") and not n.startswith(f"mailarchiver-{version}-")]
+    for name in stale:
+        print(f"Пропущен пакет приложения другой версии: {name}")
+    wheels = [n for n in wheels if n not in stale]
+    if not any(n.startswith(f"mailarchiver-{version}-") for n in wheels):
+        raise SystemExit(f"В каталоге {wheels_dir} нет пакета приложения mailarchiver-{version}-*.whl.\n"
+                         "Соберите его: pip wheel . --no-deps -w КАТАЛОГ (или scripts/make_offline_bundle.sh).")
+    return wheels
+
+
+def _platform_family(tag: str) -> str:
+    """``manylinux_2_17_x86_64`` → ``linux_x86_64``, ``musllinux_1_2_aarch64`` → ``musllinux_aarch64``."""
+    match = re.fullmatch(r"(manylinux|musllinux|linux|macosx)(?:_?\d+(?:_\d+)?)?_(.+)", tag)
+    if not match:
+        return tag
+    family = "linux" if match.group(1) in ("manylinux", "linux") else match.group(1)
+    return f"{family}_{match.group(2)}"
+
+
+def bundle_tags(wheels: list[str]) -> tuple[str, str]:
+    """Метки Python и платформы для имени автономного архива.
+
+    Берутся из имён пакетов (``имя-версия-python-abi-платформа.whl``):
+
+    * Python — метка ``cpXY`` пакетов, собранных под конкретную версию
+      интерпретатора (ABI не ``none`` и не ``abi3``), например ``cp312``;
+    * платформа — семейство и архитектура платформенных пакетов без версии
+      glibc: ``manylinux_2_17_x86_64`` и ``manylinux2014_x86_64`` дают
+      ``linux_x86_64``.
+
+    Если таких пакетов нет (все — «чистый Python» или abi3), метка берётся у
+    интерпретатора, которым запущен сборщик: набор библиотек подбирался под
+    него (``cp313``; ``sysconfig.get_platform()`` с заменой ``-`` и ``.`` на
+    ``_``, например ``linux_x86_64``). Если пакеты собраны под несколько версий
+    или платформ, метки перечисляются через ``_``.
+    """
+    pythons, platforms = set(), set()
+    for name in wheels:
+        parts = name[:-len(".whl")].split("-")
+        if len(parts) < 5:
+            continue                      # имя не по правилам — о платформе ничего не говорит
+        py, abi, plat = parts[-3:]
+        if not set(abi.split(".")) & {"none", "abi3"}:
+            pythons.update(tag for tag in py.split(".") if re.fullmatch(r"cp\d+", tag))
+        platforms.update(_platform_family(tag) for tag in plat.split(".") if tag != "any")
+    pytag = "_".join(sorted(pythons)) or "cp%d%d" % sys.version_info[:2]
+    platform = "_".join(sorted(platforms)) or re.sub(r"[-.]", "_", sysconfig.get_platform())
+    return pytag, platform
+
+
+def build(out_dir: str, wheels_dir: str | None = None) -> str:
     versions = _versions()
     version = versions["VERSION"]
     if len(set(versions.values())) != 1:
@@ -144,14 +229,23 @@ def build(out_dir: str) -> str:
         print("В архив включены файлы, которых git ещё не отслеживает (%d):" % len(untracked))
         for name in untracked:
             print("    " + name)
-    target = os.path.join(out_dir, f"mailarchiver-{version}.tar.gz")
+    # путь в архиве → файл на диске
+    sources = {name: os.path.join(ROOT, name) for name in files}
+    archive = f"mailarchiver-{version}.tar.gz"
+    wheels: list[str] = []
+    if wheels_dir:
+        wheels = wheel_files(wheels_dir, version)
+        sources.update({f"{WHEELS}/{name}": os.path.join(wheels_dir, name) for name in wheels})
+        archive = "mailarchiver-%s-offline-%s-%s.tar.gz" % ((version,) + bundle_tags(wheels))
+    files = sorted(sources)
+    target = os.path.join(out_dir, archive)
     tmp = target + ".part"
     dirs = {""}
     for name in files:
         while "/" in name:
             name = name.rsplit("/", 1)[0]
             dirs.add(name)
-    mtimes = {name: os.stat(os.path.join(ROOT, name)).st_mtime for name in files}
+    mtimes = {name: os.stat(path).st_mtime for name, path in sources.items()}
     newest = max(mtimes.values())
     with open(tmp, "wb") as raw:
         # mtime=0 и пустое имя: один и тот же набор файлов даёт один и тот же архив
@@ -165,17 +259,19 @@ def build(out_dir: str) -> str:
                         inside = [m for f, m in mtimes.items() if not rel or f.startswith(rel + "/")]
                         tar.addfile(_entry(name, mode=0o755, mtime=max(inside or [newest]), directory=True))
                         continue
-                    path = os.path.join(ROOT, rel)
-                    info = _entry(name, mode=_mode(rel, path), mtime=mtimes[rel])
+                    path = sources[rel]
+                    # пакеты — обычные файлы, какие бы права ни были у них в каталоге сборки
+                    mode = 0o644 if rel.startswith(WHEELS + "/") else _mode(rel, path)
+                    info = _entry(name, mode=mode, mtime=mtimes[rel])
                     info.size = os.path.getsize(path)
                     with open(path, "rb") as fh:
                         tar.addfile(info, fh)
-    check(tmp)
+    check(tmp, [f"{WHEELS}/{name}" for name in wheels])
     os.replace(tmp, target)
     return target
 
 
-def check(path: str) -> None:
+def check(path: str, extra: list[str] | tuple[str, ...] = ()) -> None:
     """Архив читается, в нём есть всё нужное и нет ни одного файла, закрытого для службы."""
     names = set()
     with tarfile.open(path) as tar:
@@ -185,15 +281,48 @@ def check(path: str) -> None:
             if member.mode & wanted != wanted or member.mode & 0o022 or member.uid or member.gid:
                 raise SystemExit(f"Неверные права в архиве: {member.name} {oct(member.mode)} "
                                  f"{member.uid}:{member.gid}")
-    missing = [name for name in REQUIRED if f"{TOP}/{name}" not in names]
+    missing = [name for name in tuple(REQUIRED) + tuple(extra) if f"{TOP}/{name}" not in names]
     if missing:
         raise SystemExit("В архиве нет обязательных файлов: " + ", ".join(missing))
+    if not extra and any(name.startswith(f"{TOP}/{WHEELS}/") for name in names):
+        raise SystemExit(f"В обычный архив попал каталог {WHEELS}/ — пакеты добавляются только через --wheels.")
+
+
+def _arguments(argv: list[str]) -> tuple[str, str | None]:
+    """→ (каталог для архива, каталог с пакетами или None)."""
+    out_dir, wheels_dir, args, i = None, None, argv[1:], 0
+
+    def refuse(text: str):
+        print(text, file=sys.stderr)
+        print("Использование: python scripts/make_release.py [--wheels КАТАЛОГ] [КУДА_ПОЛОЖИТЬ_АРХИВ]", file=sys.stderr)
+        raise SystemExit(2)
+    while i < len(args):
+        arg = args[i]
+        if arg in ("-h", "--help"):
+            print(__doc__.strip())
+            raise SystemExit(0)
+        if arg == "--wheels" or arg.startswith("--wheels="):
+            if "=" in arg:
+                wheels_dir = arg.split("=", 1)[1]
+            elif i + 1 < len(args):
+                i += 1
+                wheels_dir = args[i]
+            if not wheels_dir:
+                refuse("После --wheels нужен каталог с пакетами .whl.")
+        elif arg.startswith("-"):
+            refuse(f"Неизвестный параметр: {arg}")
+        elif out_dir is None:
+            out_dir = arg
+        else:
+            refuse(f"Лишний параметр: {arg}")
+        i += 1
+    return os.path.abspath(out_dir) if out_dir else ROOT, os.path.abspath(wheels_dir) if wheels_dir else None
 
 
 def main(argv: list[str]) -> int:
-    out_dir = os.path.abspath(argv[1]) if len(argv) > 1 else ROOT
+    out_dir, wheels_dir = _arguments(argv)
     os.makedirs(out_dir, exist_ok=True)
-    target = build(out_dir)
+    target = build(out_dir, wheels_dir)
     with tarfile.open(target) as tar:
         count = sum(1 for member in tar if member.isfile())
     print(f"{target}: {count} файлов, {os.path.getsize(target)} байт")

@@ -7,7 +7,9 @@
 
 Что читается:
 
-* оба варианта файла — Unicode (Outlook 2003 и новее) и ANSI (Outlook 97–2002);
+* все три вида файла — ANSI (Outlook 97–2002), Unicode (Outlook 2003 и новее) и
+  Unicode с большими страницами (``.ost`` Outlook 2013 и новее, wVer 36): страницы
+  B-деревьев по 4 КБ, блоки до 64 КБ, блоки могут быть сжаты zlib;
 * все три способа «шифрования» данных: без него, перестановочное
   («сжимаемое шифрование» — так Outlook создаёт файлы по умолчанию) и
   циклическое («усиленное шифрование»). Пароль файла на содержимое не влияет:
@@ -17,7 +19,21 @@
   куче (BTH), контекст свойств (PC) и таблица (TC), а над ними — хранилище,
   папки, письма, получатели и вложения.
 
-Не читается формат с блоками по 4 КБ (``.ost`` Outlook 2013 и новее).
+Формат с большими страницами в [MS-PST] не описан. Его устройство здесь сверено с
+настоящими файлами ``.ost``: суммы страниц и блоков сходятся, размеры после
+распаковки совпадают с записанными, вложения читаются байт в байт.
+
+Настоящими файлами НЕ подтверждено — в четырёх доступных образцах этого нет:
+
+* деление номера кучи (HID) — 14 бит на номер кусочка, номер блока с 19-го бита;
+  с ним и куча с таблицей длиннее одного блока;
+* XXBLOCK и SIBLOCK в файле с большими блоками;
+* сжатие вместе с кодированием данных (все образцы — без кодирования).
+
+Это читается по описаниям формата и в коде помечено. Тесты на эти случаи сверяют
+читатель только с тестовым преобразователем (``tests/pst_tools.py``, ``to_4k``),
+написанным по тем же описаниям: они ловят расхождение между двумя программами,
+но не ошибку в самих описаниях.
 
 Файл приходит от пользователя, поэтому ничему в нём не верим: каждое смещение
 и размер проверяются, глубина деревьев и число записей ограничены, а ошибка в
@@ -28,7 +44,8 @@
 
 Память. Файл целиком не читается. B-дерево блоков (BBT) обходится по запросу
 с небольшим кэшем страниц; из B-дерева узлов (NBT) один раз забираются номера
-узлов в компактные массивы (28 байт на письмо). Вложения отдаются кусками.
+узлов в компактные массивы (28 байт на письмо). Вложения отдаются кусками;
+готовыми держатся только несколько последних блоков (до 0,5 МБ).
 """
 from __future__ import annotations
 
@@ -37,15 +54,19 @@ import zlib
 from array import array
 from bisect import bisect_left, bisect_right
 from collections import OrderedDict
-from typing import Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
 #  Константы формата
 # ---------------------------------------------------------------------------
 PAGE_SIZE = 512
+#: Страница B-дерева в файлах с большими страницами (wVer 36).
+PAGE_SIZE_4K = 4096
 MAGIC = 0x4E444221               # «!BDN»
 MAGIC_CLIENT = 0x4D53            # «SM» — файл хранилища Outlook (.pst)
 MAGIC_CLIENT_OST = 0x4F53        # «SO» — автономная копия ящика Exchange (.ost)
+#: С этой версии формата (wVer) страницы большие: так пишет .ost Outlook 2013 и новее.
+WVER_4K = 36
 PTYPE_BBT = 0x80
 PTYPE_NBT = 0x81
 
@@ -61,6 +82,9 @@ NT_CONTENTS_TABLE = 0x0E
 NID_MESSAGE_STORE = 0x21
 NID_ROOT_FOLDER = 0x122
 NID_IPM_SUBTREE = 0x8022
+#: Корень видимых папок в .ost: папка «IPM_SUBTREE» внутри «Root - Mailbox».
+NID_OST_IPM_SUBTREE = 0x2142
+OST_IPM_SUBTREE_NAME = "IPM_SUBTREE"
 NID_ATTACHMENT_TABLE = 0x671
 NID_RECIPIENT_TABLE = 0x692
 
@@ -90,7 +114,8 @@ FILETIME_EPOCH_DIFF = 11644473600
 # -- Пределы: файл чужой, и ни одно его число не должно съесть память службы --
 #: Глубже этого B-деревья страниц не бывают (в файле на 50 ГБ — 4–5 уровней).
 MAX_BTREE_DEPTH = 16
-#: Сколько разобранных страниц BBT держать в памяти.
+#: Сколько разобранных страниц BBT держать в памяти (больших страниц — в восемь раз
+#: меньше: записей на них в восемь раз больше).
 PAGE_CACHE = 4096
 #: Узлов в файле (письма, папки, служебные) — больше не читаем.
 MAX_NODES = 5_000_000
@@ -98,6 +123,22 @@ MAX_NODES = 5_000_000
 MAX_SUBNODES = 400_000
 #: Блоков в одном дереве данных (≈ 32 ГБ по 8 КБ — заведомо больше любого значения).
 MAX_TREE_BLOCKS = 4_000_000
+#: Сколько раз один блок данных может быть назван в одном дереве данных. В настоящих файлах
+#: повторов нет вовсе: в десяти образцах (четыре .ost и шесть .pst) в 331 дереве длиннее одного
+#: блока каждый блок назван ровно один раз, а куски с одинаковым содержимым записаны разными
+#: блоками; не повторяет блоки и писатель службы. XBLOCK же, где одна ссылка повторена тысячи
+#: раз, превращает один блок в сотни мегабайт чтения. Запас — на случайную порчу (запись
+#: XBLOCK, совпавшая с соседней); он же предел такого раздувания.
+MAX_LEAF_REPEATS = 8
+#: За сколькими разными блоками одного дерева следит счёт повторов (значение в 2 ГБ по 8 КБ;
+#: сам счёт при этом — около 20 МБ). Дальше новые блоки не запоминаются: при 4 млн блоков
+#: счёт занял бы сотни мегабайт, а чтение и тогда ограничено :data:`MAX_TREE_BLOCKS`.
+MAX_TRACKED_LEAVES = 262_144
+#: Сколько последних прочитанных блоков держать готовыми — распакованными и раскодированными.
+#: Блок не больше 64 КБ, то есть это до 0,5 МБ. Блок, который спрашивают подряд несколько раз
+#: (XBLOCK — за размером значения и за самим значением, повтор ссылки в дереве), второй раз
+#: не читается, не сверяется и не распаковывается.
+BLOCK_CACHE = 8
 #: Куча одного узла: свойства письма или таблица папки.
 MAX_HEAP_BYTES = 64 * 1024 * 1024
 #: Куча свойств одного вложения (само вложение лежит отдельно, в подузле).
@@ -261,6 +302,31 @@ def crc32(data) -> int:
     return zlib.crc32(data, 0xFFFFFFFF) ^ 0xFFFFFFFF
 
 
+def inflate(data: bytes, size: int) -> bytes:
+    """Распаковать сжатый zlib блок, в котором после распаковки должно быть ровно ``size`` байт.
+
+    Размер назван в файле, а файл чужой: распаковывается не больше ``size`` байт,
+    сколько бы ни обещал сам поток, — иначе блок в сотню байт развернулся бы в
+    гигабайты. Поток короче или длиннее названного, оборванный или с неверной
+    суммой — ошибка блока.
+    """
+    if size <= 0:
+        raise PstReadError("сжатый блок: неверный размер после распаковки")
+    try:
+        unpacker = zlib.decompressobj()
+        out = unpacker.decompress(data, size)
+        if len(out) == size and not unpacker.eof:
+            # Ровно столько, сколько названо, но поток не закончен: либо осталась только его
+            # контрольная сумма, либо данных в нём больше — второе выдаст лишний байт.
+            if unpacker.decompress(unpacker.unconsumed_tail, 1):
+                raise PstReadError(f"сжатый блок: данных больше названных {size} байт")
+    except zlib.error:
+        raise PstReadError("сжатый блок не распаковывается") from None
+    if len(out) != size or not unpacker.eof:
+        raise PstReadError(f"сжатый блок: распаковано {len(out)} байт из {size}, поток оборван")
+    return out
+
+
 def compute_sig(ib: int, bid: int) -> int:
     value = (ib ^ bid) & 0xFFFFFFFF
     return ((value >> 16) ^ value) & 0xFFFF
@@ -285,11 +351,64 @@ def nid_type(nid: int) -> int:
 #  NDB: заголовок, страницы B-деревьев, блоки, деревья данных и подузлов
 # ---------------------------------------------------------------------------
 class _Layout:
-    """Различия вариантов файла: в ANSI номера блоков и смещения — 4 байта, в Unicode — 8."""
+    """Различия вариантов файла: в ANSI номера блоков и смещения — 4 байта, в Unicode — 8.
 
-    def __init__(self, unicode_: bool) -> None:
+    ``four_k`` — Unicode с большими страницами (wVer 36). От обычного Unicode он
+    отличается (проверено на настоящих файлах, кроме помеченного):
+
+    * страница B-дерева — 4096 байт: записи в первых 4056, затем число записей и
+      предел (по 2 байта, а не по одному), размер записи и уровень, 10 байт
+      заполнения и трейлер в 24 байта — прежние 16 и ещё 8 неизвестного назначения;
+      сумма страницы считается по первым 4072 байтам;
+    * запись листа BBT: BID, смещение, размер в файле, размер после распаковки,
+      счётчик ссылок (по 2 байта) и 2 байта неизвестного назначения (0 или 1);
+    * блок выровнен на 512 байт (а не на 64), трейлер — 24 байта: размер в файле,
+      подпись, сумма (по байтам, как они лежат в файле, то есть сжатым), BID,
+      2 байта неизвестного назначения, размер после распаковки, 4 байта заполнения;
+    * данных в блоке — до 65536 − 24 байт; блок, и данных, и служебный, может быть
+      сжат zlib — тогда размер в файле меньше размера после распаковки;
+    * строки таблицы лежат в блоке подряд, сколько поместилось в большой блок;
+    * в номере кучи (HID) под номер кусочка отдано 14 бит, а не 11, под номер
+      блока — оставшиеся 13, с 19-го бита. Настоящими файлами НЕ подтверждено: ни в
+      одном образце нет кучи длиннее одного блока и блока больше чем с 2047
+      кусочками (наибольшее — 1703), а до этих пределов оба деления дают одно и то
+      же. Так делит libpff; java-libpst, pst-extractor и go-pst делят по-старому
+      (11 бит и номер блока с 16-го) во всех видах файла. Тесты на это сверяют
+      читатель только с ``pst_tools.to_4k``, где деление такое же.
+
+    Заголовок файла, записи NBT и промежуточных страниц, XBLOCK и SLBLOCK — те же,
+    что в обычном Unicode. XXBLOCK и SIBLOCK читаются так же, как в обычном Unicode, но
+    в образцах их нет (нет значений длиннее 536 МБ и узлов с тысячами подузлов) —
+    тоже НЕ подтверждено и проверяется только согласием с ``pst_tools.to_4k``.
+    """
+
+    def __init__(self, unicode_: bool, four_k: bool = False) -> None:
         self.unicode = unicode_
-        if unicode_:
+        self.four_k = four_k
+        self.page_size = PAGE_SIZE
+        self.page_meta = "<BBBB"             # записей, предел, размер записи, уровень
+        self.block_align = 64
+        self.hid_index_bits = 11
+        self.page_cache = PAGE_CACHE
+        if four_k:
+            self.page_size = PAGE_SIZE_4K
+            self.page_entries = 4056
+            self.page_meta = "<HHBB"
+            self.page_trailer = "<BBHIQ"     # как в Unicode; следом ещё 8 байт
+            self.page_trailer_at = 4072
+            self.bt_entry = "<QQQ"
+            self.bbt_entry = "<QQHHH"        # BID, смещение, размер, размер после распаковки, счётчик
+            self.nbt_entry = "<QQQI"
+            self.block_trailer = 24
+            self.block_align = 512
+            self.bid_fmt = "Q"
+            self.sub_header = 8
+            self.sl_entry = "<QQQ"
+            self.si_entry = "<QQ"
+            self.block_max = 65536 - 24
+            self.hid_index_bits = 14
+            self.page_cache = PAGE_CACHE // 8
+        elif unicode_:
             self.page_entries = 488          # под записи B-дерева
             self.page_trailer = "<BBHIQ"     # ptype, ptypeRepeat, wSig, dwCRC, bid
             self.page_trailer_at = 496
@@ -332,6 +451,7 @@ class Ndb:
         #: блоков и страниц с неверной контрольной суммой или трейлером
         self.damaged = 0
         self._pages: "OrderedDict[int, tuple]" = OrderedDict()
+        self._blocks: "OrderedDict[int, bytes]" = OrderedDict()      # последние блоки, см. BLOCK_CACHE
         self._read_header()
         self._node_nid = array("I")
         self._node_data = array("Q")
@@ -367,16 +487,21 @@ class Ndb:
                 struct.unpack_from("<IIIIIIIII", head, 0xA4)
             self.crypt = head[0x1CD]
         elif version >= 23:
-            self.layout = _Layout(True)
             (_reserved, eof, _amap, _free, _pfree, nbt_bid, nbt_ib, bbt_bid, bbt_ib) = \
                 struct.unpack_from("<IQQQQQQQQ", head, 0xB4)
             self.crypt = head[0x201]
-            # Версии новее 23 бывают с блоками по 4 КБ (.ost Outlook 2013 и новее, wVer 36)
-            # — у них и страницы другие. Смотрим на корень B-дерева узлов: если там
-            # обычная страница в 512 байт, файл читается как Unicode, иначе — не наш.
-            if version > 23 and not self._looks_like_page(nbt_ib):
-                raise PstUnsupportedError("файл в формате с блоками по 4 КБ (.ost Outlook 2013 и новее) — "
-                                          "встроенный читатель его не разбирает")
+            # Заголовок у обоих видов Unicode один. Версии новее 23 бывают с большими
+            # страницами (.ost Outlook 2013 и новее, wVer 36), а бывают и обычными (.ost
+            # Outlook 2007–2010), поэтому вид файла определяет не номер версии, а корень
+            # B-дерева узлов: по нему видно, какого размера в файле страницы.
+            kinds = (False,) if version == 23 else ((True, False) if version >= WVER_4K else (False, True))
+            for four_k in kinds:
+                if version == 23 or self._looks_like_page(nbt_ib, _Layout(True, four_k)):
+                    self.layout = _Layout(True, four_k)
+                    break
+            else:
+                raise PstUnsupportedError(f"файл неизвестного устройства (wVer={version}): страницы его "
+                                          f"B-деревьев не похожи ни на обычные, ни на большие (4 КБ)")
         else:
             raise PstUnsupportedError(f"неизвестная версия формата .pst (wVer={version})")
         if self.crypt not in (CRYPT_NONE, CRYPT_PERMUTE, CRYPT_CYCLIC):
@@ -384,17 +509,19 @@ class Ndb:
         self.eof = eof
         self.nbt_root = nbt_ib
         self.bbt_root = bbt_ib
+        page_size = self.layout.page_size
         for name, ib in (("узлов", nbt_ib), ("блоков", bbt_ib)):
-            if ib < 564 or ib % PAGE_SIZE or ib + PAGE_SIZE > self.size:
+            if ib < 564 or ib % PAGE_SIZE or ib + page_size > self.size:
                 raise PstReadError(f"корень B-дерева {name} указывает за пределы файла — файл обрезан "
                                    f"или повреждён")
 
-    def _looks_like_page(self, ib: int) -> bool:
-        """Лежит ли по смещению обычная (512 байт) страница B-дерева узлов формата Unicode."""
-        if ib < 564 or ib % PAGE_SIZE or ib + PAGE_SIZE > self.size:
+    def _looks_like_page(self, ib: int, layout: "_Layout") -> bool:
+        """Лежит ли по смещению страница B-дерева узлов в раскладке ``layout``."""
+        if ib < 564 or ib % PAGE_SIZE or ib + layout.page_size > self.size:
             return False
-        page = self._read(ib, PAGE_SIZE)
-        return page[496] == PTYPE_NBT and page[497] == PTYPE_NBT
+        page = self._read(ib, layout.page_size)
+        at = layout.page_trailer_at
+        return page[at] == PTYPE_NBT and page[at + 1] == PTYPE_NBT
 
     # -- страницы B-деревьев -------------------------------------------------
     def _bt_page(self, ib: int, ptype: int) -> tuple:
@@ -405,15 +532,15 @@ class Ndb:
             return cached[1]
         if ib % PAGE_SIZE:
             raise PstReadError(f"страница B-дерева не выровнена ({ib:#x})")
-        page = self._read(ib, PAGE_SIZE)
         lay = self.layout
+        page = self._read(ib, lay.page_size)
         trailer = struct.unpack_from(lay.page_trailer, page, lay.page_trailer_at)
         if trailer[0] != ptype or trailer[1] != ptype:
             raise PstReadError(f"страница {ib:#x}: не страница нужного B-дерева (тип {trailer[0]:#x})")
         crc = trailer[3] if lay.unicode else trailer[4]
         if crc32(page[:lay.page_trailer_at]) != crc:
             self.damaged += 1
-        count, _count_max, entry_size, level = struct.unpack_from("<BBBB", page, lay.page_entries)
+        count, _count_max, entry_size, level = struct.unpack_from(lay.page_meta, page, lay.page_entries)
         if level > MAX_BTREE_DEPTH:
             raise PstReadError(f"страница {ib:#x}: уровень {level}")
         if level:
@@ -424,7 +551,7 @@ class Ndb:
             fmt, need = lay.nbt_entry, lay.nbt_entry_size
         if entry_size < need or count * entry_size > lay.page_entries:
             raise PstReadError(f"страница {ib:#x}: записей {count} по {entry_size} байт")
-        columns: List[list] = [[] for _ in range(4 if not level else 3)]
+        columns: List[list] = [[] for _ in range(len(fmt) - 1)]       # по столбцу на поле записи
         for i in range(count):
             for column, value in zip(columns, struct.unpack_from(fmt, page, i * entry_size)):
                 column.append(value)
@@ -433,7 +560,7 @@ class Ndb:
         parsed = (level, *columns)
         if ptype == PTYPE_BBT:
             self._pages[ib] = (ptype, parsed)
-            if len(self._pages) > PAGE_CACHE:
+            if len(self._pages) > lay.page_cache:
                 self._pages.popitem(last=False)
         return parsed
 
@@ -491,8 +618,9 @@ class Ndb:
         return self._node_data[i], self._node_sub[i], self._node_parent[i]
 
     # -- блоки --------------------------------------------------------------
-    def _find_block(self, bid: int) -> Tuple[int, int]:
-        """Смещение и размер данных блока по его номеру — поиском по B-дереву блоков."""
+    def _find_block(self, bid: int) -> Tuple[int, int, int]:
+        """Смещение блока, размер его данных в файле и размер после распаковки (без сжатия
+        они равны) по номеру блока — поиском по B-дереву блоков."""
         key = bid & ~1                       # младший бит служебный, в индексе его нет
         ib = self.bbt_root
         want_level: Optional[int] = None
@@ -504,7 +632,10 @@ class Ndb:
             if level == 0:
                 i = bisect_left(keys, key)
                 if i < len(keys) and keys[i] == key:
-                    return parsed[2][i], parsed[3][i]
+                    stored = parsed[3][i]
+                    # ноль на месте размера после распаковки — «не сжато» (так его оставляют
+                    # сторонние программы)
+                    return parsed[2][i], stored, (parsed[4][i] or stored) if self.layout.four_k else stored
                 break
             i = bisect_right(keys, key) - 1
             if i < 0:
@@ -514,29 +645,75 @@ class Ndb:
         raise PstReadError(f"блок {bid:#x} не найден в файле")
 
     def block_size(self, bid: int) -> int:
-        return self._find_block(bid)[1]
+        """Размер данных блока — тех, что отдаст :meth:`block` (у сжатого — после распаковки)."""
+        return self._find_block(bid)[2]
+
+    def _decode(self, bid: int, data: bytes) -> bytes:
+        if self.crypt == CRYPT_PERMUTE:
+            return decode_permute(data)
+        return crypt_cyclic(data, bid & 0xFFFFFFFE)
 
     def block(self, bid: int) -> bytes:
-        """Данные одного блока (раскодированные, если файл «зашифрован»)."""
-        ib, cb = self._find_block(bid)
+        """Данные одного блока (распакованные, если блок сжат, и раскодированные, если файл «зашифрован»)."""
+        key = bid & ~1                       # младший бит не значим ни в индексе, ни в кодировании
+        data = self._blocks.get(key)
+        if data is not None:
+            # Блок уже прочитан и сверен. Его повреждение сосчитано тогда же: второй раз не считаем.
+            self._blocks.move_to_end(key)
+            return data
+        data = self._load_block(bid)         # нечитаемый блок сюда не попадает: ошибка — каждый раз
+        self._blocks[key] = data
+        if len(self._blocks) > BLOCK_CACHE:
+            self._blocks.popitem(last=False)
+        return data
+
+    def _load_block(self, bid: int) -> bytes:
+        """Прочитать блок из файла: найти, сверить с трейлером, распаковать, раскодировать."""
+        ib, cb, size = self._find_block(bid)
         lay = self.layout
-        if cb > lay.block_max:
-            raise PstReadError(f"блок {bid:#x}: размер {cb} больше допустимого")
-        total = (cb + lay.block_trailer + 63) & ~63
+        if cb > lay.block_max or size > lay.block_max:
+            raise PstReadError(f"блок {bid:#x}: размер {max(cb, size)} больше допустимого")
+        total = (cb + lay.block_trailer + lay.block_align - 1) & -lay.block_align
         raw = self._read(ib, total)
-        if lay.unicode:
+        t_size = size
+        if lay.four_k:
+            t_cb, _sig, t_crc, t_bid, _unknown, t_size = struct.unpack_from("<HHIQHH", raw, total - 24)
+            t_size = t_size or t_cb
+        elif lay.unicode:
             t_cb, _sig, t_crc, t_bid = struct.unpack_from("<HHIQ", raw, total - 16)
         else:
             t_cb, _sig, t_bid, t_crc = struct.unpack_from("<HHII", raw, total - 12)
         data = raw[:cb]
-        if t_cb != cb or (t_bid & ~1) != (bid & ~1) or crc32(data) != t_crc:
+        sound = t_cb == cb and t_size == size and (t_bid & ~1) == (bid & ~1) and crc32(data) == t_crc
+        if not sound:
             self.damaged += 1
-        if self.crypt and not bid & 2:       # кодируются только блоки данных, служебные — нет
-            if self.crypt == CRYPT_PERMUTE:
-                data = decode_permute(data)
-            else:
-                data = crypt_cyclic(data, bid & 0xFFFFFFFE)
-        return data
+        coded = bool(self.crypt) and not bid & 2     # кодируются только блоки данных, служебные — нет
+        if size != cb:                               # блок сжат; сумма выше — по сжатым байтам
+            return self._unpack(bid, data, size, coded, sound)
+        return self._decode(bid, data) if coded else data
+
+    def _unpack(self, bid: int, packed: bytes, size: int, coded: bool, sound: bool) -> bytes:
+        """Данные сжатого блока. Сжатие бывает только в файлах с большими блоками; сжаты там и
+        блоки данных, и служебные (в образцах — список подузлов).
+
+        Сжатый блок в «зашифрованном» файле в настоящих файлах не встретился: все образцы —
+        без кодирования. По описаниям формата данные сначала кодируются, потом сжимаются,
+        так и читаем; если поток так не распаковался, пробуем обратный порядок. Настоящими
+        файлами НЕ подтверждён ни один из двух порядков: тесты сверяют читатель только с
+        блоками, которые тем же способом собраны в самих тестах.
+        """
+        try:
+            data = inflate(packed, size)
+            return self._decode(bid, data) if coded else data
+        except PstReadError as exc:
+            if coded:
+                try:
+                    return inflate(self._decode(bid, packed), size)
+                except PstReadError:
+                    pass
+            if sound:
+                self.damaged += 1            # суммы сошлись, а блок не читается — тоже повреждение
+            raise PstReadError(f"блок {bid:#x}: {exc}") from None
 
     def _tree_leaves(self, bid: int) -> Iterator[int]:
         """Номера блоков данных дерева по порядку (сам блок, XBLOCK или XXBLOCK)."""
@@ -553,12 +730,15 @@ class Ndb:
         if 8 + count * lay.bid_size > len(top):
             raise PstReadError(f"блок {bid:#x}: ссылок {count} больше, чем помещается")
         children = struct.unpack_from(f"<{count}{lay.bid_fmt}", top, 8)
+        seen: Dict[int, int] = {}            # блок данных → сколько раз он уже назван в этом дереве
         if top[1] == 1:
+            self._count_leaves(bid, children, seen)
             for child in children:
                 if child & 2:
                     raise PstReadError(f"блок {bid:#x}: XBLOCK ссылается на служебный блок")
                 yield child
             return
+        # XXBLOCK. В файлах с большими блоками настоящими файлами не подтверждён — см. _Layout.
         emitted = 0
         for child in children:
             if not child & 2:
@@ -572,10 +752,29 @@ class Ndb:
             emitted += n
             if emitted > MAX_TREE_BLOCKS:
                 raise PstReadError("значение слишком велико")
-            for leaf in struct.unpack_from(f"<{n}{lay.bid_fmt}", mid, 8):
+            leaves = struct.unpack_from(f"<{n}{lay.bid_fmt}", mid, 8)
+            self._count_leaves(child, leaves, seen)
+            for leaf in leaves:
                 if leaf & 2:
                     raise PstReadError(f"блок {child:#x}: XBLOCK ссылается на служебный блок")
                 yield leaf
+
+    @staticmethod
+    def _count_leaves(where: int, leaves, seen: Dict[int, int]) -> None:
+        """Учесть ссылки очередного XBLOCK (``where``) в счёте ``seen`` по всему дереву данных.
+
+        Блок, названный в дереве больше :data:`MAX_LEAF_REPEATS` раз, — ошибка всего значения,
+        и до чтения самих блоков: иначе несколько байт служебного блока заставляли бы читать
+        один и тот же блок тысячи раз — и набирать из него сотни мегабайт.
+        """
+        for leaf in leaves:
+            key = leaf & ~1                  # младший бит не значим: это тот же блок
+            times = seen.get(key, 0) + 1
+            if times > MAX_LEAF_REPEATS:
+                raise PstReadError(f"блок {where:#x}: дерево данных ссылается на блок {key:#x} "
+                                   f"больше {MAX_LEAF_REPEATS} раз")
+            if times > 1 or len(seen) < MAX_TRACKED_LEAVES:
+                seen[key] = times
 
     def tree_blocks(self, bid: int) -> Iterator[bytes]:
         """Содержимое дерева данных — блоками по порядку."""
@@ -619,6 +818,7 @@ class Ndb:
         if top[1] == 0:
             self._sl_entries(bid, top, count, out)
             return out
+        # SIBLOCK. В файлах с большими блоками настоящими файлами не подтверждён — см. _Layout.
         if lay.sub_header + count * lay.si_entry_size > len(top):
             raise PstReadError(f"блок {bid:#x}: записей {count} больше, чем помещается")
         for i in range(count):
@@ -663,6 +863,20 @@ class Heap:
         if sig != 0xEC:
             raise PstReadError("узел не содержит кучу (нет подписи 0xEC)")
         self._maps: Dict[int, tuple] = {}
+        # Как номер HID делится на номер блока и номер кусочка в блоке. В обычных файлах — 11 бит
+        # на кусочек, блок — с 16-го бита. В файлах с большими блоками открытые читатели делят
+        # по-разному: так же или 14 и 13 бит (в блок до 64 КБ помещается больше 2047 кусочков).
+        # Настоящих файлов, где это различимо, нет: в образцах куча всегда из одного блока.
+        #
+        # Поэтому у такой кучи деление определяется по её же номерам. Номер, который читается
+        # только при одном делении, — голос за него. Номер, который при обоих делениях указывает
+        # на разные кусочки, читается по сложившемуся большинству без возражений; если голосов
+        # нет или они спорят — кусок не читается вовсе (PstReadError): отказ лучше подмены данных.
+        # Прежде здесь было «пробуем 14, не нашли — 11, и дальше всё по 11»: так номер девятого
+        # блока при делении 11/16 молча читался как кусочек второго блока.
+        self._splits: Tuple[int, ...] = (11,) if getattr(ndb.layout, "hid_index_bits", 11) == 11 else (11, 14)
+        self._votes = {11: 0, 14: 0}
+        self._wide: Optional[bool] = None       # есть ли блок, где кусочков больше 2047
 
     def _map(self, index: int) -> tuple:
         offsets = self._maps.get(index)
@@ -680,20 +894,106 @@ class Heap:
             self._maps[index] = offsets
         return offsets
 
-    def get(self, hid: int) -> bytes:
-        if hid & 0x1F:
-            raise PstReadError(f"{hid:#x} — не номер в куче")
-        block_index = hid >> 16
-        index = (hid >> 5) & 0x7FF
+    def _locate(self, hid: int, bits: int) -> Optional[Tuple[int, int, int]]:
+        """(блок, начало, конец) кусочка, если номер делится так: ``bits`` бит — номер в блоке."""
+        block_index = hid >> (5 + bits)
+        index = (hid >> 5) & ((1 << bits) - 1)
         if block_index >= len(self.blocks) or index == 0:
-            raise PstReadError(f"номера {hid:#x} нет в куче")
+            return None
         offsets = self._map(block_index)
         if index >= len(offsets):
-            raise PstReadError(f"номера {hid:#x} нет в куче")
-        start, end = offsets[index - 1], offsets[index]
-        if start > end or end > len(self.blocks[block_index]):
-            raise PstReadError(f"кусок кучи {hid:#x} за пределами блока")
+            return None
+        return block_index, offsets[index - 1], offsets[index]
+
+    def _candidates(self, hid: int) -> Tuple[Dict[int, Tuple[int, int, int]], Optional[PstReadError]]:
+        """Где лежит кусочек при каждом возможном делении номера (только места в пределах блока)."""
+        found: Dict[int, Tuple[int, int, int]] = {}
+        error: Optional[PstReadError] = None
+        for bits in self._splits:
+            try:
+                place = self._locate(hid, bits)
+            except PstReadError as exc:           # испорченная карта блока, на который указывает
+                error = error or exc               # лишь одно из делений, другому не мешает
+                continue
+            if place is None:
+                continue
+            block_index, start, end = place
+            if start > end or end > len(self.blocks[block_index]):
+                error = error or PstReadError(f"кусок кучи {hid:#x} за пределами блока")
+                continue
+            found[bits] = place
+        return found, error
+
+    def _settled(self) -> Optional[int]:
+        """Деление, о котором говорят номера кучи (None — не понять)."""
+        if self._wide is None:
+            # Блок, где кусочков больше 2047, при делении 11/16 целиком не адресуется —
+            # значит, куча записана с делением 14/13.
+            self._wide = False
+            for i in range(len(self.blocks)):
+                try:
+                    if len(self._map(i)) - 1 > 2047:
+                        self._wide = True
+                        break
+                except PstReadError:
+                    continue
+        if self._wide:
+            return 14
+        narrow, wide = self._votes[11], self._votes[14]
+        if narrow and not wide:
+            return 11
+        if wide and not narrow:
+            return 14
+        return None
+
+    def vote(self, hids: Iterable[int]) -> None:
+        """Учесть номера, которые ещё будут прочитаны: решающие из них показывают деление."""
+        if len(self._splits) == 1:
+            return
+        for hid in hids:
+            if not hid or hid & 0x1F:
+                continue
+            found, _error = self._candidates(hid)
+            if len(found) == 1:
+                self._votes[next(iter(found))] += 1
+
+    def get(self, hid: int, accept: Optional[Callable[[bytes], bool]] = None) -> bytes:
+        """Кусочек кучи по номеру. ``accept`` — проверка, которой должен отвечать нужный кусочек:
+        ею снимается двусмысленность номера (см. выше), если номера кучи её не сняли."""
+        if hid & 0x1F:
+            raise PstReadError(f"{hid:#x} — не номер в куче")
+        if len(self._splits) == 1:
+            found = self._locate(hid, 11)
+            if found is None:
+                raise PstReadError(f"номера {hid:#x} нет в куче")
+            block_index, start, end = found
+            if start > end or end > len(self.blocks[block_index]):
+                raise PstReadError(f"кусок кучи {hid:#x} за пределами блока")
+            return self.blocks[block_index][start:end]
+        found, error = self._candidates(hid)
+        if not found:
+            raise error or PstReadError(f"номера {hid:#x} нет в куче")
+        places = set(found.values())
+        if len(places) == 1:
+            if len(found) == 1:
+                self._votes[next(iter(found))] += 1
+            block_index, start, end = places.pop()
+            return self.blocks[block_index][start:end]
+        bits = self._settled()
+        if bits is None and accept is not None:
+            fitting = [b for b, (i, start, end) in found.items() if accept(self.blocks[i][start:end])]
+            if len(fitting) == 1:
+                bits = fitting[0]
+                self._votes[bits] += 1
+        if bits is None:
+            raise PstReadError(f"номер {hid:#x} в куче можно прочесть двояко, а по другим её номерам "
+                               f"не понять как — кусок не читается, чтобы не подменить данные")
+        block_index, start, end = found[bits]
         return self.blocks[block_index][start:end]
+
+
+def _bth_header_ok(data: bytes) -> bool:
+    return len(data) >= 8 and data[0] == 0xB5 and data[1] in (2, 4, 8, 16) and 1 <= data[2] <= 32
 
 
 def read_bth(heap: Heap, hid: int, max_records: int = MAX_BTH_RECORDS) -> List[Tuple[bytes, bytes]]:
@@ -705,7 +1005,7 @@ def read_bth(heap: Heap, hid: int, max_records: int = MAX_BTH_RECORDS) -> List[T
     """
     if not hid:
         return []
-    header = heap.get(hid)
+    header = heap.get(hid, _bth_header_ok)
     if len(header) < 8 or header[0] != 0xB5:
         raise PstReadError("не заголовок B-дерева кучи")
     key_size, entry_size, levels = header[1], header[2], header[3]
@@ -724,16 +1024,16 @@ def read_bth(heap: Heap, hid: int, max_records: int = MAX_BTH_RECORDS) -> List[T
         seen.add(node)
         if len(seen) > max_records + 1024:
             raise PstReadError("B-дерево кучи слишком велико")
-        data = heap.get(node)
+        step = key_size + (entry_size if level == 0 else 4)
+        data = heap.get(node, lambda d, step=step: len(d) >= step and len(d) % step == 0)
         if level == 0:
-            step = key_size + entry_size
             for at in range(0, len(data) - step + 1, step):
                 out.append((data[at:at + key_size], data[at + key_size:at + step]))
             if len(out) > max_records:
                 raise PstReadError("B-дерево кучи слишком велико")
             continue
-        step = key_size + 4
         children = [struct.unpack_from("<I", data, at + key_size)[0] for at in range(0, len(data) - step + 1, step)]
+        heap.vote(children)
         for child in reversed(children):            # в стек — в обратном порядке, чтобы ключи шли по возрастанию
             stack.append((child, level - 1))
     return out
@@ -782,6 +1082,9 @@ class PropertyContext:
                 raise PstReadError("неверная запись в наборе свойств")
             ptype, raw = struct.unpack_from("<HI", value, 0)
             self._props[struct.unpack("<H", key)[0]] = (ptype, raw)
+        # номера значений в куче — заранее: по ним видно, как в этой куче делится номер HID
+        self.heap.vote(raw for ptype, raw in self._props.values()
+                       if not (_FIXED.get(ptype) is not None and _FIXED[ptype] <= 4))
 
     def __contains__(self, pid: int) -> bool:
         return pid in self._props
@@ -888,7 +1191,7 @@ def read_table(ndb: Ndb, bid_data: int, bid_sub: int, codec: str = "cp1252",
     heap = Heap(ndb, bid_data)
     if heap.client != 0x7C:
         raise PstReadError("узел не содержит таблицу (подпись кучи не 0x7C)")
-    info = heap.get(heap.root)
+    info = heap.get(heap.root, _tcinfo_ok)
     if len(info) < 22 or info[0] != 0x7C:
         raise PstReadError("неверный заголовок таблицы")
     n_cols = info[1]
@@ -919,13 +1222,28 @@ def read_table(ndb: Ndb, bid_data: int, bid_sub: int, codec: str = "cp1252",
             blocks.append(blk)
         per_block = ndb.layout.block_max // row_size
     else:
-        blocks = [heap.get(hnid_rows)]
+        blocks = [heap.get(hnid_rows, lambda d: len(d) >= row_size and len(d) % row_size == 0)]
         per_block = max(1, len(blocks[0]) // row_size)
+    # В файлах с большими блоками строки лежат в блоке подряд, сколько поместилось (проверено:
+    # матрица в 56 КБ — один блок, строки без разрывов на 8 КБ). Таблицы длиннее одного блока в
+    # образцах не нашлось, поэтому число строк в блоке там не вычисляется, а берётся по длине
+    # каждого блока: при полных блоках это одно и то же.
+    firsts: Optional[List[int]] = None
+    if len(blocks) > 1 and getattr(ndb.layout, "four_k", False):
+        firsts = [0]
+        for blk in blocks:
+            firsts.append(firsts[-1] + len(blk) // row_size)
 
     def row_at(index: int) -> Optional[bytes]:
-        blk_no, in_blk = divmod(index, per_block)
-        if blk_no >= len(blocks):
-            return None
+        if firsts is not None:
+            blk_no = bisect_right(firsts, index) - 1
+            if blk_no >= len(blocks):
+                return None
+            in_blk = index - firsts[blk_no]
+        else:
+            blk_no, in_blk = divmod(index, per_block)
+            if blk_no >= len(blocks):
+                return None
         row = blocks[blk_no][in_blk * row_size:(in_blk + 1) * row_size]
         return row if len(row) == row_size else None
 
@@ -938,6 +1256,19 @@ def read_table(ndb: Ndb, bid_data: int, bid_sub: int, codec: str = "cp1252",
         places = list(range(sum(len(b) // row_size for b in blocks)))
     if len(places) > max_rows:
         raise PstReadError(f"в таблице больше {max_rows} строк")
+    # номера ячеек в куче — заранее: по ним видно, как в этой куче делится номер HID
+    ref_cols = [(at, bit) for tag, at, size, bit in cols
+                if size == 4 and not tag & 0x1000 and _FIXED.get(tag & 0xFFFF) is None]
+    if ref_cols:
+        def cell_refs():
+            for place in places:
+                row = row_at(place)
+                if row is None:
+                    continue
+                for at, bit in ref_cols:
+                    if row[rgib[2] + bit // 8] & (0x80 >> (bit % 8)):
+                        yield struct.unpack_from("<I", row, at)[0]
+        heap.vote(cell_refs())
     out: List[Dict[int, object]] = []
     budget = MAX_TABLE_BYTES                     # на значения ячеек всей таблицы
     for place in places:
@@ -976,12 +1307,16 @@ def read_table(ndb: Ndb, bid_data: int, bid_sub: int, codec: str = "cp1252",
     return out
 
 
+def _tcinfo_ok(data: bytes) -> bool:
+    return len(data) >= 22 and data[0] == 0x7C
+
+
 def table_row_ids(ndb: Ndb, bid_data: int) -> List[int]:
     """Номера строк таблицы (у таблиц папок это NID писем и подпапок) — без чтения самих строк."""
     heap = Heap(ndb, bid_data)
     if heap.client != 0x7C:
         raise PstReadError("узел не содержит таблицу")
-    info = heap.get(heap.root)
+    info = heap.get(heap.root, _tcinfo_ok)
     if len(info) < 22 or info[0] != 0x7C:
         raise PstReadError("неверный заголовок таблицы")
     hid_index = struct.unpack_from("<I", info, 10)[0]
@@ -1153,7 +1488,7 @@ class Message:
 
 
 class PstReader:
-    """Открытый файл .pst: папки и письма.
+    """Открытый файл .pst или .ost: папки и письма.
 
     ``ansi_codec`` — кодировка строк старого файла ANSI для писем, в которых
     она не названа (в Unicode-файле строки хранятся в UTF-16 и она не нужна).
@@ -1186,6 +1521,11 @@ class PstReader:
         return self.ndb.layout.unicode
 
     @property
+    def four_k(self) -> bool:
+        """Файл с большими страницами и блоками (``.ost`` Outlook 2013 и новее)."""
+        return self.ndb.layout.four_k
+
+    @property
     def crypt(self) -> int:
         return self.ndb.crypt
 
@@ -1194,7 +1534,10 @@ class PstReader:
         return self.ndb.damaged
 
     def describe(self) -> str:
-        kind = "Unicode (Outlook 2003 и новее)" if self.unicode else "ANSI (Outlook 97–2002)"
+        if self.four_k:
+            kind = "Unicode с блоками до 64 КБ (Outlook 2013 и новее)"
+        else:
+            kind = "Unicode (Outlook 2003 и новее)" if self.unicode else "ANSI (Outlook 97–2002)"
         if self.ndb.ost:
             kind = "автономная копия ящика Exchange (.ost), " + kind
         crypt = {CRYPT_NONE: "без кодирования", CRYPT_PERMUTE: "сжимаемое шифрование",
@@ -1255,10 +1598,39 @@ class PstReader:
                     return nid
         except PstReadError:
             pass
+        if self.ndb.ost:
+            nid = self._ost_root()
+            if nid:
+                return nid
         for nid in (NID_IPM_SUBTREE, NID_ROOT_FOLDER):
             if self.ndb.has_node(nid):
                 return nid
         raise PstReadError("в файле нет корневой папки")
+
+    def _ost_root(self) -> int:
+        """Корень видимых папок файла .ost или 0, если он не нашёлся.
+
+        В хранилище .ost свойства с корнем нет, а узел 0x8022 там — случайная папка.
+        Ящик лежит так: корень → «Root - Mailbox» → «IPM_SUBTREE» → папки (рядом —
+        «Root - Public» со своим пустым «IPM_SUBTREE» и служебные папки). У нужной
+        папки постоянный номер; если под ним что-то другое, ищем её по имени среди
+        внуков корня — непустую, ту, в которой больше подпапок. Иначе корнем остаётся
+        корень файла: лучше показать служебные папки, чем потерять почту.
+        """
+        def named(nid: int) -> bool:
+            pc = self._folder_pc(nid)
+            return pc is not None and pc.text(0x3001).strip() == OST_IPM_SUBTREE_NAME
+
+        def weight(nid: int) -> Tuple[int, int]:
+            return len(self._subfolders.get(nid, ())), len(self._messages.get(nid, ()))
+
+        if self.ndb.has_node(NID_OST_IPM_SUBTREE) and named(NID_OST_IPM_SUBTREE):
+            return NID_OST_IPM_SUBTREE
+        found = [nid for top in self._subfolders.get(NID_ROOT_FOLDER, ())[:64]
+                 for nid in self._subfolders.get(top, ())[:64] if any(weight(nid)) and named(nid)]
+        if found:
+            return max(found, key=weight)
+        return NID_ROOT_FOLDER if self.ndb.has_node(NID_ROOT_FOLDER) else 0
 
     def folders(self, check: Optional[Callable[[], None]] = None) -> List[Folder]:
         """Все папки с письмами — в порядке обхода дерева; у корня видимых папок путь пуст.

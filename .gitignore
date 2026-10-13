@@ -27,3 +27,9 @@ tmp/
 .vscode/
 build/
 *.egg-info/
+
+# Пакеты для установки без сети (scripts/make_offline_bundle.sh --wheels-dir wheels)
+wheels/
+
+# Рабочие снимки экрана и черновики (не часть проекта)
+Claude outputs/

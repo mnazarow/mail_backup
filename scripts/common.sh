@@ -4,7 +4,20 @@
 #  Файл подключается командой source и сам по себе не запускается.
 #
 #  Ожидает переменные: APP_NAME APP_USER APP_GROUP INSTALL_DIR APP_DIR VENV_DIR
-#  CONFIG_FILE DATA_DIR UNIT_FILE LOG_PREFIX и цвета RED GRN YLW BLU NC.
+#  CONFIG_FILE DATA_DIR UNIT_FILE LOG_PREFIX и цвета RED GRN YLW BLU NC;
+#  для подсказок — SCRIPT_NAME (install.sh | update.sh), для установки без
+#  сети — SRC_DIR (каталог с исходниками новой версии).
+#
+#  Переменные окружения, которые разбираются здесь:
+#    MA_START_TIMEOUT   сколько секунд ждать ответа веб-интерфейса (180)
+#    MA_HEALTH_URL      свой адрес проверки вместо взятого из конфигурации
+#    MA_RELAX_SANDBOX   1 — ослабить защиту службы для контейнеров, где systemd
+#                       не может создать пространства имён (status=226/NAMESPACE)
+#    MA_WHEELS          каталог с пакетами .whl для установки без сети
+#    MA_INDEX_URL       свой индекс пакетов (зеркало PyPI) для установки из сети
+#
+#  Только для тестов (в справке и документации их нет):
+#    MA_FSTAB           файл вместо /etc/fstab — см. unmounted_fstab_mount
 # ============================================================================
 
 # Всё, что создают скрипты (код, окружение, unit, команда mailarchiver), должно
@@ -18,6 +31,23 @@ info(){ echo -e "${BLU}${LOG_PREFIX}${NC} $*" || true; }
 ok(){ echo -e "${GRN}${LOG_PREFIX} ✓${NC} $*" || true; }
 warn(){ echo -e "${YLW}${LOG_PREFIX} ⚠${NC} $*" || true; }
 err(){ echo -e "${RED}${LOG_PREFIX} ✗${NC} $*" >&2 || true; }
+# Продолжение сообщения (пояснение, что делать) — без знака: в выводе проверок
+# на каждую приходится один ✓, ⚠ или ✗, и по знакам ✗ видно число отказов.
+warn_more(){ echo -e "${YLW}${LOG_PREFIX}${NC}     $*" || true; }
+err_more(){ echo -e "${RED}${LOG_PREFIX}${NC}     $*" >&2 || true; }
+
+# Свой индекс пакетов (зеркало PyPI в локальной сети): pip получает его как
+# PIP_INDEX_URL, и этот же адрес опрашивает проверка перед обновлением.
+if [ -n "${MA_INDEX_URL:-}" ]; then export PIP_INDEX_URL="$MA_INDEX_URL"; fi
+
+# Путь без «/» на конце (сам «/» остаётся). С косой чертой проверка «[ -L ]»
+# для ссылки в никуда ложна — и каталог данных на неподключённом диске
+# выглядел просто отсутствующим.
+strip_slash(){
+  local p="$1"
+  while [ "$p" != "/" ] && [ "${p%/}" != "$p" ]; do p="${p%/}"; done
+  printf '%s\n' "$p"
+}
 
 # Команда от имени пользователя службы. Из корня: текущий каталог того, кто
 # запустил скрипт (обычно /root/…), пользователю службы недоступен.
@@ -34,7 +64,9 @@ as_app_user(){
 # с исходниками, и без него «import mailarchiver» брал пакет из текущего
 # каталога, а не установленный, — проверки и номер версии относились не к той
 # установке, которая будет работать.
-venv_py(){ ( trap - ERR; cd / && "$VENV_DIR/bin/python" -I "$@" ); }
+# Ключ -B: проверки идут от root, и без него каждая оставляла бы в окружении
+# свои файлы .pyc — а «update.sh --check» обещает ничего не менять на диске.
+venv_py(){ ( trap - ERR; cd / && "$VENV_DIR/bin/python" -I -B "$@" ); }
 
 installed_version(){
   venv_py -c 'from mailarchiver.version import __version__; print(__version__)' 2>/dev/null || echo '?'
@@ -49,6 +81,228 @@ keep_newest(){
     | sort -r | tail -n +"$((keep + 1))" | while IFS= read -r old; do
         rm -rf "$old"
       done || true
+}
+
+# Сравнить номера версий по числам («1.9.10» новее «1.9.9»): печатает -1, 0 или 1.
+version_cmp(){
+  local i a b
+  local -a x=() y=()
+  IFS=. read -r -a x <<< "$1" || true
+  IFS=. read -r -a y <<< "$2" || true
+  for ((i = 0; i < ${#x[@]} || i < ${#y[@]}; i++)); do
+    a="${x[i]:-0}"; b="${y[i]:-0}"
+    a="${a%%[!0-9]*}"; b="${b%%[!0-9]*}"      # «1rc2» → 1
+    a=$((10#${a:-0})); b=$((10#${b:-0}))
+    if [ "$a" -lt "$b" ]; then echo -1; return 0; fi
+    if [ "$a" -gt "$b" ]; then echo 1; return 0; fi
+  done
+  echo 0
+}
+
+# Номер версии из файла VERSION исходников. Пусто, если файла нет или в нём не
+# номер версии: значение подставляется в имя пакета для pip.
+source_version(){
+  local v=""
+  if [ -f "$SRC_DIR/VERSION" ]; then IFS= read -r v < "$SRC_DIR/VERSION" || true; fi
+  v="${v//[[:space:]]/}"
+  case "$v" in ''|*[!0-9A-Za-z.+!_-]*) v="" ;; esac
+  printf '%s\n' "$v"
+}
+
+# Свободное место (КБ) там, где будет лежать ПУТЬ. Самого каталога может ещё не
+# быть (каталог копий создаётся только перед самим обновлением) — тогда смотрим
+# ближайший существующий каталог выше. Пусто, если узнать не удалось.
+free_kb(){
+  local dir="$1"
+  while [ -n "$dir" ] && [ ! -d "$dir" ]; do
+    case "$dir" in */*) dir="${dir%/*}" ;; *) dir="" ;; esac
+  done
+  { df -Pk "${dir:-/}" 2>/dev/null || true; } | awk 'NR==2{print $4}'
+}
+
+# Тип контейнера (lxc, openvz, docker…). Пусто — не контейнер или узнать нечем.
+container_type(){
+  local kind=""
+  command -v systemd-detect-virt >/dev/null 2>&1 || return 0
+  kind="$(systemd-detect-virt --container 2>/dev/null || true)"
+  if [ -n "$kind" ] && [ "$kind" != "none" ]; then printf '%s\n' "$kind"; fi
+}
+
+# ---------------------------------------------------------------------------
+#  Установка без доступа в интернет
+# ---------------------------------------------------------------------------
+# Каталог с готовыми пакетами (.whl): $MA_WHEELS, иначе wheels/ рядом с
+# исходниками (он есть в автономном архиве — см. scripts/make_offline_bundle.sh).
+# Если каталог найден, pip работает только с ним (--no-index): из пакетов
+# ставятся и библиотеки, и само приложение. Собрать приложение из исходников
+# без сети нельзя — для сборки pip скачивает setuptools.
+WHEELS_DIR=""
+PIP_OFFLINE=()
+
+# has_wheel КАТАЛОГ [НАЧАЛО_ИМЕНИ] — есть ли в каталоге такой пакет.
+has_wheel(){
+  local f
+  for f in "$1"/"${2:-}"*.whl; do
+    if [ -f "$f" ]; then return 0; fi
+  done
+  return 1
+}
+
+count_wheels(){
+  local f n=0
+  for f in "$1"/*.whl; do
+    if [ -f "$f" ]; then n=$((n + 1)); fi
+  done
+  echo "$n"
+}
+
+# Определить каталог пакетов (WHEELS_DIR; пусто — установка из сети).
+# Заданный явно MA_WHEELS обязан существовать и содержать пакеты: молча пойти
+# вместо него в сеть значило бы зависнуть на сервере без интернета уже после
+# остановки службы.
+detect_wheels(){
+  local dir="${MA_WHEELS:-}" abs=""
+  WHEELS_DIR=""; PIP_OFFLINE=()
+  if [ -n "$dir" ]; then
+    if [ ! -d "$dir" ]; then
+      err "Каталог пакетов MA_WHEELS=$dir не найден."
+      err_more "Укажите каталог wheels из автономного архива или уберите переменную (тогда установка пойдёт из сети)."
+      return 1
+    fi
+    abs="$(cd -- "$dir" >/dev/null 2>&1 && pwd)" || abs=""
+    if [ -z "$abs" ]; then
+      err "Каталог пакетов MA_WHEELS=$dir недоступен."
+      return 1
+    fi
+    if ! has_wheel "$abs"; then
+      err "В каталоге MA_WHEELS=$abs нет ни одного пакета .whl."
+      err_more "Соберите автономный архив на машине с интернетом: bash scripts/make_offline_bundle.sh"
+      return 1
+    fi
+    dir="$abs"
+  elif [ -n "${SRC_DIR:-}" ] && [ -d "$SRC_DIR/wheels" ] && has_wheel "$SRC_DIR/wheels"; then
+    dir="$SRC_DIR/wheels"
+  fi
+  if [ -n "$dir" ]; then
+    WHEELS_DIR="$dir"
+    PIP_OFFLINE=(--no-index --find-links "$WHEELS_DIR")
+  fi
+  return 0
+}
+
+# Без сети приложение ставится из своего пакета: он должен лежать в каталоге,
+# и именно той версии, что в файле VERSION исходников.
+require_app_wheel(){
+  local version="$1"
+  if [ -z "$WHEELS_DIR" ]; then return 0; fi
+  if [ -z "$version" ]; then
+    err "Не удалось прочитать номер версии из ${SRC_DIR:-.}/VERSION — без него не выбрать пакет приложения в $WHEELS_DIR."
+    return 1
+  fi
+  if ! has_wheel "$WHEELS_DIR" "mailarchiver-$version-"; then
+    err "В каталоге пакетов $WHEELS_DIR нет пакета приложения mailarchiver-$version-*.whl."
+    err_more "Без сети приложение ставится из него (сборка из исходников требует интернета)."
+    err_more "Соберите автономный архив заново на машине с интернетом: bash scripts/make_offline_bundle.sh"
+    if [ -z "${MA_WHEELS:-}" ]; then
+      err_more "Если пакеты должны загружаться из сети — уберите или переименуйте каталог $WHEELS_DIR."
+    fi
+    return 1
+  fi
+}
+
+# Подходят ли пакеты каталога этому Python — по меткам в именах файлов (cp312,
+# …x86_64). Печатает строки «TAG …» (под что нужны пакеты), «MISFIT …»
+# (библиотеки, для которых подходящего пакета нет) и «SDIST n» (сколько в
+# каталоге архивов исходников). Проверка приблизительная — точно решает pip.
+wheels_report(){   # wheels_report PYTHON КАТАЛОГ
+  ( trap - ERR; cd / && "$1" -I -B - "$2" <<'PY' 2>/dev/null
+import os, re, sys, sysconfig
+
+minor = sys.version_info[1]
+machine = sysconfig.get_platform().rsplit("-", 1)[-1]          # linux-x86_64 → x86_64
+
+
+def python_fits(py, abi):
+    for tag in py.split("."):
+        m = re.fullmatch(r"(py|cp)3(\d*)", tag)
+        if not m:
+            continue
+        kind, want = m.group(1), m.group(2)
+        if not want:
+            return True                                   # py3 — любой Python 3
+        if kind == "py" and int(want) <= minor:
+            return True
+        if kind == "cp" and (int(want) == minor or (int(want) < minor and "abi3" in abi.split("."))):
+            return True
+    return False
+
+
+def platform_fits(plat):
+    return any(tag == "any" or tag.endswith("_" + machine) for tag in plat.split("."))
+
+
+seen, fits, sdists = set(), set(), 0
+for name in sorted(os.listdir(sys.argv[1])):
+    if name.endswith((".tar.gz", ".tar.bz2", ".zip")):
+        sdists += 1
+    if not name.endswith(".whl"):
+        continue
+    parts = name[:-4].split("-")
+    if len(parts) < 5:
+        continue
+    dist = re.sub(r"[-_.]+", "-", parts[0]).lower()       # PyYAML и pyyaml — одна библиотека
+    seen.add(dist)
+    if python_fits(parts[-3], parts[-2]) and platform_fits(parts[-1]):
+        fits.add(dist)
+print("TAG cp3%d %s" % (minor, machine))
+print("MISFIT " + " ".join(sorted(seen - fits)))
+print("SDIST %d" % sdists)
+PY
+  ) || true
+}
+
+# Предупредить, если пакеты каталога похожи на собранные под другой Python.
+# Возвращает 1, если было о чём предупредить.
+check_wheels_fit(){   # check_wheels_fit PYTHON
+  local report tag bad sdists warned=0
+  if [ -z "$WHEELS_DIR" ]; then return 0; fi
+  report="$(wheels_report "$1" "$WHEELS_DIR")"
+  tag="$(printf '%s\n' "$report" | sed -n 's/^TAG //p')"
+  bad="$(printf '%s\n' "$report" | sed -n 's/^MISFIT //p')"
+  sdists="$(printf '%s\n' "$report" | sed -n 's/^SDIST //p')"
+  if [ -n "$bad" ]; then
+    warned=1
+    warn "В каталоге пакетов $WHEELS_DIR нет пакетов под этот Python (${tag:-?}) для: $bad."
+    warn_more "Похоже, архив собран под другую версию Python или другую архитектуру — pip их не установит."
+    warn_more "Соберите архив на машине с той же версией Python и той же архитектурой, что у сервера."
+  fi
+  if [ -n "$sdists" ] && [ "$sdists" != "0" ]; then
+    warned=1
+    warn "В каталоге пакетов $WHEELS_DIR есть архивы исходников ($sdists): без сети pip, скорее всего, не сможет их собрать."
+    warn_more "Соберите архив заново: bash scripts/make_offline_bundle.sh — он кладёт в каталог только готовые пакеты."
+  fi
+  if [ "$warned" = "1" ]; then return 1; fi
+  return 0
+}
+
+# Точная проверка каталога пакетов: пробная установка самим pip (--dry-run) —
+# те же библиотеки из requirements.txt и тот же пакет приложения, что будут
+# ставиться после остановки службы. Ничего не устанавливает и не пишет (кэш и
+# .pyc отключены), сеть не нужна. Метки в именах файлов (check_wheels_fit) —
+# лишь догадка: архив, собранный под другой Python, проходил проверку и
+# отказывал уже при остановленной службе.
+#   0 — pip нашёл всё; 1 — не нашёл (в stdout — последние строки его сообщения);
+#   2 — этот pip не знает --dry-run (он появился в pip 22.2).
+wheels_dry_run(){   # wheels_dry_run ВЕРСИЯ [ФАЙЛ_REQUIREMENTS]
+  local out="" rc=0
+  local -a args=(install --dry-run --quiet --disable-pip-version-check --no-cache-dir "${PIP_OFFLINE[@]}")
+  if [ -n "${2:-}" ] && [ -f "$2" ]; then args+=(-r "$2"); fi
+  args+=("mailarchiver==$1")
+  out="$( ( trap - ERR; cd / && PYTHONDONTWRITEBYTECODE=1 "$VENV_DIR/bin/pip" "${args[@]}" ) 2>&1 )" || rc=$?
+  if [ "$rc" = "0" ]; then return 0; fi
+  case "$out" in *"no such option: --dry-run"*) return 2 ;; esac
+  printf '%s\n' "$out" | tail -n 6
+  return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -74,6 +328,35 @@ normalize_app_perms(){
   fi
 }
 
+# Каталог данных: вернуть службе файлы, у которых владелец не тот (например
+# созданные командами от root). Меняется только то, что нужно: на миллионах
+# писем «chown -R» — долгая пауза, а резервные копии (borg, restic) из-за смены
+# ctime перечитывают весь архив.
+#
+# Содержимое import/ не трогаем: туда администратор кладёт свои файлы для
+# импорта, службе достаточно их читать. Сам каталог import/ остаётся за службой.
+fix_data_owner(){
+  local dir item
+  [ -d "$DATA_DIR" ] || return 0
+  # Каталог данных бывает ссылкой на другой диск: работаем с тем, куда она ведёт
+  # (find в каталог-ссылку не входит, а «chown -h» менял владельца самой ссылки).
+  dir="$(readlink -f -- "$DATA_DIR" 2>/dev/null || true)"
+  if [ -z "$dir" ] || [ ! -d "$dir" ]; then dir="$DATA_DIR"; fi
+  find "$dir" -path "$dir/import/*" -prune -o \
+       \( ! -user "$APP_USER" -o ! -group "$APP_GROUP" \) -exec chown -h "$APP_USER:$APP_GROUP" {} + 2>/dev/null \
+    && return 0
+  # запасной путь (find отказал): то же, по каталогам верхнего уровня
+  chown "$APP_USER:$APP_GROUP" "$dir"
+  for item in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do
+    if [ ! -e "$item" ] && [ ! -L "$item" ]; then continue; fi
+    if [ "$item" = "$dir/import" ]; then
+      chown -h "$APP_USER:$APP_GROUP" "$item"
+    else
+      chown -R -h "$APP_USER:$APP_GROUP" "$item"
+    fi
+  done
+}
+
 # Пользователь службы существует, и от его имени можно выполнять команды.
 check_service_user(){
   if ! id "$APP_USER" >/dev/null 2>&1; then
@@ -86,45 +369,219 @@ check_service_user(){
   fi
 }
 
+# Первый каталог на пути, в который пользователь службы не может войти (пусто —
+# весь путь открыт).
+closed_component(){
+  local rest="${1#/}" part path=""
+  while [ -n "$rest" ]; do
+    part="${rest%%/*}"
+    path="$path/$part"
+    if [ "$rest" = "$part" ]; then rest=""; else rest="${rest#*/}"; fi
+    if ! as_app_user test -x "$path" 2>/dev/null; then printf '%s\n' "$path"; return 0; fi
+  done
+}
+
+# Путь каталога данных занят не каталогом — в том числе ссылкой в никуда.
+data_dir_broken(){ { [ -L "$DATA_DIR" ] || [ -e "$DATA_DIR" ]; } && [ ! -d "$DATA_DIR" ]; }
+
+# Точка монтирования из /etc/fstab, под которой лежит ПУТЬ и которая сейчас не
+# подключена (пусто — такой нет или узнать нечем: нет findmnt).
+#
+# Зачем: неподключённый диск с данными выглядит как пустой каталог root:root —
+# сама точка монтирования. Совет «chown» для него вреден: служба запустится на
+# пустом каталоге и заведёт новую базу поверх точки монтирования.
+#
+# Путь берётся в настоящем виде (ссылки раскрыты; каталога может и не быть) и
+# проверяется снизу вверх: findmnt ищет в fstab только точную точку
+# монтирования, поиск «по каталогу внутри» (--target) для fstab не работает.
+# Дойдя до подключённой файловой системы, останавливаемся: что объявлено выше
+# неё, к пути уже не относится. Из нескольких неподключённых называется верхняя —
+# её нужно подключить первой.
+#
+# MA_FSTAB — файл вместо /etc/fstab. Только для тестов: настоящий fstab они
+# менять не могут.
+unmounted_fstab_mount(){   # unmounted_fstab_mount ПУТЬ
+  local dir found=""
+  local -a tab=()
+  command -v findmnt >/dev/null 2>&1 || return 0
+  if [ -n "${MA_FSTAB:-}" ]; then tab=(--tab-file "$MA_FSTAB"); fi
+  dir="$(readlink -m -- "$1" 2>/dev/null || true)"
+  case "$dir" in /*) ;; *) return 0 ;; esac
+  while [ -n "$dir" ] && [ "$dir" != "/" ]; do
+    if findmnt --kernel --noheadings --output TARGET --mountpoint "$dir" >/dev/null 2>&1; then break; fi
+    if findmnt --fstab ${tab[@]+"${tab[@]}"} --noheadings --output TARGET --mountpoint "$dir" >/dev/null 2>&1; then
+      found="$dir"
+    fi
+    dir="${dir%/*}"
+  done
+  if [ -n "$found" ]; then printf '%s\n' "$found"; fi
+  return 0
+}
+
+# Каталог данных доступен службе и не пуст, но лежит под точкой монтирования,
+# которая не подключена: служба работает с тем, что на диске под ней. Это не
+# отказ (возможно, строка в fstab просто устарела), но сказать о нём нужно.
+warn_data_dir_under_mount(){   # warn_data_dir_under_mount ТОЧКА
+  warn "Каталог данных $DATA_DIR лежит под точкой монтирования $1 из /etc/fstab, а она сейчас не подключена."
+  warn_more "Служба работает с тем, что лежит на диске под ней. Если данные должны быть на отдельном диске —"
+  warn_more "остановите службу, подключите его (mount \"$1\") и выясните, какая из двух копий данных настоящая."
+  warn_more "Если отдельного диска больше нет — уберите строку о $1 из /etc/fstab."
+}
+
+# Каталог данных: он есть, это каталог, служба может в него войти и писать, и
+# он не лежит на неподключённом диске. После вызова DATA_DIR_BAD=1, если
+# проверка не пройдена.
+#
+# Отдельно разбирается ссылка, ведущая в никуда. Так выглядит каталог данных,
+# вынесенный на другой диск, когда этот диск не подключён (после перезагрузки,
+# сбоя монтирования). С ним не запустится никакая версия: каталог указан в
+# ReadWritePaths, и systemd завершает службу со status=226/NAMESPACE. Раньше
+# скрипт этого не замечал («[ -d ]» для такой ссылки ложно, и проверка молча
+# пропускалась): обновление доходило до пробного импорта, откатывалось — и
+# прежняя версия тоже не поднималась, уже без понятной причины.
+#
+# Пустой каталог — не отказ (так выглядит новая установка), если только он не
+# под неподключённой точкой монтирования из /etc/fstab.
+DATA_DIR_BAD=0
+DATA_DIR_FROM=""       # откуда взят путь («из переменной MA_DATA_DIR», «из конфигурации …») — для сообщений
+check_data_dir(){
+  local state="" mp="" real="" hop="" dir="" shown=""
+  DATA_DIR_BAD=0
+  if [ -L "$DATA_DIR" ] && [ ! -e "$DATA_DIR" ]; then state="dangling"
+  elif [ -e "$DATA_DIR" ] && [ ! -d "$DATA_DIR" ]; then state="notdir"
+  elif [ ! -e "$DATA_DIR" ]; then state="missing"
+  elif ! as_app_user test -x "$DATA_DIR" 2>/dev/null; then state="closed"
+  elif ! as_app_user test -w "$DATA_DIR" 2>/dev/null; then state="readonly"
+  elif [ -z "$(find -H "$DATA_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true)" ]; then state="empty"
+  else return 0
+  fi
+  if [ "$state" != "notdir" ]; then mp="$(unmounted_fstab_mount "$DATA_DIR")"; fi
+  if [ "$state" = "empty" ] && [ -z "$mp" ]; then return 0; fi
+  DATA_DIR_BAD=1
+  real="$(readlink -m -- "$DATA_DIR" 2>/dev/null || true)"      # куда путь ведёт на самом деле
+  shown="$DATA_DIR"
+  if [ -n "$real" ] && [ "$real" != "$DATA_DIR" ]; then shown="$DATA_DIR ($real)"; fi
+
+  # Диск не подключён — причина в нём, каким бы ни выглядел каталог. Советов
+  # «создайте каталог» и «смените владельца» здесь быть не должно.
+  if [ -n "$mp" ]; then
+    err "Каталог данных $shown лежит на неподключённом диске — файловая система $mp из /etc/fstab не подключена: mount \"$mp\""
+    case "$state" in
+      dangling) err_more "(сейчас $DATA_DIR — ссылка на каталог, которого нет)" ;;
+      missing)  err_more "(сейчас каталога нет)" ;;
+      empty)    err_more "(сейчас каталог пуст: это место под точкой монтирования, а не данные)" ;;
+      *)        err_more "(сейчас служба — пользователь $APP_USER — не может в него войти или писать: это место под точкой монтирования, а не данные)" ;;
+    esac
+    err_more "Подключите её и убедитесь, что данные на месте: ls \"$DATA_DIR/\"   — затем: systemctl reset-failed $APP_NAME; systemctl start $APP_NAME"
+    err_more "Владельца и права не меняйте, каталог не создавайте: служба начала бы работу с пустой базой на месте точки монтирования."
+    return 1
+  fi
+
+  case "$state" in
+    dangling)
+      # конечная цель (ссылка может вести через другие ссылки или быть относительной)
+      hop="$(readlink -- "$DATA_DIR" 2>/dev/null || true)"
+      shown="${real:-${hop:-другой каталог}}"
+      if [ -n "$hop" ] && [ "$hop" != "$shown" ]; then shown="$shown (в самой ссылке записано: $hop)"; fi
+      err "Каталог данных $DATA_DIR — ссылка на $shown, а такого каталога сейчас нет."
+      err_more "Обычно это значит, что не подключён диск, на котором лежат данные."
+      err_more "Проверьте: findmnt; lsblk; grep -v '^#' /etc/fstab   — и подключите диск (mount -a)."
+      err_more "Убедитесь, что данные на месте: ls \"$DATA_DIR/\"   — затем: systemctl reset-failed $APP_NAME; systemctl start $APP_NAME"
+      err_more "Пока каталога нет, служба не запустится ни в какой версии."
+      ;;
+    notdir)
+      err "Каталог данных $DATA_DIR — не каталог ($(stat -c '%F' "$DATA_DIR" 2>/dev/null || echo '?'))."
+      err_more "Если данные лежат в другом месте — задайте MA_DATA_DIR."
+      ;;
+    missing)
+      # без слов «указан в ReadWritePaths»: unit-файла может не быть вовсе
+      err "Нет каталога данных $shown: без него служба не запустится."
+      if [ -n "$DATA_DIR_FROM" ]; then err_more "Путь взят $DATA_DIR_FROM."; fi
+      if [ "${SCRIPT_NAME:-}" = "update.sh" ]; then
+        # Служба уже установлена — данные были здесь. Совет создать каталог тут
+        # вреден: если диск подключается не через /etc/fstab (unit .mount, autofs,
+        # вручную), служба, которую systemd перезапускает каждые 5 секунд, тут же
+        # поднялась бы на пустом каталоге с новой базой.
+        err_more "Служба уже установлена, значит данные были в нём. Если они на отдельном диске или сетевом"
+        err_more "ресурсе — подключите его (findmnt; lsblk; mount -a) и убедитесь, что данные на месте: ls \"$DATA_DIR/\""
+        err_more "Если данные в другом каталоге — задайте MA_DATA_DIR. Каталог не создавайте: служба начала бы работу с пустой базой."
+      else
+        err_more "Если данные лежат на отдельном диске — проверьте, что он подключён (findmnt; mount -a)."
+        err_more "Если в другом каталоге — задайте MA_DATA_DIR. Пустой каталог для новой установки:"
+        err_more "  install -d -o $APP_USER -g $APP_GROUP -m 750 \"$DATA_DIR\""
+      fi
+      ;;
+    closed|readonly)
+      # Обновление, а каталог пуст и закрыт для службы: так выглядит точка
+      # монтирования диска или ресурса, который не подключён (и не описан в
+      # /etc/fstab — иначе сработала бы ветка выше). Совет «chown» здесь вреден.
+      if [ "${SCRIPT_NAME:-}" = "update.sh" ] && \
+         [ -z "$(find -H "$DATA_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true)" ]; then
+        err "Каталог данных $shown пуст, и служба (пользователь $APP_USER) не может в него писать."
+        err_more "Так выглядит точка монтирования неподключённого диска или сетевого ресурса: служба уже"
+        err_more "установлена, значит данные были здесь. Подключите его (findmnt; lsblk; mount -a) и проверьте: ls \"$DATA_DIR/\""
+        err_more "Владельца и права не меняйте, пока не убедитесь, что данные на месте: служба начала бы работу с пустой базой."
+        return 1
+      fi
+      ;;&
+    closed)
+      # Какой каталог закрыт: сначала по пути, как он записан (ссылка может
+      # лежать в закрытом каталоге), затем по тому, куда он ведёт.
+      dir="$(closed_component "$DATA_DIR")"
+      if [ "$dir" = "$DATA_DIR" ] && [ -n "$real" ] && [ "$real" != "$DATA_DIR" ]; then
+        dir="$(closed_component "$real")"
+      fi
+      err "Служба (пользователь $APP_USER) не может войти в каталог данных $shown."
+      if [ -z "$dir" ]; then
+        err_more "Проверьте права на него и на каталоги выше: namei -l \"$DATA_DIR\""
+      elif [ "$dir" = "$DATA_DIR" ] || [ "$dir" = "$real" ]; then
+        err_more "Он закрыт для неё (права $(stat -c '%A %U:%G' "$dir" 2>/dev/null || echo '?'))."
+        err_more "Исправьте: chown $APP_USER:$APP_GROUP \"$dir\" && chmod 750 \"$dir\""
+      else
+        err_more "Закрыт каталог $dir (права $(stat -c '%A %U:%G' "$dir" 2>/dev/null || echo '?'))."
+        err_more "Исправьте: chmod o+x \"$dir\"  — и запустите скрипт заново."
+      fi
+      ;;
+    *)
+      err "Служба (пользователь $APP_USER) не может писать в каталог данных $shown."
+      err_more "Исправьте: chown $APP_USER:$APP_GROUP \"${real:-$DATA_DIR}\" && chmod 750 \"${real:-$DATA_DIR}\""
+      ;;
+  esac
+  return 1
+}
+
 # Служба должна суметь войти в каталог (по умолчанию — свой рабочий), запустить
 # свой исполняемый файл, прочитать конфигурацию и писать в каталог данных.
-# systemd об отказе сообщает только в журнале (status=200/CHDIR, 203/EXEC) —
-# проверяем заранее и называем причину сами.
+# systemd об отказе сообщает только в журнале (status=200/CHDIR, 203/EXEC,
+# 226/NAMESPACE) — проверяем заранее и называем причину сами.
 #   check_service_access            — всё, перед запуском службы;
 #   check_service_access КАТАЛОГ    — только вход в каталог, конфигурация и данные
 #                                     (до остановки службы, пока ничего не тронуто).
 check_service_access(){
-  local target="${1:-$APP_DIR}" bad=0 rest part path="" dir=""
+  local target="${1:-$APP_DIR}" bad=0 dir=""
   check_service_user || return 1
   if ! as_app_user test -x "$target" 2>/dev/null; then
     bad=1
     err "Служба (пользователь $APP_USER) не может войти в каталог $target."
-    # какой именно каталог на пути закрыт
-    rest="${target#/}"
-    while [ -n "$rest" ]; do
-      part="${rest%%/*}"
-      path="$path/$part"
-      if [ "$rest" = "$part" ]; then rest=""; else rest="${rest#*/}"; fi
-      if ! as_app_user test -x "$path" 2>/dev/null; then dir="$path"; break; fi
-    done
+    dir="$(closed_component "$target")"      # какой именно каталог на пути закрыт
     if [ -n "$dir" ]; then
-      err "Закрыт каталог $dir (права $(stat -c '%A %U:%G' "$dir" 2>/dev/null || echo '?'))."
-      err "Исправьте: chmod o+x \"$dir\"  — и запустите скрипт заново."
+      err_more "Закрыт каталог $dir (права $(stat -c '%A %U:%G' "$dir" 2>/dev/null || echo '?'))."
+      err_more "Исправьте: chmod o+x \"$dir\"  — и запустите скрипт заново."
+    else
+      err_more "Проверьте права на него и на каталоги выше: namei -l \"$target\""
     fi
   elif [ -z "${1:-}" ] && ! as_app_user test -x "$VENV_DIR/bin/mailarchiver" 2>/dev/null; then
     bad=1
     err "Служба (пользователь $APP_USER) не может запустить $VENV_DIR/bin/mailarchiver — недоступно окружение."
-    err "Проверьте права: ls -ld \"$INSTALL_DIR\" \"$VENV_DIR\" \"$VENV_DIR/bin\""
+    err_more "Проверьте права: ls -ld \"$INSTALL_DIR\" \"$VENV_DIR\" \"$VENV_DIR/bin\""
   fi
   if [ "$bad" = "0" ] && [ -f "$CONFIG_FILE" ] && ! as_app_user test -r "$CONFIG_FILE" 2>/dev/null; then
     bad=1
     err "Служба (пользователь $APP_USER) не может прочитать конфигурацию $CONFIG_FILE."
-    err "Исправьте: chown root:$APP_GROUP \"$CONFIG_FILE\" && chmod 640 \"$CONFIG_FILE\""
+    err_more "Исправьте: chown root:$APP_GROUP \"$CONFIG_FILE\" && chmod 640 \"$CONFIG_FILE\""
   fi
-  if [ "$bad" = "0" ] && [ -d "$DATA_DIR" ] && ! as_app_user test -w "$DATA_DIR" 2>/dev/null; then
+  if [ "$bad" = "0" ] && ! check_data_dir; then
     bad=1
-    err "Служба (пользователь $APP_USER) не может писать в каталог данных $DATA_DIR."
-    err "Исправьте: chown $APP_USER:$APP_GROUP \"$DATA_DIR\" && chmod 750 \"$DATA_DIR\""
   fi
   return "$bad"
 }
@@ -181,17 +638,235 @@ render_unit(){
   chmod 644 "$UNIT_FILE"
 }
 
+# ---------------------------------------------------------------------------
+#  Ослабленная защита службы (MA_RELAX_SANDBOX=1)
+# ---------------------------------------------------------------------------
+# В непривилегированных контейнерах LXC/OpenVZ без вложенности (nesting) systemd
+# не может создать для службы пространство имён монтирования, и она завершается
+# со status=226/NAMESPACE. Ослаблять защиту молча нельзя — это решение
+# администратора: только MA_RELAX_SANDBOX=1 создаёт дополнение к unit-файлу,
+# которое отключает настройки, требующие пространств имён или правил доступа к
+# устройствам. Сам unit не меняется: чтобы вернуть полную защиту, достаточно
+# удалить один файл.
+RELAX_CREATED=0        # дополнение создано этим запуском (при откате — убрать)
+RELAX_DIR_CREATED=0    # и каталог для него тоже
+relax_dropin(){ printf '%s\n' "$UNIT_FILE.d/50-relax-sandbox.conf"; }
+
+# Содержимое дополнения. Список должен покрывать все настройки шаблона
+# systemd/mailarchiver.service, которым нужно пространство имён (монтирования,
+# UTS) или правила доступа к устройствам, — за этим следит тест
+# test_relax_dropin_covers_unit_template.
+relax_sandbox_conf(){
+  cat <<EOF
+# MailArchiver — ослабленная защита службы.
+# Файл создан скриптом установки/обновления по запросу MA_RELAX_SANDBOX=1.
+#
+# Зачем: в контейнерах LXC/OpenVZ без вложенности (nesting) systemd не может
+# создать для службы отдельное пространство имён, и она не запускается
+# (status=226/NAMESPACE). Этот файл отключает те настройки защиты из
+# $APP_NAME.service, которым пространства имён нужны.
+#
+# Что остаётся: служба по-прежнему работает от непривилегированного
+# пользователя ($APP_USER), не может получить новые привилегии
+# (NoNewPrivileges), её файлы создаются с UMask=0077.
+#
+# При обновлениях файл не перезаписывается. Вернуть полную защиту (например
+# после включения вложенности у контейнера):
+#   sudo rm "$1"
+#   sudo systemctl daemon-reload
+#   sudo systemctl restart $APP_NAME
+[Service]
+ProtectProc=default
+PrivateDevices=no
+ProtectKernelTunables=no
+ProtectKernelModules=no
+ProtectKernelLogs=no
+ProtectControlGroups=no
+ProtectClock=no
+ProtectHostname=no
+PrivateTmp=no
+ProtectSystem=no
+ProtectHome=no
+ReadWritePaths=
+RestrictNamespaces=no
+EOF
+}
+
+# Дополнение действует: по его пути лежит непустой файл (или ссылка на такой).
+# Ссылка на /dev/null и пустой файл — способ systemd ОТКЛЮЧИТЬ дополнение.
+relax_dropin_active(){ [ -f "$1" ] && [ -s "$1" ]; }
+
+# Вызывается перед daemon-reload. Если по пути дополнения уже что-то есть —
+# файл, ссылка (в том числе на /dev/null), что угодно, — не трогаем: это решение
+# администратора. Запись «сквозь» ссылку меняла бы чужой файл и права на нём, а
+# откат потом удалял бы саму ссылку. Без MA_RELAX_SANDBOX=1 ничего не создаём,
+# но о действующем ослаблении напоминаем — оно не должно забыться.
+apply_relax_sandbox(){
+  local file dir what=""
+  file="$(relax_dropin)"; dir="${file%/*}"
+  if [ -e "$file" ] || [ -L "$file" ]; then
+    if [ -L "$file" ]; then what="ссылка на $(readlink -- "$file" 2>/dev/null || echo '?')"
+    elif [ ! -f "$file" ]; then what="$(stat -c '%F' "$file" 2>/dev/null || echo 'не файл')"
+    elif [ ! -s "$file" ]; then what="пустой файл"
+    fi
+    if relax_dropin_active "$file"; then
+      if [ "${MA_RELAX_SANDBOX:-0}" = "1" ]; then
+        info "Ослабленная защита службы уже включена: $file${what:+ ($what)} — файл оставлен как есть."
+      else
+        warn "Служба работает с ослабленной защитой: действует дополнение $file${what:+ ($what)}."
+        warn_more "Вернуть полную защиту: удалите этот файл, затем systemctl daemon-reload && systemctl restart $APP_NAME."
+      fi
+    elif [ "${MA_RELAX_SANDBOX:-0}" = "1" ]; then
+      warn "MA_RELAX_SANDBOX=1: по пути дополнения $file уже лежит $what — оставлено как есть, защита службы НЕ ослаблена."
+      warn_more "Так дополнение отключают намеренно. Чтобы ослабить защиту, удалите его (rm \"$file\") и запустите скрипт заново."
+    fi
+    return 0
+  fi
+  case "${MA_RELAX_SANDBOX:-0}" in
+    1) ;;
+    ''|0) return 0 ;;
+    *) warn "MA_RELAX_SANDBOX=${MA_RELAX_SANDBOX}: значение не понято, защита службы не меняется."
+       warn_more "Чтобы ослабить её, задайте MA_RELAX_SANDBOX=1; чтобы оставить как есть — уберите переменную."
+       return 0 ;;
+  esac
+  if [ ! -d "$dir" ]; then
+    RELAX_DIR_CREATED=1      # до mkdir: сигнал между двумя командами не оставит пустой каталог
+    mkdir -p "$dir"
+    chmod 755 "$dir"
+  fi
+  RELAX_CREATED=1          # до записи: оборванный файл откат тоже уберёт
+  relax_sandbox_conf "$file" > "$file"
+  chmod 644 "$file"
+  warn "MA_RELAX_SANDBOX=1: защита службы ослаблена дополнением $file"
+  warn_more "(отключены настройки systemd, которым нужны пространства имён; служба по-прежнему работает от пользователя $APP_USER)."
+}
+
+# Откат: убрать то, что создал этот запуск, — дополнение и каталог для него
+# (каждое по своей отметке: каталог мог быть создан, а файл ещё нет).
+# 0 — убрано дополнение (нужен daemon-reload), 1 — убирать его не пришлось.
+# Вызывать только в условии if.
+remove_created_relax_sandbox(){
+  local file dir removed=1
+  file="$(relax_dropin)"; dir="${file%/*}"
+  if [ "$RELAX_CREATED" = "1" ]; then
+    rm -f "$file" 2>/dev/null || true
+    RELAX_CREATED=0
+    removed=0
+    warn "Дополнение с ослабленной защитой, созданное этим запуском, убрано: $file"
+  fi
+  if [ "$RELAX_DIR_CREATED" = "1" ]; then
+    rmdir "$dir" 2>/dev/null || true      # не пуст — значит, в нём уже чужие файлы
+    RELAX_DIR_CREATED=0
+  fi
+  return "$removed"
+}
+
+# Совет про MA_RELAX_SANDBOX — продолжение сообщения об отказе 226/NAMESPACE.
+relax_sandbox_advice(){
+  local file
+  file="$(relax_dropin)"
+  if relax_dropin_active "$file"; then
+    err_more "Ослабленная защита уже включена ($file), но служба всё равно завершается с этой ошибкой."
+    err_more "Проверьте, что файл действует и в нём отключены все настройки Protect*/Private*: systemctl cat $APP_NAME"
+    err_more "(если файл правили вручную — удалите его и повторите с MA_RELAX_SANDBOX=1). Иначе включите вложенность (nesting) у контейнера."
+    return 0
+  fi
+  if [ -e "$file" ] || [ -L "$file" ]; then
+    err_more "Дополнение $file есть, но отключено (пустой файл или ссылка на /dev/null): удалите его перед повтором."
+  fi
+  err_more "Повторите с MA_RELAX_SANDBOX=1:   sudo MA_RELAX_SANDBOX=1 bash scripts/${SCRIPT_NAME:-update.sh}"
+  err_more "или включите вложенность у контейнера (Proxmox: pct set <ID> --features nesting=1) и повторите как обычно."
+  err_more "MA_RELAX_SANDBOX=1 создаёт дополнение $file: оно отключает настройки защиты systemd,"
+  err_more "которым нужны пространства имён (ProtectSystem, ProtectHome, PrivateTmp, PrivateDevices, ProtectProc, ProtectKernel* и др.)."
+  err_more "Служба по-прежнему работает от непривилегированного пользователя $APP_USER."
+}
+
+# Что делать при status=226/NAMESPACE — по тому, что видно в журнале ($1) и на
+# этом сервере. Строки — продолжение сообщения «Причина: …». Причину systemd
+# пишет в конце строки «Failed to set up mount namespacing: …» или «Failed at
+# step NAMESPACE spawning …: …»:
+#   «No such file or directory» — нет каталога из ReadWritePaths (каталога
+#       данных): чаще всего он ссылка на диск, который не подключён. Сам путь
+#       называет только systemd 246 и новее; RHEL 8 и Debian 10 пишут строку без
+#       пути — по ней нельзя советовать «это контейнер»;
+#   «Permission denied» — контейнер без вложенности не даёт создать
+#       пространство имён;
+#   иное — причина неясна, называем обе.
+# Совет про MA_RELAX_SANDBOX — только при «Permission denied» или если сервер
+# действительно контейнер.
+service_namespace_hint(){
+  local lines="" reason="other" missing="" mp="" kind=""
+  kind="$(container_type)"
+  lines="$(printf '%s\n' "${1:-}" \
+    | grep -E 'Failed to set up mount namespacing|Failed at step NAMESPACE' | tail -n 2 || true)"
+  case "$lines" in
+    *"No such file or directory"*) reason="missing" ;;
+    *"Permission denied"*|*"Operation not permitted"*) reason="denied" ;;
+  esac
+  if [ "$reason" = "missing" ]; then
+    missing="$(printf '%s\n' "$lines" \
+      | sed -n 's/.*Failed to set up mount namespacing: \(.*\): No such file or directory.*/\1/p' | tail -n 1)"
+    missing="${missing#/run/systemd/unit-root}"     # так путь выглядит изнутри собираемого окружения
+    missing="${missing/#\/.\//\/}"                  # а так — «/./каталог» — снаружи
+    missing="$(strip_slash "$missing")"
+    # Названный каталог на месте (/proc, /dev…) — значит, не хватает не его:
+    # окружение не собралось по другой причине.
+    if [ -n "$missing" ] && [ -d "$missing" ]; then reason="other"; missing=""; fi
+  fi
+
+  if [ "$reason" = "missing" ]; then
+    if [ -n "$missing" ]; then
+      err_more "systemd не нашёл каталог $missing — он нужен службе (ReadWritePaths), и без него она не запускается."
+    else
+      err_more "systemd не нашёл один из каталогов, нужных службе (ReadWritePaths), — без него она не запускается."
+    fi
+    if check_data_dir; then
+      if [ -n "$missing" ]; then mp="$(unmounted_fstab_mount "$missing")"; fi
+      if [ -n "$mp" ]; then
+        err_more "Файловая система $mp из /etc/fstab не подключена: mount \"$mp\""
+      fi
+      err_more "Каталог данных $DATA_DIR на месте: сравните каталоги из ReadWritePaths (systemctl cat $APP_NAME) с тем, что есть на диске."
+      if [ -n "$kind" ]; then
+        err_more "Сервер — контейнер ($kind). Если все каталоги на месте, дело в нём:"
+        relax_sandbox_advice
+      fi
+    fi
+  elif [ "$reason" = "denied" ]; then
+    err_more "Так бывает в контейнерах LXC/OpenVZ без вложенности (nesting): systemd там не может создать пространство имён для службы."
+    relax_sandbox_advice
+  elif check_data_dir; then
+    err_more "Причин у такого отказа обычно две:"
+    err_more "  — нет каталога из ReadWritePaths (например не подключён диск с данными): сравните systemctl cat $APP_NAME с тем, что есть на диске;"
+    err_more "  — сервер — контейнер LXC/OpenVZ без вложенности (nesting), и systemd не может создать пространство имён для службы."
+    if [ -n "$kind" ]; then
+      err_more "Этот сервер — контейнер ($kind):"
+      relax_sandbox_advice
+    fi
+  fi
+  err_more "См. docs/ru/11-troubleshooting.md, строка «status=226/NAMESPACE»."
+}
+
 # Значение свойства службы (пусто, если эта версия systemd такого не знает).
 svc_prop(){ { systemctl show "$APP_NAME" -p "$1" 2>/dev/null || true; } | sed -n "s/^$1=//p" | head -n 1; }
 
-# Значение из конфигурации так, как его прочитает служба: db_path | health_url.
+# Значение из конфигурации так, как его прочитает служба: db_path | data_dir |
+# health_url. Пусто, если установленная версия не ответила (или она старая и
+# такого значения не знает), — вызывающий обходится без него.
+# Относительные пути конфигурации (data_dir: "data") служба считает от своего
+# рабочего каталога — от него же считаем и здесь, иначе база «не находилась».
 cfg_value(){
-  venv_py - "$CONFIG_FILE" "$1" <<'PY' 2>/dev/null || true
-import sys
+  venv_py - "$CONFIG_FILE" "$1" "${APP_DIR:-}" <<'PY' 2>/dev/null || true
+import os, sys
+try:
+    os.chdir(sys.argv[3])
+except OSError:
+    pass
 from mailarchiver.config import load_config
 cfg = load_config(sys.argv[1], create_dirs=False)
 if sys.argv[2] == "db_path":
     print(cfg.db_path)
+elif sys.argv[2] == "data_dir":
+    print(cfg.data_dir)
 else:
     host = str(cfg.server.get("host") or "127.0.0.1").strip()
     port = int(cfg.server.get("port") or 8493)
@@ -225,6 +900,70 @@ sys.exit(1)
 PY
 }
 http_ok(){ http_probe "$1" >/dev/null; }
+
+# Адрес индекса пакетов, к которому обратится pip: MA_INDEX_URL (он же
+# PIP_INDEX_URL), иначе настройка pip, иначе PyPI.
+pip_index_url(){
+  local url="${PIP_INDEX_URL:-}" conf=""
+  if [ -z "$url" ]; then
+    # «pip config list», а не «get»: get не видит файл, заданный в PIP_CONFIG_FILE
+    conf="$( ( trap - ERR; cd / && PYTHONDONTWRITEBYTECODE=1 "$VENV_DIR/bin/pip" --disable-pip-version-check config list ) 2>/dev/null || true)"
+    url="$(printf '%s\n' "$conf" | sed -n "s/^install\.index-url=//p" | tail -n 1)"
+    [ -n "$url" ] || url="$(printf '%s\n' "$conf" | sed -n "s/^global\.index-url=//p" | tail -n 1)"
+    url="${url#[\"\']}"; url="${url%[\"\']}"
+  fi
+  printf '%s\n' "${url:-https://pypi.org/simple/}"
+}
+
+# 0 — индекс пакетов отвечает (любым ответом HTTP: и 403, и 404 значат, что
+# связь есть); иначе в stdout — причина одной строкой. В отличие от http_probe
+# прокси из окружения используется — через него же пойдёт pip. Сертификат не
+# проверяется: вопрос только «есть ли связь», ничего не загружается, а наборы
+# доверенных сертификатов у Python и у pip разные. Ждёт не дольше 8 секунд
+# (вместе с поиском имени в DNS, на который таймаут сокета не действует).
+index_probe(){
+  venv_py - "$1" <<'PY' 2>/dev/null
+import os, ssl, sys, threading, urllib.error, urllib.request
+from urllib.parse import urlsplit, urlunsplit
+
+try:
+    parts = urlsplit(sys.argv[1])
+    if parts.scheme not in ("http", "https"):
+        os._exit(0)                     # каталог или file:// — сеть не нужна
+    host = parts.hostname or ""
+    netloc = ("[%s]" % host if ":" in host else host) + (":%d" % parts.port if parts.port else "")
+    url = urlunsplit((parts.scheme, netloc, parts.path or "/", parts.query, ""))   # без имени и пароля
+except ValueError as exc:
+    print("адрес не разобран: %s" % exc)
+    sys.exit(1)
+result = []
+
+
+def ask():
+    try:
+        https = urllib.request.HTTPSHandler(context=ssl._create_unverified_context())
+        request = urllib.request.Request(url, method="HEAD")
+        with urllib.request.build_opener(https).open(request, timeout=5):
+            pass
+        result.append("")
+    except urllib.error.HTTPError:
+        result.append("")
+    except Exception as exc:  # noqa: BLE001
+        result.append(str(getattr(exc, "reason", None) or exc) or type(exc).__name__)
+
+
+threading.Thread(target=ask, daemon=True).start()
+for _ in range(80):
+    if result:
+        break
+    threading.Event().wait(0.1)
+reason = result[0] if result else "нет ответа за 8 с"
+if reason:
+    print(reason)
+sys.stdout.flush()
+os._exit(1 if reason else 0)
+PY
+}
 
 # Дождаться, пока служба поднимется и ответит на /health.
 #   0 — работает;
@@ -270,6 +1009,12 @@ wait_service_up(){
   done
 }
 
+# Последние N строк журнала службы с отступом (пусто, если журнала нет).
+journal_tail(){
+  command -v journalctl >/dev/null 2>&1 || return 0
+  { journalctl -q -u "$APP_NAME" -n "${1:-8}" --no-pager 2>/dev/null || true; } | sed 's/^/      /'
+}
+
 # Причина отказа — прямо в выводе скрипта: последние строки журнала службы и,
 # если причина узнаётся, что с ней делать.
 show_service_failure(){
@@ -302,8 +1047,7 @@ show_service_failure(){
       err "Причина: в системе нет пользователя или группы службы ($APP_USER:$APP_GROUP)." ;;
     *"226/NAMESPACE"*)
       err "Причина: systemd не смог собрать защищённое окружение службы (status=226/NAMESPACE)."
-      err "Так бывает в контейнерах LXC/OpenVZ без вложенности (nesting) и когда нет каталога данных $DATA_DIR."
-      err "См. docs/ru/11-troubleshooting.md, строка «status=226/NAMESPACE»." ;;
+      service_namespace_hint "$out" ;;
     *"ddress already in use"*)
       err "Причина: порт веб-интерфейса занят другой программой (server.port в $CONFIG_FILE)." ;;
     *"ModuleNotFoundError"*|*"ImportError"*)

@@ -15,10 +15,12 @@
 from __future__ import annotations
 
 import copy
+import errno
 import math
 import os
 import re
 import secrets
+import shlex
 from typing import Any, Dict, Optional
 
 import yaml
@@ -494,6 +496,52 @@ def _candidate_config_paths() -> list[str]:
     ]
 
 
+#: Причины отказа файловой системы — по-русски. Иначе в русское сообщение попадал
+#: английский хвост вроде «Not a directory» или «Too many levels of symbolic links».
+_ERRNO_TEXT = {
+    errno.ENOENT: "нет такого файла или каталога",
+    errno.ENOTDIR: "на пути к нему лежит файл, а не каталог",
+    errno.ELOOP: "ссылки указывают друг на друга (слишком много переходов по ссылкам)",
+    errno.EACCES: "нет прав",
+    errno.EPERM: "операция не разрешена",
+    errno.EROFS: "файловая система доступна только для чтения",
+    errno.ENOSPC: "на диске нет места",
+}
+
+
+def os_error_text(exc: BaseException) -> str:
+    """Причина ошибки ОС по-русски; для редких кодов — текст самой системы."""
+    return (_ERRNO_TEXT.get(getattr(exc, "errno", None))
+            or getattr(exc, "strerror", None) or str(exc) or type(exc).__name__)
+
+
+def current_user() -> str:
+    """Кто выполняет команду — чтобы сказать, чьи права на каталог проверены."""
+    try:
+        import pwd
+        return pwd.getpwuid(os.geteuid()).pw_name
+    except (ImportError, AttributeError, KeyError, OSError):
+        return str(os.geteuid()) if hasattr(os, "geteuid") else "?"
+
+
+class DirProblem(str):
+    """Почему каталог не годится: текст для человека и вид причины в ``kind``.
+
+    Вид нужен, чтобы подсказка подходила к причине: «подключите диск» — только
+    ссылке в никуда, а отказ в правах при ``check-config`` — не ошибка (см.
+    :func:`mailarchiver.__main__.cmd_check_config`). Виды: ``dangling`` — ссылка
+    в никуда, ``denied`` — нет прав, ``not_dir`` — на месте каталога файл,
+    ``loop`` — ссылки по кругу, ``readonly``, ``full``, ``error`` — прочее.
+    """
+
+    kind: str = "error"
+
+    def __new__(cls, text: str, kind: str = "error") -> "DirProblem":
+        obj = super().__new__(cls, text)
+        obj.kind = kind
+        return obj
+
+
 class Config:
     """Объект конфигурации с доступом к секциям и производным путям."""
 
@@ -514,6 +562,9 @@ class Config:
         self.secret_key_path = os.path.join(self.data_dir, "secret.key")
         self.mail_root = os.path.join(self.data_dir, "mailboxes")
         self.exports_dir = os.path.join(self.data_dir, "exports")
+        #: каталог импорта: сюда администратор сам кладёт файлы .pst/.ost, которые
+        #: слишком велики для загрузки через интерфейс; служба их только читает
+        self.import_dir = os.path.join(self.data_dir, "import")
         self.tmp_dir = data["export"].get("tmp_dir") or os.path.join(self.data_dir, "tmp")
 
         self._secret_key: Optional[bytes] = None
@@ -562,12 +613,184 @@ class Config:
         return self.data["notifications"]
 
     # -- инициализация каталогов и секрета -----------------------------------
+    @staticmethod
+    def _dangling_link(path: str) -> tuple:
+        """Ссылка в никуда на пути к ``path``: (ссылка, куда ведёт) или ("", "").
+
+        Смотрим от самого пути вверх до первого существующего предка: каталог
+        данных ``/data/mailarchiver`` при ``/data -> /mnt/disk`` и неподключённом
+        диске выглядел как «ещё нет — будет создан», а служба на нём падала.
+        """
+        current = path
+        while True:
+            if os.path.islink(current) and not os.path.exists(current):
+                try:
+                    return current, os.readlink(current)
+                except OSError:
+                    return current, "другой каталог"
+            parent = os.path.dirname(current)
+            if os.path.lexists(current) or parent == current:
+                return "", ""               # дошли до существующего предка — ссылок в никуда нет
+            current = parent
+
+    @staticmethod
+    def _file_on_the_way(path: str) -> str:
+        """Ближайший предок ``path``, который существует, но не каталог ("" — не нашли)."""
+        current = os.path.dirname(path)
+        while current and current != os.path.dirname(current):
+            if os.path.lexists(current):
+                return "" if os.path.isdir(current) else current
+            current = os.path.dirname(current)
+        return ""
+
+    @staticmethod
+    def dir_problem(path: str, what: str) -> Optional[DirProblem]:
+        """Почему ``path`` не годится как каталог; None — годится или его ещё нет.
+
+        Главный случай — ссылка в никуда: так выглядит каталог данных, вынесенный
+        на другой диск, когда диск не подключён. Раньше служба падала на нём с
+        «FileExistsError: File exists», а ``check-config`` писал «Конфигурация
+        корректна ✓», хотя запуститься с таким каталогом нельзя.
+
+        Ответ — строка с видом причины (:class:`DirProblem`). Ничего не создаёт.
+        """
+        try:
+            is_dir = os.path.isdir(path)
+            os.stat(path)
+        except FileNotFoundError:
+            link, target = Config._dangling_link(path)
+            if link == path:
+                return DirProblem(f"{what} {path} — ссылка на {target}, а такого каталога сейчас нет", "dangling")
+            if link:
+                return DirProblem(f"{what} {path} лежит за ссылкой {link} → {target}, а такого каталога "
+                                  f"сейчас нет", "dangling")
+            return None                     # каталога ещё нет — он будет создан
+        except PermissionError:
+            return DirProblem(f"{what} {path} недоступен: нет прав войти в один из каталогов на пути к нему",
+                              "denied")
+        except NotADirectoryError:
+            blocker = Config._file_on_the_way(path)
+            return DirProblem(f"{what} {path} недоступен: "
+                              + (f"{blocker} — файл, а не каталог" if blocker else _ERRNO_TEXT[errno.ENOTDIR]),
+                              "not_dir")
+        except OSError as exc:
+            return DirProblem(f"{what} {path} недоступен: {os_error_text(exc)}",
+                              "loop" if exc.errno == errno.ELOOP else "error")
+        except ValueError:
+            return DirProblem(f"{what} {path!r} задан неверно: в пути есть недопустимые знаки", "error")
+        if not is_dir:
+            return DirProblem(f"{what} {path} — не каталог", "not_dir")
+        return None
+
+    def dir_problems(self) -> list:
+        """Каталоги, с которыми служба не запустится (ничего не создаёт и не меняет)."""
+        found = []
+        for path, what in ((self.data_dir, "Каталог данных"), (self.log_dir, "Каталог журналов"),
+                           (self.mail_root, "Каталог копий"), (self.exports_dir, "Каталог выгрузок"),
+                           (self.tmp_dir, "Каталог временных файлов")):
+            problem = self.dir_problem(path, what)
+            if problem:
+                found.append(problem)
+                if path == self.data_dir:
+                    break                   # остальные лежат в нём — причина одна
+        return found
+
+    #: что делать, если каталог оказался ссылкой в никуда (диск не подключён)
+    DIR_HINT = ("Если данные лежат на отдельном диске — проверьте, что он подключён (findmnt, mount -a), "
+                "и запустите службу снова.")
+
+    @classmethod
+    def dir_hint(cls, kind: str, path: str = "") -> str:
+        """Что делать с каталогом — по виду причины (:class:`DirProblem`).
+
+        Про неподключённый диск — только ссылке в никуда: остальным причинам этот
+        совет не помогал и уводил в сторону. Сверх видов причины есть ``create`` —
+        каталога нет, и создать его служба не вправе (см. :meth:`_ensure`).
+        """
+        if kind == "dangling":
+            return cls.DIR_HINT
+        if kind == "denied":
+            where = shlex.quote(path) if path else "КАТАЛОГ"
+            return (f"Каталог и весь путь к нему должны быть открыты пользователю, от имени которого работает "
+                    f"служба ({current_user()}). Права по всему пути покажет: namei -l {where}; отдать каталог "
+                    f"службе: sudo chown -R {current_user()}: {where}")
+        if kind == "not_dir":
+            return ("На месте каталога лежит файл: уберите или переименуйте его либо укажите другой каталог "
+                    "в config.yaml (paths.data_dir, export.tmp_dir).")
+        if kind == "loop":
+            return ("Пересоздайте ссылку так, чтобы она вела на настоящий каталог: куда ведёт каждая, "
+                    "покажет ls -l.")
+        if kind == "create":
+            # каталога нет, а создать его служба не вправе: chown несуществующего каталога не сработал бы
+            where = shlex.quote(path) if path else "КАТАЛОГ"
+            return (f"Создайте каталог от имени администратора и отдайте его пользователю, от имени которого "
+                    f"работает служба ({current_user()}): sudo mkdir -p {where} && sudo chown {current_user()}: "
+                    f"{where}. Права по всему пути покажет: namei -l {where}")
+        if kind == "readonly":
+            return ("Диск доступен только для чтения — так бывает после ошибок файловой системы: посмотрите "
+                    "dmesg и findmnt, проверьте диск и подключите его на запись.")
+        if kind == "full":
+            return "Освободите место на диске с каталогом данных (df -h) и запустите службу снова."
+        return "Проверьте путь к каталогу в config.yaml (paths.data_dir, export.tmp_dir) и права на него."
+
+    def _ensure(self, path: str, what: str) -> None:
+        try:
+            ensure_dir(path, 0o700)
+        except OSError as exc:
+            problem = self.dir_problem(path, what)
+            # Совет про права — о каталоге данных целиком, если не создаётся каталог внутри него:
+            # службе отдают его весь, а «chown» каталога, которого ещё нет, не сработал бы.
+            inside = path.startswith(self.data_dir.rstrip(os.sep) + os.sep)
+            where = self.data_dir if inside else path
+            hint_kind = problem.kind if problem is not None else ""
+            if problem is None:
+                kind = {errno.EACCES: "denied", errno.EPERM: "denied", errno.EROFS: "readonly",
+                        errno.ENOSPC: "full"}.get(exc.errno, "error")
+                problem = DirProblem(f"Не удалось создать {what.lower()} {path}: {os_error_text(exc)}", kind)
+                hint_kind = "create" if kind == "denied" and not os.path.lexists(where) else kind
+            raise ConfigError(problem + ".", hint=self.dir_hint(hint_kind, where)) from exc
+
     def ensure_dirs(self) -> None:
-        ensure_dir(self.data_dir, 0o700)
-        ensure_dir(self.log_dir, 0o700)
-        ensure_dir(self.mail_root, 0o700)
-        ensure_dir(self.exports_dir, 0o700)
-        ensure_dir(self.tmp_dir, 0o700)
+        self._ensure(self.data_dir, "Каталог данных")
+        self._ensure(self.log_dir, "Каталог журналов")
+        self._ensure(self.mail_root, "Каталог копий")
+        self._ensure(self.exports_dir, "Каталог выгрузок")
+        try:
+            ensure_dir(self.import_dir, 0o700)
+        except OSError:
+            # Каталог импорта службе не обязателен, а ссылкой на другой диск его делают
+            # нарочно: отключённый диск не должен мешать запуску и копированию почты.
+            pass
+        self._ensure(self.tmp_dir, "Каталог временных файлов")
+
+    def import_overlap(self) -> Optional[tuple]:
+        """Каталог импорта совпал с каталогом временных файлов или содержит его.
+
+        Ответ — настоящие пути (каталог импорта, каталог временных файлов) или None.
+        Так выходит, когда каталог импорта сделали ссылкой на диск, где лежат и
+        данные службы (``import -> /mnt/big`` при данных в ``/mnt/big/mailarchiver``),
+        или направили ``export.tmp_dir`` в каталог импорта. Временные файлы служба
+        удаляет сама, а в каталоге импорта не трогает ничего — вместе это не живёт,
+        поэтому импорт с сервера в таком случае отключается (и только он).
+        """
+        try:
+            tmp_real = os.path.realpath(str(self.tmp_dir))
+            import_real = os.path.realpath(self.import_dir)
+        except (OSError, ValueError):
+            return None
+        if tmp_real == import_real or tmp_real.startswith(import_real.rstrip(os.sep) + os.sep):
+            return import_real, tmp_real
+        return None
+
+    def import_overlap_text(self) -> str:
+        """То же словами — для предупреждения и для окна импорта ("" — всё в порядке)."""
+        overlap = self.import_overlap()
+        if not overlap:
+            return ""
+        import_real, tmp_real = overlap
+        where = self.import_dir if import_real == self.import_dir else f"{self.import_dir} (ведёт в {import_real})"
+        relation = "совпадает с каталогом" if import_real == tmp_real else "содержит каталог"
+        return f"Каталог импорта {where} {relation} временных файлов службы {tmp_real}"
 
     def secret_key(self) -> bytes:
         """Загрузить или сгенерировать секретный ключ (для подписи cookie и шифрования)."""
@@ -618,6 +841,18 @@ class Config:
             raise ConfigError("export.pst_format должен быть 'unicode' или 'ansi'")
         if int(self.backup.get("max_concurrent_jobs", 1)) < 1:
             raise ConfigError("backup.max_concurrent_jobs должен быть >= 1")
+        # Каталог временных файлов служба чистит сама, а в каталоге импорта лежат файлы
+        # администратора, которые она не трогает никогда. Пересеклись — отключается импорт
+        # с сервера, а не вся служба: каталог импорта (часто ссылка на другой диск) не
+        # должен мешать запуску и копированию почты. Раньше здесь была ошибка, и она
+        # винила export.tmp_dir, даже когда он не задан, а дело в ссылке.
+        overlap = self.import_overlap_text()
+        if overlap:
+            fix = ("задайте в export.tmp_dir другой каталог или уберите этот параметр"
+                   if self.export.get("tmp_dir") else
+                   "сделайте каталогом импорта отдельный каталог, в котором лежат только файлы .pst и .ost")
+            self.warnings.append(f"{overlap} — импорт файлов с сервера («Взять с сервера») отключён, остальное "
+                                 f"работает. Чтобы включить: {fix}.")
         trusted, _any = _check_trusted_proxies(self.server.get("trusted_proxies", ""))
         if not trusted and not _any and self.server.get("behind_proxy"):
             raise ConfigError("server.behind_proxy включён, но server.trusted_proxies пуст.",

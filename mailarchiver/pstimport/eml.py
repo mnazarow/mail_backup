@@ -175,6 +175,9 @@ def format_address(name: str, address: str) -> str:
     return f"{phrase} <{address}>" if phrase else address
 
 
+_PLACEHOLDER_DOMAIN = "@exchange.invalid"
+
+
 def placeholder_address(legacy_dn: str, name: str) -> str:
     """Адрес-заглушка для адресата без адреса SMTP (внутренний адрес Exchange).
 
@@ -187,7 +190,7 @@ def placeholder_address(legacy_dn: str, name: str) -> str:
         tail = re.sub(r"[^A-Za-z0-9._-]", "", match.group(1))
     if not tail:
         tail = hashlib.sha1((legacy_dn or name or "").encode("utf-8", "replace")).hexdigest()[:12]
-    return f"{tail[:60].lower()}@exchange.invalid"
+    return f"{tail[:60].lower()}{_PLACEHOLDER_DOMAIN}"
 
 
 _FOLD_TOKEN = re.compile(r" +|[^ ]+")
@@ -441,6 +444,12 @@ class _Sink:
 # ---------------------------------------------------------------------------
 #  Сборка
 # ---------------------------------------------------------------------------
+#: Свойства письма, где адрес Exchange записан рядом с адресом SMTP того же лица: отправитель,
+#: «от имени», получивший, «для кого получено», создавший письмо, изменивший его последним.
+_EXCHANGE_PAIRS = ((0x0C1F, 0x5D01), (0x0065, 0x5D02), (0x0076, 0x5D07), (0x0078, 0x5D08),
+                   (0x4023, 0x5D0A), (0x4025, 0x5D0B))
+
+
 def _row_text(row: Dict[int, object], pid: int) -> str:
     for ptype in (PT_UNICODE, PT_STRING8):
         value = row.get((pid << 16) | ptype)
@@ -458,6 +467,8 @@ class _Builder:
         #: общее для письма и всех писем внутри него: предел размера, счётчики границ и вложенных писем
         self.shared = shared if shared is not None else {"budget": _Budget(limit), "boundaries": 0, "embedded": 0}
         self._seed: Optional[str] = None
+        self._rows: Optional[List[Dict[int, object]]] = None
+        self._rows_error = ""
 
     # -- мелочи ---------------------------------------------------------------
     def _boundary(self) -> str:
@@ -479,7 +490,9 @@ class _Builder:
         addrtype = (addrtype or "").strip().upper()
         if _smtp_address(smtp):
             return name, _smtp_address(smtp)
-        if addrtype != "EX" and _smtp_address(email):
+        # Адрес вида «EX» — путь в каталоге Exchange («/o=…»): он не адрес, даже если в нём
+        # есть «@». Но в .ost ящика Outlook.com под видом «EX» записан и обычный адрес SMTP.
+        if _smtp_address(email) and (addrtype != "EX" or not _clean_address(email).startswith("/")):
             return name, _smtp_address(email)
         if " " not in name and _smtp_address(name):
             return "", _smtp_address(name)
@@ -487,10 +500,56 @@ class _Builder:
             return name, placeholder_address(_clean_address(email), name)
         return "", ""
 
-    def _sender(self) -> Tuple[Tuple[str, str], Tuple[str, str]]:
+    def _recipient_rows(self) -> List[Dict[int, object]]:
+        """Строки таблицы получателей. Читаются один раз; ошибка чтения запоминается."""
+        if self._rows is None:
+            try:
+                self._rows = self.msg.recipients()
+            except READ_ERRORS as exc:
+                self._rows, self._rows_error = [], str(exc)
+        return self._rows
+
+    def _smtp_elsewhere(self, legacy_dn: str) -> str:
+        """Адрес SMTP отправителя с адресом Exchange — из других мест того же письма.
+
+        У отправителя из своей организации (и у владельца ящика в «Отправленных» файла
+        .ost) адреса SMTP в свойствах отправителя может не быть, и тогда вместо адреса
+        выходит заглушка. Но тот же адрес Exchange нередко записан в письме ещё раз, уже
+        вместе с адресом SMTP: у создавшего письмо, у получившего, среди получателей
+        (копия себе, рассылка на группу). Совпасть должен весь адрес Exchange: похожее
+        имя — ещё не тот же человек.
+        """
+        wanted = _clean_address(legacy_dn).lower()
+        if not wanted.startswith("/"):
+            return ""
         pc = self.pc
-        representing = self._address(pc.text(0x0042), pc.text(0x0064), pc.text(0x0065), pc.text(0x5D02))
-        sender = self._address(pc.text(0x0C1A), pc.text(0x0C1E), pc.text(0x0C1F), pc.text(0x5D01))
+        for address, smtp in _EXCHANGE_PAIRS:
+            if smtp in pc and _clean_address(pc.text(address)).lower() == wanted and _smtp_address(pc.text(smtp)):
+                return _smtp_address(pc.text(smtp))
+        for row in self._recipient_rows():
+            if _clean_address(_row_text(row, 0x3003)).lower() == wanted and _smtp_address(_row_text(row, 0x39FE)):
+                return _smtp_address(_row_text(row, 0x39FE))
+        return ""
+
+    def _sender(self, lookup: bool = True) -> Tuple[Tuple[str, str], Tuple[str, str]]:
+        """→ (от чьего имени письмо, кто отправил). ``lookup`` — искать недостающий адрес
+        SMTP в других местах письма (не нужно, когда заголовок From уже взят из исходных)."""
+        pc = self.pc
+
+        def one(name: int, addrtype: int, address: int, smtp: int) -> Tuple[str, str]:
+            kind, email, found = pc.text(addrtype), pc.text(address), pc.text(smtp)
+            if lookup and kind.strip().upper() == "EX" and not _smtp_address(found):
+                found = self._smtp_elsewhere(email)
+            return self._address(pc.text(name), kind, email, found)
+
+        representing, sender = one(0x0042, 0x0064, 0x0065, 0x5D02), one(0x0C1A, 0x0C1E, 0x0C1F, 0x5D01)
+        # Настоящий адрес нашёлся только у одного из двух, а лицо одно и то же (идентификаторы
+        # записи равны) — это адрес обоих: иначе заглушка в From заслонила бы настоящий адрес.
+        real = [who[1] for who in (representing, sender) if who[1] and not who[1].endswith(_PLACEHOLDER_DOMAIN)]
+        if lookup and len(real) == 1 and representing[1] and sender[1]:
+            entry = pc.get(0x0041, None)
+            if isinstance(entry, (bytes, bytearray)) and entry and entry == pc.get(0x0C19, None):
+                representing, sender = (representing[0], real[0]), (sender[0], real[0])
         return representing, sender
 
     def subject(self) -> str:
@@ -529,10 +588,9 @@ class _Builder:
     # -- заголовки ------------------------------------------------------------
     def _recipient_lists(self) -> Dict[int, List[str]]:
         lists: Dict[int, List[str]] = {1: [], 2: [], 3: []}
-        try:
-            rows = self.msg.recipients()
-        except READ_ERRORS as exc:
-            self.lost.append(f"получатели не прочитаны ({exc})")
+        rows = self._recipient_rows()
+        if self._rows_error:
+            self.lost.append(f"получатели не прочитаны ({self._rows_error})")
             return lists
         for row in rows:
             kind = row.get(0x0C150003)
@@ -590,7 +648,7 @@ class _Builder:
                 names[name.lower()] = value
                 lines.append(fold(name, value))
 
-        representing, sender = self._sender()
+        representing, sender = self._sender(lookup="from" not in names)
         author = representing if representing[1] else sender
         add("From", format_address(*author))
         if not from_transport and sender[1] and representing[1] and sender[1].lower() != representing[1].lower():
