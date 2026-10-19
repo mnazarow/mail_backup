@@ -19,7 +19,11 @@
 #    MA_HOST, MA_PORT   адрес и порт веб-интерфейса в новой конфигурации
 #                       (127.0.0.1, 8493)
 #    MA_START_TIMEOUT   сколько секунд ждать ответа веб-интерфейса (180)
+#    MA_START_TIMEOUT_MAX  если срок вышел, а служба занята, — сколько ждать всего (3600)
 #    MA_HEALTH_URL      свой адрес проверки вместо взятого из конфигурации
+#    MA_SKIP_OWNER_SCAN 1 — при установке поверх не обходить весь каталог данных
+#                       в поисках файлов с чужим владельцем
+#    MA_PROGRESS_EVERY  раз в сколько секунд долгие шаги пишут, как идут дела (30)
 #    MA_RELAX_SANDBOX   1 — ослабить защиту службы (контейнеры LXC/OpenVZ без
 #                       вложенности, где служба падает со status=226/NAMESPACE):
 #                       создаётся дополнение <unit>.d/50-relax-sandbox.conf
@@ -46,7 +50,11 @@ usage(){
   MA_USER, MA_GROUP        пользователь и группа службы (mailarchiver)
   MA_HOST, MA_PORT         адрес и порт веб-интерфейса в новой конфигурации
   MA_START_TIMEOUT=N       сколько секунд ждать ответа веб-интерфейса (180)
+  MA_START_TIMEOUT_MAX=N   если срок вышел, а служба ещё занята, — сколько ждать всего (3600)
   MA_HEALTH_URL=URL        свой адрес проверки вместо взятого из конфигурации
+  MA_SKIP_OWNER_SCAN=1     при установке поверх не обходить весь каталог данных в
+                           поисках файлов с чужим владельцем (верхний уровень — всё равно)
+  MA_PROGRESS_EVERY=N      раз в сколько секунд долгие шаги пишут, как идут дела (30)
   MA_RELAX_SANDBOX=1       ослабить защиту службы: для контейнеров LXC/OpenVZ без
                            вложенности, где служба падает со status=226/NAMESPACE
   MA_WHEELS=КАТАЛОГ        пакеты .whl для установки без интернета (по умолчанию —
@@ -184,7 +192,7 @@ cleanup_on_error(){
       SVC_STARTED_AT="$(date '+%Y-%m-%d %H:%M:%S')"
       systemctl reset-failed "$APP_NAME" 2>/dev/null || true
       systemctl start "$APP_NAME" 2>/dev/null || true
-      wait_service_up 60 || back_rc=$?
+      wait_service_up 60 60 || back_rc=$?    # откат: ждём минуту, без продления
       if [ "$back_rc" = "0" ]; then
         warn "Прежняя установка возвращена, служба работает. Копия осталась в $REINSTALL_BACKUP."
       else
@@ -212,6 +220,7 @@ on_exit(){
   trap - EXIT ERR
   trap '' INT TERM HUP PIPE
   set +e
+  stop_owner_scan       # фоновый обход каталога данных Ctrl-C не получает
   if [ "$FINISHED" != "1" ]; then
     [ "$ec" -ne 0 ] || ec=1
     cleanup_on_error "$ec"
@@ -461,7 +470,12 @@ setup_venv(){
 
 setup_dirs(){
   mkdir -p "$CONFIG_DIR" "$DATA_DIR"
-  fix_data_owner
+  # весь каталог уже обойдён до остановки службы (или обход пропущен) — только верхний уровень
+  if [ "$OWNER_SCANNED" = "1" ] || [ "${MA_SKIP_OWNER_SCAN:-0}" = "1" ]; then
+    fix_data_owner 1
+  else
+    fix_data_owner
+  fi
   chmod 750 "$DATA_DIR"
   chmod 755 "$CONFIG_DIR"
 }
@@ -574,7 +588,7 @@ create_admin_prompt(){
     # от имени службы: база и каталоги сразу получают правильного владельца
     as_app_user "$VENV_DIR/bin/mailarchiver" -c "$CONFIG_FILE" create-admin \
       || warn "Администратора можно создать позже (см. ниже)."
-    fix_data_owner
+    fix_data_owner 1      # весь каталог уже проверен в setup_dirs
     systemctl restart "$APP_NAME" 2>/dev/null || true
   else
     warn "Неинтерактивный режим — админ не создан."
@@ -628,6 +642,8 @@ main(){
   fi
   check_python
   create_user
+  # Установка поверх: весь каталог данных обходим до остановки службы (см. update.sh).
+  if [ "$FRESH_INSTALL" != "1" ]; then scan_data_owner_early; fi
   backup_existing
   copy_source
   setup_venv

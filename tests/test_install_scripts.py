@@ -559,6 +559,10 @@ def main(argv=None):
         return 3
     if kind == "slow":
         time.sleep(float(param or 5))
+    if kind == "busy":                       # как построение индексов большой базы: процессор занят
+        end = time.time() + float(param or 5)
+        while time.time() < end:
+            pass
     if kind == "hang":
         time.sleep(3600)
     from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -1384,12 +1388,52 @@ def test_update_gives_up_on_hung_start(sandbox):
     sandbox.install_old()
     sandbox.behaviour("hang:" + NEW)
     # срок больше, чем запасной способ «прожила 10 секунд»: так проверяется именно опрос /health
+    began = time.time()
     proc = sandbox.run("update.sh", sandbox.sources(NEW, "src_new"), MA_START_TIMEOUT="13")
     out = proc.stdout + proc.stderr
     assert proc.returncode != 0, _report(proc)
     assert "http://127.0.0.1:%d/health" % sandbox.port in out and "MA_START_TIMEOUT" in out, _report(proc)
+    # процесс спит: срок не продлевается
+    assert "уже ничего не делала" in out and "служба занята" not in out, _report(proc)
     assert "Откат" in out
     assert sandbox.wait_version() == OLD
+    assert time.time() - began < 90, _report(proc)
+
+
+@needs_root
+def test_update_keeps_waiting_while_first_start_is_busy(sandbox):
+    """Срок вышел, а новая версия всё ещё занята (строит индексы большой базы): ждём дальше, а не откатываем.
+
+    Обновление с 1.2.0 на большой базе строит индексы при первом запуске, и за 180 секунд
+    по умолчанию это не всегда успевает: откат выбросил бы сделанное, а следующая попытка
+    начала бы заново.
+    """
+    sandbox.install_old()
+    sandbox.behaviour("busy:%s:16" % NEW)
+    proc = sandbox.run("update.sh", sandbox.sources(NEW, "src_new"), MA_START_TIMEOUT="3", MA_PROGRESS_EVERY="4")
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 0, _report(proc)
+    assert "Срок ожидания (3 с) вышел, но служба занята" in out, out
+    assert "…жду ответа веб-интерфейса: прошло" in out and "служба прочитала" in out, out
+    assert "Откат" not in out, out
+    assert sandbox.wait_version() == NEW
+
+
+@needs_root
+def test_update_gives_up_on_busy_start_after_the_overall_limit(sandbox):
+    """Занята дольше MA_START_TIMEOUT_MAX — откат, и сказано, какую переменную увеличить."""
+    sandbox.install_old()
+    sandbox.behaviour("busy:%s:600" % NEW)
+    began = time.time()
+    proc = sandbox.run("update.sh", sandbox.sources(NEW, "src_new"), MA_START_TIMEOUT="3",
+                       MA_START_TIMEOUT_MAX="15")
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, _report(proc)
+    assert re.search(r"Служба занята уже \d+ с — дольше предела MA_START_TIMEOUT_MAX", out), _report(proc)
+    assert "MA_START_TIMEOUT_MAX=14400" in out, _report(proc)
+    assert "Откат" in out
+    assert sandbox.wait_version() == OLD
+    assert time.time() - began < 120, _report(proc)
 
 
 @needs_root
@@ -2596,6 +2640,228 @@ def test_update_leaves_owner_of_import_files_alone(sandbox, linked):
     assert os.stat(os.path.join(real, "exports", "made-by-root.zip")).st_uid == uid
     assert os.stat(os.path.join(real, "exports")).st_uid == uid
     assert os.lstat(sandbox.data).st_uid == (0 if linked else uid)          # саму ссылку не трогают
+
+
+#: Подделка find: обходы в поисках чужого владельца (в аргументах есть -user)
+#: записывает вместе с состоянием службы в этот момент; с FAKE_FIND_SLEEP полный
+#: обход (с -fprintf) сначала «думает» столько секунд — как на большом архиве;
+#: FAKE_FIND_PLAIN=1 — find без расширений GNU (-fprintf, -ignore_readdir_race).
+SPY_FIND = r"""#!/bin/sh
+case " $* " in
+  *" -fprintf "*|*" -ignore_readdir_race "*)
+    if [ "${FAKE_FIND_PLAIN:-0}" = "1" ]; then echo "find: unrecognized: -fprintf" >&2; exit 1; fi ;;
+esac
+case " $* " in
+  *" -user "*)
+    echo "$(systemctl is-active mailarchiver 2>/dev/null) $PWD $*" >> "$FAKE_SYSTEMD_STATE/owner_finds"
+    case " $* " in
+      *" -fprintf "*)
+        if [ -n "${FAKE_FIND_SLEEP:-}" ]; then
+          echo $$ > "$FAKE_SYSTEMD_STATE/owner_find_pid"
+          trap 'kill $! 2>/dev/null; exit 143' TERM
+          sleep "$FAKE_FIND_SLEEP" &
+          wait $!
+          trap - TERM
+        fi ;;
+    esac ;;
+esac
+exec @FIND@ "$@"
+"""
+
+
+def _spy_find(sandbox) -> None:
+    real = shutil.which("find", path="/usr/bin:/bin")
+    _write(os.path.join(sandbox.bin, "find"), SPY_FIND.replace("@FIND@", real), 0o755)
+
+
+def _owner_finds(sandbox) -> list:
+    """Обходы каталога данных: (состояние службы, глубина или None — весь каталог).
+
+    find запускается из каталога данных по «.»; проба выражения (-maxdepth 0) не в счёт.
+    """
+    found, data = [], os.path.realpath(sandbox.data)
+    for line in sandbox.calls("owner_finds"):
+        words = line.split()
+        if words[1:3] != [data, "."]:
+            continue                       # другие обходы (normalize_app_perms — по каталогу установки)
+        depth = words[words.index("-maxdepth") + 1] if "-maxdepth" in words else None
+        if depth != "0":
+            found.append((words[0], depth))
+    return found
+
+
+def _foreign_mail(sandbox) -> tuple:
+    """Письмо и каталог глубоко в архиве — от root (как после команд, запущенных от root)."""
+    folder = os.path.join(sandbox.data, "mailboxes", "user@example.org", "INBOX")
+    mail = os.path.join(folder, "1.eml")
+    _write(mail, "Subject: x\n\nx\n")
+    os.chown(os.path.join(sandbox.data, "mailboxes"), pwd.getpwnam(USER).pw_uid, grp.getgrnam(GROUP).gr_gid)
+    return folder, mail
+
+
+@needs_root
+@pytest.mark.parametrize("skip", [False, True])
+def test_update_checks_owners_of_the_whole_archive_before_stopping_the_service(sandbox, skip):
+    """Весь архив обходится, пока служба работает; после остановки — только верхний уровень.
+
+    На сервере с сотнями тысяч писем обход шёл после остановки службы, без
+    единой строки на экране: обновление «висело» после «Конфигурация корректна»,
+    а веб-интерфейс не открывался.
+    """
+    sandbox.install_old()
+    _spy_find(sandbox)
+    folder, mail = _foreign_mail(sandbox)
+    extra = {"MA_SKIP_OWNER_SCAN": "1"} if skip else {}
+    proc = sandbox.run("update.sh", sandbox.sources(NEW, "src_new"), MA_PROGRESS_EVERY="1", FAKE_FIND_SLEEP="3",
+                       **extra)
+    assert proc.returncode == 0, _report(proc)
+    assert sandbox.wait_version() == NEW
+    out = proc.stdout
+    uid = pwd.getpwnam(USER).pw_uid
+    if skip:
+        assert _owner_finds(sandbox) == [("inactive", "1")], sandbox.calls("owner_finds")
+        assert "пропущена (MA_SKIP_OWNER_SCAN=1)" in out, out
+        assert os.stat(mail).st_uid == 0 and os.stat(folder).st_uid == 0
+        return
+    assert _owner_finds(sandbox) == [("active", None), ("inactive", "1")], sandbox.calls("owner_finds")
+    scan = out.index("Проверка владельца файлов в каталоге данных (служба пока работает")
+    assert scan < out.index("Останавливаю службу"), out
+    # обход сообщает о ходе работы и итоге
+    assert "…проверено файлов:" in out[scan:out.index("Останавливаю службу")], out
+    assert re.search(r"Владелец возвращён службе у файлов: 3 из \d+ ", out), out
+    assert os.stat(mail).st_uid == uid and os.stat(folder).st_uid == uid
+    assert os.stat(os.path.dirname(folder)).st_uid == uid
+
+
+@needs_root
+def test_ctrl_c_during_owner_scan_stops_it_and_leaves_service_running(sandbox):
+    """Ctrl-C во время обхода: обход остановлен (фоновое задание само Ctrl-C не получает), служба не тронута."""
+    import signal
+    if signal.getsignal(signal.SIGINT) == signal.SIG_IGN:
+        pytest.skip("SIGINT игнорируется у самого теста: скрипт поставить на него ловушку не сможет")
+    sandbox.install_old()
+    _spy_find(sandbox)
+    _foreign_mail(sandbox)
+    sandbox.forget_calls()
+    proc = sandbox.start("update.sh", sandbox.sources(NEW, "src_new"), FAKE_FIND_SLEEP="60")
+    marker = os.path.join(sandbox.state, "owner_find_pid")
+    end = time.time() + 60
+    while time.time() < end and not os.path.exists(marker):
+        time.sleep(0.05)
+    assert os.path.exists(marker), proc.communicate(timeout=60)[0]
+    time.sleep(0.3)
+    with open(marker, encoding="utf-8") as fh:
+        pid = int(fh.read())
+    os.killpg(proc.pid, signal.SIGINT)         # как Ctrl-C в терминале: сигнал всей группе
+    out, _ = proc.communicate(timeout=60)
+    assert proc.returncode == 130, out
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+    assert "Откат" not in out, out
+    assert sandbox.changed_state() == [], sandbox.calls()
+    assert sandbox.wait_version() == OLD
+
+
+@needs_root
+def test_owner_fix_without_gnu_find(sandbox):
+    """find без расширений GNU (busybox): владельца исправляет тот же обход, только без отчёта о ходе."""
+    sandbox.install_old()
+    _spy_find(sandbox)
+    folder, mail = _foreign_mail(sandbox)
+    _write(os.path.join(sandbox.data, "import", "2024", "archive.pst"), "x")
+    proc = sandbox.run("update.sh", sandbox.sources(NEW, "src_new"), FAKE_FIND_PLAIN="1")
+    assert proc.returncode == 0, _report(proc)
+    assert sandbox.wait_version() == NEW
+    assert _owner_finds(sandbox) == [("active", None), ("inactive", "1")], sandbox.calls("owner_finds")
+    uid = pwd.getpwnam(USER).pw_uid
+    assert os.stat(mail).st_uid == uid and os.stat(folder).st_uid == uid
+    assert os.stat(os.path.join(sandbox.data, "import", "2024", "archive.pst")).st_uid == 0
+
+
+#: Подделка chown: файлы *.locked владельца не меняют (как неизменяемые, chattr +i),
+#: *.gone «исчезли» между проверкой и chown (их убрала работающая служба).
+FAKE_CHOWN = r"""#!@PYTHON@
+import subprocess, sys
+args = sys.argv[1:]
+opts = [a for a in args if a.startswith("-")]
+rest = [a for a in args if not a.startswith("-")]
+owner, files, keep, rc = rest[0], rest[1:], [], 0
+for name in files:
+    if name.endswith(".locked"):
+        print("chown: changing ownership of '%s': Operation not permitted" % name, file=sys.stderr)
+        rc = 1
+    elif name.endswith(".gone"):
+        print("chown: cannot access '%s': No such file or directory" % name, file=sys.stderr)
+        rc = 1
+    else:
+        keep.append(name)
+if keep:
+    rc = subprocess.run(["@CHOWN@", *opts, owner, *keep]).returncode or rc
+sys.exit(rc)
+"""
+
+
+@needs_root
+def test_owner_fix_failures_are_warnings_not_a_failed_update(sandbox):
+    """chown отказал у части файлов — предупреждение с их именами, а не откат после остановки службы.
+
+    Исчезнувший между проверкой и chown файл (его убрала служба) — вовсе не ошибка.
+    """
+    sandbox.install_old()
+    real = shutil.which("chown", path="/usr/bin:/bin")
+    _write(os.path.join(sandbox.bin, "chown"), FAKE_CHOWN.replace("@PYTHON@", PYTHON).replace("@CHOWN@", real),
+           0o755)
+    folder, mail = _foreign_mail(sandbox)
+    _write(os.path.join(sandbox.data, "stuck.locked"), "x")              # верхний уровень: оба прохода
+    _write(os.path.join(sandbox.data, "exports", "old.gone"), "x")
+    proc = sandbox.run("update.sh", sandbox.sources(NEW, "src_new"))
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 0, _report(proc)
+    assert sandbox.wait_version() == NEW
+    assert out.count("Владельца части файлов в ") == 2 and "stuck.locked" in out, out
+    assert "old.gone" not in out, out
+    assert "исправить удалось не все" in out and "Владелец возвращён службе" not in out, out
+    uid = pwd.getpwnam(USER).pw_uid
+    assert os.stat(mail).st_uid == uid and os.stat(folder).st_uid == uid
+
+
+@needs_root
+def test_import_is_left_alone_when_data_path_has_pattern_characters(sandbox):
+    """Знаки [ ] * ? в пути каталога данных: содержимое import/ всё равно не трогается."""
+    sandbox.install_old()
+    sandbox.stop()
+    mount = os.path.join(sandbox.base, "disk[1]*?")
+    os.makedirs(mount)
+    real = os.path.join(mount, "mailarchiver")
+    os.rename(sandbox.data, real)
+    os.symlink(real, sandbox.data)
+    sandbox.systemctl("start", "mailarchiver")
+    assert sandbox.wait_version() == OLD, sandbox.journal()
+    _write(os.path.join(real, "import", "2024", "archive.pst"), "x")
+    _write(os.path.join(real, "exports", "made-by-root.zip"), "x")
+    proc = sandbox.run("update.sh", sandbox.sources(NEW, "src_new"))
+    assert proc.returncode == 0, _report(proc)
+    assert sandbox.wait_version() == NEW
+    uid = pwd.getpwnam(USER).pw_uid
+    assert os.stat(os.path.join(real, "import")).st_uid == uid
+    assert os.stat(os.path.join(real, "import", "2024", "archive.pst")).st_uid == 0
+    assert os.stat(os.path.join(real, "exports", "made-by-root.zip")).st_uid == uid
+
+
+@needs_root
+def test_reinstall_checks_owners_before_stopping_the_service(sandbox):
+    """Установка поверх: весь каталог данных — до остановки службы, после — только верхний уровень."""
+    sandbox.install_old()
+    _spy_find(sandbox)
+    folder, mail = _foreign_mail(sandbox)
+    proc = sandbox.run("install.sh", sandbox.sources(NEW, "src_new"))
+    assert proc.returncode == 0, _report(proc)
+    assert sandbox.wait_version() == NEW
+    assert _owner_finds(sandbox) == [("active", None), ("inactive", "1")], sandbox.calls("owner_finds")
+    out = proc.stdout
+    assert out.index("Проверка владельца файлов в каталоге данных (служба пока работает") \
+        < out.index("Обнаружена существующая установка"), out
+    assert os.stat(mail).st_uid == pwd.getpwnam(USER).pw_uid
 
 
 # ---------------------------------------------------------------------------

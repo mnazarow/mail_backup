@@ -10,11 +10,16 @@
 #
 #  Переменные окружения, которые разбираются здесь:
 #    MA_START_TIMEOUT   сколько секунд ждать ответа веб-интерфейса (180)
+#    MA_START_TIMEOUT_MAX  сколько секунд всего ждать службу, которая ещё занята
+#                       (обновляет базу), когда MA_START_TIMEOUT вышел (3600)
 #    MA_HEALTH_URL      свой адрес проверки вместо взятого из конфигурации
 #    MA_RELAX_SANDBOX   1 — ослабить защиту службы для контейнеров, где systemd
 #                       не может создать пространства имён (status=226/NAMESPACE)
 #    MA_WHEELS          каталог с пакетами .whl для установки без сети
 #    MA_INDEX_URL       свой индекс пакетов (зеркало PyPI) для установки из сети
+#    MA_PROGRESS_EVERY  раз в сколько секунд долгие шаги — обход каталога данных
+#                       (проверка владельца файлов), ожидание запуска службы — пишут,
+#                       как идут дела (30)
 #
 #  Только для тестов (в справке и документации их нет):
 #    MA_FSTAB           файл вместо /etc/fstab — см. unmounted_fstab_mount
@@ -335,26 +340,192 @@ normalize_app_perms(){
 #
 # Содержимое import/ не трогаем: туда администратор кладёт свои файлы для
 # импорта, службе достаточно их читать. Сам каталог import/ остаётся за службой.
+#
+#   fix_data_owner          — весь каталог. Каждое письмо — отдельный файл, и на
+#                             большом архиве обход идёт минуты (на диске, который
+#                             только что подключили, — десятки минут). Поэтому
+#                             update.sh делает его ДО остановки службы, а сам обход
+#                             раз в MA_PROGRESS_EVERY секунд (30) пишет, сколько
+#                             проверено: молчащий скрипт принимали за зависший.
+#   fix_data_owner ГЛУБИНА  — только верхние уровни (find -maxdepth): быстро.
+#
+# Каталог данных бывает ссылкой на другой диск: работаем с тем, куда она ведёт
+# (find в каталог-ссылку не входит, а «chown -h» менял владельца самой ссылки).
+OWNER_SCAN_PID=""     # фоновый обход (его останавливает stop_owner_scan)
+OWNER_SCAN_TMP=""
+OWNER_FIXED=""        # сколько файлов с чужим владельцем нашёл последний полный обход
+OWNER_SCANNED=0       # весь каталог уже обойдён (scan_data_owner_early)
+
 fix_data_owner(){
-  local dir item
+  local depth="${1:-}" dir
   [ -d "$DATA_DIR" ] || return 0
-  # Каталог данных бывает ссылкой на другой диск: работаем с тем, куда она ведёт
-  # (find в каталог-ссылку не входит, а «chown -h» менял владельца самой ссылки).
   dir="$(readlink -f -- "$DATA_DIR" 2>/dev/null || true)"
   if [ -z "$dir" ] || [ ! -d "$dir" ]; then dir="$DATA_DIR"; fi
-  find "$dir" -path "$dir/import/*" -prune -o \
-       \( ! -user "$APP_USER" -o ! -group "$APP_GROUP" \) -exec chown -h "$APP_USER:$APP_GROUP" {} + 2>/dev/null \
-    && return 0
-  # запасной путь (find отказал): то же, по каталогам верхнего уровня
-  chown "$APP_USER:$APP_GROUP" "$dir"
+  OWNER_FIXED=""
+  if [ -z "$depth" ] && _find_reports_progress; then
+    _scan_data_owner "$dir"
+    return 0
+  fi
+  # Путь — из каталога: «-path ./import/*» не зависит от знаков [ ] * ? в самом пути.
+  local -a lim=()
+  if [ -n "$depth" ]; then lim=(-maxdepth "$depth"); fi
+  if _find_owner_expr_works "$dir"; then
+    local errors rc=0
+    errors="$(mktemp)"
+    ( cd "$dir" && LC_ALL=C exec find . "${lim[@]}" -path './import/*' -prune -o \
+        \( ! -user "$APP_USER" -o ! -group "$APP_GROUP" \) -exec chown -h "$APP_USER:$APP_GROUP" {} + ) \
+      2>"$errors" || rc=$?
+    _report_owner_errors "$dir" "$rc" "$errors"
+    rm -f "$errors"
+    return 0
+  fi
+  # запасной путь (такого выражения find не понимает): то же, по каталогам
+  # верхнего уровня; что не вышло — предупреждение, а не отказ всего обновления
+  local item failed=0
+  chown "$APP_USER:$APP_GROUP" "$dir" 2>/dev/null || failed=1
   for item in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do
     if [ ! -e "$item" ] && [ ! -L "$item" ]; then continue; fi
-    if [ "$item" = "$dir/import" ]; then
-      chown -h "$APP_USER:$APP_GROUP" "$item"
+    if [ "$item" = "$dir/import" ] || [ -n "$depth" ]; then
+      chown -h "$APP_USER:$APP_GROUP" "$item" 2>/dev/null || failed=1
     else
-      chown -R -h "$APP_USER:$APP_GROUP" "$item"
+      chown -R -h "$APP_USER:$APP_GROUP" "$item" 2>/dev/null || failed=1
     fi
   done
+  if [ "$failed" = "1" ]; then
+    warn "Владельца части файлов в $dir исправить не удалось — проверьте: ls -la \"$dir\""
+  fi
+}
+
+# Весь каталог данных — пока служба ещё работает (update.sh; install.sh поверх
+# установки): иначе минуты обхода большого архива становились минутами простоя.
+scan_data_owner_early(){
+  [ -d "$DATA_DIR" ] || return 0
+  if [ "${MA_SKIP_OWNER_SCAN:-0}" = "1" ]; then
+    warn "Проверка владельца файлов в каталоге данных пропущена (MA_SKIP_OWNER_SCAN=1)."
+    return 0
+  fi
+  if systemctl is-active --quiet "$APP_NAME" 2>/dev/null; then
+    info "Проверка владельца файлов в каталоге данных (служба пока работает; на большом архиве — несколько минут)…"
+  else
+    info "Проверка владельца файлов в каталоге данных (на большом архиве — несколько минут)…"
+  fi
+  fix_data_owner
+  OWNER_SCANNED=1
+}
+
+# GNU find: умеет -fprintf (по нему считаем проверенное) и -ignore_readdir_race
+# (файл, который служба удалила во время обхода, — не ошибка).
+_find_reports_progress(){
+  find / -maxdepth 0 -ignore_readdir_race -fprintf /dev/null '' >/dev/null 2>&1
+}
+
+# find понимает выражение обхода (-path, -prune, -user, -group, -exec … +).
+_find_owner_expr_works(){
+  ( cd "$1" && find . -maxdepth 0 -path './import/*' -prune -o \
+      \( ! -user "$APP_USER" -o ! -group "$APP_GROUP" \) -exec true {} + ) >/dev/null 2>&1
+}
+
+# Ошибки обхода — предупреждением. «No such file or directory» не в счёт: файл
+# убрала работающая служба между проверкой и chown (так бывает с журналами и
+# выгрузками).
+_report_owner_errors(){   # _report_owner_errors КАТАЛОГ КОД ФАЙЛ_ОШИБОК
+  local dir="$1" rc="$2" errors="$3" line real
+  [ "$rc" != "0" ] || return 0
+  real="$(grep -v 'No such file or directory' "$errors" 2>/dev/null || true)"
+  [ -n "$real" ] || return 0
+  warn "Владельца части файлов в $dir исправить не удалось (пути — от этого каталога):"
+  while IFS= read -r line; do warn_more "$line"; done < <(printf '%s\n' "$real" | head -n 5)
+  warn_more "Служба может не суметь записать в эти каталоги — проверьте их: ls -la."
+  OWNER_SCAN_FAILED=1
+}
+OWNER_SCAN_FAILED=0
+
+# Полный обход в фоне; на переднем плане — отчёт о ходе. Фоновое задание
+# Ctrl-C не получает (у скрипта без управления заданиями оно его игнорирует),
+# поэтому ловушки выхода в install.sh и update.sh вызывают stop_owner_scan.
+_scan_data_owner(){   # _scan_data_owner КАТАЛОГ
+  local dir="$1" every="${MA_PROGRESS_EVERY:-30}" rc=0 start="$SECONDS" next seen spent
+  case "$every" in ''|*[!0-9]*|0) every=30 ;; esac
+  OWNER_SCAN_TMP="$(mktemp -d)"
+  OWNER_SCAN_FAILED=0
+  : > "$OWNER_SCAN_TMP/seen"; : > "$OWNER_SCAN_TMP/fixed"
+  ( cd "$dir" && LC_ALL=C exec find . -ignore_readdir_race -path './import/*' -prune -o \
+       -fprintf "$OWNER_SCAN_TMP/seen" 'x' \
+       \( ! -user "$APP_USER" -o ! -group "$APP_GROUP" \) -fprintf "$OWNER_SCAN_TMP/fixed" 'x' \
+       -exec chown -h "$APP_USER:$APP_GROUP" {} + ) 2>"$OWNER_SCAN_TMP/errors" &
+  OWNER_SCAN_PID=$!
+  next=$((start + every))
+  while kill -0 "$OWNER_SCAN_PID" 2>/dev/null; do
+    sleep 1
+    if [ "$SECONDS" -ge "$next" ]; then
+      next=$((SECONDS + every))
+      seen="$(_file_size "$OWNER_SCAN_TMP/seen")"
+      # счётчик пишется блоками по 4 КБ: в начале обхода он ещё пуст
+      if [ "$seen" -gt 0 ]; then
+        info "  …проверено файлов: $(_group_digits "$seen") ($(_elapsed $((SECONDS - start))))"
+      else
+        info "  …проверка идёт ($(_elapsed $((SECONDS - start))))"
+      fi
+    fi
+  done
+  wait "$OWNER_SCAN_PID" || rc=$?
+  OWNER_SCAN_PID=""
+  seen="$(_file_size "$OWNER_SCAN_TMP/seen")"
+  OWNER_FIXED="$(_file_size "$OWNER_SCAN_TMP/fixed")"
+  spent=$((SECONDS - start))
+  _report_owner_errors "$dir" "$rc" "$OWNER_SCAN_TMP/errors"
+  if [ "$OWNER_FIXED" -gt 0 ] && [ "$OWNER_SCAN_FAILED" = "1" ]; then
+    info "Файлов с чужим владельцем: $(_group_digits "$OWNER_FIXED") из $(_group_digits "$seen");" \
+         "исправить удалось не все (см. выше)."
+  elif [ "$OWNER_FIXED" -gt 0 ]; then
+    info "Владелец возвращён службе у файлов: $(_group_digits "$OWNER_FIXED") из $(_group_digits "$seen")" \
+         "(например, созданных командами от root)."
+  elif [ "$spent" -ge "$every" ]; then
+    info "Владелец у всех файлов верный (проверено $(_group_digits "$seen") за $(_elapsed "$spent"))."
+  fi
+  rm -rf "$OWNER_SCAN_TMP"
+  OWNER_SCAN_TMP=""
+}
+
+# Прервать фоновый обход (для ловушек выхода; без обхода ничего не делает).
+# Не дольше 5 секунд: find, застрявший в вводе-выводе (зависший диск), не
+# умирает и от SIGKILL — тогда говорим об этом и не ждём.
+stop_owner_scan(){
+  local pid="$OWNER_SCAN_PID" i
+  if [ -n "$pid" ]; then
+    OWNER_SCAN_PID=""
+    pkill -TERM -P "$pid" 2>/dev/null || true      # уже запущенный chown
+    kill -TERM "$pid" 2>/dev/null || true
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.5
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -KILL "$pid" 2>/dev/null || true
+      sleep 0.5
+    fi
+    if kill -0 "$pid" 2>/dev/null; then
+      warn "Обход каталога данных (find, процесс $pid) не завершается — похоже, диск не отвечает; оставляю его."
+    else
+      wait "$pid" 2>/dev/null || true
+    fi
+  fi
+  if [ -n "$OWNER_SCAN_TMP" ]; then rm -rf "$OWNER_SCAN_TMP"; OWNER_SCAN_TMP=""; fi
+}
+
+_file_size(){ local n; n="$(wc -c < "$1" 2>/dev/null)" || n=0; echo $((n + 0)); }
+
+_group_digits(){   # 1234567 → 1 234 567
+  local n="$1" out=""
+  while [ "${#n}" -gt 3 ]; do out=" ${n: -3}$out"; n="${n:0:${#n}-3}"; done
+  printf '%s\n' "$n$out"
+}
+
+_elapsed(){   # _elapsed СЕКУНД → «45 с», «3 мин 12 с», «1 ч 05 мин»
+  local s="$1"
+  if [ "$s" -lt 60 ]; then printf '%d с\n' "$s"
+  elif [ "$s" -lt 3600 ]; then printf '%d мин %02d с\n' $((s / 60)) $((s % 60))
+  else printf '%d ч %02d мин\n' $((s / 3600)) $((s % 3600 / 60)); fi
 }
 
 # Пользователь службы существует, и от его имени можно выполнять команды.
@@ -1233,11 +1404,31 @@ PY
 # числится «activating», и проверка is-active ничего не говорила о причине.
 # Срок ожидания — MA_START_TIMEOUT секунд (по умолчанию 180); адрес проверки
 # берётся из конфигурации, свой можно задать в MA_HEALTH_URL.
+#
+# Срок вышел, а служба занята — её процесс тратит процессорное время, читает
+# или пишет (по /proc), — ждём дальше, пока она работает, но не дольше
+# MA_START_TIMEOUT_MAX секунд (3600) всего. Так первый запуск, который строит
+# индексы большой базы (обновление через несколько версий), не принимается за
+# зависший: откат выбросил бы сделанное, и следующая попытка начала бы заново.
+# Процесс, который за SVC_IDLE_WINDOW секунд (10) ничего не сделал, — завис.
+# Пока ждём, раз в MA_PROGRESS_EVERY секунд (30) пишем, сколько прошло.
 HEALTH_URL=""
-wait_service_up(){
-  local timeout="${1:-${MA_START_TIMEOUT:-180}}"
+SVC_IDLE_WINDOW=10
+WAIT_BUSY_CAP=""      # не пусто — сдались по MA_START_TIMEOUT_MAX, хотя служба была занята
+WAIT_IDLE=""          # 1 — сдались, потому что служба ничего не делала (по /proc)
+WAIT_EXTENDED=""      # 1 — срок продлевался: служба была занята
+wait_service_up(){   # wait_service_up [СРОК [ПРЕДЕЛ]] — ПРЕДЕЛ = СРОК: не продлевать (откат)
+  local timeout="${1:-${MA_START_TIMEOUT:-180}}" cap="${2:-${MA_START_TIMEOUT_MAX:-3600}}" every="${MA_PROGRESS_EVERY:-30}"
   local began=$SECONDS active sub restarts base stable=0 told=0 elapsed
+  local window="$SVC_IDLE_WINDOW" check_at baseline="" act extended=0 report_at
+  WAIT_BUSY_CAP=""; WAIT_IDLE=""; WAIT_EXTENDED=""
   case "$timeout" in ''|*[!0-9]*) timeout=180 ;; esac
+  case "$cap" in ''|*[!0-9]*) cap=3600 ;; esac
+  case "$every" in ''|*[!0-9]*|0) every=30 ;; esac
+  if [ "$cap" -lt "$timeout" ]; then cap="$timeout"; fi
+  # первый замер — за окно до срока: к сроку будет с чем сравнить
+  check_at=$((timeout > window ? timeout - window : 0))
+  report_at="$every"
   HEALTH_URL="${MA_HEALTH_URL:-}"
   [ -n "$HEALTH_URL" ] || HEALTH_URL="$(cfg_value health_url)"
   base="$(svc_prop NRestarts)"
@@ -1259,13 +1450,61 @@ wait_service_up(){
       fi
     fi
     elapsed=$((SECONDS - began))
-    if [ "$elapsed" -ge "$timeout" ]; then return 2; fi
+    if [ "$elapsed" -ge "$check_at" ]; then
+      act="$(_svc_activity "$(svc_prop MainPID)")"
+      if [ "$elapsed" -ge "$timeout" ]; then
+        # срок вышел: ждём дальше, только если служба с прошлого замера что-то делала
+        if [ -z "$act" ]; then
+          # процесса нет: служба могла упасть между проверкой состояния и замером
+          case "$(svc_prop ActiveState)/$(svc_prop SubState)" in
+            failed/*|inactive/*|*/auto-restart*) return 1 ;;
+          esac
+          return 2
+        fi
+        if [ "$act" = "$baseline" ]; then WAIT_IDLE=1; return 2; fi
+        if [ "$elapsed" -ge "$cap" ]; then WAIT_BUSY_CAP="$elapsed"; return 2; fi
+        if [ "$extended" = "0" ]; then
+          extended=1; WAIT_EXTENDED=1
+          info "Срок ожидания ($timeout с) вышел, но служба занята — первый запуск новой версии, видимо, ещё"
+          info "    обновляет базу. Жду, пока она работает (всего не дольше $cap с; Ctrl-C — откат)."
+          report_at="$elapsed"
+        fi
+      fi
+      baseline="$act"
+      check_at=$((elapsed + window))
+    fi
     if [ "$told" = "0" ] && [ "$elapsed" -ge 8 ]; then
       info "Служба запущена, жду ответа веб-интерфейса (до $timeout с; первый запуск новой версии обновляет базу)…"
       told=1
+    elif [ "$told" = "1" ] && [ "$elapsed" -ge "$report_at" ]; then
+      info "  …жду ответа веб-интерфейса: прошло $(_elapsed "$elapsed")$(_svc_activity_note "$(svc_prop MainPID)")"
     fi
+    if [ "$elapsed" -ge "$report_at" ]; then report_at=$((elapsed + every)); fi
     sleep 1
   done
+}
+
+# Сколько главный процесс службы успел сделать: такты процессора и байты,
+# прочитанные и записанные (/proc/ПРОЦЕСС/stat и io; root их видит и у службы
+# в своём пространстве имён). Пусто — узнать нельзя.
+_svc_activity(){   # _svc_activity PID
+  local pid="$1" stat io
+  case "$pid" in ''|0|*[!0-9]*) return 0 ;; esac
+  stat="$(cat "/proc/$pid/stat" 2>/dev/null)" || return 0
+  stat="${stat##*) }"                        # имя процесса в скобках может содержать пробелы
+  io="$(cat "/proc/$pid/io" 2>/dev/null || true)"
+  awk -v st="$stat" 'BEGIN { split(st, f, " "); cpu = f[12] + f[13] }
+       /^rchar:/ { r = $2 } /^wchar:/ { w = $2 }
+       END { printf "%d %d %d\n", cpu, r, w }' <<< "$io"
+}
+
+# «; служба прочитала 2,1 ГБ, записала 310,4 МБ» — для строки о ходе ожидания.
+_svc_activity_note(){   # _svc_activity_note PID
+  local act cpu r w
+  act="$(_svc_activity "$1")"
+  [ -n "$act" ] || return 0
+  read -r cpu r w <<< "$act"
+  printf '; служба прочитала %s, записала %s' "$(_human_bytes "$r")" "$(_human_bytes "$w")"
 }
 
 # Последние N строк журнала службы с отступом (пусто, если журнала нет).
@@ -1344,9 +1583,23 @@ start_service_checked(){
     show_service_failure
   elif [ "$rc" = "2" ]; then
     reason="$(http_probe "$HEALTH_URL" || true)"
-    err "Служба запущена, но веб-интерфейс так и не ответил: $HEALTH_URL${reason:+ ($reason)}."
-    err "Если база большая и первый запуск новой версии длится дольше — повторите с MA_START_TIMEOUT=900;"
-    err "если служба слушает другой адрес — задайте его в MA_HEALTH_URL."
+    if [ -n "$WAIT_BUSY_CAP" ]; then
+      err "Служба занята уже $(_elapsed "$WAIT_BUSY_CAP") — дольше предела MA_START_TIMEOUT_MAX, — а веб-интерфейс так"
+      err "и не ответил: $HEALTH_URL${reason:+ ($reason)}."
+      err "Если база очень большая — повторите с MA_START_TIMEOUT_MAX=14400 (сколько секунд ждать всего);"
+      err "чем занята служба, покажет её журнал (ниже)."
+    else
+      err "Служба запущена, но веб-интерфейс так и не ответил: $HEALTH_URL${reason:+ ($reason)}."
+      if [ "$WAIT_IDLE" = "1" ]; then
+        err "Служба при этом уже ничего не делала (не тратила процессорное время, не читала и не писала) — похоже, зависла."
+      fi
+      if [ "$WAIT_EXTENDED" != "1" ]; then
+        err "Если база большая и первый запуск новой версии длится дольше — повторите с MA_START_TIMEOUT=900;"
+        err "если служба слушает другой адрес — задайте его в MA_HEALTH_URL."
+      else
+        err "Если служба слушает другой адрес — задайте его в MA_HEALTH_URL."
+      fi
+    fi
     show_service_failure
   fi
   return "$rc"

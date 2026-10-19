@@ -264,7 +264,7 @@ def _data_dir_must_be_usable(cfg) -> None:
     from .errors import ConfigError
     problem = cfg.dir_problem(cfg.data_dir, "Каталог данных")
     if problem and problem.kind != "denied":
-        hint = ("Если данные лежат на отдельном диске — проверьте, что он подключён (findmnt, mount -a), "
+        hint = ("Если данные лежат на отдельном диске — проверьте, что он подключён (lsblk -f, findmnt; пул ZFS — zpool import), "
                 "и повторите команду." if problem.kind == "dangling" else cfg.dir_hint(problem.kind, cfg.data_dir))
         raise ConfigError(problem + ".", hint=hint)
 
@@ -386,7 +386,7 @@ def cmd_check_config(args) -> int:
         # каталог, которого нет, чаще всего означает неподключённый диск с данными.
         print(f"Замечание: каталога данных {cfg.data_dir} нет. Новую установку его создаёт install.sh; "
               f"служба, уже установленная скриптом, без него не запустится. Если данные лежат на "
-              f"отдельном диске — проверьте, что он подключён (findmnt, mount -a).")
+              f"отдельном диске — проверьте, что он подключён (lsblk -f, findmnt; пул ZFS — zpool import).")
     print("Конфигурация корректна ✓" + (" (есть предупреждения)" if cfg.warnings or denied else ""))
     return 0
 
