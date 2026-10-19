@@ -418,6 +418,255 @@ unmounted_fstab_mount(){   # unmounted_fstab_mount ПУТЬ
   return 0
 }
 
+# Ближайший существующий каталог на пути (ссылки раскрыты): для ссылки в никуда
+# /storage/disk/mailarchiver — это /storage/disk, если его нет — /storage и т. д.
+existing_parent(){   # existing_parent ПУТЬ
+  local dir
+  dir="$(readlink -m -- "$1" 2>/dev/null || true)"
+  case "$dir" in /*) ;; *) return 0 ;; esac
+  while [ -n "$dir" ] && [ ! -d "$dir" ]; do dir="${dir%/*}"; done
+  printf '%s\n' "${dir:-/}"
+}
+
+# Файловые системы на дисках, которые сейчас не подключены (по lsblk), строками
+# «УСТРОЙСТВО|ТИП|РАЗМЕР|UUID|МЕТКА». Без подкачки, образов (loop, squashfs,
+# компакт-диски) и составных частей LVM, RAID, ZFS и зашифрованных разделов: их
+# подключают не командой mount — о них говорится отдельно (unmounted_containers).
+#
+# MA_LSBLK — команда вместо lsblk. Только для тестов: настоящие диски машины
+# тесты видеть не должны.
+_lsblk_pairs(){
+  local cmd="${MA_LSBLK:-lsblk}"
+  command -v "$cmd" >/dev/null 2>&1 || return 0
+  "$cmd" -P -p -o NAME,TYPE,FSTYPE,MOUNTPOINT,SIZE,UUID,LABEL 2>/dev/null || true
+}
+_lsblk_field(){   # _lsblk_field СТРОКА КЛЮЧ
+  if [[ " $1" =~ \ $2=\"([^\"]*)\" ]]; then printf '%s' "${BASH_REMATCH[1]}"; fi
+}
+unmounted_filesystems(){
+  local line type fstype mnt
+  while IFS= read -r line; do
+    type="$(_lsblk_field "$line" TYPE)"; fstype="$(_lsblk_field "$line" FSTYPE)"
+    mnt="$(_lsblk_field "$line" MOUNTPOINT)"
+    [ -n "$fstype" ] && [ -z "$mnt" ] || continue
+    case "$type" in loop|rom) continue ;; esac
+    case "$fstype" in
+      swap|squashfs|iso9660|udf|LVM2_member|linux_raid_member|zfs_member|crypto_LUKS|BitLocker) continue ;;
+    esac
+    printf '%s|%s|%s|%s|%s\n' "$(_lsblk_field "$line" NAME)" "$fstype" "$(_lsblk_field "$line" SIZE)" \
+      "$(_lsblk_field "$line" UUID)" "$(_lsblk_field "$line" LABEL)"
+  done < <(_lsblk_pairs)
+}
+unmounted_containers(){   # зашифрованные разделы и части томов, которые сейчас не в работе: «УСТРОЙСТВО (ТИП)»
+  local line fstype name
+  local -a used=()
+  while IFS= read -r line; do
+    name="$(_lsblk_field "$line" NAME)"; fstype="$(_lsblk_field "$line" FSTYPE)"
+    case "$fstype" in
+      crypto_LUKS|BitLocker|LVM2_member|linux_raid_member) used+=("$name|$fstype") ;;
+    esac
+  done < <(_lsblk_pairs)
+  # у открытого или собранного — есть устройство уровнем ниже (lsblk -P печатает его следом)
+  local item dev kind
+  for item in ${used[@]+"${used[@]}"}; do
+    dev="${item%%|*}"; kind="${item#*|}"
+    if ! "${MA_LSBLK:-lsblk}" -n -p -o NAME "$dev" 2>/dev/null | sed -n '2p' | grep -q .; then
+      printf '%s (%s)\n' "$dev" "$kind"
+    fi
+  done
+}
+
+# Пулы ZFS, которые есть на дисках (по lsblk: FSTYPE=zfs_member, метка — имя
+# пула), но сейчас не импортированы, строками «ПУЛ|УСТРОЙСТВА». Импортированный
+# пул в lsblk выглядит так же (точки монтирования у раздела нет), поэтому
+# импортированные берутся из «zpool list». Нет команды zpool — значит, и пул не
+# импортирован (без неё ZFS не работает).
+unimported_zfs_pools(){
+  local line fstype name label imported=" " pool devs
+  local -A pools=()
+  while IFS= read -r line; do
+    fstype="$(_lsblk_field "$line" FSTYPE)"
+    [ "$fstype" = "zfs_member" ] || continue
+    name="$(_lsblk_field "$line" NAME)"; label="$(_lsblk_field "$line" LABEL)"
+    label="${label:-?}"
+    pools[$label]="${pools[$label]:+${pools[$label]} }$name"
+  done < <(_lsblk_pairs)
+  [ "${#pools[@]}" -gt 0 ] || return 0
+  if command -v zpool >/dev/null 2>&1; then
+    imported=" $(zpool list -H -o name 2>/dev/null | tr '\n' ' ')"
+  fi
+  for pool in "${!pools[@]}"; do
+    case "$imported" in *" $pool "*) continue ;; esac
+    printf '%s|%s\n' "$pool" "${pools[$pool]}"
+  done | sort
+}
+
+# Почему нет каталога, на который ведёт путь, и что подключить: ближайший
+# существующий каталог, неподключённые файловые системы и строка для /etc/fstab.
+# Только для пути, которого нет в /etc/fstab (иначе причину называет
+# unmounted_fstab_mount): так бывает, когда диск или сетевой ресурс подключали
+# вручную, а после перезагрузки его никто не подключил.
+explain_missing_disk(){   # explain_missing_disk ЦЕЛЬ [found — база уже нашлась в другом месте]
+  local target="$1" found="${2:-}" parent fs="" containers="" zpools="" line dev type size uuid label first="" count=0
+  local pool devs here dropin_dir="${UNIT_FILE:-/etc/systemd/system/$APP_NAME.service}.d"
+  parent="$(existing_parent "$target")"
+  zpools="$(unimported_zfs_pools)"
+  if [ -n "$found" ]; then
+    :   # база нашлась в другом месте — гадать, что подключали в $parent, незачем
+  elif [ -z "$parent" ] || [ "$parent" = "/" ]; then
+    err_more "Ни одного каталога на пути $target нет."
+  elif findmnt --kernel --noheadings --mountpoint "$parent" >/dev/null 2>&1; then
+    err_more "Каталог $parent есть (к нему подключена файловая система), но в нём нет ${target#"$parent"/}."
+  elif [ -n "$zpools" ] && [ -z "$(find "$parent" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true)" ]; then
+    err_more "Каталог $parent есть, но он пуст и к нему ничего не подключено — так выглядит точка монтирования"
+    err_more "пула ZFS, который не импортирован (о пулах — ниже)."
+  elif [ -z "$(find "$parent" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true)" ]; then
+    err_more "Каталог $parent есть, но он пуст и к нему ничего не подключено, а в /etc/fstab о нём нет ни строки:"
+    err_more "похоже, диск или сетевой ресурс с данными подключали в $parent вручную, и сейчас он не подключён"
+    err_more "(например, после перезагрузки сервера)."
+  else
+    err_more "Каталог $parent есть, но в нём нет ${target#"$parent"/}."
+  fi
+  fs="$(unmounted_filesystems)"
+  containers="$(unmounted_containers)"
+  if [ -n "$fs" ]; then
+    if [ -n "$found" ]; then
+      err_more "Если данные всё же на диске, который не подключён, — вот какие файловые системы сейчас не подключены (lsblk):"
+    else
+      err_more "Файловые системы, которые сейчас не подключены (lsblk):"
+    fi
+    while IFS='|' read -r dev type size uuid label; do
+      [ -n "$dev" ] || continue
+      count=$((count + 1)); [ -n "$first" ] || first="$dev|$type|$uuid"
+      err_more "  $dev — $type, $size${label:+, метка «$label»}${uuid:+, UUID=$uuid}"
+    done <<< "$fs"
+    if [ "$parent" != "/" ] && [ -n "$parent" ]; then
+      if [ "$count" = "1" ]; then
+        IFS='|' read -r dev type uuid <<< "$first"
+        err_more "Подключите её и проверьте, что данные на месте: mount $dev \"$parent\"; ls -la \"$target/\""
+        err_more "Чтобы диск подключался сам после перезагрузки, добавьте в /etc/fstab строку:"
+        err_more "  UUID=$uuid $parent $type defaults,nofail 0 2"
+      else
+        err_more "Подключите ту, на которой данные, и проверьте: mount УСТРОЙСТВО \"$parent\"; ls -la \"$target/\""
+        err_more "Чтобы диск подключался сам после перезагрузки — строка в /etc/fstab: UUID=… $parent ТИП defaults,nofail 0 2"
+      fi
+    fi
+  fi
+  if [ -n "$containers" ]; then
+    err_more "Не открыты (не собраны) зашифрованные разделы или тома: $(printf '%s' "$containers" | tr '\n' ' ')"
+    err_more "Если данные на них — откройте или соберите (cryptsetup open, vgchange -ay, mdadm --assemble --scan) и подключите."
+  fi
+  if [ -n "$zpools" ]; then
+    while IFS='|' read -r pool devs; do
+      [ -n "$pool" ] || continue
+      here=""
+      case "$target/" in "/$pool/"*) here=" — путь $target лежит в его точке монтирования по умолчанию (/$pool)" ;; esac
+      err_more "Пул ZFS «$pool» ($devs) не импортирован$here."
+      if command -v zpool >/dev/null 2>&1; then
+        err_more "Подключите его и проверьте, что данные на месте: zpool import $pool; zfs mount -a; ls -la \"$target/\""
+        err_more "(«pool was previously in use from another system» — zpool import -f $pool, только если диск больше нигде не подключён)."
+      else
+        err_more "Команды zpool нет — установите утилиты ZFS (Ubuntu, Debian: apt install zfsutils-linux), затем: zpool import $pool"
+      fi
+      err_more "Чтобы пул подключался сам после перезагрузки: zpool set cachefile=/etc/zfs/zpool.cache $pool;"
+      err_more "  systemctl enable zfs-import-cache.service zfs-mount.service zfs.target"
+      err_more "и чтобы служба его дожидалась — дополнение к unit-файлу (обновление его не трогает):"
+      err_more "  mkdir -p \"$dropin_dir\""
+      err_more "  printf '[Unit]\\\\nRequires=zfs-mount.service\\\\nAfter=zfs-mount.service\\\\n' > \"$dropin_dir/zfs.conf\"; systemctl daemon-reload"
+    done <<< "$zpools"
+  fi
+  if [ -z "$fs" ] && [ -z "$containers" ] && [ -z "$zpools" ] && [ -z "$found" ]; then
+    err_more "Неподключённых дисков lsblk не видит. Возможно, данные были на сетевом ресурсе (NFS, SMB) — подключите"
+    err_more "его${parent:+ в $parent}; или каталог данных переносили и ссылку не поправили — найдите базу:"
+    err_more "  find / \\( -path /proc -o -path /sys -o -path /run -o -path /dev \\) -prune -o -name mailarchiver.db -print"
+  fi
+}
+
+# Где ещё лежит база службы, если путь каталога данных ведёт в никуда: каталоги
+# с mailarchiver.db рядом с целью ссылки и в обычных местах для данных. Так
+# бывает, когда каталог данных перенесли, а ссылку сделали с опечаткой
+# (/storage/storage/… вместо /storage/…) или не поправили. Служба при этом
+# могла неделями работать дальше — с каталогом, открытым до переноса, — и
+# перестать запускаться только при первом перезапуске (обновлении).
+#
+# Ищем неглубоко и недолго (каждое место — не дольше 15 секунд), ничего не
+# меняем. Строки «КАТАЛОГ|РАЗМЕР_БАЗЫ_БАЙТ|ВРЕМЯ_БАЗЫ_UNIX|secret.key|mailboxes»
+# (последние два поля — 1/0), самые свежие первыми, не больше пяти.
+#
+# MA_DATA_SEARCH — места для поиска вместо обычных мест для данных (/srv, /mnt …;
+# через «:»). Только для тестов: настоящие каталоги машины тесты видеть не должны.
+find_data_candidates(){   # find_data_candidates ЦЕЛЬ
+  local target="$1" parent top rest root depth db dir self found="" line
+  local -a roots=() extra=()
+  parent="$(existing_parent "$target")"
+  rest="${target#/}"; top="/${rest%%/*}"
+  self="$(readlink -m -- "$DATA_DIR" 2>/dev/null || true)"
+  # рядом с целью ссылки: ближайший существующий каталог, каталог над ним и верхний каталог пути
+  roots=("$parent" "${parent%/*}" "$top")
+  if [ -n "${MA_DATA_SEARCH:-}" ]; then
+    IFS=':' read -r -a extra <<< "$MA_DATA_SEARCH"
+  else
+    extra=("$(dirname -- "$DATA_DIR")" /srv /mnt /media /data /storage /backup /var/backups)
+  fi
+  roots+=(${extra[@]+"${extra[@]}"})
+  for root in ${roots[@]+"${roots[@]}"}; do
+    # /tmp целиком — не место для данных (служба видит свой /tmp: PrivateTmp), /home ей закрыт (ProtectHome)
+    case "$root" in ""|/|/tmp|/var/tmp|/proc|/proc/*|/sys|/sys/*|/dev|/dev/*|/run|/run/*|/home|/home/*) continue ;; esac
+    [ -d "$root" ] || continue
+    case ":$found:" in *":$root:"*) continue ;; esac
+    found="$found:$root"
+    depth=3
+    if [ "$root" = "$top" ]; then depth=4; fi
+    while IFS= read -r db; do
+      dir="${db%/mailarchiver.db}"
+      [ -n "$dir" ] && [ "$dir" != "$self" ] || continue
+      printf '%s|%s|%s|%s|%s\n' "$dir" "$(stat -c %s "$db" 2>/dev/null || echo 0)" \
+        "$(stat -c %Y "$db" 2>/dev/null || echo 0)" \
+        "$([ -f "$dir/secret.key" ] && echo 1 || echo 0)" "$([ -d "$dir/mailboxes" ] && echo 1 || echo 0)"
+    done < <(_with_timeout 15 find -H "$root" -maxdepth "$depth" -type f -name mailarchiver.db -print 2>/dev/null || true)
+  done | sort -t'|' -k1,1 -u | sort -t'|' -k3,3nr | head -n 5
+}
+
+# Команда с пределом времени, если есть timeout (coreutils), иначе как есть.
+_with_timeout(){   # _with_timeout СЕКУНД КОМАНДА…
+  local secs="$1"; shift
+  if command -v timeout >/dev/null 2>&1; then timeout "$secs" "$@"; else "$@"; fi
+}
+
+_human_bytes(){   # _human_bytes БАЙТ
+  awk -v b="${1:-0}" 'BEGIN { split("Б КБ МБ ГБ ТБ", u, " "); i = 1;
+    while (b >= 1024 && i < 5) { b /= 1024; i++ }
+    if (i == 1) printf "%d %s", b, u[i]; else printf "%.1f %s", b, u[i] }' | sed 's/\./,/'
+}
+
+# Рассказать о найденных базах и дать команду, которая направит путь каталога
+# данных на нужную (сами данные не перемещаются). Код возврата 0 — что-то нашлось.
+suggest_data_candidates(){   # suggest_data_candidates ЦЕЛЬ
+  local cands dir size when key boxes marks first="" count=0 how
+  cands="$(find_data_candidates "$1")"
+  [ -n "$cands" ] || return 1
+  err_more "База службы (mailarchiver.db) нашлась в другом месте — похоже, каталог данных перенесли, а путь не"
+  err_more "поправили (или в ссылке опечатка):"
+  while IFS='|' read -r dir size when key boxes; do
+    [ -n "$dir" ] || continue
+    count=$((count + 1)); [ -n "$first" ] || first="$dir"
+    marks=""
+    if [ "$key" = "1" ]; then marks="$marks, есть secret.key"; else marks="$marks, НЕТ secret.key"; fi
+    if [ "$boxes" = "1" ]; then marks="$marks и mailboxes/"; else marks="$marks, нет mailboxes/"; fi
+    err_more "  $dir — база $(_human_bytes "$size"), изменена $(date -d "@$when" '+%Y-%m-%d %H:%M' 2>/dev/null || echo '?')$marks"
+  done <<< "$cands"
+  if [ -L "$DATA_DIR" ]; then how="ln -sfn"; else how="ln -s"; fi
+  if [ "$count" = "1" ]; then
+    err_more "Если это они — направьте путь туда (сами данные не перемещаются): $how \"$first\" \"$DATA_DIR\""
+  else
+    err_more "Направьте путь на настоящий (самый свежий — первый в списке; сами данные не перемещаются):"
+    err_more "  $how КАТАЛОГ \"$DATA_DIR\""
+  fi
+  err_more "Каталог с secret.key и mailboxes/ рядом с базой — настоящий каталог данных; без secret.key не"
+  err_more "расшифруются пароли ящиков."
+  return 0
+}
+
 # Каталог данных доступен службе и не пуст, но лежит под точкой монтирования,
 # которая не подключена: служба работает с тем, что на диске под ней. Это не
 # отказ (возможно, строка в fstab просто устарела), но сказать о нём нужно.
@@ -484,10 +733,15 @@ check_data_dir(){
       shown="${real:-${hop:-другой каталог}}"
       if [ -n "$hop" ] && [ "$hop" != "$shown" ]; then shown="$shown (в самой ссылке записано: $hop)"; fi
       err "Каталог данных $DATA_DIR — ссылка на $shown, а такого каталога сейчас нет."
-      err_more "Обычно это значит, что не подключён диск, на котором лежат данные."
-      err_more "Проверьте: findmnt; lsblk; grep -v '^#' /etc/fstab   — и подключите диск (mount -a)."
-      err_more "Убедитесь, что данные на месте: ls \"$DATA_DIR/\"   — затем: systemctl reset-failed $APP_NAME; systemctl start $APP_NAME"
-      err_more "Пока каталога нет, служба не запустится ни в какой версии."
+      if suggest_data_candidates "${real:-$hop}"; then
+        explain_missing_disk "${real:-$hop}" found
+      else
+        err_more "Обычно это значит, что не подключён диск, на котором лежат данные."
+        explain_missing_disk "${real:-$hop}"
+      fi
+      err_more "Каталог ${real:-$hop} не создавайте: служба начала бы работу с пустой базой."
+      err_more "Когда данные на месте (ls \"$DATA_DIR/\" показывает mailarchiver.db): systemctl reset-failed $APP_NAME; systemctl start $APP_NAME"
+      err_more "Пока каталога нет, служба не запустится ни в какой версии — и обновление её не починит."
       ;;
     notdir)
       err "Каталог данных $DATA_DIR — не каталог ($(stat -c '%F' "$DATA_DIR" 2>/dev/null || echo '?'))."
@@ -503,7 +757,12 @@ check_data_dir(){
         # вручную), служба, которую systemd перезапускает каждые 5 секунд, тут же
         # поднялась бы на пустом каталоге с новой базой.
         err_more "Служба уже установлена, значит данные были в нём. Если они на отдельном диске или сетевом"
-        err_more "ресурсе — подключите его (findmnt; lsblk; mount -a) и убедитесь, что данные на месте: ls \"$DATA_DIR/\""
+        err_more "ресурсе — подключите его и убедитесь, что данные на месте: ls \"$DATA_DIR/\""
+        if suggest_data_candidates "${real:-$DATA_DIR}"; then
+          explain_missing_disk "${real:-$DATA_DIR}" found
+        else
+          explain_missing_disk "${real:-$DATA_DIR}"
+        fi
         err_more "Если данные в другом каталоге — задайте MA_DATA_DIR. Каталог не создавайте: служба начала бы работу с пустой базой."
       else
         err_more "Если данные лежат на отдельном диске — проверьте, что он подключён (findmnt; mount -a)."

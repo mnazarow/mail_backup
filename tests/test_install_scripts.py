@@ -606,6 +606,22 @@ fi
 exec @DF@ "$@"
 '''
 
+# Подделка lsblk: настоящие диски машины тесты видеть не должны. «Диски» задаёт тест
+# файлом $FAKE_SYSTEMD_STATE/lsblk (строки lsblk -P) и lsblk_children (строки
+# «УСТРОЙСТВО ДОЧЕРНЕЕ» — что открыто или собрано поверх устройства).
+FAKE_LSBLK = '''#!/bin/sh
+state="$FAKE_SYSTEMD_STATE"
+case " $* " in
+  *" -P "*) cat "$state/lsblk" 2>/dev/null; exit 0 ;;
+esac
+for dev in "$@"; do last="$dev"; done
+echo "$last"
+if [ -f "$state/lsblk_children" ]; then
+  awk -v d="$last" '$1 == d { print $2 }' "$state/lsblk_children"
+fi
+exit 0
+'''
+
 # Подделка systemd-detect-virt: тип контейнера задаёт тест (FAKE_VIRT), иначе «не контейнер».
 FAKE_DETECT_VIRT = '''#!/bin/sh
 if [ -n "$FAKE_VIRT" ]; then echo "$FAKE_VIRT"; exit 0; fi
@@ -716,6 +732,7 @@ class Sandbox:
         self.dropin = os.path.join(self.unit + ".d", "50-relax-sandbox.conf")
         self.wrapper = os.path.join(base, "usrbin", "mailarchiver")
         self.db = os.path.join(self.data, "mailarchiver.db")
+        self.stashes: list = []          # «отключённые диски» вне песочницы (unplug)
         for path in (self.config_dir, self.state, self.bin, os.path.dirname(self.unit),
                      os.path.dirname(self.wrapper)):
             os.makedirs(path)
@@ -738,6 +755,7 @@ class Sandbox:
                    0o755)
         _write(os.path.join(self.bin, "df"), FAKE_DF.replace("@DF@", shutil.which("df") or "/bin/df"), 0o755)
         _write(os.path.join(self.bin, "systemd-detect-virt"), FAKE_DETECT_VIRT, 0o755)
+        _write(os.path.join(self.bin, "lsblk"), FAKE_LSBLK, 0o755)
         # свой «/etc/fstab»: настоящий тесты менять не могут, а от его содержимого зависеть не должны
         self.fstab_file = os.path.join(self.state, "fstab")
         self.fstab()
@@ -755,6 +773,8 @@ class Sandbox:
             "MA_UNIT_FILE": self.unit, "MA_CLI_WRAPPER": self.wrapper,
             "MA_HOST": self.host, "MA_PORT": str(self.port),
             "MA_FSTAB": self.fstab_file, "MA_INDEX_URL": _index_url(),
+            # где ещё искать перенесённую базу: не в настоящих /srv, /mnt … машины
+            "MA_DATA_SEARCH": os.path.join(self.base, ".no-search"),
         }
         env.update(extra)
         return {key: value for key, value in env.items() if value is not None}
@@ -771,6 +791,21 @@ class Sandbox:
         return subprocess.Popen(["bash", os.path.join(src, "scripts", script)], env=self.env(**extra), cwd=src,
                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, start_new_session=True)
+
+    def unplug(self, path: str) -> str:
+        """«Отключить диск»: убрать каталог из песочницы туда, где его не найдёт и поиск перенесённых данных.
+
+        Рядом с песочницей, прямо в /tmp: /tmp целиком скрипты не просматривают.
+        """
+        stash = tempfile.mkdtemp(prefix="ma-unplugged-")
+        self.stashes.append(stash)
+        target = os.path.join(stash, "disk")
+        os.rename(path, target)
+        return target
+
+    def plug(self, stash: str, path: str) -> None:
+        """Вернуть «отключённый» каталог на место."""
+        os.rename(stash, path)
 
     def health_hits(self, version: str) -> int:
         try:
@@ -975,6 +1010,8 @@ def sandbox():
     finally:
         box.stop()
         shutil.rmtree(base, ignore_errors=True)
+        for stash in box.stashes:
+            shutil.rmtree(stash, ignore_errors=True)
 
 
 def _report(proc) -> str:
@@ -1238,7 +1275,7 @@ def test_update_refuses_when_data_disk_is_not_mounted(sandbox, args):
     sandbox.install_old()
     mount = _move_data_to_storage(sandbox)
     sandbox.stop()
-    os.rename(mount, mount + ".unmounted")                       # диск «отключился»
+    stash = sandbox.unplug(mount)                                # диск «отключился»
     sandbox.systemctl("start", "mailarchiver")
     assert sandbox.wait_crashed() and "No such file or directory" in sandbox.journal()
     src = sandbox.sources(NEW, "src_new")
@@ -1246,7 +1283,7 @@ def test_update_refuses_when_data_disk_is_not_mounted(sandbox, args):
     out = proc.stdout + proc.stderr
     assert proc.returncode != 0, _report(proc)
     assert "ссылка на %s" % os.path.join(mount, "mailarchiver") in out, _report(proc)
-    assert "не подключён диск" in out and "mount -a" in out, _report(proc)
+    assert "не подключён диск" in out and "Неподключённых дисков lsblk не видит" in out, _report(proc)
     assert "Служба не работает уже сейчас, до обновления" in out, _report(proc)
     # ничего не тронуто
     assert "Останавливаю" not in out and "Откат" not in out, _report(proc)
@@ -1254,7 +1291,7 @@ def test_update_refuses_when_data_disk_is_not_mounted(sandbox, args):
         assert fh.read().strip() == OLD
     assert not os.path.exists(os.path.join(sandbox.install_dir, "backups"))
     # диск вернули — служба поднимается, обновление проходит, база на месте
-    os.rename(mount + ".unmounted", mount)
+    sandbox.plug(stash, mount)
     sandbox.systemctl("start", "mailarchiver")
     assert sandbox.wait_version() == OLD
     proc = sandbox.run("update.sh", src)
@@ -1274,9 +1311,11 @@ def test_rollback_names_missing_data_directory(sandbox, style):
     """
     sandbox.install_old()
     mount = _move_data_to_storage(sandbox)
+    stash = os.path.join(tempfile.mkdtemp(prefix="ma-unplugged-"), "disk")
+    sandbox.stashes.append(os.path.dirname(stash))
     proc = sandbox.run("update.sh", sandbox.sources(NEW, "src_new"), FAKE_SYSTEMD_STYLE=style,
-                       FAKE_PIP_RUN='mv "%s" "%s.unmounted"' % (mount, mount))
-    os.rename(mount + ".unmounted", mount)
+                       FAKE_PIP_RUN='mv "%s" "%s"' % (mount, stash))
+    sandbox.plug(stash, mount)
     out = proc.stdout + proc.stderr
     assert proc.returncode != 0, _report(proc)
     assert "ссылка на %s" % os.path.join(mount, "mailarchiver") in out, _report(proc)
@@ -1379,6 +1418,8 @@ def test_update_health_check_uses_configured_address():
     finally:
         box.stop()
         shutil.rmtree(base, ignore_errors=True)
+        for stash in box.stashes:
+            shutil.rmtree(stash, ignore_errors=True)
 
 
 @needs_root
@@ -2029,8 +2070,7 @@ def test_update_never_advises_creating_data_dir_on_a_share_outside_fstab(sandbox
     """
     sandbox.install_old()
     sandbox.stop()
-    aside = sandbox.data + ".share"
-    os.rename(sandbox.data, aside)
+    aside = sandbox.unplug(sandbox.data)                   # ресурс «не подключён»
     if shape == "empty mount point":
         os.mkdir(sandbox.data, 0o700)                      # root:root, пусто
     sandbox.fstab()                                         # в fstab ресурса нет
@@ -2042,14 +2082,15 @@ def test_update_never_advises_creating_data_dir_on_a_share_outside_fstab(sandbox
         out = proc.stdout + proc.stderr
         assert proc.returncode != 0, (args, _report(proc))
         assert "install -d" not in out and "chown" not in out and "chmod" not in out, (args, _report(proc))
-        assert "mount -a" in out and "данные были" in out, (args, _report(proc))
+        assert "одключите его" in out and "данные были" in out, (args, _report(proc))
+        assert "нашлась в другом месте" not in out, (args, _report(proc))
         assert ("Каталог не создавайте" if shape == "missing" else "Владельца и права не меняйте") in out, \
             (args, _report(proc))
         _untouched(sandbox, before, proc, src)
     # ресурс подключили — обновление проходит на настоящих данных
     if shape == "empty mount point":
         os.rmdir(sandbox.data)
-    os.rename(aside, sandbox.data)
+    sandbox.plug(aside, sandbox.data)
     proc = sandbox.run("update.sh", src)
     assert proc.returncode == 0, _report(proc)
     assert sandbox.wait_version() == NEW and sandbox.db_text().startswith("created-by-" + OLD)
@@ -2268,6 +2309,177 @@ def test_relative_data_dir_in_config_is_read_the_way_the_service_reads_it(sandbo
 
 
 @needs_root
+def test_update_names_the_disk_that_was_mounted_by_hand(sandbox):
+    """Ссылка ведёт в каталог диска, который подключали вручную (в /etc/fstab его нет), а сейчас он не подключён.
+
+    Каталог, куда ведёт ссылка, — пустой каталог корневой файловой системы, в fstab только
+    корень и подкачка. Совет «mount -a» тут ничего не даёт: скрипт называет пустой каталог,
+    диски, которые не подключены, команду подключения и строку для /etc/fstab.
+    """
+    sandbox.install_old()
+    mount = _move_data_to_storage(sandbox)
+    sandbox.stop()
+    stash = sandbox.unplug(os.path.join(mount, "mailarchiver"))                   # диск «отключился»
+    root_dev = 'NAME="/dev/sda" TYPE="disk" FSTYPE="" MOUNTPOINT="" SIZE="40G" UUID="" LABEL=""'
+    _write(os.path.join(sandbox.state, "lsblk"), "\n".join([
+        root_dev,
+        'NAME="/dev/sda1" TYPE="part" FSTYPE="ext4" MOUNTPOINT="/" SIZE="39G" UUID="4f38-root" LABEL=""',
+        'NAME="/dev/sda2" TYPE="part" FSTYPE="swap" MOUNTPOINT="" SIZE="1G" UUID="sw-1" LABEL=""',
+        'NAME="/dev/sdb" TYPE="disk" FSTYPE="" MOUNTPOINT="" SIZE="500G" UUID="" LABEL=""',
+        'NAME="/dev/sdb1" TYPE="part" FSTYPE="ext4" MOUNTPOINT="" SIZE="500G" UUID="1234-abcd" LABEL="archive"',
+        'NAME="/dev/sdc1" TYPE="part" FSTYPE="crypto_LUKS" MOUNTPOINT="" SIZE="1T" UUID="lu-1" LABEL=""',
+        'NAME="/dev/loop0" TYPE="loop" FSTYPE="squashfs" MOUNTPOINT="" SIZE="60M" UUID="" LABEL=""',
+    ]) + "\n")
+    src = sandbox.sources(NEW, "src_new")
+    sandbox.forget_calls()
+    before = sandbox.snapshot(src)
+    proc = sandbox.run("update.sh", src, args=("--check",))
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, _report(proc)
+    target = os.path.join(mount, "mailarchiver")
+    assert "ссылка на %s, а такого каталога сейчас нет" % target in out, _report(proc)
+    assert "Каталог %s есть, но он пуст и к нему ничего не подключено" % mount in out, _report(proc)
+    assert "/dev/sdb1 — ext4, 500G, метка «archive», UUID=1234-abcd" in out, _report(proc)
+    assert 'mount /dev/sdb1 "%s"; ls -la "%s/"' % (mount, target) in out, _report(proc)
+    assert "UUID=1234-abcd %s ext4 defaults,nofail 0 2" % mount in out, _report(proc)
+    assert "/dev/sdc1 (crypto_LUKS)" in out, _report(proc)
+    assert "/dev/loop0" not in out and "/dev/sda2" not in out and "mount -a" not in out, _report(proc)
+    _untouched(sandbox, before, proc, src)
+
+    # открытый зашифрованный раздел о себе не напоминает; дисков не видно — совет про сетевой ресурс
+    _write(os.path.join(sandbox.state, "lsblk"),
+           root_dev + '\nNAME="/dev/sdc1" TYPE="part" FSTYPE="crypto_LUKS" MOUNTPOINT="" SIZE="1T" UUID="" LABEL=""\n')
+    _write(os.path.join(sandbox.state, "lsblk_children"), "/dev/sdc1 /dev/mapper/vault\n")
+    proc = sandbox.run("update.sh", src, args=("--check",))
+    out = proc.stdout + proc.stderr
+    assert "Неподключённых дисков lsblk не видит" in out and "-prune -o -name mailarchiver.db -print" in out, \
+        _report(proc)
+    assert "нашлась в другом месте" not in out, _report(proc)
+    assert "Подключите её" not in out and "crypto_LUKS" not in out, _report(proc)
+
+    # диск «подключили» — проверка проходит
+    sandbox.plug(stash, target)
+    sandbox.systemctl("start", "mailarchiver")
+    assert sandbox.wait_version() == OLD
+    proc = sandbox.run("update.sh", src, args=("--check",))
+    assert proc.returncode == 0, _report(proc)
+
+
+@needs_root
+def test_update_names_zfs_pool_that_is_not_imported(sandbox):
+    """Каталог данных — на пуле ZFS, который не импортирован (так было на сервере 19.10.2026).
+
+    /var/lib/mailarchiver → /storage/storage/mailarchiver/; /storage и /storage/storage —
+    пустые точки монтирования; в lsblk у sdb1 — zfs_member с меткой storage (имя пула);
+    в /etc/fstab ZFS не записывают. Скрипт называет пул и команды zpool import, автоимпорт
+    после перезагрузки и дополнение к unit-файлу, чтобы служба ждала ZFS.
+    """
+    sandbox.install_old()
+    mount = _move_data_to_storage(sandbox)
+    sandbox.stop()
+    stash = sandbox.unplug(os.path.join(mount, "mailarchiver"))                   # пул «экспортирован»
+    _write(os.path.join(sandbox.state, "lsblk"), "\n".join([
+        'NAME="/dev/sda2" TYPE="part" FSTYPE="ext4" MOUNTPOINT="/" SIZE="465G" UUID="4f38" LABEL=""',
+        'NAME="/dev/sdb" TYPE="disk" FSTYPE="" MOUNTPOINT="" SIZE="4T" UUID="" LABEL=""',
+        'NAME="/dev/sdb1" TYPE="part" FSTYPE="zfs_member" MOUNTPOINT="" SIZE="4T" UUID="1614" LABEL="storage"',
+        'NAME="/dev/sdb9" TYPE="part" FSTYPE="" MOUNTPOINT="" SIZE="8M" UUID="" LABEL=""',
+        'NAME="/dev/sr0" TYPE="rom" FSTYPE="iso9660" MOUNTPOINT="" SIZE="3G" UUID="" LABEL="Ubuntu-Server"',
+    ]) + "\n")
+    src = sandbox.sources(NEW, "src_new")
+    sandbox.forget_calls()
+    before = sandbox.snapshot(src)
+    target = os.path.join(mount, "mailarchiver")
+
+    # утилит ZFS нет — так и сказано
+    proc = sandbox.run("update.sh", src, args=("--check",))
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, _report(proc)
+    assert "Пул ZFS «storage» (/dev/sdb1) не импортирован." in out, _report(proc)
+    assert "apt install zfsutils-linux" in out, _report(proc)
+    assert "так выглядит точка монтирования" in out and "вручную" not in out, _report(proc)
+    assert "Неподключённых дисков lsblk не видит" not in out and "/dev/sr0" not in out, _report(proc)
+    _untouched(sandbox, before, proc, src)
+
+    # zpool есть, пул не импортирован — команды целиком
+    _write(os.path.join(sandbox.bin, "zpool"),
+           '#!/bin/sh\n[ "$1" = list ] && cat "$FAKE_SYSTEMD_STATE/zpools" 2>/dev/null\nexit 0\n', 0o755)
+    proc = sandbox.run("update.sh", src, args=("--check",))
+    out = proc.stdout + proc.stderr
+    assert 'zpool import storage; zfs mount -a; ls -la "%s/"' % target in out, _report(proc)
+    assert "zpool set cachefile=/etc/zfs/zpool.cache storage" in out, _report(proc)
+    assert "systemctl enable zfs-import-cache.service zfs-mount.service zfs.target" in out, _report(proc)
+    assert 'mkdir -p "%s.d"' % sandbox.unit in out, _report(proc)
+    assert ("printf '[Unit]\\nRequires=zfs-mount.service\\nAfter=zfs-mount.service\\n' > "
+            '"%s.d/zfs.conf"; systemctl daemon-reload' % sandbox.unit) in out, _report(proc)
+
+    # пул импортирован (а каталога всё равно нет) — о пуле не говорится
+    _write(os.path.join(sandbox.state, "zpools"), "storage\n")
+    proc = sandbox.run("update.sh", src, args=("--check",))
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0 and "Пул ZFS" not in out, _report(proc)
+
+    # пул «импортировали» — служба поднимается, обновление проходит
+    sandbox.plug(stash, target)
+    sandbox.systemctl("start", "mailarchiver")
+    assert sandbox.wait_version() == OLD
+    proc = sandbox.run("update.sh", src)
+    assert proc.returncode == 0, _report(proc)
+    assert sandbox.wait_version() == NEW
+
+
+@needs_root
+def test_update_finds_data_moved_under_a_mistyped_link(sandbox):
+    """Каталог данных перенесли, а ссылку сделали с опечаткой: скрипт находит базу и называет команду.
+
+    Служба после переноса работает дальше с открытым каталогом и падает только при
+    перезапуске (обновлении). Совет «подключите диск» тут ложный: данные лежат рядом.
+    """
+    sandbox.install_old()
+    sandbox.stop()
+    storage = os.path.join(sandbox.base, "storage")
+    os.makedirs(os.path.join(storage, "storage"))                 # тот каталог, что в ссылке, есть
+    real = os.path.join(storage, "mailarchiver")
+    os.rename(sandbox.data, real)
+    _write(os.path.join(real, "secret.key"), "k" * 96)
+    os.makedirs(os.path.join(real, "mailboxes"), exist_ok=True)
+    old_copy = os.path.join(storage, "copy-2025", "mailarchiver")   # давняя копия без ключа
+    _write(os.path.join(old_copy, "mailarchiver.db"), "old\n")
+    os.utime(os.path.join(old_copy, "mailarchiver.db"), (1735732800, 1735732800))
+    os.symlink(os.path.join(storage, "storage", "mailarchiver") + "/", sandbox.data)   # опечатка, «/» на конце
+    sandbox.systemctl("start", "mailarchiver")
+    assert sandbox.wait_crashed() and "No such file or directory" in sandbox.journal()
+    src = sandbox.sources(NEW, "src_new")
+    sandbox.forget_calls()
+    before = sandbox.snapshot(src, storage)
+    proc = sandbox.run("update.sh", src, args=("--check",))
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, _report(proc)
+    assert "нашлась в другом месте — похоже, каталог данных перенесли" in out, _report(proc)
+    found = [line.split("]", 1)[1].strip() for line in out.splitlines() if " — база " in line]
+    assert len(found) == 2, _report(proc)
+    assert found[0].strip().startswith(real + " — база ") and "есть secret.key и mailboxes/" in found[0], found
+    assert found[1].strip().startswith(old_copy + " — база 4 Б, изменена 2025-01-01") and "НЕТ secret.key" in found[1]
+    assert 'ln -sfn КАТАЛОГ "%s"' % sandbox.data in out, _report(proc)
+    assert "Каталог %s не создавайте" % os.path.join(storage, "storage", "mailarchiver") in out, _report(proc)
+    assert "не подключён диск" not in out and "mount -a" not in out, _report(proc)
+    _untouched(sandbox, before, proc, src, storage)
+
+    # одна находка — команда готова целиком; выполнили её — служба поднимается, обновление проходит
+    shutil.rmtree(os.path.dirname(old_copy))
+    proc = sandbox.run("update.sh", src, args=("--check",))
+    command = 'ln -sfn "%s" "%s"' % (real, sandbox.data)
+    assert command in proc.stderr, _report(proc)
+    subprocess.run(["bash", "-c", command], check=True)
+    assert os.path.realpath(sandbox.data) == real and sandbox.db_text().startswith("created-by-")
+    sandbox.systemctl("reset-failed", "mailarchiver")
+    sandbox.systemctl("restart", "mailarchiver")
+    assert sandbox.wait_version() == OLD
+    proc = sandbox.run("update.sh", src)
+    assert proc.returncode == 0, _report(proc)
+    assert sandbox.wait_version() == NEW
+
+
+@needs_root
 def test_dangling_link_with_trailing_slash_and_through_other_links(sandbox):
     """MA_DATA_DIR с «/» на конце, ссылка относительная и ведёт через другую ссылку: названа конечная цель."""
     sandbox.install_old()
@@ -2285,6 +2497,9 @@ def test_dangling_link_with_trailing_slash_and_through_other_links(sandbox):
     assert ("Каталог данных %s — ссылка на %s (в самой ссылке записано: hop), а такого каталога сейчас нет."
             % (sandbox.data, final)) in out, _report(proc)
     assert "Нет каталога данных" not in out, _report(proc)
+    # данные лежат рядом под другим именем — они найдены и названа команда
+    assert "  %s.disk — база " % sandbox.data in out, _report(proc)
+    assert 'ln -sfn "%s.disk" "%s"' % (sandbox.data, sandbox.data) in out, _report(proc)
     # Отказ один. Настоящая программа (и учебная) на таком каталоге не проходит и check-config —
     # но второго ✗ «исправьте конфигурацию» быть не должно: конфигурация ни при чём.
     assert "Конфигурация новой версией не проверялась" in out, _report(proc)
