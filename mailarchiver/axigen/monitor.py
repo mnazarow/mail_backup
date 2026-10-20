@@ -130,7 +130,7 @@ def license_days_left(status: Dict, today: Optional[date] = None) -> Optional[in
 
 def problems(svc, st: Optional[AxigenSettings] = None, status: Optional[Dict] = None) -> List[Dict]:
     """Что требует внимания: [{key, level, text}] — по состоянию сервера и последней сверке."""
-    from .directory import is_axigen_mailbox, match
+    from .directory import inherited_addresses, is_axigen_mailbox, match
     st = st or load_settings(svc)
     if not st.enabled:
         return []
@@ -207,7 +207,7 @@ def problems(svc, st: Optional[AxigenSettings] = None, status: Optional[Dict] = 
         except Exception:  # noqa: BLE001
             dmap = {}
         still_open = []
-        own = {str(r["email"]).lower() for r in rows}          # адреса учётных записей, и удалённых тоже
+        own = inherited_addresses(rows)          # адреса учётных записей и псевдонимы удалённых — чужие
         for r in live:
             if r.get("login_blocked") is not False:
                 continue

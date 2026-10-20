@@ -52,6 +52,7 @@ def handle_job(ctx) -> Dict:
         op_id = svc.db.create_bulk_op(f"расписание №{sid}", base.HISTORY_PREFIX + action.key, action.label,
                                       base.history_params(options), len(keys))
         op.data["op_id"] = op_id
+        progress.started(svc.db, op_id)             # до prepare: его отказ — «ни один ящик не тронут»
 
         def _who(k: str):
             t = known.get(k)
@@ -131,6 +132,8 @@ def handle_job(ctx) -> Dict:
             if t is not None:
                 record(t, "fail", "задание отменено во время обработки этого ящика — часть изменений могла "
                                   "выполниться (подробности — в журнале задания)")
+                # для «Повторить»: этот ящик — «прерван посреди работы», а не просто «ошибка»
+                progress.mark(svc.db, op_id, t.key, progress.RUNNING)
                 cancelled_at += 1
             break
         record(t, status, text)

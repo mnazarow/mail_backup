@@ -26,7 +26,7 @@ SOON_DAYS = 30
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS server_usage (
     key        TEXT NOT NULL,              -- ax:<адрес> или mb:<номер ящика архива>
-    day        TEXT NOT NULL,              -- ГГГГ-ММ-ДД (UTC)
+    day        TEXT NOT NULL,              -- ГГГГ-ММ-ДД, день по часовому поясу расписаний
     used_bytes INTEGER,
     quota_bytes INTEGER,
     messages   INTEGER,

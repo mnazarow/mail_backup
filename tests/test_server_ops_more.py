@@ -182,6 +182,7 @@ def test_retry_of_old_job_without_marks_refuses_when_result_is_lost(ax, monkeypa
     ax.svc.db.execute("UPDATE bulk_ops SET results=replace(results, '\"job_id\": 77', ?) WHERE id=?",
                       (f'"job_id": {job_id}', res["op_id"]))
     ax.svc.db.finish_job(job_id, JobStatus.FAILED, error="прервано")          # как у задания 1.12 после сбоя
+    ax.svc.db.execute("DELETE FROM server_op_items WHERE op_id=?", (res["op_id"],))   # операция 1.12 — без отметок
     with pytest.raises(ValidationError, match="неизвестно"):
         base.retry_info(ax.svc, res["op_id"])
     assert base.history_item_full(ax.svc, res["op_id"])["retry"] == 0
@@ -431,3 +432,81 @@ def test_report_records_usage_of_imap_mailbox(services, monkeypatch):
     assert items[f"mb:{acc}"]["status"] == "success", items
     row = services.db.query_one("SELECT used_bytes, quota_bytes FROM server_usage WHERE key=?", (f"mb:{acc}",))
     assert row["used_bytes"] == 2048 * 1024 and row["quota_bytes"] == 10240 * 1024
+
+
+# ---------------------------------------------------------------------------
+#  Второй разбор: повтор без единого тронутого ящика, псевдонимы уволенных
+# ---------------------------------------------------------------------------
+def queue_only(svc, action, keys, params, monkeypatch):
+    """Запуск как из интерфейса, но задание только поставлено в очередь (не выполнено)."""
+    queued = []
+    monkeypatch.setattr(svc.queue, "enqueue", lambda *a, **k: queued.append(a) or 77)
+    res = base.run(svc, ADMIN, action, keys, params, preview=False,
+                   confirm=base.run(svc, ADMIN, action, keys, params, preview=True)["confirm_value"])
+    job_id = svc.db.enqueue_job(JobType.SERVER_ACTION, None, queued[0][2], 5, 1, "tester")
+    svc.db.execute("UPDATE bulk_ops SET results=replace(results, '\"job_id\": 77', ?) WHERE id=?",
+                   (f'"job_id": {job_id}', res["op_id"]))
+    return res["op_id"], job_id, queued[0][2]
+
+
+def test_retry_after_cancel_in_queue_or_failed_prepare_offers_all(ax, monkeypatch):
+    op_id, job_id, _params = queue_only(ax.svc, "ax_must_change", [IV, PE], {"value": "yes"}, monkeypatch)
+    ax.svc.db.finish_job(job_id, JobStatus.CANCELLED, error="Отменено пользователем")       # отменено в очереди
+    assert base.retry_info(ax.svc, op_id)["keys"] == [IV, PE]
+    op_id, job_id, params = queue_only(ax.svc, "ax_must_change", [IV, PE], {"value": "yes"}, monkeypatch)
+    ax.svc.db.set_settings_many({"axigen.allow_changes": False})                              # запретили до запуска
+    ax.svc.apply_runtime_settings()
+    with pytest.raises(ValidationError):
+        HANDLERS[JobType.SERVER_ACTION](JobContext(ax.svc, job_id, JobType.SERVER_ACTION, None, params))
+    ax.svc.db.finish_job(job_id, JobStatus.FAILED, error="изменения запрещены")
+    assert base.retry_count(ax.svc, op_id) == (2, "")
+
+
+def test_cancel_in_the_middle_of_a_mailbox_is_uncertain(ax, monkeypatch):
+    from mailarchiver.axigen import actions as axactions
+    from mailarchiver.errors import JobCancelled
+    op_id, job_id, params = queue_only(ax.svc, "ax_must_change", [IV, PE], {"value": "yes"}, monkeypatch)
+    real = axactions.set_account_flag
+
+    def applied_then_cancelled(cli, email, attr, value):
+        real(cli, email, attr, value)                       # на сервере изменено…
+        raise JobCancelled("Задание отменено.")             # …и тут же отмена
+    monkeypatch.setattr(axactions, "set_account_flag", applied_then_cancelled)
+    monkeypatch.setattr(ax.svc.db, "is_cancel_requested", lambda _id: True)
+    ctx = JobContext(ax.svc, job_id, JobType.SERVER_ACTION, None, params)
+    monkeypatch.setattr(ctx, "is_cancelled", lambda: False)          # отмену заметили внутри ящика
+    out = HANDLERS[JobType.SERVER_ACTION](ctx)
+    ax.svc.db.finish_job(job_id, out["final_status"], out)
+    assert out["items"][0]["status"] == "failed" and "часть изменений могла" in out["items"][0]["detail"]
+    info = base.retry_info(ax.svc, op_id)
+    assert info["keys"] == [IV, PE] and info["uncertain"] == [IV]
+
+
+def test_alias_of_dismissed_account_passed_to_colleague_is_not_his(ax):
+    from mailarchiver import employees
+    ax.world.domains["company.ru"].accounts["petrov"].aliases = ["p.petrov"]
+    run_job(ax.svc, JobType.AXIGEN_SYNC, {"requested_by": "tester"})
+    ftp_mailbox(ax.svc, "petrov@company.ru")
+    alias_box = ftp_mailbox(ax.svc, "p.petrov@company.ru", name="p.petrov")       # ящик, что входит по псевдониму
+    emp = ax.svc.db.create_employee(full_name="Петров Пётр", email="p.petrov@company.ru")
+    employees.dismiss_employee(ax.svc, emp, reason="тест")
+    act(ax.svc, "ax_block", [PE], final_copy=False, keep_receiving=True)
+    res, items = act(ax.svc, "ax_delete", [PE], forward_to="ivanov@company.ru", forward_aliases=True)
+    assert items[PE]["status"] == "success", items[PE]
+    assert "p.petrov@company.ru" in axstore.get_account(ax.svc.db, "ivanov@company.ru")["aliases"]
+    rows = {r["key"]: r for r in tg.overview(ax.svc)["rows"]}
+    assert not rows[IV]["dismissed_at"] and not rows[IV]["mailbox"]
+    assert "dismissed_open" not in {p["key"] for p in monitor.problems(ax.svc)}
+    assert f"mb:{alias_box}" in rows                       # ящик по псевдониму к коллеге не прилип
+
+
+def test_deleted_account_keeps_mailbox_linked_by_alias(ax):
+    ax.world.domains["company.ru"].accounts["petrov"].aliases = ["p.petrov"]
+    run_job(ax.svc, JobType.AXIGEN_SYNC, {"requested_by": "tester"})
+    box = ftp_mailbox(ax.svc, "p.petrov@company.ru", name="p.petrov")
+    assert ({r["key"]: r for r in tg.overview(ax.svc)["rows"]}[PE]["mailbox"] or {}).get("id") == box
+    del ax.world.domains["company.ru"].accounts["petrov"]
+    run_job(ax.svc, JobType.AXIGEN_SYNC, {"requested_by": "tester"})
+    rows = {r["key"]: r for r in tg.overview(ax.svc)["rows"]}
+    assert (rows[PE]["mailbox"] or {}).get("id") == box and f"mb:{box}" not in rows
+    assert "gone" in {p["key"] for p in monitor.problems(ax.svc)}

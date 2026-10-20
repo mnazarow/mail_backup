@@ -168,6 +168,8 @@ def run(svc, user: dict, params: Dict[str, Any], *, preview: bool = True, confir
     safe = {"source": params.get("source") or "text", "password_mode": mode, "must_change": options["must_change"],
             "quota_mb": quota_mb, "add_to_archive": options["add_to_archive"]}
     op_id = svc.db.create_bulk_op(username, base.HISTORY_PREFIX + KEY, LABEL, safe, len(items))
+    from . import progress
+    progress.started(svc.db, op_id)                 # до очереди — см. base.run
     job_id = svc.queue.enqueue(JobType.SERVER_ACTION, None,
                                {"action": KEY, "keys": [], "options": options, "requested_by": username,
                                 "op_id": op_id}, priority=4, max_attempts=1, created_by=username)

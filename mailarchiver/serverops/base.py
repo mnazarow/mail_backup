@@ -309,6 +309,10 @@ def run(svc, user: dict, action_key: str, keys: Sequence, params: Optional[Dict[
             continue
         results.append(_item(t, OK, "в задании «Действия с ящиками на сервере»"))
     if not preview and not action.immediate and to_apply:
+        # отметка «операция с заданием» — сразу, до очереди: даже если задание отменят в очереди или оно
+        # упадёт до первого ящика, «Повторить» будет знать, что ни один ящик не тронут
+        from . import progress
+        progress.started(svc.db, op_id)
         job_id = svc.queue.enqueue(JobType.SERVER_ACTION, None,
                                    {"action": action.key, "keys": [t.key for t in to_apply],
                                     "options": action.options(ctx), "requested_by": username, "op_id": op_id},

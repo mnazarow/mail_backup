@@ -311,22 +311,42 @@ def match(server_rows: Sequence[Dict], accounts: Sequence[Account], st: AxigenSe
     # Сначала — точное совпадение логина с адресом учётной записи (и удалённой тоже): ящик уволенного,
     # чей адрес после удаления передан коллеге псевдонимом, остаётся за своей (удалённой) учётной записью
     # и не «переезжает» к коллеге.
-    own = {str(row["email"]).strip().lower() for row in server_rows}
     for row in server_rows:
         acc = by_login.get(row["email"])
         if acc is not None:
             out[row["email"]] = acc
+    taken = {acc.id for acc in out.values()}
+    # Затем — по псевдонимам: сначала живые учётные записи (без адресов, принадлежавших удалённым —
+    # переданных коллеге), потом удалённые (ящик, который входил по псевдониму уволенного).
+    inherited = inherited_addresses(server_rows)
+    live = [r for r in server_rows if not r.get("deleted_at")]
+    gone = [r for r in server_rows if r.get("deleted_at")]
+    live_emails = {str(r["email"]).strip().lower() for r in live}
+    for rows, skip in ((live, inherited), (gone, live_emails)):
+        for row in rows:
+            email = row["email"]
+            if email in out:
+                continue
+            for alias in row.get("aliases") or []:
+                alias = str(alias).strip().lower()
+                if alias in skip:
+                    continue
+                acc = by_login.get(alias)
+                if acc is not None and acc.id not in taken:
+                    out[email] = acc
+                    taken.add(acc.id)
+                    break
+    return out
+
+
+def inherited_addresses(server_rows: Sequence[Dict]) -> set:
+    """Адреса, которые принадлежат (принадлежали) другим учётным записям: адреса всех учётных записей и
+    псевдонимы удалённых. У живой учётной записи такой псевдоним — переданный ей адрес уволенного."""
+    out = set()
     for row in server_rows:
-        email = row["email"]
-        if email in out or row.get("deleted_at"):
-            continue
-        for alias in row.get("aliases") or []:
-            if str(alias).strip().lower() in own:
-                continue                    # это адрес другой учётной записи (например, переданный коллеге)
-            acc = by_login.get(alias)
-            if acc is not None:
-                out[email] = acc
-                break
+        out.add(str(row["email"]).strip().lower())
+        if row.get("deleted_at"):
+            out.update(str(a).strip().lower() for a in row.get("aliases") or [])
     return out
 
 

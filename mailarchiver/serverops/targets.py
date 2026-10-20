@@ -166,8 +166,10 @@ def dismissed_map(svc) -> Dict[str, str]:
 
 
 def own_addresses(items: Sequence[Target]) -> Set[str]:
-    """Адреса учётных записей Axigen (и удалённых): псевдоним с таким адресом — чужой, переданный коллеге."""
-    return {str(t.email).strip().lower() for t in items if t.axigen is not None}
+    """Адреса учётных записей Axigen (и удалённых) и псевдонимы удалённых: у живой учётной записи такой
+    псевдоним — чужой адрес, переданный коллеге."""
+    from ..axigen.directory import inherited_addresses
+    return inherited_addresses([t.axigen for t in items if t.axigen is not None])
 
 
 def dismissed_at(t: Target, dismissed: Dict[str, str], own: Optional[Set[str]] = None) -> str:

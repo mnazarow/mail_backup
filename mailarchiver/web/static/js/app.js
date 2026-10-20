@@ -4924,9 +4924,11 @@ function srvList(box, rows, meta, ax){
     // повтор: отмеченные ящики должны быть видны — удалённые без архива показывает только свой отбор
     const p=Srv.pending; Srv.pending=null;
     const picked=[...Srv.sel].map(k=>byKey.get(k));
-    if(picked.length && picked.every(r=>!srvMatches(r,'',''))) Srv.filter='deleted';
+    const hidden=picked.filter(r=>!srvMatches(r,'','')).length;
+    if(picked.length && hidden===picked.length) Srv.filter='deleted';
     const n=Srv.sel.size, gone=asked-n;
     const notes=[`«${p.label}» с прежними параметрами — нажмите «Проверить и запустить…».`];
+    if(hidden && hidden<picked.length) notes.push(`${fmtNum(hidden)} из них удалены на сервере — их видно в отборе «Удалены на сервере» (отмечены и там).`);
     if(gone>0) notes.push(`${fmtNum(gone)} ${plural(gone,'ящика','ящиков','ящиков')} больше нет в таблице.`);
     if(p.blank) notes.push('Пароль введите заново — он не сохраняется.');
     if(p.uncertain) notes.push(`На ${fmtNum(p.uncertain)} ${plural(p.uncertain,'ящике','ящиках','ящиках')} задание прервалось посреди работы — часть изменений могла выполниться; посмотрите их в проверке.`);
