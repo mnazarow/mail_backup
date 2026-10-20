@@ -256,6 +256,48 @@ def note_services(db, email: str, services: List[str], blocked: Optional[bool]) 
                 email.lower()))
 
 
+#: Поля снимка, которые групповые действия обновляют после изменения на сервере.
+_UPDATABLE = ("quota_kb", "aliases", "first_name", "last_name", "services", "login_blocked")
+
+
+def update_fields(db, email: str, **fields: Any) -> None:
+    """Обновить в снимке поля учётной записи, которые только что изменили на сервере.
+
+    Так раздел показывает новое значение сразу, не дожидаясь следующей сверки.
+    """
+    sets, args = [], []
+    for key, value in fields.items():
+        if key not in _UPDATABLE:
+            raise ValueError(f"поле {key} так не обновляется")
+        if key == "aliases":
+            value = json.dumps(list(value or []), ensure_ascii=False)
+        elif key == "services":
+            value = None if value is None else json.dumps(list(value), ensure_ascii=False)
+        elif key == "login_blocked":
+            value = None if value is None else (1 if value else 0)
+        sets.append(f"{key}=?")
+        args.append(value)
+    if not sets:
+        return
+    db.execute(f"UPDATE axigen_accounts SET {', '.join(sets)} WHERE email=?", (*args, (email or "").lower()))
+
+
+def merge_info(db, email: str, values: Dict[str, Any]) -> None:
+    """Дописать в поле ``info`` (сведения для карточки) прочитанные с сервера значения."""
+    row = db.query_one("SELECT info FROM axigen_accounts WHERE email=?", ((email or "").lower(),))
+    if row is None:
+        return
+    try:
+        info = json.loads(row["info"] or "{}")
+    except (TypeError, ValueError):
+        info = {}
+    if not isinstance(info, dict):
+        info = {}
+    info.update(values)
+    db.execute("UPDATE axigen_accounts SET info=? WHERE email=?",
+               (json.dumps(info, ensure_ascii=False)[:20000], (email or "").lower()))
+
+
 def note_deleted(db, email: str) -> None:
     db.execute("UPDATE axigen_accounts SET deleted_at=? WHERE email=?", (utcnow_iso(), email.lower()))
 

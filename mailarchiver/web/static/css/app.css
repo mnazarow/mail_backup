@@ -479,3 +479,9 @@ table.tbl select[data-role]:focus { outline: none; border-color: var(--primary);
 .bulk-results table.tbl { min-width: 620px; }
 .sched-tbl { min-width: 760px; }
 @media (max-width: 600px) { .sel-bar { position: static; } }
+/* Ящики на сервере: на узком экране таблицы прокручиваются вбок, а не сжимают колонки до буквы. */
+.srv-tbl { min-width: 860px; }
+.srv-hist { min-width: 720px; }
+.srv-items { min-width: 560px; }
+.srv-tbl td, .srv-tbl th, .srv-hist td, .srv-items td { overflow-wrap: normal; }
+.srv-tbl td.srv-mail { overflow-wrap: anywhere; min-width: 200px; }

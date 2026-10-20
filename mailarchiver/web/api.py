@@ -1843,6 +1843,9 @@ def retry_job(request: Request, job_id: int, user: dict = Depends(auth_mod.requi
         raise HTTPException(403, _OPERATOR_JOB_REFUSAL)
     if row["status"] not in JobStatus.TERMINAL:
         raise ValidationError("Повторить можно только завершённое задание.")
+    if row["type"] in JobType.NOT_RESUMABLE:
+        raise ValidationError(JobType.NO_RETRY_TEXT,
+                              hint="История операций раздела → «Подробнее» покажет, что уже сделано.")
     _operator_job_guard(svc, user, row["type"], row["account_id"], need_enabled=row["type"] == JobType.BACKUP,
                         rebuild=str(roles.job_params(row).get("rebuild") or ""))
     if user.get("role") == "mailbox":

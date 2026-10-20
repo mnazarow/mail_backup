@@ -24,7 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
-from ..errors import JobCancelled, MailArchiverError
+from ..errors import JobCancelled, MailArchiverError, ValidationError
 from ..logging_setup import get_logger
 from ..models import JobStatus, JobType
 from ..util import clamp
@@ -45,7 +45,7 @@ LOCAL_JOB_TYPES = (JobType.BACKUP, JobType.RETENTION, JobType.STORAGE_CONVERT, J
 SINGLETON_JOB_TYPES = (JobType.SYNC_EMPLOYEES, JobType.CHECK_LOGINS, JobType.REPLICATE,
                        JobType.DB_SNAPSHOT, JobType.SEARCH_INDEX, JobType.DEDUP_REPORT,
                        JobType.BACKUP_ALL, JobType.SEARCH_REINDEX, JobType.FOLDERS_CHECK,
-                       JobType.AXIGEN_SYNC, JobType.AXIGEN_ACTION)
+                       JobType.AXIGEN_SYNC, JobType.AXIGEN_ACTION, JobType.SERVER_ACTION)
 #: О каких заданиях не слать уведомления (служебные, по кнопке).
 _QUIET_TYPES = (JobType.TEST, JobType.CHECK_LOGINS, JobType.SEARCH_INDEX, JobType.DEDUP_REPORT,
                 JobType.QUARANTINE_CHECK, JobType.FOLDERS_CHECK, JobType.SEARCH_REINDEX)
@@ -152,6 +152,8 @@ class QueueManager:
     def retry(self, job_id: int) -> None:
         """Ручной «Повторить»: снова все попытки и снятый флаг отмены."""
         row = self.db.get_job(job_id)
+        if row is not None and row["type"] in JobType.NOT_RESUMABLE:
+            raise ValidationError(JobType.NO_RETRY_TEXT)
         if row is not None and row["type"] == JobType.BACKUP and row["status"] == JobStatus.SUCCESS:
             # Удачно законченную копию «с нуля» «Повторить» пересоздаёт заново, а не
             # «продолжает» (задание, прерванное сбоем, по-прежнему продолжается).

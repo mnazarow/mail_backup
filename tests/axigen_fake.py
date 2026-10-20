@@ -79,12 +79,20 @@ class FakeAccount:
     folders: Dict[str, Tuple[int, int]] = field(default_factory=lambda: {"INBOX": (3, 30720), "Sent": (1, 2048)})
     last_login: str = "2026-09-30 10:15:00"
     purges: List[Tuple[str, str]] = field(default_factory=list)
+    #: прочие поля ContactInfo (department, company…) и признаки учётной записи
+    contact: Dict[str, str] = field(default_factory=dict)
+    must_change_pass: str = "no"
+    account_type: str = "basic"
+    publish: str = "yes"
+    quota_threshold: int = 0
 
 
 @dataclass
 class FakeDomain:
     accounts: Dict[str, FakeAccount] = field(default_factory=dict)
     purge_folders: List[str] = field(default_factory=lambda: ["Trash", "Spam"])
+    available_services: List[str] = field(default_factory=lambda: ["localDelivery", "remoteDelivery", "pop3", "imap",
+                                                                   "webmail", "activesync"])
 
 
 @dataclass
@@ -307,7 +315,8 @@ class _CliHandler(socketserver.BaseRequestHandler):
             if verb == "SHOW":
                 dom = w.domains[self.stack[0][1]["name"]]
                 return self.reply(self.show_lines({"purgeFolders": _list_value(dom.purge_folders, w.style),
-                                                   "maxAccounts": "0"}, raw=("purgeFolders",)))
+                                                   "availableServices": _list_value(dom.available_services, w.style),
+                                                   "maxAccounts": "0"}, raw=("purgeFolders", "availableServices")))
             raise _Err("unknown command")
         if kind == "queue":
             if verb == "LIST":
@@ -423,6 +432,27 @@ class _CliHandler(socketserver.BaseRequestHandler):
         if verb == "SET" and len(t) >= 3 and t[1].lower() == "password":
             pending["password"] = t[2]
             return self.reply([])
+        flags = {"mustchangepass": ("must_change_pass", ("yes", "no")), "accounttype": ("account_type",
+                                                                                         ("basic", "premium")),
+                 "publishcontactinfo": ("publish", ("yes", "no"))}
+        if verb == "SET" and len(t) >= 3 and t[1].lower() in flags:
+            attr, allowed = flags[t[1].lower()]
+            if t[2].lower() not in allowed:
+                raise _Err(f"invalid value {t[2]}")
+            pending[attr] = t[2].lower()
+            return self.reply([])
+        if verb in ("ADD", "REMOVE") and len(t) >= 3 and up[1] == "ALIAS" and not creating:
+            name = t[2].split("@", 1)[0]
+            current = pending.setdefault("aliases", list(acc.aliases))
+            if verb == "ADD":
+                if name in current:
+                    raise _Err("Alias already exists")
+                current.append(name)
+            else:
+                if name not in current:
+                    raise _Err(f"Alias {name} not found")
+                current.remove(name)
+            return self.reply([])
         if verb == "COMMIT":
             name = self._acc_name()
             if creating:
@@ -448,7 +478,9 @@ class _CliHandler(socketserver.BaseRequestHandler):
                 values["last login date"] = acc.last_login
             return self.reply(self.show_lines(values))
         if verb == "SHOW" and len(t) == 1:
-            return self.reply(self.show_lines({"name": self._acc_name(), "accountType": "basic"}))
+            return self.reply(self.show_lines({"name": self._acc_name(), "accountType": acc.account_type,
+                                               "mustChangePass": acc.must_change_pass,
+                                               "publishContactInfo": acc.publish}))
         if verb == "PURGE" and len(up) >= 4 and up[1] == "ACCOUNT" and up[2] == "FOLDERS":
             if "BEFORE" not in up:
                 raise _Err("test server: purge without condition is refused")
@@ -477,8 +509,10 @@ class _CliHandler(socketserver.BaseRequestHandler):
                 values = {"services": _list_value(acc.services, w.style), "imapConnectionCount": "10"}
                 return self.reply(self.show_lines(values, raw=("services",)))
             if sub == "account-quotas":
-                return self.reply(self.show_lines({"mboxCount": "0", "totalMessageSize": str(acc.quota_kb)}))
-            return self.reply(self.show_lines({"firstName": acc.first_name, "lastName": acc.last_name}))
+                return self.reply(self.show_lines({"mboxCount": "0", "totalMessageSize": str(acc.quota_kb),
+                                                   "quotaLimitThreshold": str(acc.quota_threshold)}))
+            return self.reply(self.show_lines({"firstName": acc.first_name, "lastName": acc.last_name,
+                                               **acc.contact}))
         if verb == "SET" and len(t) >= 3:
             key = t[1]
             if sub == "account-limits" and key.lower() == "services":
@@ -491,8 +525,18 @@ class _CliHandler(socketserver.BaseRequestHandler):
             if sub == "account-contactinfo" and key.lower() in ("firstname", "lastname"):
                 pending["first_name" if key.lower() == "firstname" else "last_name"] = t[2]
                 return self.reply([])
+            known = ("middleName", "company", "department", "position", "office", "businessPhone", "mobilePhone")
+            if sub == "account-contactinfo" and key in known:
+                contact = pending.setdefault("contact", dict(acc.contact) if acc else {})
+                contact[key] = " ".join(t[2:])
+                return self.reply([])
             if sub == "account-quotas" and key.lower() == "totalmessagesize":
                 pending["quota_kb"] = int(t[2])
+                return self.reply([])
+            if sub == "account-quotas" and key.lower() == "quotalimitthreshold":
+                pending["quota_threshold"] = int(t[2])
+                return self.reply([])
+            if sub == "account-quotas" and key.lower() == "quotalimitnotificationenabled":
                 return self.reply([])
         raise _Err("unknown command")
 

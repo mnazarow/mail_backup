@@ -1845,6 +1845,11 @@ def _axigen_jobs():
     return axigen_jobs
 
 
+def _server_jobs():
+    from ..serverops import jobs as server_jobs
+    return server_jobs
+
+
 def is_global_pass(job) -> bool:
     """Задание — проход по ВСЕМ включённым ящикам (а не по выбранным)."""
     try:
@@ -2540,4 +2545,5 @@ HANDLERS: Dict[str, Callable[[JobContext], Dict]] = {
     JobType.SEARCH_REINDEX: handle_search_reindex,
     JobType.AXIGEN_SYNC: lambda ctx: _axigen_jobs().handle_sync(ctx),
     JobType.AXIGEN_ACTION: lambda ctx: _axigen_jobs().handle_action(ctx),
+    JobType.SERVER_ACTION: lambda ctx: _server_jobs().handle_job(ctx),
 }

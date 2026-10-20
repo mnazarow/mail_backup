@@ -2162,9 +2162,13 @@ def bulk_create(svc, user: dict, text: str, *, host: str, port: int = 993, secur
 # =====================================================================
 #  История операций
 # =====================================================================
+#: Ключи операций раздела «Ящики на сервере» (mailarchiver.serverops) — у них своя история.
+SERVER_PREFIX = "srv_"
+
+
 def history(svc, limit: int = 50) -> List[Dict[str, Any]]:
     out = []
-    for row in svc.db.list_bulk_ops(limit=max(1, min(300, int(limit)))):
+    for row in svc.db.list_bulk_ops(limit=max(1, min(300, int(limit))), exclude_prefix=SERVER_PREFIX):
         try:
             params = json.loads(row["params"] or "{}")
         except (TypeError, ValueError):
@@ -2176,9 +2180,10 @@ def history(svc, limit: int = 50) -> List[Dict[str, Any]]:
     return out
 
 
-def history_item(svc, op_id: int) -> Optional[Dict[str, Any]]:
+def history_item(svc, op_id: int, *, server: bool = False) -> Optional[Dict[str, Any]]:
+    """Операция по номеру. ``server`` — операция раздела «Ящики на сервере» (иначе — архива)."""
     row = svc.db.get_bulk_op(op_id)
-    if row is None:
+    if row is None or str(row["action"] or "").startswith(SERVER_PREFIX) != bool(server):
         return None
     try:
         results = json.loads(row["results"] or "[]")

@@ -17,14 +17,15 @@ from __future__ import annotations
 
 import secrets
 import string
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from ..errors import ValidationError
 from . import parse
 from .cli import AxigenCLI, has_control, quote, quote_list
 from .common import (AxigenError, AxigenSettings, blocked_services, services_blocked,
                      split_email)
-from .directory import enter_account, enter_domain, read_services, valid_account_name, valid_domain, account_folders
+from .directory import (account_folders, enter_account, enter_domain, read_services, valid_account_name,
+                        valid_domain)
 
 #: Знаки случайного пароля: без кавычек, пробелов и «\» (их нельзя передать в CLI).
 _PASSWORD_ALPHABET = string.ascii_letters + string.digits
@@ -246,6 +247,210 @@ def purge_folder(cli: AxigenCLI, email: str, folder: str, days: int) -> Tuple[Op
     return before, after
 
 
+# ---------------------------------------------------------------------------
+#  Квота, псевдонимы, контактные данные, признаки учётной записи
+# ---------------------------------------------------------------------------
+#: Наибольшая квота учётной записи по документации Axigen — 4 ТБ (в КБ).
+MAX_QUOTA_KB = 4 * 1024 ** 3
+#: Поля ``CONFIG ContactInfo``, которые меняют групповые действия (имя в CLI → подпись).
+CONTACT_FIELDS = {"firstName": "имя", "lastName": "фамилия", "middleName": "отчество", "company": "организация",
+                  "department": "отдел", "position": "должность", "office": "офис",
+                  "businessPhone": "рабочий телефон", "mobilePhone": "мобильный телефон"}
+#: Признаки учётной записи (``SET`` в её контексте) и допустимые значения.
+ACCOUNT_FLAGS = {"mustChangePass": ("yes", "no"), "accountType": ("basic", "premium"),
+                 "publishContactInfo": ("yes", "no")}
+
+
+def read_quota_kb(cli: AxigenCLI, email: str) -> Optional[int]:
+    """Квота объёма писем учётной записи, КБ (None — сервер не показал)."""
+    local, domain = parse_email(email)
+    enter_account(cli, domain, local)
+    try:
+        cli.run("CONFIG Quotas")
+        try:
+            values = parse.parse_show(cli.run("SHOW").lines)
+        finally:
+            cli.run("BACK", check=False)
+    finally:
+        cli.to_root()
+    return parse.parse_int(parse.get(values, "totalMessageSize", "messageSizeQuota", "totalMessageSizeQuota"))
+
+
+def set_quota(cli: AxigenCLI, email: str, quota_kb: int, *, threshold: Optional[int] = None) -> Optional[int]:
+    """Задать квоту объёма писем (КБ) и, по желанию, порог предупреждения (%).
+
+    Возвращает квоту, которую сервер показывает после изменения (None — не показал).
+    """
+    local, domain = parse_email(email)
+    quota_kb = int(quota_kb)
+    if quota_kb < 1024 or quota_kb > MAX_QUOTA_KB:
+        raise ValidationError("Квота — от 1 МБ до 4 ТБ.")
+    enter_account(cli, domain, local)
+    try:
+        cli.run("CONFIG Quotas")
+        cli.run(f"SET totalMessageSize {quota_kb}", strict=True)
+        if threshold is not None:
+            threshold = int(threshold)
+            if not 1 <= threshold <= 100:
+                raise ValidationError("Порог предупреждения — от 1 до 100 %.")
+            cli.run(f"SET quotaLimitThreshold {threshold}", strict=True)
+            cli.run("SET quotaLimitNotificationEnabled yes", strict=True)
+        cli.run("DONE")
+        cli.run("COMMIT", strict=True)
+    finally:
+        cli.to_root()
+    return read_quota_kb(cli, email)
+
+
+def list_aliases(cli: AxigenCLI, email: str) -> List[str]:
+    """Псевдонимы учётной записи — полными адресами в нижнем регистре."""
+    local, domain = parse_email(email)
+    enter_account(cli, domain, local)
+    try:
+        table = parse.parse_table(cli.run("LIST Aliases").lines)
+    finally:
+        cli.to_root()
+    col = table.column("alias", "name") or (table.columns[0] if table.columns else "name")
+    out: List[str] = []
+    for row in table.rows:
+        alias = (row.get(col) or "").strip().split()
+        if not alias:
+            continue
+        name = alias[0]
+        if "@" not in name:
+            name = f"{name}@{domain}"
+        name = name.lower()
+        if name != email.lower() and name not in out:
+            out.append(name)
+    return out
+
+
+def alias_local(alias: str, domain: str) -> str:
+    """Имя псевдонима без домена; псевдоним в чужом домене — отказ."""
+    text = (alias or "").strip()
+    local, at, dom = text.rpartition("@")
+    if at:
+        if dom.lower() != domain.lower():
+            raise ValidationError(f"Псевдоним «{text}» — в другом домене: Axigen заводит псевдонимы только в домене "
+                                  f"учётной записи ({domain}).")
+        text = local
+    if not valid_account_name(text):
+        raise ValidationError(f"«{text}» — недопустимое имя псевдонима.")
+    return text
+
+
+def add_alias(cli: AxigenCLI, email: str, alias: str) -> List[str]:
+    """Добавить псевдоним и вернуть псевдонимы после изменения (проверка, что сервер его принял)."""
+    local, domain = parse_email(email)
+    name = alias_local(alias, domain)
+    enter_account(cli, domain, local)
+    try:
+        cli.run(f"ADD Alias {quote(name, 'имя псевдонима')}", strict=True)
+        cli.run("COMMIT", strict=True)
+    finally:
+        cli.to_root()
+    after = list_aliases(cli, email)
+    if f"{name}@{domain}".lower() not in after:
+        raise AxigenError(f"{email}: сервер не показал новый псевдоним {name}@{domain} — проверьте в WebAdmin.")
+    return after
+
+
+def remove_alias(cli: AxigenCLI, email: str, alias: str) -> List[str]:
+    local, domain = parse_email(email)
+    name = alias_local(alias, domain)
+    enter_account(cli, domain, local)
+    try:
+        cli.run(f"REMOVE Alias {quote(name, 'имя псевдонима')}", strict=True)
+        cli.run("COMMIT", strict=True)
+    finally:
+        cli.to_root()
+    after = list_aliases(cli, email)
+    if f"{name}@{domain}".lower() in after:
+        raise AxigenError(f"{email}: псевдоним {name}@{domain} после удаления всё ещё есть.")
+    return after
+
+
+def read_contact(cli: AxigenCLI, email: str) -> Dict[str, str]:
+    """Контактные данные учётной записи (``CONFIG ContactInfo`` → ``SHOW``): поле → значение."""
+    local, domain = parse_email(email)
+    enter_account(cli, domain, local)
+    try:
+        cli.run("CONFIG ContactInfo")
+        try:
+            values = parse.parse_show(cli.run("SHOW").lines)
+        finally:
+            cli.run("BACK", check=False)
+    finally:
+        cli.to_root()
+    out: Dict[str, str] = {}
+    for key in CONTACT_FIELDS:
+        out[key] = parse.get(values, key)[:255]
+    return out
+
+
+def set_contact(cli: AxigenCLI, email: str, fields: Dict[str, str]) -> Dict[str, str]:
+    """Записать поля контактных данных; вернуть, что сервер показывает после изменения."""
+    local, domain = parse_email(email)
+    for key in fields:
+        if key not in CONTACT_FIELDS:
+            raise ValidationError(f"Неизвестное поле контактных данных: {key}.")
+    if not fields:
+        return read_contact(cli, email)
+    enter_account(cli, domain, local)
+    try:
+        cli.run("CONFIG ContactInfo")
+        for key, value in fields.items():
+            cli.run(f"SET {key} {quote(value, CONTACT_FIELDS[key])}", strict=True)
+        cli.run("DONE")
+        cli.run("COMMIT", strict=True)
+    finally:
+        cli.to_root()
+    after = read_contact(cli, email)
+    wrong = [CONTACT_FIELDS[k] for k, v in fields.items() if (after.get(k) or "") and after.get(k) != v]
+    if wrong:
+        raise AxigenError(f"{email}: сервер показывает не то, что записано ({', '.join(wrong)}).")
+    return after
+
+
+def set_account_flag(cli: AxigenCLI, email: str, attr: str, value: str) -> None:
+    """``SET <признак> <значение>`` учётной записи: смена пароля при входе, тип, публикация в контактах."""
+    if attr not in ACCOUNT_FLAGS or value not in ACCOUNT_FLAGS[attr]:
+        raise ValidationError(f"Недопустимый признак учётной записи: {attr}={value}.")
+    local, domain = parse_email(email)
+    enter_account(cli, domain, local)
+    try:
+        cli.run(f"SET {attr} {value}", strict=True)
+        cli.run("COMMIT", strict=True)
+    finally:
+        cli.to_root()
+
+
+def read_account_flags(cli: AxigenCLI, email: str) -> Dict[str, str]:
+    """Признаки учётной записи из ``SHOW`` (что сервер показал; нет — пусто)."""
+    local, domain = parse_email(email)
+    enter_account(cli, domain, local)
+    try:
+        values = parse.parse_show(cli.run("SHOW").lines)
+    finally:
+        cli.to_root()
+    return {attr: parse.get(values, attr).lower() for attr in ACCOUNT_FLAGS}
+
+
+def domain_available_services(cli: AxigenCLI, domain: str) -> Optional[List[str]]:
+    """Службы, разрешённые домену (``CONFIG adminLimits`` → availableServices), как их пишет сервер."""
+    enter_domain(cli, domain)
+    try:
+        cli.run("CONFIG adminLimits")
+        values = parse.parse_show(cli.run("SHOW").lines)
+        cli.run("BACK", check=False)
+    finally:
+        cli.to_root()
+    raw = parse.get(values, "availableServices", "available services")
+    if not raw:
+        return None
+    return parse.parse_list_value(raw)
+
+
 def match_server_folder(archive_folder: str, server: List[str]) -> Optional[str]:
     """Папка сервера для папки архива: то же имя без учёта регистра (INBOX ↔ Inbox)."""
     low = archive_folder.lower()
@@ -263,4 +468,7 @@ def describe_services(services: Optional[List[str]]) -> str:
 
 __all__ = ["block", "unblock", "set_password", "create_account", "remove_account", "purge_folder",
            "purge_allowed_folders", "server_folders", "random_password", "check_password",
-           "require_changes_allowed", "match_server_folder", "describe_services", "get_services"]
+           "require_changes_allowed", "match_server_folder", "describe_services", "get_services",
+           "read_quota_kb", "set_quota", "list_aliases", "add_alias", "remove_alias", "alias_local",
+           "read_contact", "set_contact", "set_account_flag", "read_account_flags", "domain_available_services",
+           "set_services"]

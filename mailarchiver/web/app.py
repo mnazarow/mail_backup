@@ -28,6 +28,7 @@ from . import auth as auth_mod
 from .api import router as api_router
 from .bulk_api import router as bulk_router
 from .axigen_api import router as axigen_router
+from .server_api import router as server_router
 from .proxy import ProxyHeadersMiddleware, SecurityHeadersMiddleware
 from .ws import router as ws_router
 
@@ -155,6 +156,7 @@ def create_app() -> FastAPI:
     # групповые действия — раньше общих путей /accounts/{id}: «bulk» не номер ящика
     app.include_router(bulk_router)
     app.include_router(axigen_router)
+    app.include_router(server_router)
     app.include_router(api_router)
     app.include_router(ws_router)
 

@@ -192,6 +192,9 @@ class Database:
             # Сервер Axigen: снимок учётных записей, файлы FTP Backup, журнал команд.
             from .axigen.store import ensure_schema as _ensure_axigen_schema
             _ensure_axigen_schema(conn)
+            # Пароли для одной выдачи (групповые действия раздела «Ящики на сервере»).
+            from .serverops.secrets import ensure_schema as _ensure_server_secrets
+            _ensure_server_secrets(conn)
         self._encrypt_plain_settings()
 
     def _encrypt_plain_settings(self) -> None:
@@ -2197,10 +2200,18 @@ class Database:
             (utcnow_iso(), int(ok), int(skipped), int(failed), int(jobs), summary[:2000],
              json.dumps(list(results), ensure_ascii=False), op_id))
 
-    def list_bulk_ops(self, limit: int = 50) -> List[sqlite3.Row]:
+    def list_bulk_ops(self, limit: int = 50, *, prefix: Optional[str] = None,
+                      exclude_prefix: Optional[str] = None) -> List[sqlite3.Row]:
+        """Последние групповые операции. ``prefix`` — только с таким началом ключа действия
+        (операции раздела «Ящики на сервере» — ``srv_``), ``exclude_prefix`` — без них."""
+        where, args = "", []
+        if prefix:
+            where, args = "WHERE substr(action, 1, ?)=?", [len(prefix), prefix]
+        elif exclude_prefix:
+            where, args = "WHERE substr(COALESCE(action, ''), 1, ?)<>?", [len(exclude_prefix), exclude_prefix]
         return self.query(
             "SELECT id, created_at, finished_at, user, action, label, params, total, ok, skipped, failed, "
-            "jobs, summary FROM bulk_ops ORDER BY id DESC LIMIT ?", (int(limit),))
+            f"jobs, summary FROM bulk_ops {where} ORDER BY id DESC LIMIT ?", (*args, int(limit)))
 
     def get_bulk_op(self, op_id: int) -> Optional[sqlite3.Row]:
         return self.query_one("SELECT * FROM bulk_ops WHERE id=?", (op_id,))

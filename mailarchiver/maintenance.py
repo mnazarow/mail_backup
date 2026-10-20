@@ -169,6 +169,13 @@ def run_maintenance(svc) -> Dict[str, int]:
     out["runs"] = db.purge_runs(keep_runs)
     out["exports"] = purge_old_exports(svc)
     out["tmp"] = clean_tmp(svc, TMP_STALE_HOURS * 3600)
+    # Невыданные пароли для раздачи («Ящики на сервере»): дольше суток не храним,
+    # даже если «Историю» раздела никто не открывал.
+    try:
+        from .serverops.secrets import purge_old as purge_server_secrets
+        out["server_secrets"] = purge_server_secrets(db)
+    except Exception:  # noqa: BLE001 — обслуживание не должно падать из-за одной таблицы
+        log.exception("Не удалось удалить устаревшие пароли для раздачи")
     if any(out.values()):
         log.info("Обслуживание: %s", ", ".join(f"{k}={v}" for k, v in out.items() if v))
     return out

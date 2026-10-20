@@ -33,11 +33,12 @@ class JobType:
     SEARCH_REINDEX = "search_reindex"    # переиндексировать поиск по письмам выбранных ящиков
     AXIGEN_SYNC = "axigen_sync"          # сверка учётных записей сервера Axigen с архивом
     AXIGEN_ACTION = "axigen_action"      # изменения на сервере Axigen для выбранных ящиков
+    SERVER_ACTION = "server_action"      # групповые действия с ящиками на почтовом сервере (Axigen и IMAP)
 
     ALL = [BACKUP, RESTORE, EXPORT, IMPORT_PST, TEST, RETENTION, VERIFY, ANALYZE, SYNC_EMPLOYEES,
            STORAGE_CONVERT, CHECK_LOGINS, REPLICATE, DB_SNAPSHOT, SEARCH_INDEX, DEDUP_REPORT, CLEANUP,
            BACKUP_ALL, QUARANTINE_CHECK, QUARANTINE_RESCUE, FOLDERS_CHECK, SEARCH_REINDEX, AXIGEN_SYNC,
-           AXIGEN_ACTION]
+           AXIGEN_ACTION, SERVER_ACTION]
     LABELS = {
         BACKUP: "Резервное копирование",
         RESTORE: "Восстановление",
@@ -62,14 +63,20 @@ class JobType:
         SEARCH_REINDEX: "Переиндексация поиска",
         AXIGEN_SYNC: "Сверка с сервером Axigen",
         AXIGEN_ACTION: "Действия на сервере Axigen",
+        SERVER_ACTION: "Действия с ящиками на сервере",
     }
     #: Задания, которые после перезапуска службы не продолжаются сами: они меняют
     #: почтовый сервер по кнопке администратора, а за время простоя состояние могли
     #: поменять вручную (например, открыть вход в WebAdmin) — повторять вслепую нельзя.
-    NOT_RESUMABLE = frozenset({AXIGEN_ACTION})
+    NOT_RESUMABLE = frozenset({AXIGEN_ACTION, SERVER_ACTION})
     NOT_RESUMED_TEXT = ("Задание прервано перезапуском службы и само не продолжается: оно меняет почтовый сервер. "
                         "Что успело выполниться — в событиях задания; для остальных ящиков запустите действие "
                         "заново.")
+    #: «Повторить» у таких заданий нет: повтор вслепую изменил бы ещё раз и уже изменённые ящики
+    #: (например, выдал бы новые пароли тем, кому их уже раздали) — без проверки и подтверждения.
+    NO_RETRY_TEXT = ("Задание меняло почтовый сервер — кнопкой «Повторить» оно не запускается: часть ящиков уже "
+                     "изменена, и повтор сделал бы это ещё раз без проверки. Запустите действие заново из раздела "
+                     "(«Ящики на сервере» или «Сервер Axigen») — проверка покажет, что осталось сделать.")
 
 
 class JobStatus:

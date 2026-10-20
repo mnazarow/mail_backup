@@ -1222,6 +1222,159 @@ class ImapConnection:
             raise _map_exception(exc) from exc
 
 
+    # -- изменения в ящике (групповые действия на сервере) --------------------
+    # Каждая операция — тонкая обёртка над командой IMAP с переводом ошибок в
+    # понятные (как и остальные методы): решения «можно ли удалять» принимает
+    # вызывающий код (mailarchiver.serverops.imap_ops), а не клиент.
+    def has_capability(self, name: str) -> bool:
+        try:
+            return bool(self.client.has_capability(name))
+        except Exception:  # noqa: BLE001
+            return name.upper() in {c.upper() for c in self.capabilities()}
+
+    def search(self, criteria) -> List[int]:
+        """UID писем открытой папки по условию SEARCH (список, как его принимает IMAPClient)."""
+        try:
+            return sorted(int(u) for u in self.client.search(criteria))
+        except Exception as exc:  # noqa: BLE001
+            raise _map_exception(exc) from exc
+
+    def add_flags(self, uids: List[int], flags) -> None:
+        for start in range(0, len(uids), 500):
+            try:
+                self.client.add_flags(uids[start:start + 500], list(flags), silent=True)
+            except Exception as exc:  # noqa: BLE001
+                raise _map_exception(exc) from exc
+
+    def remove_flags(self, uids: List[int], flags) -> None:
+        for start in range(0, len(uids), 500):
+            try:
+                self.client.remove_flags(uids[start:start + 500], list(flags), silent=True)
+            except Exception as exc:  # noqa: BLE001
+                raise _map_exception(exc) from exc
+
+    def expunge_uids(self, uids: List[int]) -> None:
+        """UID EXPUNGE — стереть только эти письма (нужно расширение UIDPLUS)."""
+        for start in range(0, len(uids), 500):
+            try:
+                self.client.expunge(uids[start:start + 500])
+            except Exception as exc:  # noqa: BLE001
+                raise _map_exception(exc) from exc
+
+    def expunge_all(self) -> None:
+        """EXPUNGE — стереть все письма папки с отметкой \\Deleted."""
+        try:
+            self.client.expunge()
+        except Exception as exc:  # noqa: BLE001
+            raise _map_exception(exc) from exc
+
+    def move_uids(self, uids: List[int], folder: str) -> None:
+        """MOVE (RFC 6851) — переложить письма в другую папку одной командой."""
+        for start in range(0, len(uids), 500):
+            try:
+                self.client.move(uids[start:start + 500], folder)
+            except Exception as exc:  # noqa: BLE001
+                raise _map_exception(exc) from exc
+
+    def copy_uids(self, uids: List[int], folder: str) -> None:
+        for start in range(0, len(uids), 500):
+            try:
+                self.client.copy(uids[start:start + 500], folder)
+            except Exception as exc:  # noqa: BLE001
+                raise _map_exception(exc) from exc
+
+    def folder_exists(self, folder: str) -> bool:
+        try:
+            return bool(self.client.folder_exists(folder))
+        except Exception as exc:  # noqa: BLE001
+            raise _map_exception(exc) from exc
+
+    def rename_folder(self, old: str, new: str) -> None:
+        try:
+            self.client.rename_folder(old, new)
+        except Exception as exc:  # noqa: BLE001
+            raise _map_exception(exc) from exc
+
+    def delete_folder(self, folder: str) -> None:
+        try:
+            self.client.delete_folder(folder)
+        except Exception as exc:  # noqa: BLE001
+            raise _map_exception(exc) from exc
+
+    def subscribe_folder(self, folder: str) -> None:
+        try:
+            self.client.subscribe_folder(folder)
+        except Exception as exc:  # noqa: BLE001
+            raise _map_exception(exc) from exc
+
+    def subscribed_folders(self) -> List[str]:
+        try:
+            raw = self.client.list_sub_folders()
+        except Exception as exc:  # noqa: BLE001
+            raise _map_exception(exc) from exc
+        return [_as_text(name) for _flags, _deli, name in raw or ()]
+
+    def message_counts(self, folder: str) -> Optional[Dict[str, int]]:
+        """Писем и непрочитанных в папке (STATUS, без открытия). None — сервер не ответил."""
+        try:
+            raw = self.client.folder_status(folder, [b"MESSAGES", b"UNSEEN"])
+        except Exception as exc:  # noqa: BLE001
+            mapped = _map_exception(exc)
+            if isinstance(mapped, (ImapConnectionError, ImapTimeoutError)):
+                raise mapped from exc
+            return None
+        data = {_as_text(k).upper(): v for k, v in (raw or {}).items()}
+        out = {}
+        for key in ("MESSAGES", "UNSEEN"):
+            try:
+                out[key.lower()] = int(data.get(key) or 0)
+            except (TypeError, ValueError):
+                out[key.lower()] = 0
+        return out
+
+    def messages_now(self, folder: str) -> Optional[int]:
+        """Сколько писем в папке прямо сейчас (STATUS MESSAGES). None — сервер не ответил числом.
+
+        Нужна перед удалением папки: DELETE стирает всё, что в ней лежит в эту минуту, — и письмо,
+        пришедшее после сверки с архивом, тоже. Ответ без числа — не «пусто», а «неизвестно».
+        """
+        try:
+            raw = self.client.folder_status(folder, [b"MESSAGES"])
+        except Exception as exc:  # noqa: BLE001
+            mapped = _map_exception(exc)
+            if isinstance(mapped, (ImapConnectionError, ImapTimeoutError)):
+                raise mapped from exc
+            return None                     # сервер отказал в STATUS — «неизвестно», а не «пусто»
+        data = {_as_text(k).upper(): v for k, v in (raw or {}).items()}
+        try:
+            return int(data["MESSAGES"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def quota(self, folder: str = "INBOX") -> List[Dict[str, object]]:
+        """Квоты ящика (GETQUOTAROOT, RFC 9208): ресурс, занято, предел. Пусто — квот нет или сервер не умеет.
+
+        STORAGE сервер считает в килобайтах (по 1024 байта).
+        """
+        if not self.has_capability("QUOTA"):
+            return []
+        try:
+            _roots, quotas = self.client.get_quota_root(folder)
+        except Exception as exc:  # noqa: BLE001
+            mapped = _map_exception(exc)
+            if isinstance(mapped, (ImapConnectionError, ImapTimeoutError)):
+                raise mapped from exc
+            return []
+        out = []
+        for q in quotas or ():
+            try:
+                out.append({"root": _as_text(getattr(q, "quota_root", "")),
+                            "resource": _as_text(getattr(q, "resource", "")).upper(),
+                            "usage": int(getattr(q, "usage", 0) or 0), "limit": int(getattr(q, "limit", 0) or 0)})
+            except (TypeError, ValueError):
+                continue
+        return out
+
 #: Сколько раз подряд можно переподключаться, если между обрывами не удалось
 #: продвинуться ни на одно письмо или папку (сервер лежит — ждать бесполезно).
 MAX_RECONNECTS_WITHOUT_PROGRESS = 3
