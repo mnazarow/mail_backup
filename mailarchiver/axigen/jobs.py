@@ -49,6 +49,12 @@ def handle_sync(ctx) -> Dict:
         ctx.event("WARNING", f"Домен {domain}: список учётных записей не прочитан ({problem}) — его учётные "
                              f"записи в этой сверке не обновлялись и удалёнными не считаются.")
     changes = axstore.save_snapshot(svc.db, res.accounts, res.domains)
+    try:
+        # занятое место — точкой в истории («Ящики на сервере»: рост в месяц и прогноз до квоты)
+        from ..serverops.usage import record_axigen_rows, today
+        record_axigen_rows(svc.db, res.accounts, day=today(svc))
+    except Exception:  # noqa: BLE001
+        log.warning("Не удалось записать занятое место учётных записей в историю", exc_info=True)
     partial = [a for a in res.accounts if a.get("errors")]
     for acc in partial[:20]:
         ctx.event("WARNING", f"{acc['email']}: прочитано не всё — {acc['errors']}")
@@ -447,13 +453,16 @@ def _purge_folders(ctx, open_cli, acc, email, domain, days, options, who, emit) 
     return ("ok" if done else "skip"), text
 
 
-def _do_delete(ctx, open_cli, acc, row, email, options, who, emit) -> Tuple[str, str]:
+def _do_delete(ctx, open_cli, acc, row, email, options, who, emit, before_remove=None) -> Tuple[str, str]:
     """Удалить учётную запись — только если архив ящика полон (или администратор принял потери).
 
     Порядок: вход уже закрыт → приём писем на время удаления останавливается (иначе
     письмо, пришедшее между сверкой и удалением, пропало бы) → бессрочное удержание
     архива → последняя копия → сверка всех папок с архивом → удаление. Отказ или сбой
     на любом шаге до удаления возвращает приём писем и удержание как было.
+
+    ``before_remove(cli)`` — последняя проверка в той же сессии CLI прямо перед удалением
+    (например, что адрес можно передать коллеге): непустой ответ — причина не удалять.
     """
     from ..accountops import after_hold_set
     from ..employees import HOLD_FOREVER
@@ -507,6 +516,10 @@ def _do_delete(ctx, open_cli, acc, row, email, options, who, emit) -> Tuple[str,
             now = actions.get_services(cli, email)
             if services_blocked(now, blocked_by_us=by_us or stopped) is not True:
                 return "skip", "пока шла последняя копия, вход на сервере открыли — учётная запись не удалена"
+            if before_remove is not None:
+                problem = before_remove(cli)
+                if problem:
+                    return "skip", f"{problem} — учётная запись не удалена"
             actions.remove_account(cli, email)
         deleted = True
     finally:

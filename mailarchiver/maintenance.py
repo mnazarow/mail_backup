@@ -176,6 +176,16 @@ def run_maintenance(svc) -> Dict[str, int]:
         out["server_secrets"] = purge_server_secrets(db)
     except Exception:  # noqa: BLE001 — обслуживание не должно падать из-за одной таблицы
         log.exception("Не удалось удалить устаревшие пароли для раздачи")
+    try:
+        from .serverops.usage import purge_old as purge_server_usage
+        out["server_usage"] = purge_server_usage(db)
+    except Exception:  # noqa: BLE001
+        log.exception("Не удалось удалить старые точки занятого места на сервере")
+    try:
+        from .serverops.progress import purge_orphans as purge_server_progress
+        out["server_progress"] = purge_server_progress(db)
+    except Exception:  # noqa: BLE001
+        log.exception("Не удалось удалить отметки хода заданий раздела «Ящики на сервере»")
     if any(out.values()):
         log.info("Обслуживание: %s", ", ".join(f"{k}={v}" for k, v in out.items() if v))
     return out

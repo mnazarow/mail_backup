@@ -109,7 +109,9 @@ def _item(request: Request, op_id: int) -> dict:
 
 @router.get("/history/{op_id}")
 def server_history_item(request: Request, op_id: int, user: dict = Depends(auth_mod.require_admin)):
-    return _item(request, op_id)
+    from ..serverops.base import history_item_full
+    _item(request, op_id)
+    return history_item_full(_svc(request), op_id)
 
 
 @router.post("/history/{op_id}/cancel")
@@ -120,6 +122,14 @@ def server_history_cancel(request: Request, op_id: int, user: dict = Depends(aut
     cancelled = cancel_op(svc, op_id)
     svc.db.add_audit(user["username"], "server_cancel", f"операция №{op_id}: отменено заданий {cancelled}")
     return {"ok": True, "cancelled": cancelled}
+
+
+@router.get("/history/{op_id}/retry")
+def server_history_retry(request: Request, op_id: int, user: dict = Depends(auth_mod.require_admin)):
+    """Что запустить заново: то же действие для ящиков с ошибкой и не обработанных (запуск — через проверку)."""
+    from ..serverops.base import retry_info
+    _item(request, op_id)
+    return retry_info(_svc(request), op_id)
 
 
 @router.post("/history/{op_id}/report")
@@ -140,6 +150,50 @@ def server_history_passwords(request: Request, op_id: int, user: dict = Depends(
     data, name, ctype = passwords_file(svc, op_id)
     svc.db.add_audit(user["username"], "server_passwords_download", f"операция №{op_id}")
     return _file(data, name, ctype)
+
+
+# ---------------------------------------------------------------------------
+#  Расписания (только по явному согласию)
+# ---------------------------------------------------------------------------
+class ScheduleCreateBody(BaseModel):
+    action: str = Field("", max_length=64)
+    keys: List[str] = Field(default_factory=list)
+    params: Dict[str, Any] = Field(default_factory=dict)
+    when: Dict[str, Any] = Field(default_factory=dict)
+    consent: bool = False
+    confirm: str = Field("", max_length=20)
+
+
+class ScheduleToggleBody(BaseModel):
+    enabled: bool
+
+
+@router.get("/schedules")
+def server_schedules(request: Request, user: dict = Depends(auth_mod.require_admin)):
+    from ..serverops import schedules
+    svc = _svc(request)
+    return {"items": schedules.list_all(svc), "scheduler_enabled": bool(svc.rt("scheduler", "enabled"))}
+
+
+@router.post("/schedules")
+def server_schedule_create(request: Request, body: ScheduleCreateBody, user: dict = Depends(auth_mod.require_admin)):
+    from ..serverops import schedules
+    return schedules.create(_svc(request), user, action_key=body.action, keys=body.keys, params=body.params,
+                            when=body.when, consent=body.consent, confirm=body.confirm)
+
+
+@router.put("/schedules/{schedule_id}")
+def server_schedule_toggle(request: Request, schedule_id: int, body: ScheduleToggleBody,
+                           user: dict = Depends(auth_mod.require_admin)):
+    from ..serverops import schedules
+    return schedules.set_enabled(_svc(request), user, schedule_id, body.enabled)
+
+
+@router.delete("/schedules/{schedule_id}")
+def server_schedule_delete(request: Request, schedule_id: int, user: dict = Depends(auth_mod.require_admin)):
+    from ..serverops import schedules
+    schedules.delete(_svc(request), user, schedule_id)
+    return {"ok": True}
 
 
 def _file(data: bytes, name: str, ctype: str) -> Response:

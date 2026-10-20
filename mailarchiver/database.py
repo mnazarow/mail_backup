@@ -195,6 +195,10 @@ class Database:
             # Пароли для одной выдачи (групповые действия раздела «Ящики на сервере»).
             from .serverops.secrets import ensure_schema as _ensure_server_secrets
             _ensure_server_secrets(conn)
+            from .serverops.usage import ensure_schema as _ensure_server_usage
+            _ensure_server_usage(conn)
+            from .serverops.progress import ensure_schema as _ensure_server_progress
+            _ensure_server_progress(conn)
         self._encrypt_plain_settings()
 
     def _encrypt_plain_settings(self) -> None:

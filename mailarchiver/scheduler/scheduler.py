@@ -417,6 +417,19 @@ class SchedulerService:
                                 "в очереди или выполняется.", schedule_id, job_type)
                     svc.db.set_schedule_runtimes(schedule_id, last_run=now)
                     return
+            elif job_type == JobType.SERVER_ACTION:
+                # Действие с ящиками на сервере по расписанию: прежний запуск этого же расписания ещё
+                # в очереди или идёт — второй не ставим (иначе при долгой очистке запуски копились бы).
+                def _same(job) -> bool:
+                    try:
+                        return json.loads(job["params"] or "{}").get("schedule_id") == schedule_id
+                    except (TypeError, ValueError):
+                        return False
+                if any(job["type"] == JobType.SERVER_ACTION and _same(job) for job in svc.db.active_jobs()):
+                    log.warning("Расписание #%s пропущено: его прежний запуск ещё в очереди или выполняется.",
+                                schedule_id)
+                    svc.db.set_schedule_runtimes(schedule_id, last_run=now)
+                    return
             elif job_type == JobType.BACKUP_ALL:
                 # Проход по всем ящикам по очереди может идти дольше интервала
                 # между запусками: второй такой же проход не ставим, прежний

@@ -59,6 +59,8 @@ class ReportAction(ServerAction):
         else:
             data = self._imap(ctx, t)
         data.update({"email": t.email, "name": t.name, "server": t.host})
+        from .usage import record, today
+        record(ctx.db, t.key, data.get("size"), data.get("quota"), data.get("messages"), day=today(ctx.svc))
         ctx.data.setdefault("item_extra", {})[t.key] = {"report": data}
         parts = [f"писем {data.get('messages') if data.get('messages') is not None else '?'}",
                  f"занято {human_size(data['size']) if data.get('size') is not None else '?'}"]
@@ -203,15 +205,28 @@ def passwords_file(svc, op_id: int) -> Tuple[bytes, str, str]:
 def targets_file(svc, keys: Optional[Sequence[str]] = None) -> Tuple[bytes, str, str]:
     """Список ящиков раздела (все или перечисленные) — для Excel."""
     items = tg.load(svc)
+    own = tg.own_addresses(items)
     if keys:
         wanted = set(keys)
         items = [t for t in items if t.key in wanted]
     totals = svc.db.message_totals_by_account()
     keeps = tg.keeps_everything_map(svc, [t.mailbox for t in items if t.mailbox is not None])
+    from .usage import latest
+    from .usage import trends as usage_trends
+    dismissed = tg.dismissed_map(svc)
+    trends = usage_trends(svc.db, [t.key for t in items])
+    last = latest(svc.db)
     rows = []
     for t in items:
-        r = tg.row_dict(svc, t, totals, keeps)
+        r = tg.row_dict(svc, t, totals, keeps, dismissed, trends, own, last)
         mb = r.get("mailbox") or {}
+        trend = r.get("trend") or {}
+        if r["kind"] != "axigen" and r.get("usage"):
+            # ящик не на Axigen: место — по последнему «Отчёту»
+            r["used_bytes"] = r["usage"]["used"]
+            r["quota_kb"] = (r["usage"]["quota"] or 0) // 1024 or None
+            if r["quota_kb"] and r["used_bytes"] is not None:
+                r["quota_percent"] = round(100.0 * r["used_bytes"] / (r["quota_kb"] * 1024), 1)
         rows.append({
             "email": r["email"], "name": r["name"], "server": r["host"],
             "kind": "Axigen" if r["kind"] == "axigen" else "IMAP",
@@ -224,13 +239,17 @@ def targets_file(svc, keys: Optional[Sequence[str]] = None) -> Tuple[bytes, str,
             "imap": ("да" if mb.get("imap") else (mb.get("imap_problem") or "")) if mb else "",
             "archive_messages": mb.get("messages") if mb else None,
             "keeps_all": ("да" if mb.get("keeps_all") else "нет") if mb else "",
+            "growth_mb": round(trend["per_month"] / 1048576, 1) if trend else None,
+            "days_to_quota": trend.get("days_to_quota") if trend else None,
+            "dismissed": (r.get("dismissed_at") or "")[:10],
             "deleted": "удалена на сервере" if r.get("deleted") else ""})
     columns = (("email", "Адрес", 32), ("name", "Имя", 28), ("server", "Сервер", 22), ("kind", "Вид", 8),
                ("login", "Вход", 9), ("quota_mb", "Квота, МБ", 11), ("used_mb", "Занято, МБ", 11),
                ("percent", "Заполнено, %", 11), ("last_login", "Последний вход", 17), ("aliases", "Псевдонимы", 30),
                ("mailbox", "Ящик в архиве", 26), ("auth", "Как копируется", 18), ("imap", "Вход по IMAP", 24),
                ("archive_messages", "Писем в архиве", 13), ("keeps_all", "Архив хранит всё", 12),
-               ("deleted", "Состояние", 16))
+               ("growth_mb", "Рост в месяц, МБ", 12), ("days_to_quota", "До квоты, дней", 11),
+               ("dismissed", "Уволен", 11), ("deleted", "Состояние", 16))
     return _workbook("Ящики на сервере", columns, rows), f"server_mailboxes_{_stamp()}.xlsx", _XLSX
 
 

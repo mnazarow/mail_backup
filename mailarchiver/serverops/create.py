@@ -203,6 +203,8 @@ def handle_job(ctx) -> Dict[str, Any]:
     common = svc.db.secret.decrypt(options.get("password_enc") or "") if mode == "same" else ""
     quota_kb = int(options.get("quota_mb") or 0) * 1024
     ctx.event("INFO", f"{LABEL}: {len(items)}.")
+    from . import progress
+    progress.started(svc.db, op_id)
     results: List[Dict] = []
     stats = {"ok": 0, "skip": 0, "fail": 0}
     cancelled_at = None
@@ -221,6 +223,7 @@ def handle_job(ctx) -> Dict[str, Any]:
         status = "ok"
         created = False
         to_file = mode == "random_file" and bool(op_id)
+        progress.mark(svc.db, op_id, email, progress.RUNNING)
         try:
             with logged_session(svc, username=who, kind="write", summary=f"Создание учётной записи {email}",
                                 st=st) as cli:
@@ -284,9 +287,10 @@ def handle_job(ctx) -> Dict[str, Any]:
             text = f"{type(exc).__name__}: {exc}"
             notes = notes + [f"затем ошибка: {text}"] if created else [text]
         stats[status] += 1
-        results.append({"name": email, "key": email, "status": {"ok": "success", "skip": "skipped",
-                                                                "fail": "failed"}[status],
-                        "detail": "; ".join(notes)[:1000]})
+        item_status = {"ok": "success", "skip": "skipped", "fail": "failed"}[status]
+        results.append({"name": email, "key": email, "status": item_status, "detail": "; ".join(notes)[:1000]})
+        # создана, но потом ошибка (квота, ящик в архиве) — повтор создания не нужен: учётная запись уже есть
+        progress.mark(svc.db, op_id, email, progress.SUCCESS if created else item_status)
         ctx.event({"ok": "INFO", "skip": "WARNING", "fail": "ERROR"}[status], f"{email}: {'; '.join(notes)}"[:600])
     if cancelled_at is not None:
         summary = (f"{LABEL}: отменено — создано {stats['ok']}, пропущено {stats['skip']}, ошибок {stats['fail']}; "

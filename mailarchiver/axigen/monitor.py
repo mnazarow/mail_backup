@@ -200,6 +200,39 @@ def problems(svc, st: Optional[AxigenSettings] = None, status: Optional[Dict] = 
             add("blocked_imap", "warning",
                 f"Вход заблокирован на сервере, а ящик копируется по IMAP — копирование не пройдёт: {len(stuck)} "
                 f"— {', '.join(stuck[:10])}. Переведите их на копирование через FTP Backup.")
+        # Уволенные с открытым входом: сам MailArchiver сервер не меняет — только предлагает.
+        try:
+            from ..serverops.targets import dismissed_map
+            dmap = dismissed_map(svc)
+        except Exception:  # noqa: BLE001
+            dmap = {}
+        still_open = []
+        own = {str(r["email"]).lower() for r in rows}          # адреса учётных записей, и удалённых тоже
+        for r in live:
+            if r.get("login_blocked") is not False:
+                continue
+            acc = matched.get(r["email"])
+            # псевдоним — адрес другой (удалённой) учётной записи, переданный коллеге: коллега не уволен
+            addresses = [r["email"]] + [a for a in (r.get("aliases") or []) if str(a).lower() not in own]
+            if (acc is not None and acc.dismissed_at) or any(dmap.get(str(a).lower()) for a in addresses):
+                still_open.append(r["email"])
+        if still_open:
+            add("dismissed_open", "warning",
+                f"Сотрудники уволены, а вход на сервере открыт: {len(still_open)} — "
+                f"{', '.join(still_open[:10])}{' …' if len(still_open) > 10 else ''}. Закрыть вход: «Ящики на "
+                f"сервере» → отбор «Уволены, вход открыт» → «Заблокировать вход».")
+        # Скоро упрутся в квоту — по росту занятого места за последние месяцы.
+        try:
+            from ..serverops.usage import SOON_DAYS, soon_full
+            soon = [k[3:] for k in soon_full(svc.db) if k.startswith("ax:")]
+        except Exception:  # noqa: BLE001
+            soon = []
+        alive = {r["email"] for r in live}
+        soon = [e for e in soon if e in alive]
+        if soon:
+            add("quota_soon", "warning",
+                f"При нынешнем росте упрутся в квоту за {SOON_DAYS} дн.: {len(soon)} — "
+                f"{', '.join(soon[:10])}{' …' if len(soon) > 10 else ''}. Квоту можно поднять в «Ящики на сервере».")
     return out
 
 
@@ -273,7 +306,7 @@ def metrics(svc) -> List[tuple]:
     out.append(("mailarchiver_axigen_problems", "Что требует внимания на сервере Axigen (1 — есть)", "gauge",
                 [({"problem": key}, 1 if key in probs else 0)
                  for key in ("unreachable", "queue", "license", "quota", "unarchived", "gone", "blocked_imap",
-                             "tls_unverified")]))
+                             "tls_unverified", "dismissed_open", "quota_soon")]))
     return out
 
 

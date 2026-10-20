@@ -1845,7 +1845,10 @@ def retry_job(request: Request, job_id: int, user: dict = Depends(auth_mod.requi
         raise ValidationError("Повторить можно только завершённое задание.")
     if row["type"] in JobType.NOT_RESUMABLE:
         raise ValidationError(JobType.NO_RETRY_TEXT,
-                              hint="История операций раздела → «Подробнее» покажет, что уже сделано.")
+                              hint=("«Ящики на сервере» → «История» → «Подробнее» → «Повторить для неудачных» отметит "
+                                    "необработанные ящики — с проверкой перед запуском."
+                                    if row["type"] == JobType.SERVER_ACTION else
+                                    "История операций раздела → «Подробнее» покажет, что уже сделано."))
     _operator_job_guard(svc, user, row["type"], row["account_id"], need_enabled=row["type"] == JobType.BACKUP,
                         rebuild=str(roles.job_params(row).get("rebuild") or ""))
     if user.get("role") == "mailbox":
@@ -1962,6 +1965,8 @@ def list_schedules(request: Request, user: dict = Depends(auth_mod.require_user)
     mailbox_aid = user.get("account_id") if user.get("role") == "mailbox" else None
     out = []
     for r in svc.db.list_schedules(account_id=mailbox_aid):
+        if r["job_type"] == JobType.SERVER_ACTION:
+            continue                    # расписания раздела «Ящики на сервере» — только там
         out.append({"id": r["id"], "account_id": r["account_id"], "kind": r["kind"], "job_type": r["job_type"],
                     "cron_expr": r["cron_expr"], "interval_seconds": r["interval_seconds"],
                     "enabled": bool(r["enabled"]), "last_run": r["last_run"],
@@ -2100,7 +2105,8 @@ def update_schedule(request: Request, schedule_id: int, body: ScheduleBody, user
     svc = svc_dep(request)
     _require_not_mailbox(user, "Изменение расписаний")
     existing = svc.db.get_schedule(schedule_id)
-    if existing is None:
+    if existing is None or existing["job_type"] == JobType.SERVER_ACTION:
+        # расписание раздела «Ящики на сервере» меняется только там (и только администратором)
         raise HTTPException(404, "Расписание не найдено")
     _schedule_target(svc, body)
     try:
@@ -2131,7 +2137,7 @@ def delete_schedule(request: Request, schedule_id: int, user: dict = Depends(aut
     svc = svc_dep(request)
     _require_not_mailbox(user, "Изменение расписаний")
     existing = svc.db.get_schedule(schedule_id)
-    if existing is None:
+    if existing is None or existing["job_type"] == JobType.SERVER_ACTION:
         raise HTTPException(404, "Расписание не найдено")
     svc.db.delete_schedule(schedule_id)
     svc.db.add_audit(user["username"], "schedule_delete", f"id={schedule_id} account={existing['account_id']}")

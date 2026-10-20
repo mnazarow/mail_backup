@@ -128,6 +128,7 @@ class ServerAction:
         return {"key": self.key, "label": self.label, "group": self.group, "icon": self.icon, "desc": self.desc,
                 "note": self.note, "danger": self.danger, "needs": self.needs, "immediate": self.immediate,
                 "unavailable": self.available(svc),
+                "schedulable": self.key in _schedulable(),
                 "params": [p.to_dict() for p in self.params_for(svc)]}
 
     # -- шаги ----------------------------------------------------------------
@@ -188,6 +189,11 @@ class ServerAction:
         """После последнего ящика (дописать в итог задания общее)."""
 
 
+def _schedulable() -> Tuple[str, ...]:
+    from .schedules import SCHEDULABLE
+    return SCHEDULABLE
+
+
 REGISTRY: Dict[str, ServerAction] = {}
 
 
@@ -223,16 +229,23 @@ def coerce_params(action: ServerAction, svc, raw: Optional[Dict[str, Any]]) -> D
     return {p.key: p.coerce(raw.get(p.key)) for p in action.params_for(svc)}
 
 
-#: Параметры с секретами (общий пароль и т. п.): в историю пишется только «задан».
+#: Параметры с секретами (общий пароль и т. п.): в историю пишется только «задан». Имена — точно:
+#: «random_password» (флажок) и «password_mode» (способ) секретами не являются.
 SECRET_PARAMS = ("password", "secret", "token")
+SECRET_GIVEN = "задан (не сохраняется)"
+
+
+def is_secret(key: str) -> bool:
+    key = str(key or "").lower()
+    return key in SECRET_PARAMS or key.endswith("_enc")
 
 
 def history_params(values: Dict[str, Any]) -> Dict[str, Any]:
     """Параметры для истории операций — без секретов (история видна всем администраторам)."""
     out = {}
     for key, value in (values or {}).items():
-        if any(word in key.lower() for word in SECRET_PARAMS):
-            value = "задан (не сохраняется)" if value else ""
+        if is_secret(key):
+            value = SECRET_GIVEN if value else ""
         out[key] = value
     return _safe_params(out)
 
@@ -372,12 +385,161 @@ def history_item(svc, op_id: int) -> Optional[Dict[str, Any]]:
     return item
 
 
+def history_item_full(svc, op_id: int) -> Optional[Dict[str, Any]]:
+    """Операция для окна «Подробнее»: с числом ящиков для «Повторить для неудачных»."""
+    item = history_item(svc, op_id)
+    if item is not None:
+        job = item.get("job")
+        if job is not None and job.get("status") in JobStatus.ACTIVE:
+            item["retry"], item["retry_problem"] = 0, ""
+        else:
+            item["retry"], item["retry_problem"] = retry_count(svc, op_id)
+    return item
+
+
 def _passwords_waiting(svc, op_id: int) -> int:
     from .secrets import count
     try:
         return count(svc.db, op_id)
     except Exception:  # noqa: BLE001
         return 0
+
+
+_UNKNOWN = ("Какие ящики задание успело обработать, неизвестно ({why}) — повтор вслепую мог бы ещё раз изменить "
+            "уже изменённые (например, выдать новые пароли тем, кому их уже раздали).")
+_UNKNOWN_HINT = "Запустите действие заново из раздела: проверка перед запуском покажет, что осталось сделать."
+
+
+def _retry_params(svc, item: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
+    """Параметры для повтора: полные — из задания (в истории длинные тексты укорочены), без секретов.
+
+    → (параметры, какие секреты ввести заново).
+    """
+    from . import create
+    hist = item.get("params") or {}
+    if item["action"] == create.KEY:
+        params = {k: v for k, v in hist.items() if not is_secret(k)}
+        return params, (["password"] if hist.get("password_mode") == "same" else [])
+    try:
+        declared = [p.key for p in get(item["action"]).params_for(svc)]
+    except ValidationError:
+        declared = list(hist)
+    source, from_job = None, False
+    if item.get("job_id"):
+        row = svc.db.get_job(item["job_id"])
+        if row is not None:
+            try:
+                source = (json.loads(row["params"] or "{}") or {}).get("options")
+                from_job = isinstance(source, dict)
+            except (TypeError, ValueError):
+                source = None
+    if not from_job:
+        source = hist
+    params: Dict[str, Any] = {}
+    blank: List[str] = []
+    for key in declared:
+        if is_secret(key):
+            params[key] = ""
+            if hist.get(key):                       # «задан (не сохраняется)» — был введён, введите заново
+                blank.append(key)
+            continue
+        if key not in source:
+            continue
+        value = source[key]
+        if not from_job and isinstance(value, str) and len(value) > 300 and value.endswith("…"):
+            continue                                # укороченный текст из истории не подставляем
+        params[key] = value
+    return params, blank
+
+
+def retry_info(svc, op_id: int) -> Dict[str, Any]:
+    """Что запустить заново после операции: то же действие для ящиков с ошибкой и не обработанных.
+
+    Само ничего не запускает: интерфейс подставляет ящики и параметры, а запуск — как обычно, через
+    проверку (условия перечитываются, опасное подтверждается числом ящиков). Какие ящики сделаны, задание
+    отмечает по ходу работы (``progress``): после перезапуска службы или у операции больше 5000 ящиков
+    повтор всё равно знает их точно. Ящик, на котором задание прервалось посреди работы, предлагается с
+    предупреждением (``uncertain``). Удаление прошло, а адрес коллеге не передан — такие ящики идут в
+    «Передать адрес коллеге» (``follow``), а не в повторное удаление. Секретные параметры (общий пароль)
+    не сохранялись — их вводят заново (``blank``).
+    """
+    from . import progress
+    item = history_item(svc, op_id)
+    if item is None:
+        raise ValidationError("Операция не найдена.")
+    job = item.get("job")
+    if job is not None and job.get("status") in JobStatus.ACTIVE:
+        raise ValidationError("Задание этой операции ещё идёт — дождитесь его конца или отмените.")
+    results = item.get("results") or []
+    launched = [r["key"] for r in results if r.get("status") == OK]
+    keys: List[str] = []
+    uncertain: List[str] = []
+    follow: List[str] = []
+    marks = progress.items(svc.db, op_id)
+    if marks is not None:
+        for key in launched:
+            mark = marks.get(key)
+            if mark is None or mark["status"] == progress.FAILED and not mark["next"]:
+                keys.append(key)                    # не начат или ошибка
+            elif mark["status"] == progress.RUNNING:
+                keys.append(key)                    # задание прервалось посреди этого ящика
+                uncertain.append(key)
+            elif mark["status"] == progress.FAILED and mark["next"] == "ax_forward":
+                follow.append(key)
+    elif item.get("job_id") and launched:
+        # задание до 1.13 — отметок нет, есть только итог задания
+        if job is None:
+            raise ValidationError(_UNKNOWN.format(why="задания уже нет в журнале"), hint=_UNKNOWN_HINT)
+        items = job.get("items") or []
+        if not job.get("summary"):
+            raise ValidationError(_UNKNOWN.format(why="задание прервано, его итог не сохранился"), hint=_UNKNOWN_HINT)
+        if len(items) >= 5000:
+            raise ValidationError(_UNKNOWN.format(why="итог задания сохранён не полностью"), hint=_UNKNOWN_HINT)
+        done = {i.get("key"): i for i in items}
+        for key in launched:
+            got = done.get(key)
+            if got is None or got.get("status") == "failed":
+                keys.append(key)
+    else:
+        keys = [r["key"] for r in results if r.get("status") == FAIL and r.get("username")]
+    params, blank = _retry_params(svc, item)
+    out: Dict[str, Any] = {"op_id": op_id, "action": item["action"], "label": item["label"], "params": params,
+                           "blank": blank, "keys": keys, "uncertain": uncertain, "follow": None}
+    if follow:
+        fwd = {"action": "ax_forward", "label": get("ax_forward").label, "keys": follow,
+               "params": {"to": params.get("forward_to") or "", "with_aliases": bool(params.get("forward_aliases", True))}}
+        if keys:
+            out["follow"] = fwd                     # сначала — повтор, затем — передача адресов
+        else:
+            out.update({"action": fwd["action"], "label": fwd["label"], "keys": follow, "params": fwd["params"],
+                        "blank": []})
+    from . import create
+    if out["action"] == create.KEY:
+        # строки списка — с именем и фамилией из задания (в истории их нет)
+        names: Dict[str, Tuple[str, str]] = {}
+        if item.get("job_id"):
+            row = svc.db.get_job(item["job_id"])
+            try:
+                opts = (json.loads(row["params"] or "{}") or {}).get("options") or {} if row is not None else {}
+            except (TypeError, ValueError):
+                opts = {}
+            for it in opts.get("items") or []:
+                names[it.get("email")] = (it.get("first") or "", it.get("last") or "")
+        lines = []
+        for k in keys:
+            first, last = names.get(k, ("", ""))
+            lines.append(f"{k}; {first}; {last}" if (first or last) else k)
+        out["lines"] = "\n".join(lines)
+    return out
+
+
+def retry_count(svc, op_id: int) -> Tuple[int, str]:
+    """Сколько ящиков предложит «Повторить для неудачных» (и почему 0, если повтор невозможен)."""
+    try:
+        info = retry_info(svc, op_id)
+    except ValidationError as exc:
+        return 0, exc.message
+    return len(info["keys"]) + len((info.get("follow") or {}).get("keys") or []), ""
 
 
 def cancel_op(svc, op_id: int) -> int:

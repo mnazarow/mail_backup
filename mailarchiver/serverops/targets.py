@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Set
 
 from ..models import Account, AuthType
 
@@ -152,12 +152,57 @@ AUTH_SHORT = {AuthType.PASSWORD: "по паролю", AuthType.MASTER: "вход
               AuthType.OAUTH2: "OAuth2", AuthType.AXIGEN_FTP: "FTP Backup Axigen"}
 
 
-def row_dict(svc, t: Target, totals: Dict[int, Dict[str, int]], keeps: Dict[int, bool]) -> Dict:
+def dismissed_map(svc) -> Dict[str, str]:
+    """Уволенные сотрудники: адрес (в нижнем регистре) → когда уволен."""
+    out: Dict[str, str] = {}
+    try:
+        rows = svc.db.query("SELECT email, dismissed_at FROM employees WHERE dismissed_at IS NOT NULL "
+                            "AND dismissed_at != '' AND email IS NOT NULL AND email != ''")
+    except Exception:  # noqa: BLE001 — справочника сотрудников может не быть в старой базе
+        return out
+    for r in rows:
+        out[str(r["email"]).strip().lower()] = r["dismissed_at"]
+    return out
+
+
+def own_addresses(items: Sequence[Target]) -> Set[str]:
+    """Адреса учётных записей Axigen (и удалённых): псевдоним с таким адресом — чужой, переданный коллеге."""
+    return {str(t.email).strip().lower() for t in items if t.axigen is not None}
+
+
+def dismissed_at(t: Target, dismissed: Dict[str, str], own: Optional[Set[str]] = None) -> str:
+    """Когда уволен сотрудник этого ящика: по карточке ящика архива или по «Сотрудникам» (адрес, псевдоним).
+
+    Псевдоним, который сам — адрес другой учётной записи (адрес уволенного, переданный коллеге после
+    удаления), коллегу уволенным не делает.
+    """
+    if t.mailbox is not None and t.mailbox.dismissed_at:
+        return t.mailbox.dismissed_at
+    own = own or set()
+    for i, address in enumerate([t.email] + list((t.axigen or {}).get("aliases") or [])):
+        address = str(address or "").strip().lower()
+        if i and address in own:
+            continue
+        when = dismissed.get(address)
+        if when:
+            return when
+    return ""
+
+
+def row_dict(svc, t: Target, totals: Dict[int, Dict[str, int]], keeps: Dict[int, bool],
+             dismissed: Optional[Dict[str, str]] = None, trends: Optional[Dict[str, Dict]] = None,
+             own: Optional[Set[str]] = None, last: Optional[Dict[str, Dict]] = None) -> Dict:
     """Строка таблицы раздела."""
     ax = t.axigen or {}
     acc = t.mailbox
     item = {"key": t.key, "email": t.email, "name": t.name, "host": t.host, "kind": t.kind,
-            "deleted": t.deleted}
+            "deleted": t.deleted, "dismissed_at": dismissed_at(t, dismissed or {}, own)}
+    trend = (trends or {}).get(t.key)
+    item["trend"] = ({"per_month": int(trend["per_month"]), "days_to_quota": trend["days_to_quota"],
+                      "since": trend["since"], "span_days": trend["span_days"], "used": trend["used"],
+                      "quota": trend["quota"]} if trend else None)
+    # последний замер места (у ящиков не на Axigen — из «Отчёта»)
+    item["usage"] = (last or {}).get(t.key)
     if t.axigen is not None:
         quota = ax.get("quota_kb")
         used = ax.get("used_bytes")
@@ -205,7 +250,13 @@ def overview(svc) -> Dict:
     accounts = [t.mailbox for t in items if t.mailbox is not None]
     totals = svc.db.message_totals_by_account()
     keeps = keeps_everything_map(svc, accounts)
-    rows = [row_dict(svc, t, totals, keeps) for t in items]
+    from .usage import trends as usage_trends
+    dismissed = dismissed_map(svc)
+    trends = usage_trends(svc.db)
+    own = own_addresses(items)
+    from .usage import latest
+    last = latest(svc.db)
+    rows = [row_dict(svc, t, totals, keeps, dismissed, trends, own, last) for t in items]
     st = _axigen_settings(svc)
     ax = {"enabled": bool(st and st.enabled), "configured": bool(st and st.configured),
           "allow_changes": bool(st and st.allow_changes), "host": (st.host if st else "") or "",

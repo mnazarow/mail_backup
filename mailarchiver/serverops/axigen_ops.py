@@ -846,6 +846,8 @@ class RefreshAction(ServerAction):
                 return "ok", "учётной записи на сервере больше нет — помечена удалённой (архив сохранён)"
             info = directory.account_details(cli, domain, name)
         axstore.save_snapshot(ctx.db, [info], [])
+        from .usage import record_axigen_rows, today
+        record_axigen_rows(ctx.db, [dict(info, email=t.email)], day=today(ctx.svc))
         parts = []
         if info.get("used_bytes") is not None:
             parts.append(f"занято {human_size(info['used_bytes'])}")
@@ -914,7 +916,26 @@ class AxDeleteAction(ServerAction):
             "ящик копируется через FTP Backup: на время удаления останавливается приём писем, архив ставится на "
             "бессрочное удержание, ящик копируется ещё раз, и все папки сверяются с архивом — хоть одного письма "
             "нет, учётная запись не удаляется. Копирование ящика выключается.")
-    note = "Удаление на сервере необратимо: вернуть письма можно только из архива, создав учётную запись заново."
+    note = ("Удаление на сервере необратимо: вернуть письма можно только из архива, создав учётную запись заново. "
+            "Чтобы письма на адрес уволенного не терялись, укажите коллегу — адрес станет его псевдонимом.")
+    params = (
+        Param("forward_to", "Передать адрес коллеге", "text", "", placeholder="пусто — не передавать",
+              help="Адрес учётной записи коллеги в том же домене. После удаления адрес (и псевдонимы, если "
+                   "отмечено) станет её псевдонимом — письма будут приходить коллеге."),
+        Param("forward_aliases", "Передать и псевдонимы удаляемой учётной записи", "bool", True),
+    )
+
+    def prepare(self, ctx):
+        super().prepare(ctx)
+        to = (ctx.params.get("forward_to") or "").strip().lower()
+        if to:
+            ctx.params["forward_to"] = to
+            ctx.data["colleague"] = colleague_row(ctx, to)
+
+    def validate_plan(self, ctx, items):
+        to = ctx.params.get("forward_to")
+        if to and any(t.email == to for t in items):
+            raise ValidationError(f"Коллега {to} сам среди удаляемых учётных записей.")
 
     def check(self, ctx, t):
         acc = t.mailbox
@@ -925,20 +946,219 @@ class AxDeleteAction(ServerAction):
         if acc.auth_type != AuthType.AXIGEN_FTP:
             return ("ящик копируется по IMAP — полноту архива перед удалением не проверить; переведите его на "
                     "копирование через FTP Backup")
+        to = ctx.params.get("forward_to")
+        if to:
+            if t.email == ctx.data["colleague"]["email"]:
+                return "это коллега, которому передаются адреса, — её не удаляем"
+            problem = transfer_problem(ctx, t, to)
+            if problem:
+                # просили передать адрес — без этого не удаляем (письма на адрес иначе пойдут в отказ)
+                return f"адрес коллеге передать нельзя: {problem}"
         return ""
 
     def plan(self, ctx, t):
         stats = ctx.totals.get(t.mailbox.id) or {}
-        return (f"приём писем остановится, удержание архива, последняя копия, сверка всех папок, удаление; в архиве "
+        text = (f"приём писем остановится, удержание архива, последняя копия, сверка всех папок, удаление; в архиве "
                 f"писем {int(stats.get('messages', 0))}")
+        to = ctx.params.get("forward_to")
+        if to:
+            colleague = ctx.data["colleague"]["email"]
+            text += (f"; затем {', '.join(transfer_addresses(t, colleague, ctx.params.get('forward_aliases', True)))}"
+                     f" → {colleague}")
+        return text
 
     def execute(self, ctx, t):
         from ..axigen import jobs as axjobs
-        return axjobs._do_delete(ctx.job, _open_cli(ctx), t.mailbox, t.axigen, t.email,
-                                 {"hold": True, "allow_loss": False}, ctx.user, _emit(ctx, t))
+        to = ctx.params.get("forward_to")
+        before = None
+        if to:
+            # прямо перед удалением, в той же сессии CLI: коллега на сервере есть, адрес передать можно —
+            # сверка могла устареть (коллегу удалили в WebAdmin)
+            def before(cli):
+                return transfer_live_problem(ctx, cli, t)
+        status, text = axjobs._do_delete(ctx.job, _open_cli(ctx), t.mailbox, t.axigen, t.email,
+                                         {"hold": True, "allow_loss": False}, ctx.user, _emit(ctx, t),
+                                         before_remove=before)
+        if status != "ok" or not to:
+            return status, text
+        # учётная запись удалена — это необратимо: в аудит сразу, что бы ни случилось с передачей адреса
+        ctx.db.add_audit(ctx.user, base.HISTORY_PREFIX + self.key, f"{t.email}: {text}"[:300])
+        ctx.data.setdefault("audited", set()).add(t.key)
+        try:
+            problem = transfer_problem(ctx, t, to)
+            if problem:
+                raise ValidationError(problem)
+            added = transfer(ctx, t, to, ctx.params.get("forward_aliases", True))
+        except Exception as exc:  # noqa: BLE001
+            ctx.data.setdefault("item_extra", {})[t.key] = {"next_action": "ax_forward"}
+            return "fail", (f"{text}; адрес коллеге НЕ передан: {getattr(exc, 'message', exc)}. Учётная запись уже "
+                            f"удалена — передайте адрес действием «Передать адрес коллеге» («Повторить для "
+                            f"неудачных» подставит его сам)")
+        return "ok", f"{text}; письма на {', '.join(added)} теперь приходят {ctx.data['colleague']['email']}"
+
+
+# ---------------------------------------------------------------------------
+#  Передать адрес коллеге (после удаления учётной записи)
+# ---------------------------------------------------------------------------
+def colleague_row(ctx, address: str) -> Dict:
+    """Учётная запись коллеги по последней сверке (существует, не удалена)."""
+    from ..axigen import store as axstore
+    from ..axigen.directory import valid_account_name, valid_domain
+    address = (address or "").strip().lower()
+    local, _sep, domain = address.partition("@")
+    if not local or not domain or not valid_account_name(local) or not valid_domain(domain):
+        raise ValidationError(f"Адрес коллеги указан неверно: «{address}».")
+    row = axstore.get_account(ctx.db, address)
+    if row is None:
+        # адрес может быть псевдонимом коллеги — тогда берём его учётную запись
+        for other in axstore.list_accounts(ctx.db, include_deleted=False):
+            if address in (other.get("aliases") or []):
+                row = other
+                break
+    if row is None or row.get("deleted_at"):
+        raise ValidationError(f"Учётной записи {address} нет на сервере (по последней сверке).",
+                              hint="Проверьте адрес или сверьте учётные записи заново.")
+    return row
+
+
+def transfer_addresses(t: tg.Target, colleague: str, with_aliases: bool) -> List[str]:
+    """Какие адреса удалённой учётной записи станут псевдонимами коллеги (только из его домена)."""
+    domain = colleague.split("@", 1)[1]
+    out = [t.email] + (list((t.axigen or {}).get("aliases") or []) if with_aliases else [])
+    return [a for a in out if a.split("@", 1)[-1] == domain]
+
+
+def transfer_problem(ctx, t: tg.Target, colleague: str) -> str:
+    """Почему адрес нельзя передать (пусто — можно)."""
+    from ..axigen import store as axstore
+    row = ctx.data.get("colleague") or colleague_row(ctx, colleague)
+    target = row["email"]
+    if target == t.email:
+        return "коллега — та же учётная запись"
+    if t.email.split("@", 1)[1] != target.split("@", 1)[1]:
+        return f"коллега {target} в другом домене — псевдоним бывает только в своём домене"
+    have = set(row.get("aliases") or [])
+    busy = []
+    for other in axstore.list_accounts(ctx.db, include_deleted=False):
+        if other["email"] in (t.email, target):
+            continue
+        for address in transfer_addresses(t, target, ctx.params.get("forward_aliases", True)):
+            if address == other["email"] or address in (other.get("aliases") or []):
+                busy.append(f"{address} занят учётной записью {other['email']}")
+    if busy:
+        return "; ".join(busy[:3])
+    if all(a in have for a in transfer_addresses(t, target, ctx.params.get("forward_aliases", True))):
+        return "адреса уже переданы этому коллеге"
+    return ""
+
+
+def transfer_live_problem(ctx, cli, t: tg.Target) -> str:
+    """Проверка на сервере прямо перед удалением: учётная запись коллеги есть (сверка могла устареть).
+
+    Заодно запоминает нынешние псевдонимы удаляемой учётной записи — передаются они, а не из сверки.
+    """
+    from ..axigen import actions, directory
+    target = ctx.data["colleague"]["email"]
+    local, domain = actions.parse_email(target)
+    try:
+        names = directory.list_account_names(cli, domain)
+    except Exception as exc:  # noqa: BLE001
+        return f"не удалось проверить учётную запись коллеги {target} ({getattr(exc, 'message', exc)})"
+    if not any(n.lower() == local.lower() for n in names):
+        return f"учётной записи коллеги {target} на сервере нет — адрес передать некому"
+    try:
+        ctx.data.setdefault("live_aliases", {})[t.key] = actions.list_aliases(cli, t.email)
+    except Exception:  # noqa: BLE001 — не прочитали: передаются псевдонимы из сверки
+        pass
+    return ""
+
+
+def transfer(ctx, t: tg.Target, colleague: str, with_aliases: bool) -> List[str]:
+    """Сделать адреса удалённой учётной записи псевдонимами коллеги. → какие адреса переданы.
+
+    Каждый добавленный псевдоним — сразу в аудит и в сверку: сбой посередине не теряет сделанного.
+    """
+    from ..axigen import actions, directory
+    from ..axigen import store as axstore
+    row = ctx.data.get("colleague") or colleague_row(ctx, colleague)
+    target = row["email"]
+    local, domain = actions.parse_email(t.email)
+    live = (ctx.data.get("live_aliases") or {}).get(t.key)
+    if live is not None:
+        t = tg.Target(key=t.key, email=t.email, name=t.name, host=t.host,
+                      axigen=dict(t.axigen or {}, aliases=list(live)), mailbox=t.mailbox)
+    added: List[str] = []
+    after = list(row.get("aliases") or [])
+    try:
+        with _cli(ctx, f"Передача адреса {t.email} → {target}") as cli:
+            # учётной записи на сервере уже нет — иначе адрес занят ею самой
+            names = directory.list_account_names(cli, domain)
+            if any(n.lower() == local.lower() for n in names):
+                raise ValidationError(f"учётная запись {t.email} ещё есть на сервере — адрес занят ею")
+            for address in transfer_addresses(t, target, with_aliases):
+                if address in after:
+                    continue
+                after = actions.add_alias(cli, target, address.split("@", 1)[0])
+                added.append(address)
+                ctx.db.add_audit(ctx.user, base.HISTORY_PREFIX + "ax_forward", f"{address} → {target}"[:300])
+                if ctx.job is not None:
+                    ctx.job.event("INFO", f"{address} → {target}: псевдоним добавлен")
+    finally:
+        if added:
+            axstore.update_fields(ctx.db, target, aliases=after)
+            axstore.merge_info(ctx.db, t.email, {"forwarded_to": target})
+            ctx.data.setdefault("audited", set()).add(t.key)
+    return added
+
+
+class ForwardAction(ServerAction):
+    key = "ax_forward"
+    label = "Передать адрес коллеге"
+    group = "accounts"
+    icon = "📨"
+    danger = 1
+    axigen_change = True
+    desc = ("Для учётных записей, удалённых на сервере: их адрес (и псевдонимы) станет псевдонимом учётной записи "
+            "коллеги — письма на адрес уволенного будут приходить коллеге. Только в том же домене и только если "
+            "адрес не занят другой учётной записью.")
+    note = ("Пока учётная запись есть на сервере, её адрес занят ею самой; для удаления с передачей есть поле "
+            "«Передать адрес коллеге» в «Удалить учётную запись».")
+    params = (
+        Param("to", "Адрес коллеги", "text", "", placeholder="petrova@company.ru"),
+        Param("with_aliases", "Передать и псевдонимы удалённой учётной записи", "bool", True),
+    )
+
+    def prepare(self, ctx):
+        super().prepare(ctx)
+        to = (ctx.params.get("to") or "").strip().lower()
+        if not to:
+            raise ValidationError("Укажите адрес коллеги.")
+        ctx.params["to"] = to
+        ctx.params["forward_aliases"] = bool(ctx.params.get("with_aliases", True))
+        ctx.data["colleague"] = colleague_row(ctx, to)
+
+    def base_check(self, ctx, t):
+        if t.axigen is None:
+            return "это не учётная запись Axigen (ящик на другом сервере)"
+        if not t.deleted:
+            return "учётная запись ещё есть на сервере — сначала удалите её (там же можно сразу передать адрес)"
+        return ""
+
+    def check(self, ctx, t):
+        return transfer_problem(ctx, t, ctx.params["to"])
+
+    def plan(self, ctx, t):
+        return f"{', '.join(transfer_addresses(t, ctx.data['colleague']['email'], ctx.params['forward_aliases']))} " \
+               f"→ {ctx.data['colleague']['email']}"
+
+    def execute(self, ctx, t):
+        added = transfer(ctx, t, ctx.params["to"], ctx.params["forward_aliases"])
+        if not added:
+            return "skip", "адреса уже переданы"
+        return "ok", f"письма на {', '.join(added)} теперь приходят {ctx.data['colleague']['email']}"
 
 
 base.register(BlockAction(), UnblockAction(), PasswordAction(), MustChangeAction(), ServicesOffAction(),
               ServicesOnAction(), QuotaAction(), AliasAddAction(), AliasRemoveAction(), ContactAction(),
               AccountTypeAction(), PublishContactAction(), AddToArchiveAction(), RefreshAction(), AxPurgeAction(),
-              AxDeleteAction())
+              AxDeleteAction(), ForwardAction())

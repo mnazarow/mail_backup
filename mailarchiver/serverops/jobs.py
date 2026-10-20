@@ -14,10 +14,11 @@ from __future__ import annotations
 
 from typing import Dict, List
 
+from ..bulk import OK
 from ..errors import DiskSpaceError, JobCancelled, MailArchiverError, ValidationError
 from ..logging_setup import get_logger
 from ..models import JobStatus
-from . import base
+from . import base, progress
 from . import targets as tg
 
 log = get_logger("serverops.jobs")
@@ -37,6 +38,31 @@ def handle_job(ctx) -> Dict:
     keys = tg.clean_keys(params.get("keys") or [])
     op = base.Ctx(svc, who, options, preview=False, job=ctx)
     op.data["op_id"] = params.get("op_id")
+    known = tg.resolve(svc, keys)
+    if params.get("schedule_id") and not params.get("op_id"):
+        # запуск по расписанию — своя запись в истории раздела, как у ручного запуска
+        sid = params["schedule_id"]
+        from .schedules import SCHEDULABLE
+        consent = (params.get("schedule") or {}).get("consent_by")
+        if action.key not in SCHEDULABLE or not consent:
+            # расписание из старой или испорченной записи: без согласия и не для своих действий не выполняется
+            raise ValidationError(f"Расписание №{sid}: действие «{action.label}» по расписанию не выполняется "
+                                  f"или нет отметки согласия администратора.",
+                                  hint="Удалите расписание и создайте заново в «Ящики на сервере».")
+        op_id = svc.db.create_bulk_op(f"расписание №{sid}", base.HISTORY_PREFIX + action.key, action.label,
+                                      base.history_params(options), len(keys))
+        op.data["op_id"] = op_id
+
+        def _who(k: str):
+            t = known.get(k)
+            return ((t.name or t.email) if t else k.split(":", 1)[-1]), ((t.email if t else "") or k.split(":", 1)[-1])
+        launch = [{"id": k, "key": k, "name": _who(k)[0], "username": _who(k)[1], "status": OK,
+                   "detail": f"в задании по расписанию №{sid}", "job_id": ctx.job_id} for k in keys]
+        svc.db.finish_bulk_op(op_id, ok=len(keys), skipped=0, failed=0, jobs=1, results=launch,
+                              summary=f"{action.label}: по расписанию №{sid}, ящиков {len(keys)}. "
+                                      f"Задание №{ctx.job_id}.")
+        ctx.event("INFO", f"Запуск по расписанию №{sid} (согласие на выполнение без проверки перед запуском: "
+                          f"{(params.get('schedule') or {}).get('consent_by') or '—'}).")
     try:
         action.prepare(op)
     except ValidationError as exc:
@@ -44,6 +70,8 @@ def handle_job(ctx) -> Dict:
         ctx.event("ERROR", f"{action.label}: {exc.message}")
         raise
     ctx.event("INFO", f"{action.label}: ящиков {len(keys)}.")
+    op_id = op.data.get("op_id")
+    progress.started(svc.db, op_id)
     results: List[Dict] = []
     stats = {"ok": 0, "skip": 0, "fail": 0}
     action.job_started(op)
@@ -57,10 +85,10 @@ def handle_job(ctx) -> Dict:
         if extra:
             item.update(extra)
         results.append(item)
+        progress.mark(svc.db, op_id, t.key, item["status"], (extra or {}).get("next_action", ""))
         level = {"ok": "INFO", "skip": "WARNING", "fail": "ERROR"}[status]
         ctx.event(level, f"{t.email or t.name}: {text}"[:600])
 
-    known = tg.resolve(svc, keys)
     cancelled_at = None
     for index, key in enumerate(keys):
         t = None
@@ -74,6 +102,7 @@ def handle_job(ctx) -> Dict:
                 stats["skip"] += 1
                 results.append({"name": key.split(":", 1)[-1], "key": key, "status": "skipped",
                                 "detail": "ящика больше нет (удалён или пропал из сверки)"})
+                progress.mark(svc.db, op_id, key, progress.SKIPPED)
                 continue
             try:
                 reason = action.base_check(op, t) or action.check(op, t)
@@ -82,6 +111,8 @@ def handle_job(ctx) -> Dict:
             if reason:
                 record(t, "skip", reason)
                 continue
+            # до изменения: если служба упадёт посреди ящика, «Повторить» предупредит о нём
+            progress.mark(svc.db, op_id, t.key, progress.RUNNING)
             try:
                 status, text = action.execute(op, t)
             except (JobCancelled, DiskSpaceError):
@@ -103,7 +134,7 @@ def handle_job(ctx) -> Dict:
                 cancelled_at += 1
             break
         record(t, status, text)
-        if status == "ok" and not getattr(action, "read_only", False):
+        if status == "ok" and not getattr(action, "read_only", False) and t.key not in op.data.get("audited", ()):
             svc.db.add_audit(who, base.HISTORY_PREFIX + action.key, f"{t.email}: {text}"[:300])
     if cancelled_at is not None:
         rest = len(keys) - cancelled_at

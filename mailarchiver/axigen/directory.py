@@ -308,16 +308,25 @@ def match(server_rows: Sequence[Dict], accounts: Sequence[Account], st: AxigenSe
         if prev is None or (not is_axigen_mailbox(prev, st) and is_axigen_mailbox(acc, st)):
             by_login[key] = acc
     out: Dict[str, Account] = {}
+    # Сначала — точное совпадение логина с адресом учётной записи (и удалённой тоже): ящик уволенного,
+    # чей адрес после удаления передан коллеге псевдонимом, остаётся за своей (удалённой) учётной записью
+    # и не «переезжает» к коллеге.
+    own = {str(row["email"]).strip().lower() for row in server_rows}
+    for row in server_rows:
+        acc = by_login.get(row["email"])
+        if acc is not None:
+            out[row["email"]] = acc
     for row in server_rows:
         email = row["email"]
-        acc = by_login.get(email)
-        if acc is None:
-            for alias in row.get("aliases") or []:
-                acc = by_login.get(alias)
-                if acc is not None:
-                    break
-        if acc is not None:
-            out[email] = acc
+        if email in out or row.get("deleted_at"):
+            continue
+        for alias in row.get("aliases") or []:
+            if str(alias).strip().lower() in own:
+                continue                    # это адрес другой учётной записи (например, переданный коллеге)
+            acc = by_login.get(alias)
+            if acc is not None:
+                out[email] = acc
+                break
     return out
 
 

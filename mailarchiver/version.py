@@ -1,5 +1,5 @@
 """Версия приложения MailArchiver."""
 
-__version__ = "1.12.0"
+__version__ = "1.13.0"
 APP_NAME = "MailArchiver"
 APP_TITLE = "MailArchiver — резервное копирование почты по IMAP"

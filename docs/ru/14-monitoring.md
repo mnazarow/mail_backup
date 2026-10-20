@@ -90,7 +90,7 @@ curl -s -H "Authorization: Bearer ВАШ_ТОКЕН" https://mail-archive.compan
 | `mailarchiver_axigen_queue_messages` | Писем в очереди Axigen |
 | `mailarchiver_axigen_license_days_left` | Дней до окончания лицензии Axigen |
 | `mailarchiver_axigen_accounts{state}` | Учётные записи Axigen по последней сверке: `total`, `blocked`, `deleted` |
-| `mailarchiver_axigen_problems{problem}` | 1 — на сервере Axigen есть проблема: `unreachable`, `queue`, `license`, `quota`, `unarchived`, `gone`, `blocked_imap`, `tls_unverified` ([19-axigen.md](19-axigen.md), раздел 19.9) |
+| `mailarchiver_axigen_problems{problem}` | 1 — на сервере Axigen есть проблема: `unreachable`, `queue`, `license`, `quota`, `unarchived`, `gone`, `blocked_imap`, `tls_unverified`, `dismissed_open`, `quota_soon` ([19-axigen.md](19-axigen.md), раздел 19.9) |
 
 Метрики по каждому ящику (`mailarchiver_account_*`) можно выключить параметром «Метрики по
 каждому ящику», если нужны только общие цифры. Тяжёлые показатели (размеры, диск) кэшируются на

@@ -4795,10 +4795,12 @@ async function axigenForMailbox(a){
 //  с папками и письмами в ящиках любого сервера (по IMAP).
 // ===================================================================
 const Srv = { tab:'list', filter:'', query:'', sel:new Set(), shown:200, source:'selected', list:'', action:null, params:{}, meta:null };
-const SRV_TABS = [['list','🧰 Ящики и действия'],['history','📜 История']];
+const SRV_TABS = [['list','🧰 Ящики и действия'],['history','📜 История'],['schedules','🕑 Расписания']];
+const SRV_SOON_DAYS = 30;
 const SRV_FILTERS = [['','Все'],['axigen','Axigen'],['other','Другие серверы'],['imap','Вход по IMAP есть'],['noimap','Без входа по IMAP'],
   ['archived','Есть в архиве'],['noarchive','Нет в архиве'],['keeps','Архив хранит всё'],['blocked','Вход закрыт'],['quota','У предела квоты'],
-  ['inactive',`Не входили ${AX_INACTIVE_DAYS}+ дн.`],['deleted','Удалены на сервере']];
+  ['soon',`Упрутся в квоту за ${SRV_SOON_DAYS} дн.`],['inactive',`Не входили ${AX_INACTIVE_DAYS}+ дн.`],['dismissed','Уволены, вход открыт'],
+  ['deleted','Удалены на сервере']];
 const SRV_LOGIN = {ok:['ok','вход удался'], auth_error:['err','неверный пароль'], conn_error:['warn','нет связи'], no_password:['','нет пароля'], secret_broken:['err','пароль не читается']};
 
 function srvMatches(r, f, q){
@@ -4812,12 +4814,37 @@ function srvMatches(r, f, q){
   if(f==='keeps' && !(mb && mb.keeps_all)) return false;
   if(f==='blocked' && !(r.login_blocked===true && !r.deleted)) return false;
   if(f==='quota' && !(r.quota_percent!=null && r.quota_percent>=90)) return false;
+  if(f==='soon' && !srvSoonFull(r)) return false;
+  if(f==='dismissed' && !srvDismissedOpen(r)) return false;
   if(f==='inactive'){ const d=axDaysSince(r.last_login); if(r.deleted || d==null || d<AX_INACTIVE_DAYS) return false; }
   if(f==='deleted' && !r.deleted) return false;
   if(f!=='deleted' && r.deleted && !mb) return false;      // удалённые без архива — только в своём отборе
   q=(q||'').trim().toLowerCase();
   if(!q) return true;
   return [r.email, r.name, r.host, (r.aliases||[]).join(' '), mb&&mb.name].some(v=>String(v||'').toLowerCase().includes(q));
+}
+
+/** Сотрудник уволен, а вход на сервере открыт. */
+function srvDismissedOpen(r){ return !!r.dismissed_at && r.login_blocked===false && !r.deleted; }
+/** При нынешнем росте упрётся в квоту за SRV_SOON_DAYS дней. */
+function srvSoonFull(r){ const t=r.trend; return !r.deleted && !!t && t.days_to_quota!=null && t.days_to_quota<=SRV_SOON_DAYS; }
+/** Рост места: «+120 МБ/мес · до квоты ~45 дн.» (по замерам при сверке и отчётах). */
+function srvTrendHtml(r){
+  const t=r.trend; if(!t) return '';
+  const pm=t.per_month||0;
+  const grow=Math.abs(pm)<1024*1024?'почти не растёт':`${pm>0?'+':'−'}${fmtBytes(Math.abs(pm))}/мес`;
+  const d=t.days_to_quota;
+  const left=d==null?'':(d<=0?' · <span class="tag err">квота занята</span>':` · <span class="${d<=SRV_SOON_DAYS?'tag err':(d<=90?'tag warn':'muted')}">до квоты ~${fmtNum(d)} дн.</span>`);
+  return `<div class="small muted" title="${esc(`По замерам с ${srvDay(t.since)} (${t.span_days} дн.): при сверке с Axigen, «Перечитать с сервера» и «Отчёте»`)}">📈 ${esc(grow)}${left}</div>`;
+}
+/** «2026-10-20» → «20.10.2026» (день замера — без времени). */
+function srvDay(d){ const m=String(d||'').match(/^(\d{4})-(\d\d)-(\d\d)/); return m?`${m[3]}.${m[2]}.${m[1]}`:String(d||''); }
+/** Место ящика не на Axigen — по последнему «Отчёту». */
+function srvUsageCell(r){
+  const u=r.usage; if(!u) return '<span class="muted small">— (в «Отчёте»)</span>';
+  const pct=u.quota?Math.round(1000*u.used/u.quota)/10:null; const cls=pct>=90?'err':(pct>=75?'warn':'ok');
+  return `<div class="small" title="${esc('По «Отчёту» от '+srvDay(u.day))}">${esc(fmtBytes(u.used))}${u.quota?' из '+esc(fmtBytes(u.quota))+` <span class="tag ${cls}">${pct}%</span>`:' <span class="muted">без квоты</span>'}</div>
+    <div class="small muted">по «Отчёту» от ${esc(srvDay(u.day))}</div>`;
 }
 
 /** Список адресов → строки таблицы (по адресу, псевдониму или названию ящика). */
@@ -4872,6 +4899,7 @@ async function viewServer(c){
   c.appendChild(h(`<div class="tabs" role="tablist">${SRV_TABS.map(([k,t])=>`<a href="#/server?tab=${k}" class="${k===tab?'active':''}" role="tab">${t}</a>`).join('')}</div>`));
   const body=h('<div></div>'); c.appendChild(body);
   if(tab==='history') return srvHistory(body);
+  if(tab==='schedules') return srvSchedules(body, meta);
   return srvList(body, rows, meta, ax);
 }
 
@@ -4890,8 +4918,28 @@ function srvArchiveCell(r){
 
 function srvList(box, rows, meta, ax){
   const byKey=new Map(rows.map(r=>[r.key, r]));
+  const asked=Srv.sel.size;
   Srv.sel.forEach(k=>{ if(!byKey.has(k)) Srv.sel.delete(k); });
+  if(Srv.pending){
+    // повтор: отмеченные ящики должны быть видны — удалённые без архива показывает только свой отбор
+    const p=Srv.pending; Srv.pending=null;
+    const picked=[...Srv.sel].map(k=>byKey.get(k));
+    if(picked.length && picked.every(r=>!srvMatches(r,'',''))) Srv.filter='deleted';
+    const n=Srv.sel.size, gone=asked-n;
+    const notes=[`«${p.label}» с прежними параметрами — нажмите «Проверить и запустить…».`];
+    if(gone>0) notes.push(`${fmtNum(gone)} ${plural(gone,'ящика','ящиков','ящиков')} больше нет в таблице.`);
+    if(p.blank) notes.push('Пароль введите заново — он не сохраняется.');
+    if(p.uncertain) notes.push(`На ${fmtNum(p.uncertain)} ${plural(p.uncertain,'ящике','ящиках','ящиках')} задание прервалось посреди работы — часть изменений могла выполниться; посмотрите их в проверке.`);
+    toast(`Отмечено ${fmtNum(n)} ${plural(n,'ящик','ящика','ящиков')}`, notes.join(' '), (gone||p.uncertain)?'warn':'success', 12000);
+  }
   const count=f=>rows.filter(r=>srvMatches(r,f,'')).length;
+  // что требует внимания: уволенные с открытым входом, ящики накануне квоты
+  const nDism=count('dismissed'), nSoon=count('soon');
+  const alerts=h(`<div>${nDism?`<div class="hint warnbox" style="margin-bottom:10px">👤 Сотрудники уволены, а вход на сервере открыт: <b>${fmtNum(nDism)}</b> — ${esc(rows.filter(srvDismissedOpen).slice(0,5).map(r=>r.email).join(', '))}${nDism>5?' …':''}.
+      ${ax.enabled&&ax.allow_changes?'<button class="btn sm" data-dism style="margin-left:6px">Показать и закрыть вход…</button>':'<span class="small">Закрыть вход можно, когда разрешены изменения на сервере.</span>'}</div>`:''}
+    ${nSoon?`<div class="hint warnbox" style="margin-bottom:10px">📈 При нынешнем росте упрутся в квоту за ${SRV_SOON_DAYS} дней: <b>${fmtNum(nSoon)}</b> — ${esc(rows.filter(srvSoonFull).slice(0,5).map(r=>r.email).join(', '))}${nSoon>5?' …':''}.
+      <button class="btn sm" data-soon style="margin-left:6px">Показать</button></div>`:''}</div>`);
+  box.appendChild(alerts);
   // 1. ящики
   const card=h(`<div class="card bulk-card"><h3>1. Какие ящики</h3>
     <div class="bulk-chips" data-chips>${SRV_FILTERS.map(([f,t])=>`<button class="chip ${Srv.filter===f?'active':''}" data-f="${f}">${t} (${fmtNum(count(f))})</button>`).join('')}</div>
@@ -4925,9 +4973,9 @@ function srvList(box, rows, meta, ax){
     table.innerHTML=list.length?`<table class="tbl srv-tbl"><thead><tr><th style="width:28px"><input type="checkbox" data-all ${allSel?'checked':''}></th><th>Ящик</th><th>Сервер</th><th>Вход</th><th>Место на сервере</th><th>В архиве</th></tr></thead><tbody>
       ${shown.map(r=>`<tr data-row="${esc(r.key)}">
         <td><input type="checkbox" data-sel="${esc(r.key)}" ${Srv.sel.has(r.key)?'checked':''}></td>
-        <td class="srv-mail"><b>${esc(r.email)}</b>${r.errors?' <span class="tag warn" title="'+esc(r.errors)+'">не всё прочитано</span>':''}<div class="small muted">${esc([r.name!==r.email?r.name:'', (r.aliases||[]).length?'псевдонимы: '+r.aliases.join(', '):''].filter(Boolean).join(' · ')||'—')}</div></td>
+        <td class="srv-mail"><b>${esc(r.email)}</b>${r.dismissed_at?` <span class="tag ${srvDismissedOpen(r)?'err':''}" title="${esc('Сотрудник уволен '+fmtDate(r.dismissed_at)+(srvDismissedOpen(r)?' — а вход на сервере открыт':''))}">уволен</span>`:''}${r.errors?' <span class="tag warn" title="'+esc(r.errors)+'">не всё прочитано</span>':''}<div class="small muted">${esc([r.name!==r.email?r.name:'', (r.aliases||[]).length?'псевдонимы: '+r.aliases.join(', '):''].filter(Boolean).join(' · ')||'—')}</div></td>
         <td class="small">${r.kind==='axigen'?'<span class="tag">Axigen</span>':'<span class="tag">IMAP</span>'}<div class="muted mono">${esc(r.host||'—')}</div></td>
-        <td>${srvLoginCell(r)}</td><td style="min-width:140px">${r.kind==='axigen'?axQuotaCell(r):'<span class="muted small">— (в «Отчёте»)</span>'}</td>
+        <td>${srvLoginCell(r)}</td><td style="min-width:150px">${r.kind==='axigen'?axQuotaCell(r):srvUsageCell(r)}${srvTrendHtml(r)}</td>
         <td>${srvArchiveCell(r)}</td></tr>`).join('')}</tbody></table>
       ${list.length>shown.length?`<div style="padding:10px"><button class="btn sm" data-more>Показать ещё (${fmtNum(list.length-shown.length)})</button></div>`:''}`
       : `<div class="empty">${rows.length?'Ничего не подходит под отбор.':'Ящиков нет: заведите ящики в «Почтовых ящиках» или настройте сервер Axigen.'}</div>`;
@@ -4979,9 +5027,18 @@ function srvList(box, rows, meta, ax){
       ${a.note?`<div class="hint" style="margin-bottom:12px">💡 ${esc(a.note)}</div>`:''}
       ${a.params.length?`<div class="bulk-form" data-form>${bulkFormHtml(a.params, saved)}</div>`:''}
       <div class="btn-row" style="margin-top:6px"><button class="btn ${a.danger>=2?'danger':'primary'}" data-go>Проверить и запустить…</button>
+      ${a.schedulable&&!a.unavailable?'<button class="btn" data-sched title="Выполнять это действие для выбранных ящиков регулярно — только с вашего явного согласия">🕑 По расписанию…</button>':''}
       <span class="muted small" style="align-self:center">Сначала покажем, что будет сделано с каждым ящиком, — без изменений.</span></div>`;
     const form=paramsCard.querySelector('[data-form]');
     if(form) bulkFormWire(form, a.params);
+    const sched=paramsCard.querySelector('[data-sched]');
+    if(sched) sched.onclick=()=>{
+      const values=form?bulkFormRead(form, a.params):{};
+      Srv.params[key]=values;
+      const ks=keys();
+      if(!ks.length) return toast('Не выбрано ни одного ящика','Отметьте ящики в таблице или выберите их отбором','warn');
+      srvScheduleModal(a, ks, values);
+    };
     paramsCard.querySelector('[data-go]').onclick=async()=>{
       const values=form?bulkFormRead(form, a.params):{};
       Srv.params[key]=values;
@@ -5005,6 +5062,12 @@ function srvList(box, rows, meta, ax){
     select(t.dataset.act);
   });
   if(Srv.action) select(Srv.action);
+  const showFilter=f=>{ Srv.filter=f; Srv.query=''; $('#srvQ',card).value=''; Srv.shown=200; Srv.source='visible';
+    card.querySelectorAll('[data-chips] .chip').forEach(x=>x.classList.toggle('active', x.dataset.f===f)); draw(); };
+  const dism=alerts.querySelector('[data-dism]');
+  if(dism) dism.onclick=()=>{ showFilter('dismissed'); if(meta.actions.some(a=>a.key==='ax_block'&&!a.unavailable)) select('ax_block'); else card.scrollIntoView({behavior:'smooth'}); };
+  const soon=alerts.querySelector('[data-soon]');
+  if(soon) soon.onclick=()=>{ showFilter('soon'); card.scrollIntoView({behavior:'smooth', block:'start'}); };
 }
 
 // ---------- История раздела ----------
@@ -5043,6 +5106,9 @@ async function srvOpModal(opId, reload){
   const params=Object.entries(o.params||{}).filter(([k,v])=>v!==''&&v!==null&&v!==undefined&&v!==false)
     .map(([k,v])=>{ const p=pdefs.get(k); return `<span class="tag">${esc(p?p.label:k)}: ${esc(pval(p,v))}</span>`; }).join(' ');
   const items=(job&&job.items)||[];
+  // есть что повторить: сервер знает по отметкам задания, какие ящики не сделаны
+  const retryBlock = o.retry ? `<div style="margin-top:10px"><button class="btn sm" data-retry title="Отметить ящики с ошибкой и не обработанные — и подставить то же действие с теми же параметрами; запуск — как обычно, через проверку">🔁 Повторить для неудачных (${fmtNum(o.retry)})…</button></div>`
+    : (o.retry_problem ? `<div class="small muted" style="margin-top:8px">🔁 Повторить для неудачных нельзя: ${esc(o.retry_problem)}</div>` : '');
   const jobBlock = job ? `<div class="card" style="margin:12px 0">
       <div class="section-title" style="margin:0 0 6px"><b>Задание №${job.id}</b> <span class="badge ${esc(job.status)}">${esc(STATUS_LBL[job.status]||job.status)}</span><div class="spacer"></div>
         <button class="btn sm ghost" data-jd>Журнал задания</button></div>
@@ -5058,7 +5124,7 @@ async function srvOpModal(opId, reload){
     <div class="kv"><div class="k">Когда и кто</div><div>${esc(fmtDate(o.created_at))} · ${esc(o.user)}</div></div>
     ${params?`<div class="kv"><div class="k">Параметры</div><div>${params}</div></div>`:''}
     <div class="kv"><div class="k">Итог запуска</div><div>${esc(o.summary)}</div></div>
-    ${jobBlock}
+    ${jobBlock}${retryBlock}
     <details style="margin-top:8px"><summary class="small muted">Проверка перед запуском (${fmtNum(o.total)})</summary><div data-res>${bulkResultHtml(r, false)}</div></details>`, {wide:true});
   bulkWireResults(m.body.querySelector('[data-res]'), r, false);
   const on=(sel, fn)=>{ const el=m.body.querySelector(sel); if(el) el.onclick=fn; };
@@ -5072,14 +5138,43 @@ async function srvOpModal(opId, reload){
     if(!await confirmDlg('Отменить задание?', 'Уже сделанное останется; остальные ящики обработаны не будут.', {okText:'Отменить задание'})) return;
     try{ await api(`/server/history/${o.id}/cancel`,{method:'POST'}); toast('Задание отменяется'); m.close(); if(reload) reload(); }catch(e){ toastErr(e); }
   });
+  on('[data-retry]', async()=>{
+    let r; try{ r=await api(`/server/history/${o.id}/retry`); }catch(e){ return toastErr(e); }
+    if(!(r.keys||[]).length) return toast('Повторять нечего', 'Все ящики операции обработаны.', 'warn');
+    m.close();
+    if(r.action==='ax_create') return srvCreateModal({lines:r.lines, params:r.params});
+    if(r.follow && (r.keys||[]).length){
+      // часть учётных записей удалить не удалось, у части удаление прошло, а адрес не передан — два разных повтора
+      const f=r.follow;
+      const c=modal('Что повторить?', `<p style="margin-top:0">У этой операции два вида незаконченных ящиков:</p>
+        <ul><li>«${esc(r.label)}» не выполнено — <b>${fmtNum(r.keys.length)}</b>;</li>
+        <li>учётная запись удалена, а адрес коллеге не передан — <b>${fmtNum(f.keys.length)}</b>: для них — «${esc(f.label)}».</li></ul>
+        <p class="muted small">Выберите одно; ко второму вернитесь через «Подробнее» этой операции.</p>`,
+        {footer:`<button class="btn" data-a>${esc(r.label)} (${fmtNum(r.keys.length)})</button><button class="btn primary" data-b>${esc(f.label)} (${fmtNum(f.keys.length)})</button>`});
+      c.foot.querySelector('[data-a]').onclick=()=>{ c.close(); srvRetry(r); };
+      c.foot.querySelector('[data-b]').onclick=()=>{ c.close(); srvRetry({keys:f.keys, action:f.action, label:f.label, params:f.params}); };
+      return;
+    }
+    srvRetry(r);
+  });
+}
+
+/** Повторить операцию для неудачных: отметить их ящики и подставить действие с параметрами. */
+function srvRetry(r){
+  Srv.sel=new Set(r.keys); Srv.source='selected'; Srv.filter=''; Srv.query=''; Srv.shown=200;
+  Srv.action=r.action; Srv.params[r.action]=Object.assign({}, Srv.params[r.action]||{}, r.params||{});
+  // сколько ящиков на самом деле отмечено и не скрыты ли они отбором — скажет таблица (srvList)
+  Srv.pending={label:r.label, total:(r.keys||[]).length, blank:(r.blank||[]).length, uncertain:(r.uncertain||[]).length};
+  if(location.hash==='#/server?tab=list' || location.hash==='#/server') route(); else location.hash='#/server?tab=list';
 }
 
 // ---------- Создание учётных записей списком ----------
-function srvCreateModal(){
+function srvCreateModal(pre){
+  pre=pre||{}; const pp=pre.params||{};
   const m=modal('Создать учётные записи на сервере Axigen', `
     <p class="muted" style="margin-top:0">Сначала — проверка: что будет с каждой строкой. Учётные записи создаются заданием, по одной; пароли — случайные (файлом для раздачи сотрудникам) или один общий временный.</p>
     <div class="form-row"><label>Откуда</label><select id="scSrc"><option value="text">Список адресов</option><option value="employees">Сотрудники с адресом, у которых нет учётной записи</option></select></div>
-    <div class="form-row" data-text><label>Адреса</label><textarea id="scText" rows="6" placeholder="ivanov@company.ru; Иван; Иванов&#10;Петрова Мария <petrova@company.ru>"></textarea>
+    <div class="form-row" data-text><label>Адреса</label><textarea id="scText" rows="6" placeholder="ivanov@company.ru; Иван; Иванов&#10;Петрова Мария <petrova@company.ru>">${esc(pre.lines||'')}</textarea>
       <div class="hint">По одной в строке: «адрес; имя; фамилия» или «Фамилия Имя &lt;адрес&gt;».</div></div>
     <div class="form-row"><label>Пароли</label><select id="scMode"><option value="random_file">Случайные — файлом для раздачи (скачать один раз)</option><option value="same">Один общий временный пароль</option></select></div>
     <div class="form-row" data-pw style="display:none"><label>Пароль</label><input type="text" id="scPw" autocomplete="off"><div class="hint">От 6 до 64 знаков, без пробелов, кавычек и «\\».</div></div>
@@ -5089,6 +5184,12 @@ function srvCreateModal(){
     <div data-pv></div>`, {wide:true, footer:'<button class="btn ghost" data-c>Отмена</button><button class="btn" data-check>Проверить</button><button class="btn primary" data-go disabled>Создать</button>'});
   const g=x=>m.body.querySelector(x), go=m.foot.querySelector('[data-go]');
   const sync=()=>{ g('[data-text]').style.display=g('#scSrc').value==='text'?'':'none'; g('[data-pw]').style.display=g('#scMode').value==='same'?'':'none'; go.disabled=true; };
+  if(pre.lines){
+    if(pp.password_mode) g('#scMode').value=pp.password_mode;
+    if(pp.must_change!=null) g('#scMust').checked=!!pp.must_change;
+    if(pp.quota_mb!=null) g('#scQuota').value=pp.quota_mb;
+    if(pp.add_to_archive!=null) g('#scArch').checked=!!pp.add_to_archive;
+  }
   g('#scSrc').onchange=sync; g('#scMode').onchange=sync; sync();
   // поменяли список или параметры — прежняя проверка уже не о том: сначала «Проверить» заново
   m.body.addEventListener('input', ()=>{ if(!go.disabled){ go.disabled=true; go.textContent='Создать'; } });
@@ -5111,4 +5212,94 @@ function srvCreateModal(){
     try{ const r=await api('/server/create',{method:'POST',body:body(false)}); m.close(); toast('Создание запущено', r.summary, 'success', 8000);
       if(r.op_id) srvOpModal(r.op_id, null); }
     catch(e){ toastErr(e); go.disabled=false; go.textContent='Создать'; } };
+}
+
+// ---------- По расписанию — только по явному согласию ----------
+const SRV_DOW=[[1,'понедельник'],[2,'вторник'],[3,'среда'],[4,'четверг'],[5,'пятница'],[6,'суббота'],[7,'воскресенье']];
+
+function srvScheduleModal(a, keys, values){
+  const n=keys.length;
+  const m=modal(`🕑 По расписанию: ${a.label}`, `
+    <p class="muted" style="margin-top:0">Сам MailArchiver почтовый сервер не меняет — расписание вы включаете сами, для этого действия и этих ящиков.
+      При каждом запуске условия проверяются заново по каждому ящику (полный архив, свежая копия, сверка писем), итог — в «Истории» раздела.
+      В расписании — именно эти ${fmtNum(n)} ${plural(n,'ящик','ящика','ящиков')}: новые ящики сами в него не попадут.</p>
+    <div data-pv><div class="empty"><span class="spinner"></span> Проверяем ${fmtNum(n)} ${plural(n,'ящик','ящика','ящиков')}…</div></div>
+    <div class="bulk-form boxed" style="margin-top:10px">
+      <div class="form-row"><label>Как часто</label><select id="ssFreq"><option value="daily">Каждый день</option><option value="weekly">Каждую неделю</option><option value="monthly" selected>Каждый месяц</option></select></div>
+      <div class="form-row" data-dow style="display:none"><label>День недели</label><select id="ssDow">${SRV_DOW.map(([v,t])=>`<option value="${v}" ${v===6?'selected':''}>${t}</option>`).join('')}</select></div>
+      <div class="form-row" data-day><label>Число месяца</label><input type="number" id="ssDay" min="1" max="28" value="1"><div class="hint">От 1 до 28 — такое число есть в любом месяце.</div></div>
+      <div class="form-row"><label>Время</label><input type="time" id="ssTime" value="03:00"><div class="hint">По часовому поясу расписаний («Настройки → Планировщик»). Лучше ночью, когда ящиками почти не пользуются.</div></div>
+    </div>
+    <div class="form-row check" style="margin-top:10px"><span class="switch"><input type="checkbox" id="ssConsent"><span class="track"></span></span>
+      <label>Разрешаю выполнять «${esc(a.label)}» для ${fmtNum(n)} ${plural(n,'ящика','ящиков','ящиков')} по расписанию, без проверки перед каждым запуском. Кто и когда разрешил — запишется в журнал.</label></div>
+    ${a.danger>=2?`<div class="form-row confirm-row"><label>Действие удаляет письма с сервера. Для подтверждения введите число ящиков в расписании: <b>${fmtNum(n)}</b></label><input type="text" id="ssConfirm" inputmode="numeric" autocomplete="off" placeholder="${n}"></div>`:''}
+    <div data-sw></div>`,
+    {wide:true, footer:'<button class="btn ghost" data-c>Отмена</button><button class="btn primary" data-go disabled>Создать расписание</button>'});
+  const g=x=>m.body.querySelector(x), go=m.foot.querySelector('[data-go]');
+  const syncWhen=()=>{ const f=g('#ssFreq').value; g('[data-dow]').style.display=f==='weekly'?'':'none'; g('[data-day]').style.display=f==='monthly'?'':'none'; };
+  const ready=()=>{ const c=g('#ssConfirm'); go.disabled=!(g('#ssConsent').checked && (!c || c.value.replace(/\s/g,'')===String(n))); };
+  g('#ssFreq').onchange=syncWhen; syncWhen();
+  m.body.addEventListener('input', ready); m.body.addEventListener('change', ready); ready();
+  m.foot.querySelector('[data-c]').onclick=()=>m.close();
+  (async()=>{
+    try{
+      const [pv, st]=await Promise.all([api('/server/ops',{method:'POST',body:{action:a.key, keys, params:values, preview:true}}), api('/server/schedules',{bg:true})]);
+      g('[data-pv]').innerHTML=`<div class="small" style="margin-bottom:4px">Если бы запуск был сейчас:</div>${bulkResultHtml(pv, true)}
+        ${(pv.counts&&pv.counts.ok)?'':'<div class="hint warnbox" style="margin-top:8px">⚠️ Сейчас ни один из ящиков не подходит — запуски будут их пропускать, пока не выполнятся условия (причины — выше).</div>'}`;
+      bulkWireResults(g('[data-pv]'), pv, true);
+      if(!st.scheduler_enabled) g('[data-sw]').innerHTML='<div class="hint warnbox">⚠️ Планировщик выключен («Настройки → Планировщик»): расписание сохранится, но запускаться не будет, пока его не включить.</div>';
+    }catch(e){ g('[data-pv]').innerHTML=`<div class="hint warnbox">⚠️ ${esc(e.message)}${e.data&&e.data.hint?'<br><span class="small">'+esc(e.data.hint)+'</span>':''}</div>`; }
+  })();
+  go.onclick=async()=>{
+    const when={freq:g('#ssFreq').value, time:g('#ssTime').value||'03:00', dow:parseInt(g('#ssDow').value,10), day:parseInt(g('#ssDay').value||'1',10)};
+    go.disabled=true; go.innerHTML='<span class="spinner"></span> Сохраняем…';
+    try{
+      const r=await api('/server/schedules',{method:'POST',body:{action:a.key, keys, params:values, when, consent:g('#ssConsent').checked, confirm:((g('#ssConfirm')||{}).value||'').replace(/\s/g,'')}});
+      m.close(); toast('Расписание создано', r.summary, 'success', 8000);
+      location.hash='#/server?tab=schedules';
+    }catch(e){ toastErr(e); go.textContent='Создать расписание'; ready(); }
+  };
+}
+
+async function srvSchedules(box, meta){
+  box.appendChild(h(`<div class="card"><div class="section-title" style="margin-bottom:8px"><h3 style="margin:0">Действия по расписанию</h3><div class="spacer"></div><button class="btn sm ghost" data-r>↻ Обновить</button></div>
+    <p class="muted small" style="margin-top:0">Создаются только вами: на вкладке «Ящики и действия» выберите ящики и действие (очистить корзину или спам, удалить или перенести старые письма, отчёт) и нажмите «🕑 По расписанию…».
+      Каждый запуск — обычное задание: условия проверяются заново, итог — в «Истории» (кто — «расписание №…»).</p>
+    <div data-sw></div><div data-list><div class="empty"><span class="spinner"></span></div></div></div>`));
+  const list=box.querySelector('[data-list]');
+  const pdefs=k=>new Map((((meta&&meta.actions)||[]).find(a=>a.key===k)||{params:[]}).params.map(p=>[p.key,p]));
+  const pval=(p,v)=>{ if(p&&p.kind==='bool') return v?'да':'нет'; const opt=p&&(p.options||[]).find(x=>String(x.value)===String(v)); return opt?opt.label:(typeof v==='object'?JSON.stringify(v):String(v)); };
+  const load=async()=>{
+    let d; try{ d=await api('/server/schedules',{bg:true}); }catch(e){ list.innerHTML=`<div class="empty">${esc(e.message)}</div>`; return; }
+    box.querySelector('[data-sw]').innerHTML=d.scheduler_enabled?'':'<div class="hint warnbox" style="margin-bottom:10px">⚠️ Планировщик выключен («Настройки → Планировщик») — расписания не запускаются.</div>';
+    const items=d.items||[];
+    if(!items.length){ list.innerHTML='<div class="empty">Расписаний нет. Без вашего согласия MailArchiver ничего на сервере сам не делает.</div>'; return; }
+    list.innerHTML=`<div class="table-wrap"><table class="tbl"><thead><tr><th>№</th><th>Действие</th><th>Когда</th><th>Ящики</th><th class="nowrap">Согласие</th><th class="nowrap">Запуски</th><th>Состояние</th><th></th></tr></thead><tbody>${items.map(x=>{
+      const pd=pdefs(x.action);
+      const params=Object.entries(x.params||{}).filter(([k,v])=>v!==''&&v!==null&&v!==undefined&&v!==false).map(([k,v])=>{ const p=pd.get(k); return `<span class="tag">${esc(p?p.label:k)}: ${esc(pval(p,v))}</span>`; }).join(' ');
+      return `<tr>
+        <td class="muted nowrap">${x.id}</td>
+        <td><b>${esc(x.label)}</b>${params?`<div style="margin-top:3px">${params}</div>`:''}</td>
+        <td class="small">${esc(x.when_text)}</td>
+        <td class="small"><b>${fmtNum(x.count)}</b><div class="muted" title="${esc(x.emails.join(', '))}">${esc(x.emails.slice(0,3).join(', '))}${x.count>3?' …':''}</div></td>
+        <td class="small">${esc(x.consent_by||'—')}<div class="muted nowrap">${x.consent_at?esc(fmtDate(x.consent_at)):''}</div></td>
+        <td class="small">${x.last_run?'был: '+esc(fmtDate(x.last_run)):'ещё не было'}<div class="muted">${x.enabled&&x.next_run?'следующий: '+esc(fmtDate(x.next_run)):''}</div></td>
+        <td>${x.enabled?'<span class="tag ok">включено</span>':'<span class="tag">выключено</span>'}</td>
+        <td style="text-align:right" class="nowrap"><button class="btn sm" data-en="${x.id}" data-on="${x.enabled?0:1}">${x.enabled?'⏸ Выключить':'▶ Включить'}</button> <button class="btn sm" data-sel="${x.id}" title="Отметить ящики расписания на вкладке «Ящики и действия»">Ящики</button> <button class="btn sm danger" data-del="${x.id}">Удалить</button></td></tr>`; }).join('')}</tbody></table></div>`;
+    list.querySelectorAll('[data-en]').forEach(b=>b.onclick=async()=>{
+      const on=b.dataset.on==='1'; b.disabled=true;
+      try{ await api(`/server/schedules/${b.dataset.en}`,{method:'PUT',body:{enabled:on}}); toast(on?'Расписание включено':'Расписание выключено'); load(); }
+      catch(e){ toastErr(e); b.disabled=false; }
+    });
+    list.querySelectorAll('[data-del]').forEach(b=>b.onclick=async()=>{
+      if(!await confirmDlg(`Удалить расписание №${b.dataset.del}?`, 'Больше запусков не будет; история прошлых запусков останется.', {okText:'Удалить'})) return;
+      try{ await api(`/server/schedules/${b.dataset.del}`,{method:'DELETE'}); toast('Расписание удалено'); load(); }catch(e){ toastErr(e); }
+    });
+    list.querySelectorAll('[data-sel]').forEach(b=>b.onclick=()=>{
+      const x=items.find(i=>String(i.id)===b.dataset.sel); if(!x) return;
+      srvRetry({keys:x.keys, action:x.action, label:x.label, params:x.params});
+    });
+  };
+  box.querySelector('[data-r]').onclick=load;
+  load();
 }
