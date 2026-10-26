@@ -56,6 +56,15 @@ class ImapWorld:
         self.commands: List[str] = []
         #: команда → текст отказа (например {"DELETE": "NO [CANNOT] busy"})
         self.fail: Dict[str, str] = {}
+        #: токены XOAUTH2: токен → адреса ящиков, в которые он пускает ("*" — во все)
+        self.tokens: Dict[str, Set[str]] = {}
+        #: администраторы почты: логин → пароль (SASL PLAIN с authzid и вход «ящик<разделитель>администратор»)
+        self.admins: Dict[str, str] = {}
+        self.master_separator = "*"
+        #: мастер-пароль Kerio Connect (X-MASTERAUTH / X-SETUSER); пусто — сервер так не пускает
+        self.kerio_master = ""
+        #: как вошли последний раз: (способ, логин, в чей ящик)
+        self.last_login: tuple = ()
 
     def mailbox(self, login: str, password: str = "pw", folders: Optional[Dict[str, List[bytes]]] = None) -> None:
         self.passwords[login] = password
@@ -123,15 +132,47 @@ class FakeIMAPClient:
 
     def login(self, user, password):
         self._cmd("LOGIN")
+        sep = self.world.master_separator
+        if self.world.admins and sep and sep in user:
+            box, admin = user.split(sep, 1)
+            if self.world.admins.get(admin) == password and box in self.world.boxes:
+                self.login_name = box
+                self.world.last_login = ("separator", admin, box)
+                return
+            raise LoginError("[AUTHENTICATIONFAILED] Authentication failed.")
         if self.world.passwords.get(user) != password:
             raise LoginError("[AUTHENTICATIONFAILED] Authentication failed.")
         self.login_name = user
+        self.world.last_login = ("login", user, user)
 
     def plain_login(self, user, password, authorization_identity=None):
-        raise LoginError("not supported")
+        self._cmd("AUTHENTICATE PLAIN")
+        if authorization_identity and authorization_identity != user:
+            if self.world.admins.get(user) == password and authorization_identity in self.world.boxes:
+                self.login_name = authorization_identity
+                self.world.last_login = ("plain_authzid", user, authorization_identity)
+                return
+            raise LoginError("[AUTHENTICATIONFAILED] Authentication failed.")
+        self.login(user, password)
+
+    def kerio_master_login(self, mailbox, master_password):
+        self._cmd("X-MASTERAUTH")
+        if not self.world.kerio_master or master_password != self.world.kerio_master:
+            raise LoginError("X-MASTERAUTH failed")
+        self._cmd("X-SETUSER")
+        if mailbox not in self.world.boxes:
+            raise LoginError("X-SETUSER failed")
+        self.login_name = mailbox
+        self.world.last_login = ("kerio_master", "master", mailbox)
 
     def oauth2_login(self, user, token):
-        raise LoginError("not supported")
+        self._cmd("AUTHENTICATE XOAUTH2")
+        allowed = self.world.tokens.get(token)
+        if allowed is not None and (user in allowed or "*" in allowed) and user in self.world.boxes:
+            self.login_name = user
+            self.world.last_login = ("xoauth2", user, user)
+            return
+        raise LoginError("AUTHENTICATE failed.")
 
     def starttls(self, ctx=None):
         return None

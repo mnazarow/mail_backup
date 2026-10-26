@@ -56,6 +56,18 @@ def _row_str(row, key: str) -> str:
     return "" if value is None else str(value)
 
 
+def _row_opt_int(row, key: str):
+    """Значение колонки числом или None (колонки нет или там NULL)."""
+    try:
+        value = row[key]
+    except (IndexError, KeyError):
+        return None
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _row_int(row, key: str) -> int:
     """Значение колонки числом (0, если колонки нет или там NULL)."""
     try:
@@ -199,6 +211,9 @@ class Database:
             _ensure_server_usage(conn)
             from .serverops.progress import ensure_schema as _ensure_server_progress
             _ensure_server_progress(conn)
+            # подключения к почтовым серверам (1.14.0)
+            from .mailservers.store import ensure_schema as _ensure_mailservers
+            _ensure_mailservers(conn)
         self._encrypt_plain_settings()
 
     def _encrypt_plain_settings(self) -> None:
@@ -272,6 +287,8 @@ class Database:
             ("accounts", "dismissed_at", "TEXT"),
             ("accounts", "auto_disabled", "INTEGER NOT NULL DEFAULT 0"),
             ("employees", "dismissed_at", "TEXT"),
+            # копирование через подключение к почтовому серверу (1.14.0)
+            ("accounts", "server_id", "INTEGER"),
         ]
         changed = False
         # Индекс (account_id, folder) полностью покрыт уникальным ключом
@@ -796,6 +813,7 @@ class Database:
             hold_reason=_row_str(row, "hold_reason"),
             dismissed_at=_row_str(row, "dismissed_at"),
             auto_disabled=bool(_row_int(row, "auto_disabled")),
+            server_id=_row_opt_int(row, "server_id"),
         )
 
     def set_account_hold(self, account_id: int, hold_until: str, reason: str = "manual") -> None:
@@ -842,8 +860,8 @@ class Database:
                     name, host, port, username, password_enc, auth_type, security, enabled,
                     folder_include, folder_exclude,
                     oauth_client_id, oauth_client_secret_enc, oauth_refresh_token_enc, oauth_token_url,
-                    notes, retention_days, created_at, updated_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    notes, retention_days, created_at, updated_at, server_id)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 acc.name, acc.host, acc.port, acc.username,
                 self.secret.encrypt(acc.password) if acc.password else "",
@@ -854,6 +872,7 @@ class Database:
                 self.secret.encrypt(acc.oauth_client_secret) if acc.oauth_client_secret else "",
                 self.secret.encrypt(acc.oauth_refresh_token) if acc.oauth_refresh_token else "",
                 acc.oauth_token_url, acc.notes, acc.retention_days, utcnow_iso(), utcnow_iso(),
+                acc.server_id if acc.auth_type == models.AuthType.SERVER else None,
             ),
         )
         return int(cur.lastrowid)
@@ -865,7 +884,7 @@ class Database:
         fields = [
             "name=?", "host=?", "port=?", "username=?", "auth_type=?", "security=?",
             "enabled=?", "folder_include=?", "folder_exclude=?",
-            "oauth_client_id=?", "oauth_token_url=?", "notes=?", "retention_days=?", "updated_at=?",
+            "oauth_client_id=?", "oauth_token_url=?", "notes=?", "retention_days=?", "updated_at=?", "server_id=?",
         ]
         params: List[Any] = [
             acc.name, acc.host, acc.port, acc.username, acc.auth_type, acc.security,
@@ -873,6 +892,7 @@ class Database:
             json.dumps(acc.folder_include, ensure_ascii=False),
             json.dumps(acc.folder_exclude, ensure_ascii=False),
             acc.oauth_client_id, acc.oauth_token_url, acc.notes, acc.retention_days, utcnow_iso(),
+            acc.server_id if acc.auth_type == models.AuthType.SERVER else None,
         ]
         if update_password:
             fields.append("password_enc=?")
@@ -2500,7 +2520,8 @@ CREATE TABLE IF NOT EXISTS accounts (
     hold_until                TEXT DEFAULT '',   -- удержание архива до даты (ГГГГ-ММ-ДД)
     hold_reason               TEXT DEFAULT '',   -- dismissed | manual
     dismissed_at              TEXT,              -- когда сотрудник уволен
-    auto_disabled             INTEGER NOT NULL DEFAULT 0  -- копирование выключено увольнением
+    auto_disabled             INTEGER NOT NULL DEFAULT 0, -- копирование выключено увольнением
+    server_id                 INTEGER                      -- подключение к почтовому серверу (auth_type=server)
 );
 
 -- Сотрудники организации. Ящик (accounts) необязателен: сотрудник может

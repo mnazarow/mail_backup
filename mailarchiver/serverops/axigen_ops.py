@@ -101,11 +101,13 @@ class BlockAction(ServerAction):
     icon = "🔒"
     danger = 1
     axigen_change = True
-    desc = ("Закрыть учётной записи вход на сервере Axigen: POP3, IMAP, WebMail, телефоны, отправку писем. Если у "
-            "учётной записи есть ящик в архиве, сначала делается его последняя копия; не удалась — вход не "
-            "закрывается. Прежний список служб запоминается — «Разблокировать вход» вернёт его.")
-    note = "Ящик, который копируется по IMAP с паролем, после блокировки копироваться не сможет — переведите его " \
-           "на копирование через FTP Backup."
+    desc = ("Закрыть учётной записи вход на сервере (Axigen или подключённом): почтовые программы, веб-почта, "
+            "телефоны, отправка писем. Если у учётной записи есть ящик в архиве, сначала делается его последняя "
+            "копия; не удалась — вход не закрывается. У Axigen прежний список служб запоминается — «Разблокировать "
+            "вход» вернёт его; у подключённых серверов (Microsoft 365, Google…) ещё и завершаются открытые сеансы, "
+            "если сервер это умеет.")
+    note = "Ящик, который копируется по IMAP с паролем сотрудника, после блокировки копироваться не сможет — " \
+           "переведите его на копирование без пароля (FTP Backup Axigen или через подключение к серверу)."
     params = (
         Param("final_copy", "Сначала сделать последнюю копию ящика (если он есть в архиве)", "bool", True),
         Param("keep_receiving", "Продолжать принимать письма", "bool", True,
@@ -161,7 +163,8 @@ class UnblockAction(ServerAction):
     icon = "🔓"
     danger = 1
     axigen_change = True
-    desc = "Вернуть учётной записи службы, которые были до блокировки из MailArchiver."
+    desc = ("Открыть учётной записи вход. У Axigen возвращаются службы, которые были до блокировки из MailArchiver; "
+            "у подключённых серверов вход просто открывается.")
 
     def check(self, ctx, t):
         if t.axigen.get("login_blocked") is False:
@@ -200,19 +203,35 @@ class PasswordAction(ServerAction):
     params = (
         Param("mode", "Какие пароли", "select", "random_file", options=PASSWORD_MODES),
         Param("password", "Пароль", "text", "", show_if={"mode": ["same"]},
-              help="От 6 до 64 знаков, без пробелов, кавычек и «\\»."),
+              help="Axigen: от 6 до 64 знаков, без пробелов, кавычек и «\\». У подключённых серверов — их правила "
+                   "(например, Microsoft 365 — от 8 знаков, три вида из четырёх): неподходящий пароль покажет "
+                   "проверка."),
         Param("must_change", "Потребовать сменить пароль при следующем входе", "bool", False),
     )
 
     def prepare(self, ctx):
         super().prepare(ctx)
         if ctx.params.get("mode") == "same":
+            password = self._same(ctx)
+            if not password:
+                raise ValidationError("Укажите общий пароль.")
+            if not base.has_connections(ctx.svc):
+                from ..axigen.actions import check_password
+                check_password(password)
+
+    @staticmethod
+    def _same(ctx) -> str:
+        if ctx.job is None:
+            return ctx.params.get("password") or ""
+        # в задании пароль — зашифрованным (см. options)
+        return ctx.db.secret.decrypt(ctx.params.get("password_enc") or "")
+
+    def check(self, ctx, t):
+        if ctx.params.get("mode") == "same":
+            # правила Axigen; у подключённых серверов — свои (проверяет их драйвер)
             from ..axigen.actions import check_password
-            if ctx.job is None:
-                check_password(ctx.params.get("password") or "")
-            else:
-                # в задании пароль — зашифрованным (см. options)
-                check_password(ctx.db.secret.decrypt(ctx.params.get("password_enc") or ""))
+            check_password(self._same(ctx))
+        return ""
 
     def options(self, ctx):
         opts = dict(ctx.params)
@@ -300,7 +319,7 @@ class MustChangeAction(ServerAction):
 
 class ServicesOffAction(ServerAction):
     key = "ax_services_off"
-    label = "Отключить службы"
+    label = "Отключить службы (Axigen)"
     group = "access"
     icon = "🚫"
     danger = 1
@@ -356,7 +375,7 @@ class ServicesOffAction(ServerAction):
 
 class ServicesOnAction(ServerAction):
     key = "ax_services_on"
-    label = "Включить службы"
+    label = "Включить службы (Axigen)"
     group = "access"
     icon = "✅"
     danger = 1
@@ -434,7 +453,8 @@ class QuotaAction(ServerAction):
             "пропускаются: с такой квотой они перестали бы принимать письма.")
     params = (
         Param("quota_mb", "Квота, МБ", "int", 2048, min=1, max=4 * 1024 * 1024,
-              help="1 ГБ = 1024 МБ. Наибольшая квота Axigen — 4 ТБ."),
+              help="1 ГБ = 1024 МБ. Наибольшая квота Axigen — 4 ТБ. Microsoft 365 и Google квоту через API не "
+                   "меняют — их учётные записи пропустятся с причиной."),
         Param("only_raise", "Только увеличивать (меньшую квоту не ставить)", "bool", True),
         Param("threshold", "Предупреждать при заполнении, %", "int", 0, min=0, max=100,
               help="0 — не менять настройку предупреждения. Иначе сервер пришлёт письмо, когда ящик заполнится на "
@@ -768,7 +788,7 @@ class _FlagAction(ServerAction):
 
 class AccountTypeAction(_FlagAction):
     key = "ax_account_type"
-    label = "Тип учётной записи"
+    label = "Тип учётной записи (Axigen)"
     icon = "⭐"
     danger = 1
     attr = "accountType"
@@ -780,7 +800,7 @@ class AccountTypeAction(_FlagAction):
 
 class PublishContactAction(_FlagAction):
     key = "ax_publish"
-    label = "Показывать в контактах домена"
+    label = "Показывать в контактах домена (Axigen)"
     icon = "👁️"
     attr = "publishContactInfo"
     values = (("yes", "показывать"), ("no", "не показывать"))
@@ -795,9 +815,10 @@ class AddToArchiveAction(ServerAction):
     icon = "📥"
     immediate = True
     desc = ("Завести в MailArchiver ящики для учётных записей, у которых их ещё нет, — на сервере ничего не "
-            "меняется. Ящики берут настройки из шаблона ящиков сотрудников (срок хранения, папки).")
+            "меняется. Ящики берут настройки из шаблона ящиков сотрудников (срок хранения, папки). Учётные записи "
+            "подключённых серверов копируются через подключение — без паролей сотрудников (если сервер это умеет).")
     params = (
-        Param("auth", "Как копировать", "select", AuthType.AXIGEN_FTP,
+        Param("auth", "Как копировать (Axigen)", "select", AuthType.AXIGEN_FTP,
               options=((AuthType.AXIGEN_FTP, "через FTP Backup Axigen — без паролей сотрудников"),
                        (AuthType.PASSWORD, "по IMAP с паролем (пароль нужно будет вписать)"))),
         Param("enable", "Сразу включить копирование", "bool", True),
@@ -912,10 +933,10 @@ class AxDeleteAction(ServerAction):
     icon = "🗑️"
     danger = 2
     axigen_change = True
-    desc = ("Удалить учётную запись на сервере Axigen, сохранив письма в архиве. Только если вход уже заблокирован и "
-            "ящик копируется через FTP Backup: на время удаления останавливается приём писем, архив ставится на "
-            "бессрочное удержание, ящик копируется ещё раз, и все папки сверяются с архивом — хоть одного письма "
-            "нет, учётная запись не удаляется. Копирование ящика выключается.")
+    desc = ("Удалить учётную запись на сервере, сохранив письма в архиве. Только если вход уже заблокирован и ящик "
+            "копируется без пароля сотрудника (Axigen — через FTP Backup, подключённые серверы — через подключение): "
+            "архив ставится на бессрочное удержание, ящик копируется ещё раз, и все папки сверяются с архивом — хоть "
+            "одного письма нет, учётная запись не удаляется. Копирование ящика выключается.")
     note = ("Удаление на сервере необратимо: вернуть письма можно только из архива, создав учётную запись заново. "
             "Чтобы письма на адрес уволенного не терялись, укажите коллегу — адрес станет его псевдонимом.")
     params = (
@@ -930,7 +951,7 @@ class AxDeleteAction(ServerAction):
         to = (ctx.params.get("forward_to") or "").strip().lower()
         if to:
             ctx.params["forward_to"] = to
-            ctx.data["colleague"] = colleague_row(ctx, to)
+            ctx.data["colleague"] = colleague_for(ctx, to)
 
     def validate_plan(self, ctx, items):
         to = ctx.params.get("forward_to")
@@ -948,6 +969,8 @@ class AxDeleteAction(ServerAction):
                     "копирование через FTP Backup")
         to = ctx.params.get("forward_to")
         if to:
+            if ctx.data.get("colleague") is None:
+                return f"адрес коллеге передать нельзя: {ctx.data.get('colleague_problem') or 'коллеги нет'}"
             if t.email == ctx.data["colleague"]["email"]:
                 return "это коллега, которому передаются адреса, — её не удаляем"
             problem = transfer_problem(ctx, t, to)
@@ -1000,6 +1023,18 @@ class AxDeleteAction(ServerAction):
 # ---------------------------------------------------------------------------
 #  Передать адрес коллеге (после удаления учётной записи)
 # ---------------------------------------------------------------------------
+def colleague_for(ctx, address: str) -> Optional[Dict]:
+    """Коллега на Axigen для «Передать адрес»; нет его — при подключённых серверах None (коллега может быть там:
+    учётные записи Axigen пропустятся с причиной), без них — ошибка."""
+    try:
+        return colleague_row(ctx, address)
+    except ValidationError as exc:
+        if getattr(exc, "kind", "") == "missing" and base.has_connections(ctx.svc):
+            ctx.data["colleague_problem"] = f"на Axigen нет учётной записи {address.strip().lower()}"
+            return None
+        raise
+
+
 def colleague_row(ctx, address: str) -> Dict:
     """Учётная запись коллеги по последней сверке (существует, не удалена)."""
     from ..axigen import store as axstore
@@ -1016,8 +1051,10 @@ def colleague_row(ctx, address: str) -> Dict:
                 row = other
                 break
     if row is None or row.get("deleted_at"):
-        raise ValidationError(f"Учётной записи {address} нет на сервере (по последней сверке).",
+        exc = ValidationError(f"Учётной записи {address} нет на сервере (по последней сверке).",
                               hint="Проверьте адрес или сверьте учётные записи заново.")
+        exc.kind = "missing"
+        raise exc
     return row
 
 
@@ -1135,16 +1172,18 @@ class ForwardAction(ServerAction):
             raise ValidationError("Укажите адрес коллеги.")
         ctx.params["to"] = to
         ctx.params["forward_aliases"] = bool(ctx.params.get("with_aliases", True))
-        ctx.data["colleague"] = colleague_row(ctx, to)
+        ctx.data["colleague"] = colleague_for(ctx, to)
 
     def base_check(self, ctx, t):
         if t.axigen is None:
-            return "это не учётная запись Axigen (ящик на другом сервере)"
+            return base.NOT_ON_SERVER
         if not t.deleted:
             return "учётная запись ещё есть на сервере — сначала удалите её (там же можно сразу передать адрес)"
         return ""
 
     def check(self, ctx, t):
+        if ctx.data.get("colleague") is None:
+            return ctx.data.get("colleague_problem") or "коллеги нет"
         return transfer_problem(ctx, t, ctx.params["to"])
 
     def plan(self, ctx, t):

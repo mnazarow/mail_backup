@@ -104,11 +104,40 @@ def params_html():
     return "\n".join(parts)
 
 
+def mailservers_html():
+    """Таблица «что умеет каждый почтовый сервер» — из описаний драйверов (всегда совпадает с кодом)."""
+    from mailarchiver.errors import ValidationError
+    from mailarchiver.mailservers.base import Cap
+    from mailarchiver.mailservers.service import TYPE_ORDER, driver_class
+    cols = [("Вход", [Cap.BLOCK]), ("Пароли", [Cap.PASSWORD, Cap.MUST_CHANGE]), ("Квота", [Cap.QUOTA]),
+            ("Псевдонимы", [Cap.ALIASES]), ("ФИО, отдел", [Cap.CONTACT]), ("Создание, удаление", [Cap.CREATE, Cap.DELETE]),
+            ("Автоответ, пересылка", [Cap.AUTOREPLY, Cap.FORWARD]), ("Место, последний вход", [Cap.USAGE, Cap.LAST_LOGIN]),
+            ("Без паролей", [Cap.IMAP_ADMIN])]
+    sub = {Cap.MUST_CHANGE: "смена при входе", Cap.PASSWORD: "пароль", Cap.CREATE: "создание",
+           Cap.DELETE: "удаление", Cap.AUTOREPLY: "автоответ", Cap.FORWARD: "пересылка", Cap.USAGE: "место",
+           Cap.LAST_LOGIN: "вход"}
+    rows = []
+    for t in TYPE_ORDER:
+        try:
+            cls = driver_class(t)
+        except ValidationError:
+            continue
+        cells = []
+        for _name, caps in cols:
+            have = [c for c in caps if cls.can(c)]
+            cells.append("—" if not have else ("✓" if len(have) == len(caps) else
+                                                "только " + ", ".join(sub.get(c, c) for c in have)))
+        rows.append(f"<tr><td><b>{esc(cls.label)}</b></td>" + "".join(f"<td>{esc(c)}</td>" for c in cells) + "</tr>")
+    head = "<tr><th>Сервер</th>" + "".join(f"<th>{esc(n)}</th>" for n, _c in cols) + "</tr>"
+    return f'<div class="tw"><table class="t">{head}{"".join(rows)}</table></div>'
+
+
 def gen_html():
     from doc_template import TEMPLATE  # локальный модуль рядом
     # Номер версии в HTML не пишем: страница документации доступна без входа,
     # а точная версия подсказывает, какие уязвимости искать (как и /health).
-    html = TEMPLATE.replace("%%VERSION%%", "").replace("%%PARAMS%%", params_html())
+    html = (TEMPLATE.replace("%%VERSION%%", "").replace("%%PARAMS%%", params_html())
+            .replace("%%MAILSERVERS%%", mailservers_html()))
     out = os.path.join(ROOT, "mailarchiver", "web", "static", "docs", "index.html")
     os.makedirs(os.path.dirname(out), exist_ok=True)
     with open(out, "w", encoding="utf-8") as f:

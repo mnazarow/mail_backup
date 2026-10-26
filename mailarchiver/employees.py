@@ -1103,6 +1103,7 @@ def account_template(svc) -> Dict[str, Any]:
     except (TypeError, ValueError):
         retention_days = -1
 
+    servers = _mailservers_for_host(svc, _text("account_host"))
     return {
         "host": _text("account_host"),
         "port": port,
@@ -1125,7 +1126,53 @@ def account_template(svc) -> Dict[str, Any]:
         # Копирование через FTP Backup Axigen — только если раздел Axigen включён и сервер шаблона — его.
         "use_axigen_ftp": bool(svc.rt("employees", "account_use_axigen_ftp")) and _axigen_host_matches(
             svc, _text("account_host")),
+        # Сервер шаблона — IMAP-сервер подключения к почтовому серверу, которое входит в ящики без паролей
+        # (Microsoft 365, Google, Zimbra…): ящик копируется через подключение.
+        "server_id": servers[0] if servers else None,
+        # несколько подключений с тем же IMAP-сервером (два клиента Microsoft 365) — выбирается по адресу
+        "server_ids": servers,
     }
+
+
+def _mailservers_for_host(svc, host: str) -> List[int]:
+    """Включённые подключения, через которые можно копировать ящики сервера ``host`` без паролей."""
+    host = (host or "").strip().lower()
+    if not host:
+        return []
+    out: List[int] = []
+    try:
+        from .mailservers import service as mss
+        from .mailservers import store as msstore
+        from .mailservers.base import Cap
+        servers = msstore.list_servers(svc.db, enabled_only=True)
+    except Exception:  # noqa: BLE001 — заглушки служб в тестах
+        return []
+    for conn in servers:
+        try:
+            cls = mss.driver_class(conn.type)
+            if cls.can(Cap.IMAP_ADMIN) and (cls(conn, None).imap_server()[0] or "").strip().lower() == host:
+                out.append(conn.id)
+        except Exception:  # noqa: BLE001 — неизвестный вид сервера, неполные настройки одного подключения
+            continue
+    return out
+
+
+def _server_for_email(svc, tpl: dict, email: str) -> Optional[int]:
+    """Подключение для ящика сотрудника: одно — оно; несколько — то, в сверке которого есть этот адрес (или его
+    домен). Не угадать — None: ящик заводится с входом по паролю, а не через чужое подключение."""
+    ids = list(tpl.get("server_ids") or ([tpl["server_id"]] if tpl.get("server_id") else []))
+    if len(ids) <= 1:
+        return ids[0] if ids else None
+    from .mailservers import store as msstore
+    email = (email or "").strip().lower()
+    domain = email.rsplit("@", 1)[-1]
+    by_domain = []
+    for sid in ids:
+        if msstore.get_account(svc.db, sid, email) is not None:
+            return sid
+        if any(r["email"].rsplit("@", 1)[-1] == domain for r in msstore.list_accounts(svc.db, sid)):
+            by_domain.append(sid)
+    return by_domain[0] if len(by_domain) == 1 else None
 
 
 def _axigen_host_matches(svc, host: str) -> bool:
@@ -1164,6 +1211,8 @@ def preview_account_template(svc, full_name: str = "Иванов Иван Ива
         "sequence_covers": tpl["sequence_covers"],
         "use_master": tpl["use_master"],
         "use_axigen_ftp": tpl.get("use_axigen_ftp", False),
+        "server_id": tpl.get("server_id"),
+        "server_ids": tpl.get("server_ids") or [],
     }
 
 
@@ -1221,11 +1270,14 @@ def ensure_account_for_employee(svc, employee_id: int, full_name: str, email: st
     if not create:
         return None, "no_host"
 
+    server_id = None if tpl.get("use_axigen_ftp") or tpl.get("use_master") else _server_for_email(svc, tpl, email)
+    via_server = bool(server_id)
     acc = Account(
         name=render_account_field(tpl["name_template"], values) or full_name or email,
         host=tpl["host"], port=tpl["port"], username=username, password="",
         auth_type=(AuthType.AXIGEN_FTP if tpl.get("use_axigen_ftp") else
-                   AuthType.MASTER if tpl.get("use_master") else AuthType.PASSWORD), security=tpl["security"],
+                   AuthType.MASTER if tpl.get("use_master") else
+                   AuthType.SERVER if via_server else AuthType.PASSWORD), security=tpl["security"],
         # Пустой пароль означает, что копирование всё равно не начнётся: даже
         # включённый по шаблону ящик ждёт, пока администратор впишет пароль.
         enabled=bool(tpl["enabled"]),
@@ -1234,6 +1286,8 @@ def ensure_account_for_employee(svc, employee_id: int, full_name: str, email: st
         retention_days=int(tpl["retention_days"]),
         notes=render_account_field(tpl["notes_template"], values),
     )
+    if via_server:
+        acc.server_id = int(server_id)
     account_id = svc.db.create_account(acc)
     svc.db.set_employee_account(employee_id, account_id)
 

@@ -342,6 +342,19 @@ def _require_credentials(acc, db=None) -> None:
             raise ValidationError(f"У ящика «{acc.name}» не указан адрес IMAP-сервера.",
                                   hint="Укажите сервер в карточке ящика.")
         return
+    if acc.auth_type == AuthType.SERVER:
+        # Пароль ящика не нужен: входит подключение к почтовому серверу (токен приложения или администратор).
+        import types
+        from ..mailservers.service import imap_problem
+        problem = imap_problem(types.SimpleNamespace(db=db), acc) if db is not None else ""
+        if problem:
+            _note_login(db, acc, "no_password", problem)
+            raise ValidationError(f"Ящик «{acc.name}»: {problem}.",
+                                  hint="Раздел «Почтовые серверы» или карточка ящика (способ входа).")
+        if not (acc.host or "").strip():
+            raise ValidationError(f"У ящика «{acc.name}» не указан адрес IMAP-сервера.",
+                                  hint="Укажите сервер в карточке ящика.")
+        return
     if acc.auth_type == AuthType.AXIGEN_FTP:
         # Пароль ящика не нужен: письма берёт администратор Axigen через FTP Backup.
         if "@" not in (acc.username or ""):
@@ -1840,6 +1853,11 @@ _SEQ_STATE = "backup_all_state_"
 _SEQ_RETRY = "backup_all_retry_at_"
 
 
+def _mailserver_jobs():
+    from ..mailservers import jobs as mailserver_jobs
+    return mailserver_jobs
+
+
 def _axigen_jobs():
     from ..axigen import jobs as axigen_jobs
     return axigen_jobs
@@ -2546,4 +2564,5 @@ HANDLERS: Dict[str, Callable[[JobContext], Dict]] = {
     JobType.AXIGEN_SYNC: lambda ctx: _axigen_jobs().handle_sync(ctx),
     JobType.AXIGEN_ACTION: lambda ctx: _axigen_jobs().handle_action(ctx),
     JobType.SERVER_ACTION: lambda ctx: _server_jobs().handle_job(ctx),
+    JobType.SERVER_SYNC: lambda ctx: _mailserver_jobs().handle_sync(ctx),
 }

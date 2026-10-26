@@ -337,6 +337,7 @@ const NAV = [
   {id:'exports', icon:'📤', title:'Экспорт (PST)', roles:'am'},
   {id:'schedules', icon:'⏰', title:'Расписания', roles:'ao'},
   {id:'axigen', icon:'📮', title:'Сервер Axigen', roles:'a', feature:'axigen'},
+  {id:'mailservers', icon:'🔌', title:'Почтовые серверы', roles:'a'},
   {id:'server', icon:'🖥️', title:'Ящики на сервере', roles:'a'},
   {sep:true},
   {id:'logs', icon:'📋', title:'Логи', roles:'ao'},
@@ -487,7 +488,7 @@ function route(){
   const c=h('<div class="view-host"><div class="empty"><div class="spinner"></div></div></div>');
   content.appendChild(c);
   State.routeSeq=(State.routeSeq||0)+1;
-  const map={dashboard:viewDashboard,analytics:viewAnalytics,mailanalytics:viewMailAnalytics,mail:viewMail,accounts:viewAccounts,employees:viewEmployees,jobs:viewJobs,exports:viewExports,schedules:viewSchedules,axigen:viewAxigen,server:viewServer,logs:viewLogs,settings:viewSettings,users:viewUsers,security:viewSecurity,audit:viewAudit};
+  const map={dashboard:viewDashboard,analytics:viewAnalytics,mailanalytics:viewMailAnalytics,mail:viewMail,accounts:viewAccounts,employees:viewEmployees,jobs:viewJobs,exports:viewExports,schedules:viewSchedules,axigen:viewAxigen,mailservers:viewMailservers,server:viewServer,logs:viewLogs,settings:viewSettings,users:viewUsers,security:viewSecurity,audit:viewAudit};
   (map[view]||viewDashboard)(c).catch(toastErr);
 }
 
@@ -603,6 +604,16 @@ async function viewDashboard(c){
       <div class="section-title"><h3>📮 Сервер Axigen</h3></div>
       <ul style="margin:0;padding-left:18px">${s.axigen_alerts.map(a=>`<li>${esc(a.text)}</li>`).join('')}</ul>
       <a class="btn small" href="#/axigen" style="margin-top:10px">Открыть раздел «Сервер Axigen»</a></div>`));
+  }
+  // Подключённые почтовые серверы (Microsoft 365, Google, Яндекс 360, Zimbra…) требуют внимания
+  if((s.mailserver_alerts||[]).length){
+    const bad=s.mailserver_alerts.some(a=>a.level==='error');
+    const shown=s.mailserver_alerts.slice(0,8);
+    c.appendChild(h(`<div class="card" style="margin-bottom:16px;border-color:var(--${bad?'danger':'warn'})">
+      <div class="section-title"><h3>🔌 Почтовые серверы</h3></div>
+      <ul style="margin:0;padding-left:18px">${shown.map(a=>`<li${a.level==='error'?' style="color:var(--danger)"':''}>${esc(a.text)}</li>`).join('')}</ul>
+      ${s.mailserver_alerts.length>shown.length?`<div class="small muted" style="margin-top:4px">и ещё ${fmtNum(s.mailserver_alerts.length-shown.length)}</div>`:''}
+      <a class="btn small" href="#/mailservers" style="margin-top:10px">Открыть раздел «Почтовые серверы»</a></div>`));
   }
   // Плашка «требуют внимания»: без неё ящик, который давно не копируется или
   // остался без пароля, ничем себя не выдаёт — и это обнаруживается тогда,
@@ -962,8 +973,8 @@ async function employeeAccountTemplateModal(){
     <div class="kv"><b>Срок хранения</b><div class="spacer"></div>${esc(keep)}</div>
     <div class="kv"><b>Расписание копирования</b><div class="spacer"></div>${p.sequence_covers?'<span class="tag ok" title="В «Расписаниях» включено копирование всех ящиков по очереди — новый ящик попадёт в него">общее: все ящики по очереди</span>':(p.schedule_enabled?`<span class="tag ok">${esc(p.schedule_cron||'')}</span>`:'<span class="tag">не создаётся</span>')}</div>
     <div class="kv"><b>Заметка</b><div class="spacer"></div>${esc(p.notes||'—')}</div>
-    <div class="kv"><b>Способ копирования</b><div class="spacer"></div>${p.use_axigen_ftp?'<span class="tag ok">через FTP Backup Axigen — без пароля</span>':(p.use_master?'<span class="tag ok">через администратора почты — без пароля</span>':'по паролю ящика')}</div>
-    <div class="hint" style="margin-top:12px">${(p.use_axigen_ftp||p.use_master)?'Пароль ящику не нужен: копирование начнётся сразу, если ящик включён.':'Пароль шаблон не задаёт: копирование начнётся только после того, как администратор впишет пароль в карточке ящика.'}</div>
+    <div class="kv"><b>Способ копирования</b><div class="spacer"></div>${p.use_axigen_ftp?'<span class="tag ok">через FTP Backup Axigen — без пароля</span>':(p.use_master?'<span class="tag ok">через администратора почты — без пароля</span>':(p.server_id?'<span class="tag ok">через подключение к почтовому серверу — без пароля</span>':'по паролю ящика'))}</div>
+    <div class="hint" style="margin-top:12px">${(p.use_axigen_ftp||p.use_master||p.server_id)?'Пароль ящику не нужен: копирование начнётся сразу, если ящик включён.':'Пароль шаблон не задаёт: копирование начнётся только после того, как администратор впишет пароль в карточке ящика.'}</div>
     <div class="hint" style="margin-top:8px">Подстановки в шаблонах названия, логина и заметки: ${vars}</div>`,
     {wide:true, footer:'<button class="btn ghost" data-c>Закрыть</button><button class="btn primary" data-s>⚙️ Изменить шаблон</button>'});
   m.foot.querySelector('[data-c]').onclick=()=>m.close();
@@ -2231,10 +2242,15 @@ async function accountModal(id){
         <option value="password"${a.auth_type==='password'?' selected':''}>Логин и пароль</option>
         <option value="oauth2"${a.auth_type==='oauth2'?' selected':''}>OAuth2 (Gmail / Microsoft 365)</option>
         <option value="master"${a.auth_type==='master'?' selected':''}>Через администратора почты (без пароля ящика)</option>
-        ${(a.auth_type==='axigen_ftp'||((State.user||{}).features||{}).axigen)?`<option value="axigen_ftp"${a.auth_type==='axigen_ftp'?' selected':''}>Через FTP Backup Axigen (без пароля ящика)</option>`:''}</select></div>
+        ${(a.auth_type==='axigen_ftp'||((State.user||{}).features||{}).axigen)?`<option value="axigen_ftp"${a.auth_type==='axigen_ftp'?' selected':''}>Через FTP Backup Axigen (без пароля ящика)</option>`:''}
+        ${(a.auth_type==='server'||((State.user||{}).features||{}).mailservers)?`<option value="server"${a.auth_type==='server'?' selected':''}>Через подключение к почтовому серверу (без пароля ящика)</option>`:''}</select></div>
     </div>
     <div class="form-row"><label>Логин ${H('username')}</label><input id="f-user" type="text" value="${esc(a.username)}" placeholder="user@example.ru"></div>
     <div class="hint" id="axftpHint" style="display:${a.auth_type==='axigen_ftp'?'block':'none'};margin-bottom:8px">Письма берёт администратор Axigen через службу FTP Backup («Настройки → Сервер Axigen») — пароль сотрудника не нужен. Логин — полный адрес. Пароль ниже необязателен: он нужен только для восстановления по IMAP и входа сотрудника в архив.</div>
+    <div id="srvAuthBox" style="display:${a.auth_type==='server'?'block':'none'}">
+      <div class="form-row"><label>Подключение</label><select id="f-srv"><option value="">— загружается… —</option></select>
+        <div class="hint" id="f-srv-hint">В ящик входит само подключение (токен приложения или администратор почты) — пароль сотрудника не нужен. Сервер, порт и шифрование подставляются из подключения.</div></div>
+    </div>
     <div class="form-row" id="pwrow" style="display:${(a.auth_type==='password'||a.auth_type==='axigen_ftp')?'block':'none'}"><label>Пароль ${H('password')}</label><input id="f-pass" type="password" placeholder="${id?'оставьте пустым, чтобы не менять':(a.auth_type==='axigen_ftp'?'необязательно':'пароль или пароль приложения')}"></div>
     <div id="axBox"></div>
     <div id="oauthBox" style="display:${a.auth_type==='oauth2'?'block':'none'}">
@@ -2258,7 +2274,21 @@ async function accountModal(id){
   const m=modal(id?'Редактирование ящика':'Новый почтовый ящик', body, {wide:true,
     footer:`<button class="btn ghost" data-c>Отмена</button><button class="btn" data-test>Проверить подключение</button><button class="btn primary" data-save>Сохранить</button>`});
   const g=(x)=>m.body.querySelector(x);
-  g('#f-auth').onchange=()=>{ const v=g('#f-auth').value; m.body.querySelector('#oauthBox').style.display=v==='oauth2'?'block':'none'; m.body.querySelector('#pwrow').style.display=(v==='password'||v==='axigen_ftp')?'block':'none'; m.body.querySelector('#axftpHint').style.display=v==='axigen_ftp'?'block':'none'; };
+  let msConns=[];
+  const srvFill=()=>{ const sel=g('#f-srv'), cur=msConns.find(x=>String(x.id)===sel.value);
+    if(cur){ g('#f-host').value=cur.imap_host||''; g('#f-port').value=cur.imap_port||993; g('#f-sec').value=cur.imap_security||'ssl'; } };
+  const srvLoad=async()=>{
+    if(msConns.length || !(((State.user||{}).features||{}).mailservers)) return;
+    try{ msConns=((await api('/mailservers/brief',{bg:true})).items||[]).filter(x=>x.imap_admin && (x.enabled || x.id===a.server_id)); }catch(e){ msConns=[]; }
+    const sel=g('#f-srv');
+    sel.innerHTML=msConns.length?msConns.map(x=>`<option value="${x.id}"${x.id===a.server_id?' selected':''}>${esc(x.label)} «${esc(x.name)}» — ${esc(x.imap_host||'')}</option>`).join('')
+      :'<option value="">нет подключений, которые входят в ящики без паролей</option>';
+    if(!a.server_id || !msConns.some(x=>x.id===a.server_id)) srvFill();
+  };
+  g('#f-srv').onchange=srvFill;
+  g('#f-auth').onchange=()=>{ const v=g('#f-auth').value; m.body.querySelector('#oauthBox').style.display=v==='oauth2'?'block':'none'; m.body.querySelector('#pwrow').style.display=(v==='password'||v==='axigen_ftp')?'block':'none'; m.body.querySelector('#axftpHint').style.display=v==='axigen_ftp'?'block':'none';
+    m.body.querySelector('#srvAuthBox').style.display=v==='server'?'block':'none'; if(v==='server') srvLoad().then(srvFill); };
+  if(a.auth_type==='server') srvLoad();
   if(id && ((State.user||{}).features||{}).axigen) axigenMailboxInfo(id, g('#axBox'));
   const collect=()=>({name:g('#f-name').value,host:g('#f-host').value,port:parseInt(g('#f-port').value||'993'),username:g('#f-user').value,
      password:g('#f-pass').value,security:g('#f-sec').value,auth_type:g('#f-auth').value,enabled:g('#f-en').checked,
@@ -2270,7 +2300,8 @@ async function accountModal(id){
      notes:g('#f-notes').value,
      retention_days:parseInt(g('#f-ret').value),
      oauth_client_id:g('#f-ocid')?g('#f-ocid').value:'',oauth_client_secret:g('#f-ocs')?g('#f-ocs').value:'',
-     oauth_refresh_token:g('#f-ort')?g('#f-ort').value:'',oauth_token_url:g('#f-otu')?g('#f-otu').value:''});
+     oauth_refresh_token:g('#f-ort')?g('#f-ort').value:'',oauth_token_url:g('#f-otu')?g('#f-otu').value:'',
+     server_id:g('#f-auth').value==='server'&&g('#f-srv').value?parseInt(g('#f-srv').value,10):null});
   m.foot.querySelector('[data-c]').onclick=m.close;
   m.foot.querySelector('[data-save]').onclick=async()=>{ try{ if(id) await api(`/accounts/${id}`,{method:'PUT',body:collect()}); else await api('/accounts',{method:'POST',body:collect()}); toast('Сохранено'); m.close(); route(); }catch(e){toastErr(e);} };
   m.foot.querySelector('[data-test]').onclick=async()=>{
@@ -3800,7 +3831,7 @@ const STATUS_LBL = {queued:'в очереди',running:'выполняется',
 // Задания, которые меняли почтовый сервер: «Повторить» у них нет — повтор вслепую изменил бы ещё раз и
 // уже изменённые ящики. Их запускают заново из раздела, с проверкой.
 const NO_RETRY_JOBS = new Set(['axigen_action','server_action']);
-const JOBLBL = {backup:'Резервное копирование',restore:'Восстановление',export:'Экспорт',import_pst:'Импорт PST',test:'Проверка подключения',retention:'Очистка (ретеншн)',verify:'Проверка целостности',analyze:'Глубокий анализ писем',sync_employees:'Синхронизация сотрудников',storage_convert:'Шифрование копии',check_logins:'Проверка паролей',replicate:'Копия вне сервера',db_snapshot:'Снимок базы',search_index:'Индексация поиска',dedup_report:'Отчёт об одинаковых вложениях',cleanup:'Удаление архивов и прежних копий',backup_all:'Копирование всех ящиков по очереди',quarantine_check:'Сравнение прежней копии с новой',quarantine_rescue:'Возврат писем из прежней копии',folders_check:'Проверка папок на сервере',search_reindex:'Переиндексация поиска',axigen_sync:'Сверка с сервером Axigen',axigen_action:'Действия на сервере Axigen',server_action:'Действия с ящиками на сервере'};
+const JOBLBL = {backup:'Резервное копирование',restore:'Восстановление',export:'Экспорт',import_pst:'Импорт PST',test:'Проверка подключения',retention:'Очистка (ретеншн)',verify:'Проверка целостности',analyze:'Глубокий анализ писем',sync_employees:'Синхронизация сотрудников',storage_convert:'Шифрование копии',check_logins:'Проверка паролей',replicate:'Копия вне сервера',db_snapshot:'Снимок базы',search_index:'Индексация поиска',dedup_report:'Отчёт об одинаковых вложениях',cleanup:'Удаление архивов и прежних копий',backup_all:'Копирование всех ящиков по очереди',quarantine_check:'Сравнение прежней копии с новой',quarantine_rescue:'Возврат писем из прежней копии',folders_check:'Проверка папок на сервере',search_reindex:'Переиндексация поиска',axigen_sync:'Сверка с сервером Axigen',axigen_action:'Действия на сервере Axigen',server_action:'Действия с ящиками на сервере',server_sync:'Сверка с почтовым сервером'};
 function cvar(n,f){ const v=getComputedStyle(document.documentElement).getPropertyValue(n).trim(); return v||f; }
 function fmtNum(n){ return Number(n||0).toLocaleString('ru-RU'); }
 function trunc(s,n){ s=String(s==null?'':s); return s.length>n? s.slice(0,n-1)+'…':s; }
@@ -4794,10 +4825,12 @@ async function axigenForMailbox(a){
 //  Ящики на сервере: групповые действия с учётными записями Axigen и
 //  с папками и письмами в ящиках любого сервера (по IMAP).
 // ===================================================================
-const Srv = { tab:'list', filter:'', query:'', sel:new Set(), shown:200, source:'selected', list:'', action:null, params:{}, meta:null };
+const Srv = { tab:'list', filter:'', query:'', sel:new Set(), shown:200, source:'selected', list:'', action:null, params:{}, meta:null,
+  // откуда учётные записи: '' — все, 'ax' — Axigen, 'mb' — ящики архива без учётной записи, '<номер>' — подключение
+  server:'', servers:[], ax:null };
 const SRV_TABS = [['list','🧰 Ящики и действия'],['history','📜 История'],['schedules','🕑 Расписания']];
 const SRV_SOON_DAYS = 30;
-const SRV_FILTERS = [['','Все'],['axigen','Axigen'],['other','Другие серверы'],['imap','Вход по IMAP есть'],['noimap','Без входа по IMAP'],
+const SRV_FILTERS = [['','Все'],['srv','С учётной записью на сервере'],['other','Без учётной записи (IMAP)'],['imap','Вход по IMAP есть'],['noimap','Без входа по IMAP'],
   ['archived','Есть в архиве'],['noarchive','Нет в архиве'],['keeps','Архив хранит всё'],['blocked','Вход закрыт'],['quota','У предела квоты'],
   ['soon',`Упрутся в квоту за ${SRV_SOON_DAYS} дн.`],['inactive',`Не входили ${AX_INACTIVE_DAYS}+ дн.`],['dismissed','Уволены, вход открыт'],
   ['deleted','Удалены на сервере']];
@@ -4805,8 +4838,14 @@ const SRV_LOGIN = {ok:['ok','вход удался'], auth_error:['err','нев�
 
 function srvMatches(r, f, q){
   const mb=r.mailbox;
+  if(Srv.server){
+    if(Srv.server==='ax'){ if(r.kind!=='axigen') return false; }
+    else if(Srv.server==='mb'){ if(r.kind!=='imap') return false; }
+    else if(!(r.server && String(r.server.id)===Srv.server)) return false;
+  }
   if(f==='axigen' && r.kind!=='axigen') return false;
-  if(f==='other' && r.kind==='axigen') return false;
+  if(f==='srv' && r.kind==='imap') return false;
+  if(f==='other' && r.kind!=='imap') return false;
   if(f==='imap' && !(mb && mb.imap)) return false;
   if(f==='noimap' && (mb && mb.imap)) return false;
   if(f==='archived' && !mb) return false;
@@ -4821,7 +4860,8 @@ function srvMatches(r, f, q){
   if(f!=='deleted' && r.deleted && !mb) return false;      // удалённые без архива — только в своём отборе
   q=(q||'').trim().toLowerCase();
   if(!q) return true;
-  return [r.email, r.name, r.host, (r.aliases||[]).join(' '), mb&&mb.name].some(v=>String(v||'').toLowerCase().includes(q));
+  return [r.email, r.name, r.host, (r.aliases||[]).join(' '), mb&&mb.name, r.server&&r.server.name, r.server&&r.server.label, r.department]
+    .some(v=>String(v||'').toLowerCase().includes(q));
 }
 
 /** Сотрудник уволен, а вход на сервере открыт. */
@@ -4841,10 +4881,28 @@ function srvTrendHtml(r){
 function srvDay(d){ const m=String(d||'').match(/^(\d{4})-(\d\d)-(\d\d)/); return m?`${m[3]}.${m[2]}.${m[1]}`:String(d||''); }
 /** Место ящика не на Axigen — по последнему «Отчёту». */
 function srvUsageCell(r){
-  const u=r.usage; if(!u) return '<span class="muted small">— (в «Отчёте»)</span>';
+  if(r.kind==='server' && (r.used_bytes!=null || r.quota_kb)) return axQuotaCell(r);
+  const u=r.usage; if(!u) return `<span class="muted small">— (${r.kind==='server'?'сервер не сообщает; ':''}в «Отчёте»)</span>`;
   const pct=u.quota?Math.round(1000*u.used/u.quota)/10:null; const cls=pct>=90?'err':(pct>=75?'warn':'ok');
   return `<div class="small" title="${esc('По «Отчёту» от '+srvDay(u.day))}">${esc(fmtBytes(u.used))}${u.quota?' из '+esc(fmtBytes(u.quota))+` <span class="tag ${cls}">${pct}%</span>`:' <span class="muted">без квоты</span>'}</div>
     <div class="small muted">по «Отчёту» от ${esc(srvDay(u.day))}</div>`;
+}
+
+/** Ячейка «Сервер»: Axigen, подключение (вид и название) или ящик архива на своём IMAP-сервере. */
+function srvServerCell(r){
+  if(r.kind==='axigen') return `<span class="tag">Axigen</span><div class="muted mono">${esc(r.host||'—')}</div>`;
+  if(r.kind==='server'){ const sv=r.server||{};
+    return `<span class="tag" title="${esc(sv.label||'')}">${esc(sv.label||'сервер')}</span><div class="muted small">«${esc(sv.name||'')}»${sv.allow_changes?'':' · <span title="Изменения на этом сервере не разрешены (раздел «Почтовые серверы»)">только чтение</span>'}</div>`; }
+  return `<span class="tag">IMAP</span><div class="muted mono">${esc(r.host||'—')}</div>`;
+}
+/** Под адресом: автоответ, пересылка, отдел и должность (у учётных записей подключений). */
+function srvExtraTags(r){
+  if(r.kind!=='server') return '';
+  const out=[];
+  if(r.autoreply) out.push('<span class="tag" title="Включён автоответ">🏖️ автоответ</span>');
+  if((r.forward_to||[]).length) out.push(`<span class="tag" title="${esc('Пересылка: '+r.forward_to.join(', '))}">↪️ пересылка</span>`);
+  if(r.account_kind && !['user',''].includes(r.account_kind)) out.push(`<span class="tag" title="Вид учётной записи на сервере">${esc(MS_KIND[r.account_kind]||r.account_kind)}</span>`);
+  return out.length?' '+out.join(' '):'';
 }
 
 /** Список адресов → строки таблицы (по адресу, псевдониму или названию ящика). */
@@ -4881,14 +4939,23 @@ async function viewServer(c){
   c.innerHTML='';
   const ax=data.axigen||{};
   const rows=data.rows||[];
+  const servers=data.servers||[];
+  Srv.servers=servers; Srv.ax=ax;
+  const want=(location.hash.match(/[?&]srv=(\w+)/)||[])[1];
+  if(want){ Srv.server=want; Srv.filter=''; }
+  if(Srv.server && !['ax','mb'].includes(Srv.server) && !servers.some(x=>String(x.id)===Srv.server)) Srv.server='';
   c.appendChild(h(`<div class="section-title"><h2 style="margin:0">Ящики на сервере</h2>
     <span class="tag">${fmtNum(rows.filter(r=>!r.deleted).length)} ${plural(rows.filter(r=>!r.deleted).length,'ящик','ящика','ящиков')}</span>
     ${ax.enabled?`<span class="tag mono" title="Сервер Axigen">${esc(ax.host||'Axigen')}</span>`:''}
+    ${servers.map(x=>`<span class="tag" title="${esc(x.label+' — подключение «'+x.name+'»')}">${esc(x.label)}</span>`).join(' ')}
     <div class="spacer"></div>
+    <a class="btn sm ghost" href="#/mailservers" title="Подключения к Microsoft 365, Google Workspace, Яндекс 360, Zimbra и другим серверам">🔌 Почтовые серверы</a>
     ${ax.enabled?`<button class="btn sm" id="srvSync" ${ax.sync_running?'disabled':''} title="Прочитать учётные записи Axigen заново">${ax.sync_running?'<span class="spinner"></span> Сверка идёт…':'🔁 Сверить с Axigen'}</button>`:''}
     <button class="btn sm ghost" id="srvXls" title="Список ящиков раздела — файлом Excel">📊 Excel</button></div>`));
   const notes=[];
-  if(!ax.enabled) notes.push('Сервер Axigen не настроен — доступны действия по IMAP с ящиками архива. Учётные записи Axigen (вход, пароли, квоты, псевдонимы) появятся после настройки в «Настройки → Сервер Axigen».');
+  if(!ax.enabled && !servers.length) notes.push('Почтовый сервер не подключён — доступны действия по IMAP с ящиками архива. Учётные записи сервера (вход, пароли, квоты, псевдонимы, автоответ) появятся, когда вы подключите сервер в разделе «Почтовые серверы» (Microsoft 365, Google Workspace, Яндекс 360, Zimbra, Kerio…) или настроите Axigen («Настройки → Сервер Axigen»).');
+  servers.filter(x=>!x.last_sync_at).forEach(x=>notes.push(`Сверки с «${x.name}» (${x.label}) ещё не было — учётные записи этого сервера появятся после неё (раздел «Почтовые серверы» → «Сверить»).`));
+  if(servers.length && servers.every(x=>!x.allow_changes) && !(ax.enabled && ax.allow_changes)) notes.push('Изменения на подключённых серверах не разрешены — доступны чтение, отчёты и действия по IMAP. Разрешить можно в карточке подключения («Почтовые серверы» → «Изменить»).');
   else if(!ax.allow_changes) notes.push('Изменения учётных записей Axigen выключены — действия, которые их меняют, недоступны. Включите «Разрешить изменения на сервере» в «Настройки → Сервер Axigen».');
   if(ax.enabled && !ax.last_sync) notes.push('Сверки с Axigen ещё не было — нажмите «Сверить с Axigen», чтобы увидеть учётные записи сервера.');
   notes.forEach(t=>c.appendChild(h(`<div class="hint" style="margin-bottom:10px">💡 ${esc(t)}</div>`)));
@@ -4900,11 +4967,11 @@ async function viewServer(c){
   const body=h('<div></div>'); c.appendChild(body);
   if(tab==='history') return srvHistory(body);
   if(tab==='schedules') return srvSchedules(body, meta);
-  return srvList(body, rows, meta, ax);
+  return srvList(body, rows, meta, ax, servers);
 }
 
 function srvLoginCell(r){
-  if(r.kind==='axigen') return axLoginTag(r);
+  if(r.kind==='axigen' || r.kind==='server') return axLoginTag(r) + (r.kind==='server'&&r.last_login?`<div class="small muted" title="Последний вход на сервере">вход ${esc(fmtDate(r.last_login))}</div>`:'');
   const mb=r.mailbox; if(!mb) return '<span class="muted">—</span>';
   const st=SRV_LOGIN[mb.login_status]; return st?`<span class="tag ${st[0]}">${st[1]}</span>`:'<span class="muted small">не проверялся</span>';
 }
@@ -4916,7 +4983,9 @@ function srvArchiveCell(r){
     ${mb.imap?' · <span title="Войти в ящик по IMAP можно">IMAP ✓</span>':` · <span title="${esc(mb.imap_problem||'')}">IMAP ✗</span>`}</div>`;
 }
 
-function srvList(box, rows, meta, ax){
+function srvList(box, rows, meta, ax, servers){
+  servers=servers||[];
+  const canChange=(ax.enabled&&ax.allow_changes) || servers.some(x=>x.allow_changes);
   const byKey=new Map(rows.map(r=>[r.key, r]));
   const asked=Srv.sel.size;
   Srv.sel.forEach(k=>{ if(!byKey.has(k)) Srv.sel.delete(k); });
@@ -4938,14 +5007,18 @@ function srvList(box, rows, meta, ax){
   // что требует внимания: уволенные с открытым входом, ящики накануне квоты
   const nDism=count('dismissed'), nSoon=count('soon');
   const alerts=h(`<div>${nDism?`<div class="hint warnbox" style="margin-bottom:10px">👤 Сотрудники уволены, а вход на сервере открыт: <b>${fmtNum(nDism)}</b> — ${esc(rows.filter(srvDismissedOpen).slice(0,5).map(r=>r.email).join(', '))}${nDism>5?' …':''}.
-      ${ax.enabled&&ax.allow_changes?'<button class="btn sm" data-dism style="margin-left:6px">Показать и закрыть вход…</button>':'<span class="small">Закрыть вход можно, когда разрешены изменения на сервере.</span>'}</div>`:''}
+      ${canChange?'<button class="btn sm" data-dism style="margin-left:6px">Показать и закрыть вход…</button>':'<span class="small">Закрыть вход можно, когда разрешены изменения на сервере.</span>'}</div>`:''}
     ${nSoon?`<div class="hint warnbox" style="margin-bottom:10px">📈 При нынешнем росте упрутся в квоту за ${SRV_SOON_DAYS} дней: <b>${fmtNum(nSoon)}</b> — ${esc(rows.filter(srvSoonFull).slice(0,5).map(r=>r.email).join(', '))}${nSoon>5?' …':''}.
       <button class="btn sm" data-soon style="margin-left:6px">Показать</button></div>`:''}</div>`);
   box.appendChild(alerts);
   // 1. ящики
   const card=h(`<div class="card bulk-card"><h3>1. Какие ящики</h3>
     <div class="bulk-chips" data-chips>${SRV_FILTERS.map(([f,t])=>`<button class="chip ${Srv.filter===f?'active':''}" data-f="${f}">${t} (${fmtNum(count(f))})</button>`).join('')}</div>
-    <div class="an-toolbar" style="margin-bottom:8px;flex-wrap:wrap"><input type="text" id="srvQ" placeholder="Поиск: адрес, имя, псевдоним, сервер" value="${esc(Srv.query)}" style="flex:1 1 260px;min-width:200px"></div>
+    <div class="an-toolbar" style="margin-bottom:8px;flex-wrap:wrap"><input type="text" id="srvQ" placeholder="Поиск: адрес, имя, псевдоним, сервер, отдел" value="${esc(Srv.query)}" style="flex:1 1 260px;min-width:200px">
+      ${(servers.length+(ax.enabled?1:0))>=1?`<select id="srvFrom" title="Учётные записи какого сервера показывать" style="flex:0 1 260px">
+        <option value="">Все серверы</option>${ax.enabled?`<option value="ax"${Srv.server==='ax'?' selected':''}>Axigen</option>`:''}
+        ${servers.map(x=>`<option value="${x.id}"${Srv.server===String(x.id)?' selected':''}>${esc(x.label)} «${esc(x.name)}»</option>`).join('')}
+        <option value="mb"${Srv.server==='mb'?' selected':''}>Ящики архива без учётной записи</option></select>`:''}</div>
     <div class="table-wrap" data-table style="max-height:460px;overflow:auto"></div>
     <div class="bulk-sources" style="margin-top:12px">
       <label class="radio"><input type="radio" name="srvSrc" value="selected"> Отмеченные в таблице — <b data-n="selected"></b></label>
@@ -4975,12 +5048,12 @@ function srvList(box, rows, meta, ax){
     table.innerHTML=list.length?`<table class="tbl srv-tbl"><thead><tr><th style="width:28px"><input type="checkbox" data-all ${allSel?'checked':''}></th><th>Ящик</th><th>Сервер</th><th>Вход</th><th>Место на сервере</th><th>В архиве</th></tr></thead><tbody>
       ${shown.map(r=>`<tr data-row="${esc(r.key)}">
         <td><input type="checkbox" data-sel="${esc(r.key)}" ${Srv.sel.has(r.key)?'checked':''}></td>
-        <td class="srv-mail"><b>${esc(r.email)}</b>${r.dismissed_at?` <span class="tag ${srvDismissedOpen(r)?'err':''}" title="${esc('Сотрудник уволен '+fmtDate(r.dismissed_at)+(srvDismissedOpen(r)?' — а вход на сервере открыт':''))}">уволен</span>`:''}${r.errors?' <span class="tag warn" title="'+esc(r.errors)+'">не всё прочитано</span>':''}<div class="small muted">${esc([r.name!==r.email?r.name:'', (r.aliases||[]).length?'псевдонимы: '+r.aliases.join(', '):''].filter(Boolean).join(' · ')||'—')}</div></td>
-        <td class="small">${r.kind==='axigen'?'<span class="tag">Axigen</span>':'<span class="tag">IMAP</span>'}<div class="muted mono">${esc(r.host||'—')}</div></td>
+        <td class="srv-mail"><b>${esc(r.email)}</b>${srvExtraTags(r)}${r.dismissed_at?` <span class="tag ${srvDismissedOpen(r)?'err':''}" title="${esc('Сотрудник уволен '+fmtDate(r.dismissed_at)+(srvDismissedOpen(r)?' — а вход на сервере открыт':''))}">уволен</span>`:''}${r.errors?' <span class="tag warn" title="'+esc(r.errors)+'">не всё прочитано</span>':''}<div class="small muted">${esc([r.name!==r.email?r.name:'', (r.aliases||[]).length?'псевдонимы: '+r.aliases.join(', '):''].filter(Boolean).join(' · ')||'—')}</div></td>
+        <td class="small">${srvServerCell(r)}</td>
         <td>${srvLoginCell(r)}</td><td style="min-width:150px">${r.kind==='axigen'?axQuotaCell(r):srvUsageCell(r)}${srvTrendHtml(r)}</td>
         <td>${srvArchiveCell(r)}</td></tr>`).join('')}</tbody></table>
       ${list.length>shown.length?`<div style="padding:10px"><button class="btn sm" data-more>Показать ещё (${fmtNum(list.length-shown.length)})</button></div>`:''}`
-      : `<div class="empty">${rows.length?'Ничего не подходит под отбор.':'Ящиков нет: заведите ящики в «Почтовых ящиках» или настройте сервер Axigen.'}</div>`;
+      : `<div class="empty">${rows.length?'Ничего не подходит под отбор.':'Ящиков нет: заведите ящики в «Почтовых ящиках», подключите почтовый сервер («Почтовые серверы») или настройте сервер Axigen.'}</div>`;
     table.querySelectorAll('[data-sel]').forEach(cb=>cb.onchange=()=>{ cb.checked?Srv.sel.add(cb.dataset.sel):Srv.sel.delete(cb.dataset.sel); if(Srv.source!=='selected'){ Srv.source='selected'; } draw(); });
     const all=table.querySelector('[data-all]'); if(all) all.onchange=()=>{ shown.forEach(r=>all.checked?Srv.sel.add(r.key):Srv.sel.delete(r.key)); Srv.source='selected'; draw(); };
     const more=table.querySelector('[data-more]'); if(more) more.onclick=()=>{ Srv.shown+=200; draw(); };
@@ -4988,6 +5061,12 @@ function srvList(box, rows, meta, ax){
   };
   card.querySelectorAll('[data-chips] .chip').forEach(b=>b.onclick=()=>{ Srv.filter=b.dataset.f; Srv.shown=200; card.querySelectorAll('[data-chips] .chip').forEach(x=>x.classList.toggle('active', x===b)); draw(); });
   let qt=null; $('#srvQ',card).oninput=e=>{ clearTimeout(qt); qt=setTimeout(()=>{ Srv.query=e.target.value; Srv.shown=200; draw(); }, 200); };
+  const from=$('#srvFrom',card);
+  if(from) from.onchange=()=>{ Srv.server=from.value; Srv.shown=200;
+    // счётчики отборов — по выбранному серверу
+    card.querySelectorAll('[data-chips] .chip').forEach(b=>{ b.textContent=`${SRV_FILTERS.find(x=>x[0]===b.dataset.f)[1]} (${fmtNum(count(b.dataset.f))})`; });
+    if(location.hash.includes('srv=')) history.replaceState(null,'','#/server?tab=list');
+    draw(); };
   $$('input[name=srvSrc]', card).forEach(x=>x.onchange=()=>{ Srv.source=x.value; updateTotals(); });
   let lt=null; $('#srvL',card).oninput=e=>{ Srv.list=e.target.value; Srv.source='list'; clearTimeout(lt); lt=setTimeout(updateTotals,250); };
   draw();
@@ -4996,7 +5075,7 @@ function srvList(box, rows, meta, ax){
   const acts=h(`<div class="card bulk-card"><h3>2. Что сделать</h3><div class="bulk-groups"></div></div>`);
   const groupsBox=acts.querySelector('.bulk-groups');
   const clientTiles={
-    accounts: ax.enabled&&ax.allow_changes?[['create','➕','Создать учётные записи списком','Завести на сервере Axigen много учётных записей сразу: из списка адресов или из раздела «Сотрудники»']]:[],
+    accounts: ((ax.enabled&&ax.allow_changes) || servers.some(x=>x.allow_changes && (x.caps||[]).includes('create')))?[['create','➕','Создать учётные записи списком','Завести на сервере (Axigen или подключённом) много учётных записей сразу: из списка адресов или из раздела «Сотрудники»']]:[],
     archive: [['backup','💾','Сделать копию сейчас','Скопировать ящики архива выбранных строк'],['restore','♻️','Восстановить на сервер','Залить письма из архива обратно в ящики на сервере'],['excel','📊','Список ящиков в Excel','Выбранные ящики раздела — файлом Excel']],
   };
   meta.groups.forEach(g=>{
@@ -5173,30 +5252,49 @@ function srvRetry(r){
 // ---------- Создание учётных записей списком ----------
 function srvCreateModal(pre){
   pre=pre||{}; const pp=pre.params||{};
-  const m=modal('Создать учётные записи на сервере Axigen', `
+  const ax=Srv.ax||{}, targets=[];
+  if(ax.enabled && ax.allow_changes) targets.push({id:0, title:`Axigen${ax.host?' — '+ax.host:''}`, rule:'От 6 до 64 знаков, без пробелов, кавычек и «\\».', caps:['quota','must_change','imap_admin'], label:'Axigen'});
+  (Srv.servers||[]).filter(x=>x.allow_changes && (x.caps||[]).includes('create'))
+    .forEach(x=>targets.push({id:x.id, title:`${x.label} «${x.name}»`, rule:x.password_rule||'', caps:x.caps||[], label:x.label}));
+  if(!targets.length) return toast('Создавать негде', 'Нет сервера, на котором разрешено создавать учётные записи.', 'warn');
+  const first=targets.find(t=>t.id===(pp.server_id||0))||targets[0];
+  const m=modal('Создать учётные записи на сервере', `
     <p class="muted" style="margin-top:0">Сначала — проверка: что будет с каждой строкой. Учётные записи создаются заданием, по одной; пароли — случайные (файлом для раздачи сотрудникам) или один общий временный.</p>
+    <div class="form-row"${targets.length>1?'':' style="display:none"'}><label>Где создать</label><select id="scWhere">${targets.map(t=>`<option value="${t.id}"${t===first?' selected':''}>${esc(t.title)}</option>`).join('')}</select></div>
     <div class="form-row"><label>Откуда</label><select id="scSrc"><option value="text">Список адресов</option><option value="employees">Сотрудники с адресом, у которых нет учётной записи</option></select></div>
     <div class="form-row" data-text><label>Адреса</label><textarea id="scText" rows="6" placeholder="ivanov@company.ru; Иван; Иванов&#10;Петрова Мария <petrova@company.ru>">${esc(pre.lines||'')}</textarea>
       <div class="hint">По одной в строке: «адрес; имя; фамилия» или «Фамилия Имя &lt;адрес&gt;».</div></div>
     <div class="form-row"><label>Пароли</label><select id="scMode"><option value="random_file">Случайные — файлом для раздачи (скачать один раз)</option><option value="same">Один общий временный пароль</option></select></div>
-    <div class="form-row" data-pw style="display:none"><label>Пароль</label><input type="text" id="scPw" autocomplete="off"><div class="hint">От 6 до 64 знаков, без пробелов, кавычек и «\\».</div></div>
+    <div class="form-row" data-pw style="display:none"><label>Пароль</label><input type="text" id="scPw" autocomplete="off"><div class="hint" id="scRule"></div></div>
     <div class="form-row check"><span class="switch"><input type="checkbox" id="scMust" checked><span class="track"></span></span><label>Потребовать сменить пароль при первом входе</label></div>
-    <div class="form-row"><label>Квота, МБ</label><input type="number" id="scQuota" min="0" value="0"><div class="hint">0 — как задано у домена.</div></div>
-    <div class="form-row check"><span class="switch"><input type="checkbox" id="scArch" checked><span class="track"></span></span><label>Сразу завести ящики в архиве (копирование через FTP Backup)</label></div>
+    <div class="form-row" data-quota><label>Квота, МБ</label><input type="number" id="scQuota" min="0" value="0"><div class="hint">0 — как задано у домена (на сервере по умолчанию).</div></div>
+    <div class="form-row check" data-arch><span class="switch"><input type="checkbox" id="scArch" checked><span class="track"></span></span><label id="scArchLbl">Сразу завести ящики в архиве</label></div>
+    <div class="hint" data-caps style="display:none"></div>
     <div data-pv></div>`, {wide:true, footer:'<button class="btn ghost" data-c>Отмена</button><button class="btn" data-check>Проверить</button><button class="btn primary" data-go disabled>Создать</button>'});
   const g=x=>m.body.querySelector(x), go=m.foot.querySelector('[data-go]');
-  const sync=()=>{ g('[data-text]').style.display=g('#scSrc').value==='text'?'':'none'; g('[data-pw]').style.display=g('#scMode').value==='same'?'':'none'; go.disabled=true; };
+  const where=()=>targets.find(t=>String(t.id)===g('#scWhere').value)||first;
+  const sync=()=>{ g('[data-text]').style.display=g('#scSrc').value==='text'?'':'none'; g('[data-pw]').style.display=g('#scMode').value==='same'?'':'none';
+    const t=where(), has=c=>t.caps.includes(c);
+    g('#scRule').textContent=t.rule?('Требования сервера: '+t.rule+'.'):'';
+    g('[data-quota]').style.display=has('quota')?'':'none';
+    g('#scArchLbl').textContent=t.id?'Сразу завести ящики в архиве (копирование через подключение — без паролей сотрудников)':'Сразу завести ящики в архиве (копирование через FTP Backup)';
+    g('[data-arch]').style.display=has('imap_admin')?'':'none';
+    const miss=[!has('quota')&&'квоту', !has('must_change')&&'требование сменить пароль при входе'].filter(Boolean);
+    const caps=g('[data-caps]'); caps.style.display=(t.id&&miss.length)?'':'none';
+    caps.textContent=miss.length?`${t.label} через API не задаёт ${miss.join(' и ')} — эти настройки будут такими, как на сервере по умолчанию.`:'';
+    go.disabled=true; };
   if(pre.lines){
     if(pp.password_mode) g('#scMode').value=pp.password_mode;
     if(pp.must_change!=null) g('#scMust').checked=!!pp.must_change;
     if(pp.quota_mb!=null) g('#scQuota').value=pp.quota_mb;
     if(pp.add_to_archive!=null) g('#scArch').checked=!!pp.add_to_archive;
   }
-  g('#scSrc').onchange=sync; g('#scMode').onchange=sync; sync();
+  g('#scSrc').onchange=sync; g('#scMode').onchange=sync; g('#scWhere').onchange=sync; sync();
   // поменяли список или параметры — прежняя проверка уже не о том: сначала «Проверить» заново
   m.body.addEventListener('input', ()=>{ if(!go.disabled){ go.disabled=true; go.textContent='Создать'; } });
   const body=preview=>({source:g('#scSrc').value, text:g('#scText').value, password_mode:g('#scMode').value, password:g('#scPw').value,
-    must_change:g('#scMust').checked, quota_mb:parseInt(g('#scQuota').value||'0',10)||0, add_to_archive:g('#scArch').checked, preview});
+    must_change:g('#scMust').checked, quota_mb:where().caps.includes('quota')?(parseInt(g('#scQuota').value||'0',10)||0):0,
+    add_to_archive:where().caps.includes('imap_admin')&&g('#scArch').checked, server_id:where().id, preview});
   const check=async()=>{
     try{ const r=await api('/server/create',{method:'POST',body:body(true)});
       const items=r.items||[];
@@ -5304,4 +5402,244 @@ async function srvSchedules(box, meta){
   };
   box.querySelector('[data-r]').onclick=load;
   load();
+}
+
+// ===================================================================
+// Почтовые серверы: подключения к Microsoft 365, Google Workspace, Яндекс 360, Zimbra, Kerio…
+// Подключение читает учётные записи сервера (сверка), следит за ним, а если
+// разрешить изменения — через него выполняются действия «Ящиков на сервере».
+const MS = { types:null };
+const MS_KIND = {shared:'общий ящик', resource:'ресурс', room:'переговорная', equipment:'оборудование', admin:'администратор',
+  unlicensed:'без лицензии', alias:'псевдоним', group:'группа', robot:'служебная', system:'системная', disabled:'отключена'};
+/** Порядок возможностей в карточках: сначала то, что меняет учётные записи. */
+const MS_CAPS = ['block','password','must_change','quota','aliases','contact','create','delete','autoreply','forward','usage','last_login','imap_admin'];
+function msCapsHtml(caps, labels){
+  return MS_CAPS.filter(k=>(caps||[]).includes(k)).map(k=>`<span class="tag">${esc((labels||{})[k]||k)}</span>`).join(' ');
+}
+const MS_LOG_KIND = {check:'проверка', monitor:'слежение', sync:'сверка', read:'чтение', write:'изменение'};
+
+async function msTypes(){ if(!MS.types) MS.types=(await api('/mailservers/types')).types||[]; return MS.types; }
+
+function msStateTag(x){
+  if(!x.enabled) return '<span class="tag">выключено</span>';
+  if(!x.last_check_at) return '<span class="tag">не проверялось</span>';
+  const p=((x.status||{}).problems||[]).find(p=>p[0]==='unreachable');
+  return x.last_check_ok ? `<span class="tag ok" title="Проверено ${esc(fmtDate(x.last_check_at))}">● доступен</span>`
+    : `<span class="tag err" title="${esc((p&&p[2])||'')}">● недоступен</span>`;
+}
+
+async function viewMailservers(c){
+  const [list, types]=await Promise.all([api('/mailservers'), msTypes()]);
+  c.innerHTML='';
+  const items=list.items||[];
+  c.appendChild(h(`<div class="section-title"><h2 style="margin:0">Почтовые серверы</h2>
+    <span class="tag">${fmtNum(items.length)} ${plural(items.length,'подключение','подключения','подключений')}</span>
+    <div class="spacer"></div>
+    <a class="btn sm ghost" href="#/server" title="Учётные записи всех серверов и действия с ними">🖥️ Ящики на сервере</a>
+    <button class="btn sm primary" id="msAdd">➕ Подключить сервер</button></div>`));
+  c.appendChild(h(`<p class="muted" style="margin-top:-4px">Через подключение к API почтового сервера MailArchiver сверяет учётные записи с архивом, следит за сервером и — если разрешить изменения — выполняет действия раздела «Ящики на сервере»: закрыть вход, пароли, ФИО, псевдонимы, квоты, автоответ, пересылку, удаление при полном архиве. Серверов можно подключить несколько (например, Axigen и Microsoft 365 на время переезда).</p>`));
+  $('#msAdd',c).onclick=()=>msTypePicker(types);
+  if(!items.length){
+    const box=h(`<div class="card"><div class="section-title"><h3>Какой сервер подключить?</h3></div><div class="ms-types"></div>
+      <p class="small muted" style="margin:12px 0 0">Сервер Axigen настраивается отдельно — «Настройки → Сервер Axigen».</p></div>`);
+    msTypeTiles(box.querySelector('.ms-types'), types, t=>msFormModal(null, t));
+    c.appendChild(box);
+    return;
+  }
+  const grid=h('<div class="grid cols-2"></div>'); c.appendChild(grid);
+  items.forEach(x=>grid.appendChild(msCard(x, types)));
+}
+
+function msTypeTiles(box, types, pick){
+  box.innerHTML=`<div class="bulk-tiles">${types.map(t=>`<button class="bulk-tile" data-t="${esc(t.type)}" title="${esc(t.summary)}" style="min-height:76px;align-items:flex-start;text-align:left">
+    <span class="ic">${t.cloud?'☁️':'🖥️'}</span><span><b>${esc(t.label)}</b><div class="small muted" style="font-weight:400;margin-top:2px">${esc(t.summary)}</div></span></button>`).join('')}</div>`;
+  box.querySelectorAll('[data-t]').forEach(b=>b.onclick=()=>pick(types.find(t=>t.type===b.dataset.t)));
+}
+
+function msTypePicker(types){
+  const m=modal('Подключить почтовый сервер', '<div class="ms-types"></div>', {wide:true});
+  msTypeTiles(m.body.querySelector('.ms-types'), types, t=>{ m.close(); msFormModal(null, t); });
+}
+
+function msCard(x, types){
+  const t=types.find(t=>t.type===x.type)||{caps_labels:{}, limits:[]};
+  const st=x.status||{}, acc=x.accounts||{};
+  const caps=msCapsHtml(x.caps, t.caps_labels);
+  const probs=(x.problems||[]).map(p=>`<li${p.level==='error'?' style="color:var(--danger)"':''}>${esc(p.text.replace(/^«[^»]*»: /,''))}</li>`).join('');
+  const sync=x.last_sync_at?`${esc(fmtDate(x.last_sync_at))} — <span class="badge ${x.last_sync_status==='success'?'success':'partial'}">${x.last_sync_status==='success'?'успешно':'не всё прочитано'}</span><div class="small muted">${esc(x.last_sync_summary||'')}</div>`:'не было';
+  const card=h(`<div class="card${(x.problems||[]).some(p=>p.level==='error')?' ms-bad':''}">
+    <div class="section-title"><h3 style="margin:0">${t.cloud?'☁️':'🖥️'} ${esc(x.name)}</h3><span class="tag">${esc(x.label)}</span> ${msStateTag(x)}
+      ${st.version?`<span class="tag" title="Версия">${esc(st.version)}</span>`:''}</div>
+    ${probs?`<div class="hint warnbox" style="margin:8px 0"><ul style="margin:0;padding-left:18px">${probs}</ul></div>`:''}
+    <div class="kv"><span class="k">Учётных записей</span><span>${fmtNum(acc.total||0)}${acc.blocked?` · вход закрыт: ${fmtNum(acc.blocked)}`:''}${acc.deleted?` · удалены на сервере: ${fmtNum(acc.deleted)}`:''}</span></div>
+    <div class="kv"><span class="k">Копируются через подключение</span><span>${fmtNum(x.mailboxes||0)} ${plural(x.mailboxes||0,'ящик','ящика','ящиков')}</span></div>
+    ${st.seats_total!=null?`<div class="kv"><span class="k">Лицензии</span><span>занято ${fmtNum(st.seats_used||0)} из ${fmtNum(st.seats_total)}</span></div>`:''}
+    <div class="kv"><span class="k">Последняя сверка</span><span>${sync}</span></div>
+    <div class="kv"><span class="k">По расписанию</span><span>${x.sync_enabled?`<span class="mono">${esc(x.sync_cron)}</span> (${esc(cronHuman(x.sync_cron))})${x.sync_add_new?' · новые — сразу в архив':''}`:'нет'}</span></div>
+    <div class="kv"><span class="k">Изменения на сервере</span><span>${x.allow_changes?'<span class="tag warn">разрешены</span>':'<span class="tag">только чтение</span>'} · слежение ${x.monitor?'каждые 15 минут':'выключено'}</span></div>
+    ${(st.details||[]).length?`<details style="margin-top:6px"><summary class="small muted">Что видно на сервере</summary><div class="small">${st.details.map(d=>esc(d)).join('<br>')}</div></details>`:''}
+    <div class="small" style="margin-top:8px">Умеет: ${caps||'<span class="muted">только сверка</span>'}</div>
+    ${x.secret_broken?'<div class="hint warnbox" style="margin-top:8px">Секреты подключения не расшифровываются (сменился secret.key) — откройте «Изменить» и введите их заново.</div>':''}
+    <div class="btn-row" style="margin-top:12px;flex-wrap:wrap">
+      <button class="btn sm" data-test>🔌 Проверить</button>
+      <button class="btn sm primary" data-sync ${x.sync_running||!x.enabled?'disabled':''}>${x.sync_running?'<span class="spinner"></span> Сверка идёт…':'🔁 Сверить'}</button>
+      <a class="btn sm" href="#/server?tab=list&srv=${x.id}">🖥️ Учётные записи</a>
+      <button class="btn sm" data-edit>✏️ Изменить</button>
+      <button class="btn sm ghost" data-log>📜 Журнал</button>
+      <button class="btn sm ghost" data-del title="Удалить подключение (учётные записи сервера не трогаются)">🗑️</button></div></div>`);
+  const on=(sel, fn)=>{ const el=card.querySelector(sel); if(el) el.onclick=fn; };
+  on('[data-test]', ()=>msTest(x.id, x.name));
+  on('[data-sync]', async(ev)=>{ const b=ev.currentTarget; b.disabled=true;
+    try{ const r=await api(`/mailservers/${x.id}/sync`,{method:'POST'}); toast('Сверка запущена', `Задание №${r.job_id}`); msWatchJob(r.job_id); }
+    catch(e){ toastErr(e); b.disabled=false; } });
+  on('[data-edit]', ()=>msFormModal(x, t));
+  on('[data-log]', ()=>msLogModal(x));
+  on('[data-del]', async()=>{
+    if(!await confirmDlg(`Удалить подключение «${x.name}»?`, 'Учётные записи на сервере не изменятся, архив писем останется. Сведения последней сверки и журнал подключения удалятся.', {okText:'Удалить'})) return;
+    try{ await api(`/mailservers/${x.id}`,{method:'DELETE'}); toast('Подключение удалено'); refreshFeatures(); route(); }catch(e){ toastErr(e); }
+  });
+  return card;
+}
+
+/** Меню показывает «через подключение» в карточке ящика, только если подключения есть — обновить после изменения. */
+async function refreshFeatures(){ try{ const me=await api('/me',{bg:true}); if(State.user) State.user.features=me.features||State.user.features; }catch(e){} }
+
+function msWatchJob(jobId){
+  let n=0;
+  const tick=async()=>{
+    n++;
+    try{ const j=await api(`/jobs/${jobId}`,{bg:true});
+      if(['success','partial','failed','cancelled'].includes(j.status)){
+        toast(j.status==='failed'?'Сверка не удалась':'Сверка закончена', (j.result&&j.result.summary)||j.error||'', j.status==='failed'?'error':(j.status==='partial'?'warn':'success'), 9000);
+        if(['mailservers','server'].includes(State.view)) route(); return; }
+    }catch(e){ return; }
+    if(n<400) setTimeout(tick, 3000);
+  };
+  setTimeout(tick, 2000);
+}
+
+function msFieldHtml(f, conn){
+  const set=(conn&&conn.settings)||{}, isSet=!!(conn&&(conn.secrets_set||[]).includes(f.key));
+  const v=set[f.key]!==undefined&&set[f.key]!==null?set[f.key]:(f.default!==null&&f.default!==undefined?f.default:'');
+  const help=f.help?`<div class="hint">${esc(f.help)}</div>`:'';
+  const ph=f.secret?(isSet?'задан — оставьте пустым, чтобы не менять':(f.placeholder||'')):(f.placeholder||'');
+  const req=f.required?' <span class="muted" title="Обязательное поле">*</span>':'';
+  const attrs=`data-f="${esc(f.key)}" placeholder="${esc(ph)}"`;
+  let input;
+  switch(f.kind){
+    case 'bool': return `<div class="form-row check" data-row="${esc(f.key)}"><span class="switch"><input type="checkbox" data-f="${esc(f.key)}" ${v?'checked':''}><span class="track"></span></span><label>${esc(f.label)}</label>${help}</div>`;
+    case 'select': input=`<select data-f="${esc(f.key)}">${(f.options||[]).map(o=>`<option value="${esc(o.value)}"${String(o.value)===String(v)?' selected':''}>${esc(o.label)}</option>`).join('')}</select>`; break;
+    case 'int': input=`<input type="number" ${attrs} value="${esc(v)}">`; break;
+    case 'password': input=`<input type="password" autocomplete="new-password" ${attrs}>`; break;
+    case 'secret_text': input=`<textarea rows="4" class="mono" autocomplete="off" ${attrs}></textarea>`; break;
+    case 'textarea': input=`<textarea rows="4" class="mono" ${attrs}>${esc(v)}</textarea>`; break;
+    default: input=`<input type="text" ${attrs} value="${esc(v)}">`;
+  }
+  return `<div class="form-row" data-row="${esc(f.key)}"><label>${esc(f.label)}${req}${f.secret?' 🔒':''}</label>${input}${help}</div>`;
+}
+
+function msFormModal(conn, t){
+  const isNew=!conn;
+  const basic=t.fields.filter(f=>!f.advanced), adv=t.fields.filter(f=>f.advanced);
+  const cron=(conn&&conn.sync_cron)||'50 4 * * *';
+  const steps=(t.setup||[]).map(s=>`<li>${esc(s)}</li>`).join(''), limits=(t.limits||[]).map(s=>`<li>${esc(s)}</li>`).join('');
+  const caps=msCapsHtml(t.caps, t.caps_labels);
+  const m=modal(isNew?`Подключить: ${t.label}`:`Подключение «${conn.name}»`, `
+    <p class="muted" style="margin-top:0">${esc(t.summary)}</p>
+    ${steps?`<details ${isNew?'open':''} style="margin-bottom:10px"><summary><b>Что настроить на стороне сервера</b></summary><ol class="small" style="margin:6px 0 0;padding-left:20px">${steps}</ol></details>`:''}
+    <div class="small" style="margin-bottom:6px">Умеет: ${caps||'только сверка'}</div>
+    ${limits?`<details style="margin-bottom:10px"><summary class="small">Чего этот сервер через API не позволяет</summary><ul class="small" style="margin:6px 0 0;padding-left:20px">${limits}</ul></details>`:''}
+    <div class="form-row"><label>Название подключения</label><input type="text" data-n="name" value="${esc((conn&&conn.name)||t.label)}" maxlength="100"></div>
+    ${basic.map(f=>msFieldHtml(f, conn)).join('')}
+    ${adv.length?`<details style="margin:6px 0 10px"><summary class="small">Дополнительно</summary>${adv.map(f=>msFieldHtml(f, conn)).join('')}</details>`:''}
+    <div class="bulk-form boxed">
+      <div class="form-row check"><span class="switch"><input type="checkbox" data-n="enabled" ${!conn||conn.enabled?'checked':''}><span class="track"></span></span><label>Подключение включено</label></div>
+      <div class="form-row check"><span class="switch"><input type="checkbox" data-n="allow_changes" ${conn&&conn.allow_changes?'checked':''}><span class="track"></span></span><label>Разрешить изменения на сервере</label>
+        <div class="hint">Без этого — только чтение: сверка, отчёты, слежение. С ним в «Ящиках на сервере» доступны действия, которые меняют учётные записи (закрыть вход, пароли, удаление при полном архиве…). Каждое действие сначала показывает проверку.</div></div>
+      <div class="form-row check"><span class="switch"><input type="checkbox" data-n="sync_enabled" ${!conn||conn.sync_enabled?'checked':''}><span class="track"></span></span><label>Сверять учётные записи по расписанию</label></div>
+      <div class="form-row" data-cron><label>Когда (cron)</label><input type="text" data-n="sync_cron" class="mono" value="${esc(cron)}"><div class="hint" data-cronh>${esc(cronHuman(cron))}</div></div>
+      <div class="form-row check"><span class="switch"><input type="checkbox" data-n="sync_add_new" ${conn&&conn.sync_add_new?'checked':''}><span class="track"></span></span><label>Новые учётные записи — сразу заводить ящики в архиве</label>
+        <div class="hint">${(t.caps||[]).includes('imap_admin')?'Ящик копируется через подключение — без пароля сотрудника; настройки (срок хранения, папки) — из шаблона ящиков сотрудников.':'Этот сервер не пускает в ящики без паролей — ящики заводятся вручную, с паролем.'}</div></div>
+      <div class="form-row check"><span class="switch"><input type="checkbox" data-n="monitor" ${!conn||conn.monitor?'checked':''}><span class="track"></span></span><label>Следить за сервером (каждые 15 минут) и писать администраторам о проблемах</label></div>
+    </div>`, {wide:true, footer:`<button class="btn ghost" data-c>Отмена</button><button class="btn" data-save>Сохранить</button><button class="btn primary" data-savetest>Сохранить и проверить</button>`});
+  const q=sel=>m.body.querySelector(sel);
+  const fval=f=>{ const el=q(`[data-f="${f.key}"]`); if(!el) return undefined; return f.kind==='bool'?el.checked:el.value; };
+  const showIf=()=>{
+    t.fields.forEach(f=>{ if(!f.show_if) return; const row=q(`[data-row="${f.key}"]`); if(!row) return;
+      const ok=Object.entries(f.show_if).every(([k,vals])=>{ const dep=t.fields.find(x=>x.key===k); const v=dep?fval(dep):undefined; return vals.map(String).includes(String(v)); });
+      row.style.display=ok?'':'none'; });
+    q('[data-cron]').style.display=q('[data-n=sync_enabled]').checked?'':'none';
+  };
+  m.body.addEventListener('change', showIf); showIf();
+  q('[data-n=sync_cron]').oninput=e=>{ q('[data-cronh]').textContent=cronHuman(e.target.value); };
+  const collect=()=>{
+    const values={name:q('[data-n=name]').value};
+    if(isNew) values.type=t.type;
+    ['enabled','allow_changes','sync_enabled','sync_add_new','monitor'].forEach(k=>values[k]=q(`[data-n=${k}]`).checked);
+    values.sync_cron=q('[data-n=sync_cron]').value;
+    t.fields.forEach(f=>{ const v=fval(f); if(v===undefined) return; if(f.secret && v==='') return; values[f.key]=f.kind==='int'&&v!==''?parseInt(v,10):v; });
+    return values;
+  };
+  const save=async(test)=>{
+    const btns=m.foot.querySelectorAll('button'); btns.forEach(b=>b.disabled=true);
+    try{
+      const r=isNew?await api('/mailservers',{method:'POST',body:{values:collect()}}):await api(`/mailservers/${conn.id}`,{method:'PUT',body:{values:collect()}});
+      (r.warnings||[]).forEach(w=>toast('Обратите внимание', w, 'warn', 9000));
+      toast('Сохранено'); m.close(); await refreshFeatures();
+      if(test) await msTest(r.id, q('[data-n=name]').value); else route();
+    }catch(e){ toastErr(e); btns.forEach(b=>b.disabled=false); }
+  };
+  m.foot.querySelector('[data-c]').onclick=()=>m.close();
+  m.foot.querySelector('[data-save]').onclick=()=>save(false);
+  m.foot.querySelector('[data-savetest]').onclick=()=>save(true);
+}
+
+async function msTest(id, name){
+  const m=modal(`Проверка подключения «${name||''}»`, '<div class="empty"><span class="spinner"></span> Обращаемся к серверу…</div>', {wide:true, onClose:()=>{ if(State.view==='mailservers') route(); }});
+  let r; try{ r=await api(`/mailservers/${id}/test`,{method:'POST'}); }catch(e){ m.body.innerHTML=`<div class="hint warnbox">⚠️ ${esc(e.message)}</div>`; return; }
+  const st=r.status||{};
+  const probs=(st.problems||[]).filter(p=>p[0]!=='unreachable').map(p=>`<li${p[1]==='error'?' style="color:var(--danger)"':''}>${esc(p[2])}</li>`).join('');
+  const fp=r.fingerprint||'';
+  m.body.innerHTML=`${r.ok?'<div class="hint okbox" style="margin-bottom:10px">✅ Подключение работает.</div>':`<div class="hint warnbox" style="margin-bottom:10px">❌ ${esc(r.error||'Сервер сообщил о проблемах.')}${r.hint?'<br><span class="small">'+esc(r.hint)+'</span>':''}</div>`}
+    ${st.version?`<div class="kv"><span class="k">Версия</span><span>${esc(st.version)}</span></div>`:''}
+    ${st.seats_total!=null?`<div class="kv"><span class="k">Лицензии</span><span>занято ${fmtNum(st.seats_used||0)} из ${fmtNum(st.seats_total)}</span></div>`:''}
+    ${(st.details||[]).length?`<div class="small" style="margin:8px 0">${st.details.map(d=>esc(d)).join('<br>')}</div>`:''}
+    ${probs?`<h4 style="margin:12px 0 4px">Требует внимания</h4><ul style="margin:0;padding-left:18px">${probs}</ul>`:''}
+    ${fp&&!r.ok?`<div class="card" style="margin-top:12px"><div class="small">Сервер прислал сертификат с отпечатком SHA-256:</div><div class="mono small" style="word-break:break-all;margin:4px 0">${esc(fp)}</div>
+      <div class="small muted">Если сертификат самоподписанный, сверьте отпечаток с тем, что показывает сервер (например, <span class="mono">openssl x509 -noout -fingerprint -sha256</span>), и разрешите доверие только при совпадении.</div>
+      <button class="btn sm" data-trust style="margin-top:8px">Доверять этому сертификату</button></div>`:''}
+    <div class="small muted" style="margin-top:10px">Что именно запрашивалось и что ответил сервер — в «Журнале» подключения (без паролей и токенов).</div>`;
+  const tb=m.body.querySelector('[data-trust]');
+  if(tb) tb.onclick=async()=>{
+    if(!await confirmDlg('Доверять сертификату?', `Соединение с сервером будет приниматься, только если отпечаток сертификата — ${fp}. Убедитесь, что это сертификат вашего сервера.`, {okText:'Доверять', okClass:'primary'})) return;
+    try{ await api(`/mailservers/${id}/trust`,{method:'POST',body:{fingerprint:fp}}); toast('Сертификат принят'); m.close(); msTest(id, name); }catch(e){ toastErr(e); }
+  };
+}
+
+async function msLogModal(x){
+  let kind='people', last=0;
+  const m=modal(`Журнал подключения «${x.name}»`, `
+    <div class="an-toolbar" style="margin-bottom:8px"><select data-kind><option value="people">Действия людей и сверки</option><option value="">Всё, включая проверки и слежение</option></select></div>
+    <div data-list><div class="empty"><span class="spinner"></span></div></div>`, {wide:true});
+  const list=m.body.querySelector('[data-list]');
+  const row=e=>`<tr data-id="${e.id}" style="cursor:pointer"><td class="small nowrap">${esc(fmtDate(e.ts))}</td><td class="small">${esc(e.username||'')}</td>
+    <td><span class="tag">${esc(MS_LOG_KIND[e.kind]||e.kind)}</span></td><td class="small">${esc(e.summary||'')}</td>
+    <td>${e.ok?'<span class="tag ok">успешно</span>':'<span class="tag err">ошибка</span>'}</td><td class="small muted">${fmtNum(e.calls)}</td></tr>`;
+  const wire=()=>list.querySelectorAll('[data-id]').forEach(tr=>tr.onclick=async()=>{
+    try{ const e=await api(`/mailservers/${x.id}/log/${tr.dataset.id}`);
+      modal(`${fmtDate(e.ts)} — ${e.summary||''}`, `<div class="small muted" style="margin-bottom:6px">${esc(e.username||'')} · ${esc(MS_LOG_KIND[e.kind]||e.kind)} · обращений к API: ${fmtNum(e.calls)}</div><pre class="mono small" style="white-space:pre-wrap;max-height:60vh;overflow:auto">${esc(e.transcript||'')}</pre>`, {wide:true});
+    }catch(err){ toastErr(err); } });
+  const load=async(more)=>{
+    let d; try{ d=await api(`/mailservers/${x.id}/log?kind=${encodeURIComponent(kind)}&limit=100${more?'&before='+last:''}`); }catch(e){ list.innerHTML=`<div class="empty">${esc(e.message)}</div>`; return; }
+    const items=d.items||[];
+    if(!more && !items.length){ list.innerHTML='<div class="empty">Записей нет.</div>'; return; }
+    if(items.length) last=items[items.length-1].id;
+    if(!more) list.innerHTML=`<div class="table-wrap" style="max-height:60vh;overflow:auto"><table class="tbl"><thead><tr><th>Когда</th><th>Кто</th><th>Что</th><th>Описание</th><th>Итог</th><th>Вызовов</th></tr></thead><tbody></tbody></table></div><div data-more></div>`;
+    list.querySelector('tbody').insertAdjacentHTML('beforeend', items.map(row).join(''));
+    list.querySelector('[data-more]').innerHTML=items.length===100?'<button class="btn sm" style="margin-top:8px">Показать ещё</button>':'';
+    const mb=list.querySelector('[data-more] button'); if(mb) mb.onclick=()=>load(true);
+    wire();
+  };
+  m.body.querySelector('[data-kind]').onchange=e=>{ kind=e.target.value; last=0; list.innerHTML='<div class="empty"><span class="spinner"></span></div>'; load(false); };
+  load(false);
 }

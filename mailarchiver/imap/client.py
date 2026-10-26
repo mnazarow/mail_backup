@@ -98,6 +98,12 @@ class ConnectOptions:
     #: вход администратора почты в чужой ящик (ящики с auth_type=master):
     #: {"host", "user", "password", "mode": sasl_plain|separator, "separator"}
     master: Optional[dict] = None
+    #: вход через подключение к почтовому серверу (ящики с auth_type=server):
+    #: функция (ящик) → :class:`mailarchiver.mailservers.base.ImapAuth`
+    server_auth: Optional[Callable] = None
+    #: проверка сертификата для таких ящиков — по настройкам подключения, а не по ``verify_ssl``:
+    #: функция (ящик) → {"verify": bool, "pin": "sha256 hex" | ""}
+    server_tls: Optional[Callable] = None
 
 
 @dataclass
@@ -316,6 +322,45 @@ def _plan_size_chunks(uids: List[int], sizes: Dict[int, int], max_count: int,
         yield chunk
 
 
+def kerio_master_login(client, mailbox: str, master_password: str) -> None:
+    """Вход в ящик Kerio Connect мастер-паролем (Master Authentication): ``X-MASTERAUTH`` + ``X-SETUSER``.
+
+    Сервер присылает строку-вызов, ответ — MD5 от «вызов + мастер-пароль» шестнадцатеричными строчными; затем
+    ``X-SETUSER "ящик"`` открывает ящик. Пускает сервер только с адресов из группы IP, заданной в Kerio.
+    Команды нестандартные, поэтому — через imaplib внутри IMAPClient.
+    """
+    import hashlib
+    if any(ch in mailbox for ch in '"\\\r\n') or not mailbox:
+        raise LoginError("недопустимое имя ящика для X-SETUSER")
+    imap = client._imap
+    imaplib.Commands.setdefault("X-MASTERAUTH", ("NONAUTH",))
+    imaplib.Commands.setdefault("X-SETUSER", ("AUTH", "SELECTED"))
+
+    class _Answer:
+        # imaplib отправляет результат «связанного метода» на продолжение «+ …» и затем CRLF
+        def process(self, challenge: bytes) -> bytes:
+            return hashlib.md5(bytes(challenge or b"") + master_password.encode("utf-8")).hexdigest().encode("ascii")
+
+    imap.literal = _Answer().process
+    try:
+        typ, data = imap._simple_command("X-MASTERAUTH")
+    except imaplib.IMAP4.error as exc:
+        raise LoginError(f"X-MASTERAUTH: {exc}") from exc
+    if typ != "OK":
+        raise LoginError(f"X-MASTERAUTH: {data}")
+    imap.state = "AUTH"
+    try:
+        typ, data = imap._simple_command("X-SETUSER", f'"{mailbox}"')
+    except imaplib.IMAP4.error as exc:
+        raise LoginError(f"X-SETUSER: {exc}") from exc
+    if typ != "OK":
+        raise LoginError(f"X-SETUSER: {data}")
+    try:
+        client._cached_capabilities = None
+    except AttributeError:
+        pass
+
+
 class ImapConnection:
     """Одно соединение с IMAP-ящиком. Используйте как контекстный менеджер."""
 
@@ -323,6 +368,7 @@ class ImapConnection:
         self.account = account
         self.opt = options or ConnectOptions()
         self.client: Optional[IMAPClient] = None
+        self._server_tls: Optional[dict] = None
         self._delimiter: str = "/"
         #: имена папок, которые сервер прислал в неверной кодировке (пропущены)
         self.bad_folder_names: List[str] = []
@@ -338,12 +384,40 @@ class ImapConnection:
         self.close(force=exc_type is not None)
 
     # -- подключение ---------------------------------------------------------
+    def _tls(self) -> Optional[dict]:
+        """Настройки сертификата подключения к почтовому серверу (только для ящиков «через подключение»)."""
+        if self.account.auth_type != AuthType.SERVER or self.opt.server_tls is None:
+            return None
+        if self._server_tls is None:
+            self._server_tls = dict(self.opt.server_tls(self.account) or {})
+        return self._server_tls
+
     def _ssl_context(self) -> ssl.SSLContext:
         ctx = ssl.create_default_context()
-        if not self.opt.verify_ssl:
+        tls = self._tls()
+        verify = self.opt.verify_ssl if tls is None else (tls.get("verify", True) and not tls.get("pin"))
+        if not verify:
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
         return ctx
+
+    def _check_pin(self) -> None:
+        """Самоподписанный сертификат сервера подключения — только тот, которому доверились (по отпечатку)."""
+        tls = self._tls()
+        if not tls or not tls.get("pin"):
+            return
+        import hashlib
+        try:
+            der = self.client._imap.sock.getpeercert(binary_form=True)  # noqa: SLF001
+        except Exception:  # noqa: BLE001
+            der = None
+        seen = hashlib.sha256(der).hexdigest() if der else ""
+        if seen != tls["pin"]:
+            raise ImapConnectionError(
+                f"Сертификат IMAP-сервера {self.account.host} не тот, которому подключение доверяет (SHA-256 "
+                f"{seen or 'неизвестен'}) — пароль администратора (токен) не отправлен.",
+                hint="IMAP-сервер должен показывать тот же сертификат, что и API (или доверенный); если сертификат "
+                     "меняли — доверьтесь новому в подключении.")
 
     def _timeout(self):
         """
@@ -379,6 +453,8 @@ class ImapConnection:
                 pass
             if acc.security == Security.STARTTLS:
                 client.starttls(self._ssl_context())
+            if acc.security != Security.PLAIN:
+                self._check_pin()
             self._login()
             log.info("Подключение к ящику «%s» (%s:%s) установлено", acc.name, acc.host, acc.port)
         except (LoginError, ImapAuthError):
@@ -418,6 +494,8 @@ class ImapConnection:
                 self.client.oauth2_login(acc.username, access)
             elif acc.auth_type == AuthType.MASTER:
                 self._master_login()
+            elif acc.auth_type == AuthType.SERVER:
+                self._server_login()
             elif acc.auth_type == AuthType.AXIGEN_FTP and not acc.password:
                 # Ящик копируется через FTP Backup Axigen, пароля у него нет: пустой
                 # LOGIN — это неудачный вход с адреса архива (fail2ban банит его целиком).
@@ -429,6 +507,18 @@ class ImapConnection:
             else:
                 self.client.login(acc.username, acc.password)
         except LoginError as exc:
+            if acc.auth_type == AuthType.SERVER:
+                reply = _server_reply(exc)
+                text = "Вход в ящик через подключение к почтовому серверу отклонён сервером."
+                if reply:
+                    text += f" Ответ сервера: «{reply}»."
+                raise ImapAuthError(
+                    text,
+                    hint="Проверьте подключение в разделе «Почтовые серверы» («Проверить подключение») и что "
+                         "серверу разрешено пускать администратора (или приложение) в ящики сотрудников — "
+                         "подробности в документации к виду сервера.",
+                    cause=exc,
+                ) from exc
             if acc.auth_type == AuthType.MASTER:
                 reply = _server_reply(exc)
                 text = "Вход через учётную запись администратора почты отклонён сервером."
@@ -485,6 +575,29 @@ class ImapConnection:
         else:
             self.client.plain_login(master["user"], master["password"],
                                     authorization_identity=acc.username)
+
+    def _server_login(self) -> None:
+        """Войти в ящик через подключение к почтовому серверу (токен приложения или вход администратора)."""
+        acc = self.account
+        if self.opt.server_auth is None:
+            raise ImapAuthError(f"Ящик «{acc.name}» копируется через подключение к почтовому серверу, а подключения "
+                                f"в этом процессе нет.", hint="Перезапустите службу.")
+        auth = self.opt.server_auth(acc)
+        if auth.mech == "xoauth2":
+            self.client.oauth2_login(auth.user or acc.username, auth.secret)
+        elif auth.mech == "plain_authzid":
+            self.client.plain_login(auth.user, auth.secret, authorization_identity=auth.authzid or acc.username)
+        elif auth.mech == "separator":
+            self.client.login(f"{auth.authzid or acc.username}{auth.separator or '*'}{auth.user}", auth.secret)
+        elif auth.mech == "kerio_master":
+            # учебный IMAP-сервер тестов умеет это сам; настоящий IMAPClient — нет
+            custom = getattr(self.client, "kerio_master_login", None)
+            if custom is not None:
+                custom(auth.authzid or acc.username, auth.secret)
+            else:
+                kerio_master_login(self.client, auth.authzid or acc.username, auth.secret)
+        else:
+            self.client.login(auth.user or acc.username, auth.secret)
 
     _CLOSE_TIMEOUT_S = 5
 

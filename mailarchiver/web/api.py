@@ -254,6 +254,8 @@ class AccountBody(BaseModel):
     oauth_token_url: Optional[str] = None
     notes: Optional[str] = None
     retention_days: Optional[int] = None
+    #: подключение к почтовому серверу (способ входа «через подключение»)
+    server_id: Optional[int] = None
 
 
 class RetentionBody(BaseModel):
@@ -389,6 +391,9 @@ def me(request: Request):
     out["must_enroll_2fa"] = auth_mod.two_factor_required(svc, user)
     # разделы, которые включаются в настройках (меню показывает их, только когда они включены)
     out["features"] = {"axigen": bool(svc.rt("axigen", "enabled")) if user.get("role") == "admin" else False}
+    if user.get("role") == "admin":
+        from ..mailservers import store as msstore
+        out["features"]["mailservers"] = len(msstore.list_servers(svc.db))
     return out
 
 
@@ -583,7 +588,17 @@ def state(request: Request, user: dict = Depends(auth_mod.require_user)):
         "replica_alert": _replica_alert(svc) if user.get("role") in roles.STAFF_ROLES else "",
         # сервер Axigen требует внимания (недоступен, очередь, лицензия…) — только администратору
         "axigen_alerts": _axigen_alerts(svc) if user.get("role") == roles.ROLE_ADMIN else [],
+        # подключённые почтовые серверы требуют внимания — тоже только администратору
+        "mailserver_alerts": _mailserver_alerts(svc) if user.get("role") == roles.ROLE_ADMIN else [],
     }
+
+
+def _mailserver_alerts(svc) -> list:
+    try:
+        from ..mailservers.monitor import problems as ms_problems
+        return ms_problems(svc)
+    except Exception:  # noqa: BLE001
+        return []
 
 
 def _axigen_alerts(svc) -> list:
@@ -687,7 +702,7 @@ def _account_from_body(body: AccountBody, account_id: Optional[int] = None,
         # затирает сохранённое — как и с секретами
         oauth_client_id = oauth_client_id or before.oauth_client_id
         oauth_token_url = oauth_token_url or before.oauth_token_url
-    return Account(
+    acc = Account(
         id=account_id, name=body.name.strip(), host=body.host.strip(), port=int(body.port),
         username=body.username.strip(), password=body.password, auth_type=body.auth_type,
         security=body.security, enabled=body.enabled,
@@ -700,6 +715,34 @@ def _account_from_body(body: AccountBody, account_id: Optional[int] = None,
         notes=keep(body.notes, before.notes if before else "", ""),
         retention_days=keep(body.retention_days, before.retention_days if before else -1, -1),
     )
+    if acc.auth_type == AuthType.SERVER:
+        acc.server_id = keep(body.server_id, getattr(before, "server_id", None) if before else None, None)
+    return acc
+
+
+def _validate_server_auth(svc, acc: Account) -> None:
+    """Ящик «через подключение к почтовому серверу»: подключение есть, умеет входить без паролей, сервер — его."""
+    if acc.auth_type != AuthType.SERVER:
+        return
+    from ..mailservers import service as mss
+    from ..mailservers import store as msstore
+    from ..mailservers.base import Cap
+    conn = msstore.get_server(svc.db, acc.server_id) if acc.server_id else None
+    if conn is None:
+        raise ValidationError("Выберите подключение к почтовому серверу.",
+                              hint="Подключения настраиваются в разделе «Почтовые серверы».")
+    cls = mss.driver_class(conn.type)
+    if not cls.can(Cap.IMAP_ADMIN):
+        raise ValidationError(f"{cls.label}: копирование без паролей сотрудников не поддерживается — выберите вход "
+                              f"по паролю.")
+    drv = mss.driver(svc, conn)
+    # токен приложения (или пароль администратора) уходит только на сервер этого подключения и только шифрованно
+    problem = mss.imap_target_problem(drv, acc.host, acc.security)
+    if problem:
+        host = (drv.imap_server()[0] or "").strip().lower()
+        raise ValidationError(problem[:1].upper() + problem[1:] + ".",
+                              hint=f"Укажите сервер {host} с SSL/TLS или STARTTLS — или другой способ входа."
+                              if host else "Задайте IMAP-сервер в подключении (раздел «Почтовые серверы»).")
 
 
 def _validate_account(acc: Account) -> None:
@@ -800,6 +843,7 @@ def create_account(request: Request, body: AccountBody, user: dict = Depends(aut
     _require_not_mailbox(user)
     acc = _account_from_body(body)
     _validate_account(acc)
+    _validate_server_auth(svc, acc)
     acc.id = svc.db.create_account(acc)
     svc.db.add_audit(user["username"], "account_create", acc.name)
     return {"ok": True, "id": acc.id}
@@ -830,6 +874,7 @@ def update_account(request: Request, account_id: int, body: AccountBody, user: d
     before = svc.db.get_account(account_id)
     acc = _account_from_body(body, account_id, before)
     _validate_account(acc)
+    _validate_server_auth(svc, acc)
     # Каждый секрет обновляется независимо: пустое поле НЕ затирает сохранённый секрет.
     svc.db.update_account(
         acc,

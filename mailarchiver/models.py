@@ -34,11 +34,12 @@ class JobType:
     AXIGEN_SYNC = "axigen_sync"          # сверка учётных записей сервера Axigen с архивом
     AXIGEN_ACTION = "axigen_action"      # изменения на сервере Axigen для выбранных ящиков
     SERVER_ACTION = "server_action"      # групповые действия с ящиками на почтовом сервере (Axigen и IMAP)
+    SERVER_SYNC = "server_sync"          # сверка учётных записей подключённого почтового сервера
 
     ALL = [BACKUP, RESTORE, EXPORT, IMPORT_PST, TEST, RETENTION, VERIFY, ANALYZE, SYNC_EMPLOYEES,
            STORAGE_CONVERT, CHECK_LOGINS, REPLICATE, DB_SNAPSHOT, SEARCH_INDEX, DEDUP_REPORT, CLEANUP,
            BACKUP_ALL, QUARANTINE_CHECK, QUARANTINE_RESCUE, FOLDERS_CHECK, SEARCH_REINDEX, AXIGEN_SYNC,
-           AXIGEN_ACTION, SERVER_ACTION]
+           AXIGEN_ACTION, SERVER_ACTION, SERVER_SYNC]
     LABELS = {
         BACKUP: "Резервное копирование",
         RESTORE: "Восстановление",
@@ -64,6 +65,7 @@ class JobType:
         AXIGEN_SYNC: "Сверка с сервером Axigen",
         AXIGEN_ACTION: "Действия на сервере Axigen",
         SERVER_ACTION: "Действия с ящиками на сервере",
+        SERVER_SYNC: "Сверка с почтовым сервером",
     }
     #: Задания, которые после перезапуска службы не продолжаются сами: они меняют
     #: почтовый сервер по кнопке администратора, а за время простоя состояние могли
@@ -106,10 +108,13 @@ class AuthType:
     #: копирование через службу FTP Backup сервера Axigen (входит администратор Axigen);
     #: пароль ящика, если задан, нужен только операциям по IMAP (восстановление на сервер)
     AXIGEN_FTP = "axigen_ftp"
+    #: вход через подключение к почтовому серверу (раздел «Почтовые серверы»): токен приложения
+    #: (Microsoft 365, Google, Яндекс 360) или вход администратора сервера — пароль ящика не нужен
+    SERVER = "server"
 
-    ALL = [PASSWORD, OAUTH2, MASTER, AXIGEN_FTP]
+    ALL = [PASSWORD, OAUTH2, MASTER, AXIGEN_FTP, SERVER]
     LABELS = {PASSWORD: "логин и пароль", OAUTH2: "OAuth2", MASTER: "через администратора почты",
-              AXIGEN_FTP: "через FTP Backup Axigen"}
+              AXIGEN_FTP: "через FTP Backup Axigen", SERVER: "через подключение к почтовому серверу"}
 
 
 def account_has_credentials(acc) -> bool:
@@ -118,6 +123,8 @@ def account_has_credentials(acc) -> bool:
         return bool(acc.oauth_refresh_token)
     if acc.auth_type in (AuthType.MASTER, AuthType.AXIGEN_FTP):
         return True
+    if acc.auth_type == AuthType.SERVER:
+        return bool(getattr(acc, "server_id", None))
     return bool(acc.password)
 
 
@@ -203,6 +210,8 @@ class Account:
     dismissed_at: str = ""
     #: копирование выключено автоматически при увольнении (вернётся при повторном приёме)
     auto_disabled: bool = False
+    #: подключение к почтовому серверу, через которое копируется ящик (``auth_type = server``)
+    server_id: Optional[int] = None
 
     def on_hold(self, today: Optional[str] = None) -> bool:
         """Удерживается ли архив ящика (очистка по сроку не действует)."""
@@ -220,6 +229,7 @@ class Account:
             "port": self.port,
             "username": self.username,
             "auth_type": self.auth_type,
+            "server_id": self.server_id,
             "security": self.security,
             "enabled": self.enabled,
             "folder_include": self.folder_include,

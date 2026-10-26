@@ -106,7 +106,7 @@ def handle_job(ctx) -> Dict:
                 progress.mark(svc.db, op_id, key, progress.SKIPPED)
                 continue
             try:
-                reason = action.base_check(op, t) or action.check(op, t)
+                reason = action.target_check(op, t)
             except MailArchiverError as exc:
                 reason = exc.message
             if reason:
@@ -115,7 +115,7 @@ def handle_job(ctx) -> Dict:
             # до изменения: если служба упадёт посреди ящика, «Повторить» предупредит о нём
             progress.mark(svc.db, op_id, t.key, progress.RUNNING)
             try:
-                status, text = action.execute(op, t)
+                status, text = action.target_execute(op, t)
             except (JobCancelled, DiskSpaceError):
                 raise
             except MailArchiverError as exc:

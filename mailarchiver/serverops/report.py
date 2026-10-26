@@ -44,20 +44,45 @@ class ReportAction(ServerAction):
             if st.enabled and st.configured:
                 return ""
         problem = tg.imap_problem(ctx.svc, t.mailbox)
+        if t.server is not None:
+            if t.deleted:
+                return "учётная запись удалена на сервере"
+            if problem and self._by_api(t):
+                return ""
         return problem
+
+    @staticmethod
+    def _by_api(t) -> bool:
+        from ..mailservers.base import Cap
+        from . import server_accounts
+        return server_accounts.has(t, Cap.USAGE)
 
     def plan(self, ctx, t):
         st = ctx.axigen()
         if t.axigen is not None and st.enabled and st.configured:
             return "через CLI Axigen"
+        if t.server is not None and tg.imap_problem(ctx.svc, t.mailbox):
+            from . import server_accounts
+            return f"через API {server_accounts.label(t)} (без папок и непрочитанных)"
         return "по IMAP"
 
     def execute(self, ctx, t):
         st = ctx.axigen()
         if t.axigen is not None and st.enabled and st.configured:
             data = self._axigen(ctx, t)
+        elif t.server is not None and tg.imap_problem(ctx.svc, t.mailbox):
+            data = self._server(ctx, t)
         else:
             data = self._imap(ctx, t)
+            if t.server is not None and data.get("quota") is None and self._by_api(t):
+                # IMAP квоту не показал — берём из API сервера (последняя сверка)
+                quota = (t.server.get("quota_kb") or 0) * 1024 or None
+                used = t.server.get("used_bytes")
+                data["quota"] = quota
+                if data.get("size") is None:
+                    data["size"] = used
+                if quota and data.get("size") is not None:
+                    data["percent"] = round(100.0 * data["size"] / quota, 1)
         data.update({"email": t.email, "name": t.name, "server": t.host})
         from .usage import record, today
         record(ctx.db, t.key, data.get("size"), data.get("quota"), data.get("messages"), day=today(ctx.svc))
@@ -93,6 +118,32 @@ class ReportAction(ServerAction):
                 "quota": quota, "percent": round(100.0 * size / quota, 1) if quota and size is not None else None,
                 "unseen": None, "folders": len(folders),
                 "top": "; ".join(f"{f.name} {human_size(f.size)}" for f in top)}
+
+    def _server(self, ctx, t) -> Dict[str, Any]:
+        from ..mailservers import service as mss
+        from ..mailservers import store as msstore
+        from ..mailservers.base import normalize_account
+        from . import server_accounts
+        with mss.session(ctx.svc, t.conn, user=ctx.user, kind="read", summary=f"Отчёт {t.email}") as drv:
+            raw = drv.get_account(t.email)
+        if raw is None:
+            raise ValidationError("учётной записи на сервере больше нет")
+        acc = normalize_account(raw)
+        msstore.upsert_account(ctx.db, t.conn.id, acc)
+        size = acc.get("used_bytes")
+        quota = acc.get("quota_bytes") or None
+        messages = acc.get("messages")
+        source = f"API {server_accounts.label(t)}"
+        if size is None and t.server.get("used_bytes") is not None:
+            # одна учётная запись занятого места не сообщает (Microsoft 365 — только отчётом) — из сверки
+            size, messages = t.server.get("used_bytes"), t.server.get("messages")
+            quota = quota or ((t.server.get("quota_kb") or 0) * 1024 or None)
+            msstore.update_fields(ctx.db, t.conn.id, t.email, used_bytes=size, messages=messages,
+                                  quota_kb=(quota // 1024) if quota else None)
+            source += " (по последней сверке)"
+        return {"source": source, "messages": messages, "size": size,
+                "quota": quota, "percent": round(100.0 * size / quota, 1) if quota and size is not None else None,
+                "unseen": None, "folders": None, "top": ""}
 
     def _imap(self, ctx, t) -> Dict[str, Any]:
         from .imap_ops import connect

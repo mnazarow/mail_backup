@@ -485,3 +485,7 @@ table.tbl select[data-role]:focus { outline: none; border-color: var(--primary);
 .srv-items { min-width: 560px; }
 .srv-tbl td, .srv-tbl th, .srv-hist td, .srv-items td { overflow-wrap: normal; }
 .srv-tbl td.srv-mail { overflow-wrap: anywhere; min-width: 200px; }
+
+/* Почтовые серверы */
+.card.ms-bad { border-color: var(--danger); }
+.ms-types .bulk-tiles { grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }

@@ -213,7 +213,19 @@ class Services:
             fetch_batch_size=int(self.rt("backup", "fetch_batch_size")),
             on_refresh_token=self._save_refresh_token,
             master=self.master_credentials(),
+            server_auth=self.server_imap_auth,
+            server_tls=self.server_imap_tls,
         )
+
+    def server_imap_tls(self, account: Account) -> dict:
+        """Проверка сертификата для ящика «через подключение» — по настройкам подключения."""
+        from .mailservers.service import imap_tls_for
+        return imap_tls_for(self, account)
+
+    def server_imap_auth(self, account: Account):
+        """Как войти в ящик, который копируется через подключение к почтовому серверу."""
+        from .mailservers.service import imap_auth_for
+        return imap_auth_for(self, account)
 
     def master_credentials(self) -> Optional[dict]:
         """Учётная запись администратора почты для ящиков «вход через администратора»."""

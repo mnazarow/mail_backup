@@ -25,7 +25,7 @@ FROM python:3.12-slim
 
 LABEL org.opencontainers.image.title="MailArchiver" \
       org.opencontainers.image.description="Резервное копирование почтовых ящиков по IMAP с веб-интерфейсом" \
-      org.opencontainers.image.version="1.13.0"
+      org.opencontainers.image.version="1.14.0"
 
 # readpst — запасной способ разбора .pst (основной встроен в службу);
 # ca-certificates — для TLS/OAuth2;

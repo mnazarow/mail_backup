@@ -33,8 +33,8 @@ log = get_logger("serverops")
 HISTORY_PREFIX = "srv_"
 
 GROUPS: List[Tuple[str, str]] = [
-    ("access", "Вход и пароли (Axigen)"),
-    ("accounts", "Учётные записи (Axigen)"),
+    ("access", "Вход и пароли"),
+    ("accounts", "Учётные записи"),
     ("folders", "Папки и письма (IMAP)"),
     ("cleanup", "Очистка — только при полном архиве"),
     ("reports", "Проверки и отчёты"),
@@ -100,10 +100,12 @@ class ServerAction:
     note = ""
     #: 0 — обычное, 1 — внимательно, 2 — опасное (подтверждается числом ящиков)
     danger = 0
-    #: что нужно ящику: "axigen" — учётная запись Axigen; "imap" — вход в ящик по IMAP;
-    #: "mailbox" — ящик в архиве
+    #: что нужно ящику: "axigen" — учётная запись на сервере (Axigen или подключённого почтового сервера —
+    #: для подключений действие выполняет :mod:`.server_accounts`, если сервер это умеет); "server" — только
+    #: учётная запись подключённого сервера; "imap" — вход в ящик по IMAP; "mailbox" — ящик в архиве
     needs = "axigen"
-    #: меняет учётные записи Axigen — нужно «Разрешить изменения на сервере»
+    #: меняет учётные записи на сервере — нужно «Разрешить изменения на сервере» (Axigen — в настройках,
+    #: подключения — в каждом подключении)
     axigen_change = False
     #: выполняется сразу при запуске (без задания): ничего не меняет на сервере
     immediate = False
@@ -115,13 +117,24 @@ class ServerAction:
 
     def available(self, svc) -> str:
         """Почему действие сейчас недоступно (пусто — доступно)."""
+        if self.needs == "server":
+            return "" if has_connections(svc) else "нет подключённых почтовых серверов (раздел «Почтовые серверы»)"
         if self.needs == "axigen" or self.axigen_change:
-            from ..axigen.common import load_settings
-            st = load_settings(svc)
-            if not st.enabled:
-                return "работа с сервером Axigen выключена (Настройки → Сервер Axigen)"
-            if self.axigen_change and not st.allow_changes:
-                return "изменения на сервере Axigen не разрешены (Настройки → Сервер Axigen)"
+            problem = self.axigen_unavailable(svc)
+            if problem and has_connections(svc) and self.key not in _axigen_only():
+                # есть подключённые серверы — действие доступно им; учётные записи Axigen пропустятся с причиной
+                return ""
+            return problem
+        return ""
+
+    def axigen_unavailable(self, svc) -> str:
+        """Почему с учётными записями Axigen это действие сейчас не выполнить (пусто — можно)."""
+        from ..axigen.common import load_settings
+        st = load_settings(svc)
+        if not st.enabled:
+            return "работа с сервером Axigen выключена (Настройки → Сервер Axigen)"
+        if self.axigen_change and not st.allow_changes:
+            return "изменения на сервере Axigen не разрешены (Настройки → Сервер Axigen)"
         return ""
 
     def describe(self, svc) -> Dict[str, Any]:
@@ -138,18 +151,29 @@ class ServerAction:
         if problem:
             raise ValidationError(problem[0].upper() + problem[1:] + ".")
         if self.needs == "axigen" or self.axigen_change:
-            st = ctx.axigen()
-            try:
-                st.require()
-            except Exception as exc:  # noqa: BLE001
-                raise ValidationError(getattr(exc, "message", str(exc)), hint=getattr(exc, "hint", None)) from exc
+            ax_problem = self.axigen_unavailable(ctx.svc)
+            if not ax_problem:
+                st = ctx.axigen()
+                try:
+                    st.require()
+                except Exception as exc:  # noqa: BLE001
+                    if not has_connections(ctx.svc):
+                        raise ValidationError(getattr(exc, "message", str(exc)),
+                                              hint=getattr(exc, "hint", None)) from exc
+                    ax_problem = "Axigen: " + getattr(exc, "message", str(exc))
+            # учётные записи Axigen пропустятся с этой причиной (действие выполняется для подключений)
+            ctx.data["axigen_problem"] = ax_problem
 
     def base_check(self, ctx: Ctx, t: tg.Target) -> str:
         if self.needs == "axigen":
             if t.axigen is None:
-                return "это не учётная запись Axigen (ящик на другом сервере)"
+                return NOT_ON_SERVER
             if t.deleted:
                 return "учётная запись удалена на сервере"
+        elif self.needs == "server":
+            if t.server is None:
+                return ("у ящика нет учётной записи на подключённом почтовом сервере (раздел «Почтовые серверы»)"
+                        + ("; у Axigen это настраивается в WebMail или WebAdmin" if t.axigen is not None else ""))
         elif self.needs == "imap":
             problem = tg.imap_problem(ctx.svc, t.mailbox)
             if problem:
@@ -160,6 +184,37 @@ class ServerAction:
             if t.mailbox is None:
                 return "ящика нет в архиве"
         return ""
+
+    # -- ящик: общая проверка, план, выполнение ------------------------------
+    def _for_server(self, t: tg.Target) -> bool:
+        return t.kind == "server" and self.needs in ("axigen", "server")
+
+    def target_check(self, ctx: Ctx, t: tg.Target) -> str:
+        """Почему ящик пропускается (пусто — выполняется). Учётные записи подключений — :mod:`.server_accounts`."""
+        if self._for_server(t):
+            from . import server_accounts
+            return server_accounts.check(self, ctx, t)
+        if t.kind == "axigen" and (self.needs == "axigen" or self.axigen_change) and ctx.data.get("axigen_problem"):
+            return ctx.data["axigen_problem"]
+        return self.base_check(ctx, t) or self.check(ctx, t)
+
+    def target_plan(self, ctx: Ctx, t: tg.Target) -> str:
+        if self._for_server(t):
+            from . import server_accounts
+            return server_accounts.plan(self, ctx, t)
+        return self.plan(ctx, t)
+
+    def target_execute(self, ctx: Ctx, t: tg.Target) -> Tuple[str, str]:
+        if self._for_server(t):
+            from . import server_accounts
+            return server_accounts.execute(self, ctx, t)
+        return self.execute(ctx, t)
+
+    def target_apply(self, ctx: Ctx, t: tg.Target) -> str:
+        if self._for_server(t):
+            from . import server_accounts
+            return server_accounts.apply(self, ctx, t)
+        return self.apply(ctx, t)
 
     def check(self, ctx: Ctx, t: tg.Target) -> str:
         return ""
@@ -194,6 +249,25 @@ def _schedulable() -> Tuple[str, ...]:
     return SCHEDULABLE
 
 
+def _axigen_only() -> Tuple[str, ...]:
+    from .server_accounts import AXIGEN_ONLY
+    return AXIGEN_ONLY
+
+
+#: Почему действие с учётной записью не выполняется для ящика без неё.
+NOT_ON_SERVER = ("у ящика нет учётной записи ни на Axigen, ни на подключённом почтовом сервере — с ним можно "
+                 "работать только по IMAP")
+
+
+def has_connections(svc) -> bool:
+    """Есть ли включённые подключения к почтовым серверам (раздел «Почтовые серверы»)."""
+    try:
+        from ..mailservers import store as msstore
+        return any(c.enabled for c in msstore.list_servers(svc.db))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 REGISTRY: Dict[str, ServerAction] = {}
 
 
@@ -206,7 +280,7 @@ def register(*actions: ServerAction) -> None:
 
 def _load_actions() -> None:
     # модули регистрируют свои действия при импорте (повторный импорт ничего не делает)
-    from . import axigen_ops, imap_ops, report  # noqa: F401
+    from . import axigen_ops, imap_ops, report, server_actions  # noqa: F401
 
 
 def get(key: str) -> ServerAction:
@@ -275,7 +349,7 @@ def run(svc, user: dict, action_key: str, keys: Sequence, params: Optional[Dict[
                             "detail": "ящик не найден (удалён или не было в сверке)"})
             continue
         try:
-            reason = action.base_check(ctx, t) or action.check(ctx, t)
+            reason = action.target_check(ctx, t)
         except MailArchiverError as exc:
             reason = exc.message
         if reason:
@@ -294,13 +368,13 @@ def run(svc, user: dict, action_key: str, keys: Sequence, params: Optional[Dict[
     for t in to_apply:
         if preview:
             try:
-                results.append(_item(t, OK, action.plan(ctx, t)))
+                results.append(_item(t, OK, action.target_plan(ctx, t)))
             except MailArchiverError as exc:
                 results.append(_item(t, FAIL, exc.message))
             continue
         if action.immediate:
             try:
-                results.append(_item(t, OK, action.apply(ctx, t)))
+                results.append(_item(t, OK, action.target_apply(ctx, t)))
             except MailArchiverError as exc:
                 results.append(_item(t, FAIL, exc.message + (f" {exc.hint}" if exc.hint else "")))
             except Exception as exc:  # noqa: BLE001

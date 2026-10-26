@@ -82,6 +82,10 @@ class SchedulerService:
             self._sched.add_job(self._axigen_monitor_tick, IntervalTrigger(minutes=15), id="axigen_monitor",
                                 replace_existing=True, coalesce=True, max_instances=1, misfire_grace_time=600,
                                 next_run_time=datetime.now(timezone.utc) + timedelta(minutes=1))
+            # состояние подключённых почтовых серверов — тоже каждые 15 минут
+            self._sched.add_job(self._mailservers_monitor_tick, IntervalTrigger(minutes=15), id="mailservers_monitor",
+                                replace_existing=True, coalesce=True, max_instances=1, misfire_grace_time=600,
+                                next_run_time=datetime.now(timezone.utc) + timedelta(minutes=2))
         self.reload(catch_up=True)
 
     def stop(self) -> None:
@@ -122,11 +126,12 @@ class SchedulerService:
         self._reload_replica()
         self._reload_summary()
         self._reload_axigen_sync()
+        self._reload_mailserver_syncs()
         if not was_enabled:
             log.info("Планировщик запущен.")
 
     #: Служебные задания, которые работают всегда (не зависят от scheduler.enabled).
-    ALWAYS_JOBS = ("maintenance", "search_index", "axigen_monitor")
+    ALWAYS_JOBS = ("maintenance", "search_index", "axigen_monitor", "mailservers_monitor")
 
     # -- синхронизация сотрудников ------------------------------------------
     EMPLOYEES_JOB_ID = "employees_sync"
@@ -268,6 +273,45 @@ class SchedulerService:
         except Exception:  # noqa: BLE001
             log.exception("Ошибка при постановке сверки с Axigen")
             return None
+
+    # -- подключённые почтовые серверы: сверка по расписанию каждого подключения ------
+    def _reload_mailserver_syncs(self) -> None:
+        try:
+            from ..mailservers import store as msstore
+            conns = msstore.list_servers(self.services.db, enabled_only=True)
+        except Exception:  # noqa: BLE001
+            return
+        for conn in conns:
+            if not conn.sync_enabled:
+                continue
+            trigger = self._cron_trigger(conn.sync_cron or "50 4 * * *", f"сверки «{conn.name}»")
+            if trigger is None:
+                continue
+            self._sched.add_job(self._fire_mailserver_sync, trigger, args=[conn.id], id=f"mailserver_sync_{conn.id}",
+                                **self._job_kwargs())
+
+    def _fire_mailserver_sync(self, server_id: int) -> Optional[int]:
+        svc = self.services
+        try:
+            for job in svc.db.active_jobs():
+                if job["type"] == JobType.SERVER_SYNC and json.loads(job["params"] or "{}").get("server_id") == server_id:
+                    log.warning("Сверка с почтовым сервером №%s по расписанию пропущена: предыдущая ещё идёт.",
+                                server_id)
+                    return None
+            job_id = svc.queue.enqueue(JobType.SERVER_SYNC, None, {"server_id": server_id, "requested_by": "scheduler"},
+                                       priority=6, created_by="scheduler")
+            log.info("Сверка с почтовым сервером №%s по расписанию → задание #%s.", server_id, job_id)
+            return job_id
+        except Exception:  # noqa: BLE001
+            log.exception("Ошибка при постановке сверки с почтовым сервером №%s", server_id)
+            return None
+
+    def _mailservers_monitor_tick(self) -> None:
+        try:
+            from ..mailservers.monitor import tick
+            tick(self.services)
+        except Exception:  # noqa: BLE001
+            log.exception("Ошибка проверки состояния почтовых серверов")
 
     def _axigen_monitor_tick(self) -> None:
         try:

@@ -59,7 +59,8 @@ GROUPS: List[Tuple[str, str]] = [
 ]
 
 AUTH_LABELS = {AuthType.PASSWORD: "по паролю ящика", AuthType.MASTER: "через администратора почты",
-               AuthType.OAUTH2: "OAuth2", AuthType.AXIGEN_FTP: "через FTP Backup Axigen"}
+               AuthType.OAUTH2: "OAuth2", AuthType.AXIGEN_FTP: "через FTP Backup Axigen",
+               AuthType.SERVER: "через подключение к почтовому серверу"}
 
 
 def retention_label(days: Optional[int]) -> str:

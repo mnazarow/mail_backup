@@ -82,11 +82,13 @@ class CreateBody(BaseModel):
     quota_mb: int = 0
     add_to_archive: bool = True
     preview: bool = True
+    #: где создавать: 0 — Axigen, иначе номер подключения к почтовому серверу
+    server_id: int = 0
 
 
 @router.post("/create")
 def server_create(request: Request, body: CreateBody, user: dict = Depends(auth_mod.require_admin)):
-    """Создать учётные записи Axigen списком (проверка — ``preview``)."""
+    """Создать учётные записи списком — на Axigen или на подключённом почтовом сервере (проверка — ``preview``)."""
     from ..serverops import create
     return create.run(_svc(request), user, body.model_dump(), preview=body.preview)
 

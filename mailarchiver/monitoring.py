@@ -248,6 +248,12 @@ def render_prometheus(svc, *, per_account: bool = True) -> str:
             out.metric(name, help_text, kind, samples)
     except Exception:  # noqa: BLE001 — метрики Axigen не должны ломать остальные
         pass
+    try:
+        from .mailservers.monitor import metrics as mailserver_metrics
+        for name, help_text, kind, samples in mailserver_metrics(svc):
+            out.metric(name, help_text, kind, samples)
+    except Exception:  # noqa: BLE001 — и метрики подключённых серверов тоже
+        pass
     if per_account:
         rows = acc["accounts"]
 
@@ -387,6 +393,14 @@ def weekly_summary(svc, days: int = 7, *, fresh: bool = True, security: bool = T
             lines.extend(ax_lines)
             problems += len(axigen_problems(svc))
     except Exception:  # noqa: BLE001 — сводка уходит и без раздела Axigen
+        pass
+    try:
+        from .mailservers.monitor import problems as ms_problems, summary_lines as ms_summary
+        ms_lines = ms_summary(svc)
+        if ms_lines:
+            lines.extend(ms_lines)
+            problems += len(ms_problems(svc))
+    except Exception:  # noqa: BLE001
         pass
     if security and sec is not None and (sec["pw"] or sec["otp"] or sec["imap"]):
         lines.append(f"Безопасность за неделю: неудачных входов {sec['pw']}, неверных кодов 2FA {sec['otp']}, "
