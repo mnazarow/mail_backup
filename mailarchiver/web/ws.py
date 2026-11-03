@@ -18,7 +18,7 @@ from typing import Dict, List, Optional
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from ..logging_setup import get_logger, memory_handler
-from .api import redact_job_for, serialize_job, visible_author
+from .api import cap_active_jobs, redact_job_for, serialize_job, visible_author
 from .proxy import check_origin, host_is_trusted
 from . import auth as auth_mod
 
@@ -197,10 +197,11 @@ async def ws_live(websocket: WebSocket):
 
 def _collect_snapshot(services) -> dict:
     """Общий снимок состояния — считается один раз на всех подписчиков."""
+    names = services.db.account_names()          # один раз на снимок, а не на каждое задание
     return {
         "type": "live",
-        "active_jobs": [serialize_job(j, services.db.account_names()) for j in services.db.active_jobs()],
-        "job_counts": services.db.count_jobs_by_status(),
+        "active_jobs": [serialize_job(j, names) for j in services.db.active_jobs()],
+        "job_counts": services.db.count_jobs_by_status(active_only=True),
         "scheduler_running": services.scheduler.running(),
         "logs": memory_handler.tail(limit=40),
     }
@@ -220,13 +221,17 @@ def _personal_snapshot(snapshot: dict, user: dict) -> dict:
         own = [dict(j, created_by=visible_author(j.get("created_by", ""), user))
                for j in snapshot.get("active_jobs", []) if j["account_id"] == aid]
         out["active_jobs"] = own
+        out["queued_hidden"] = 0
         # Счётчики очереди — тоже общесистемные данные: пользователь-ящик
         # видит количество только своих активных заданий.
         out["job_counts"] = {"running": sum(1 for j in own if j["status"] == "running"),
                              "queued": sum(1 for j in own if j["status"] == "queued")}
+    else:
+        # ждущих — первые LIVE_QUEUED_LIMIT: весь список очереди каждой вкладке каждые 1,5 с не нужен
+        out["active_jobs"], out["queued_hidden"] = cap_active_jobs(snapshot.get("active_jobs", []))
     if user.get("role") == auth_mod.ROLE_OPERATOR:
         # ход и ошибки выгрузок, восстановления и т. п. — без подробностей (как в /api/jobs)
-        out["active_jobs"] = [redact_job_for(user, j) for j in snapshot.get("active_jobs", [])]
+        out["active_jobs"] = [redact_job_for(user, j) for j in out.get("active_jobs", [])]
     if user.get("role") not in auth_mod.STAFF_ROLES:
         # Общий лог сервиса (имена и хосты чужих ящиков, ошибки чужих заданий)
         # отдаём только администратору и оператору — как и /api/logs.

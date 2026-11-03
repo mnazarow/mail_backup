@@ -118,6 +118,12 @@ def _now():
 BACKGROUND_HEADER = "x-ma-background"
 
 
+#: Как часто продлевать сессию (запись в базу). Раньше её продлевал КАЖДЫЙ запрос интерфейса: запись в базу
+#: ждала своей очереди за записями копирования писем, и даже лёгкие запросы стояли в этой очереди. Тайм-аут
+#: бездействия считается в минутах — минутная точность ему не мешает.
+TOUCH_EVERY_S = 60
+
+
 def current_user(request: Request) -> Optional[dict]:
     """Вернуть словарь пользователя по cookie сессии или None."""
     touch = request.headers.get(BACKGROUND_HEADER, "") != "1"
@@ -159,7 +165,7 @@ def user_from_token(services, token: str, touch: bool = True) -> Optional[dict]:
     if _now() > expires or (_now() - last_seen) > timedelta(minutes=idle_min):
         services.db.delete_session(token)
         return None
-    if touch:
+    if touch and (_now() - last_seen) > timedelta(seconds=TOUCH_EVERY_S):
         services.db.touch_session(token)
     role = (row["role"] or "admin")
     if role == "mailbox":

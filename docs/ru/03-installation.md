@@ -680,6 +680,7 @@ location / {
     proxy_http_version 1.1;                       # для WebSocket (живой дашборд)
     proxy_set_header Upgrade    $http_upgrade;
     proxy_set_header Connection "upgrade";
+    gzip on; gzip_types application/json;         # сжатие ответов API (в 10–15 раз)
 }
 ```
 

@@ -623,7 +623,7 @@ async function viewDashboard(c){
 
   const live=h(`<div class="card" style="margin-bottom:16px"><div class="section-title"><h3>🔴 Текущие операции</h3><div class="spacer"></div><span class="muted small">обновляется в реальном времени</span></div><div id="liveJobs"></div></div>`);
   c.appendChild(live);
-  updateDashboardLive({active_jobs:s.active_jobs, job_counts:s.job_counts});
+  updateDashboardLive({active_jobs:s.active_jobs, job_counts:s.job_counts, queued_hidden:s.queued_hidden});
 
   const grid=h(`<div class="grid cols-2">
     <div class="card"><div class="section-title"><h3>📈 Активность</h3><span class="muted small">новые письма за 30 дней</span></div><div class="an-chart" id="chartBox"></div></div>
@@ -666,6 +666,11 @@ function updateDashboardLive(d){
     </div>`);
     box.appendChild(row);
   });
+  // Ждущих сервер присылает первые 50: когда расписания ставят в очередь сотни ящиков разом, весь список
+  // каждые полторы секунды и тормозил вкладку, и не помещался на экран — он есть в «Очереди и заданиях».
+  if(d.queued_hidden>0){
+    box.appendChild(h(`<div class="kv" style="justify-content:center"><a href="#/jobs" class="muted small">…и ещё ${fmtNum(d.queued_hidden)} ${plural(d.queued_hidden,'задание','задания','заданий')} в очереди — открыть «Очередь и задания»</a></div>`));
+  }
   box.querySelectorAll('[data-cancel]').forEach(b=>b.onclick=async()=>{ try{ await api(`/jobs/${b.dataset.cancel}/cancel`,{method:'POST'}); toast('Отмена запрошена'); }catch(e){toastErr(e);} });
 }
 function accName(id){ const a=(State.accounts||[]).find(x=>x.id===id); return a?a.name:''; }
@@ -2705,6 +2710,7 @@ function renderJobsRows(jobs){
   });
 }
 let jobsRefreshAt = 0;
+let jobsMissingSeen = new Set();   // активные задания, которых нет среди последних 80 (уже перезапрашивали)
 /** Живое обновление очереди.
  *
  * Активные задания уже приходят в снимке по WebSocket — берём их оттуда, а
@@ -2718,15 +2724,20 @@ async function updateJobsLive(d){
   if(active && now - jobsRefreshAt < 10000){
     const tb=$('#jobsBody'); if(!tb) return;
     // Обновляем только прогресс уже нарисованных строк — DOM не пересобираем.
+    // Строки нет — появилось новое задание: перечитаем список целиком, но один раз. Если и после этого
+    // строки нет (в очереди сотни заданий, а в таблице — последние 80), не перечитываем на каждом такте.
+    const missing=new Set();
     active.forEach(j=>{
       const row=tb.querySelector(`tr[data-job="${j.id}"]`);
-      if(!row) { jobsRefreshAt = 0; return; }        // появилось новое задание — обновим целиком
+      if(!row) { missing.add(j.id); return; }
       const cell=row.querySelector('[data-prog]');
       if(cell) cell.innerHTML = jobProgressHtml(j);
       const badge=row.querySelector('.badge');
       if(badge){ badge.className='badge '+j.status; badge.textContent=j.status_label; }
     });
-    return;
+    const fresh=[...missing].some(id=>!jobsMissingSeen.has(id));
+    jobsMissingSeen=missing;
+    if(!fresh) return;
   }
   try{ jobsRefreshAt=now; const jobs=await api('/jobs?limit=80',{bg:true}); if(State.view==='jobs') renderJobsRows(jobs); }catch(e){}
 }

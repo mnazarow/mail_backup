@@ -279,15 +279,18 @@ def system_analytics(svc, account_id: Optional[int] = None, *, days: int = 90) -
     folders = db.distinct_folder_count(account_id)
     enabled = sum(1 for a in accounts if a.enabled)
     per_account = []
+    # по ящикам — тремя общими запросами, а не тремя на каждый ящик (на тысячах ящиков — секунды)
+    totals = db.message_totals_by_account()
+    folder_counts = db.folder_counts_by_account()
+    last_runs = db.last_runs_by_account()
     for a in accounts:
-        cnt = db.count_messages(a.id)
-        by = db.sum_message_bytes(a.id)
-        runs = db.list_runs(a.id, limit=1)
-        last = runs[0] if runs else None
+        t = totals.get(a.id) or {}
+        cnt, by = int(t.get("messages", 0)), int(t.get("bytes", 0))
+        last = last_runs.get(a.id)
         per_account.append({
             "id": a.id, "name": a.name, "username": a.username, "enabled": a.enabled,
             "messages": cnt, "bytes": by, "bytes_h": human_size(by),
-            "folders": db.distinct_folder_count(a.id),
+            "folders": int(folder_counts.get(a.id, 0)),
             "retention_days": a.retention_days,
             "last_run": ({"status": last["status"], "finished_at": last["finished_at"],
                           "messages_new": last["messages_new"]} if last else None),

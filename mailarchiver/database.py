@@ -93,6 +93,8 @@ class Database:
         self.wal = wal
         self._local = threading.local()
         self._write_lock = threading.RLock()
+        #: расшифрованные секреты по шифротексту (см. _decrypt_opt)
+        self._plain_cache: Dict[Tuple[int, str], str] = {}
 
     # -- соединения ----------------------------------------------------------
     def connect(self) -> sqlite3.Connection:
@@ -321,6 +323,10 @@ class Database:
             conn.execute("UPDATE employees SET had_account=1 WHERE account_id IS NOT NULL AND had_account=0")
             # поиск ящика по логину — на каждой строке синхронизации сотрудников
             conn.execute("CREATE INDEX IF NOT EXISTS idx_accounts_username ON accounts(username COLLATE NOCASE)")
+            # история заданий по виду и по ящику (раздел «Задания», аналитика, карточка ящика): без индекса
+            # редкий вид или ящик без свежих заданий означал обход всей истории (1.15.0)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_type ON jobs(type, id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_account ON jobs(account_id, id)")
             conn.commit()
         except sqlite3.Error as exc:
             self._safe_rollback(conn)
@@ -342,6 +348,95 @@ class Database:
             log.warning("Не удалось заполнить даты резервных копий ящиков: %s", exc)
         self._drop_legacy_retention_schedules(conn)
         self._schedules_allow_global(conn)
+        self._message_totals(conn)
+
+    #: Отметка в meta: счётчики писем по папкам заполнены (дальше их ведут триггеры).
+    _TOTALS_MARK = "folder_totals_v1"
+    #: Триггеры, которые ведут folder_totals (имя → тело). Вставка пропущенного
+    #: (INSERT OR IGNORE) письма триггер не запускает — счётчик не растёт зря.
+    _TOTALS_TRIGGERS = {
+        "messages_totals_ai": (
+            "AFTER INSERT ON messages BEGIN "
+            "INSERT INTO folder_totals(account_id, folder, messages, bytes) "
+            "VALUES (NEW.account_id, NEW.folder, 1, COALESCE(NEW.size, 0)) "
+            "ON CONFLICT(account_id, folder) DO UPDATE SET messages = messages + 1, bytes = bytes + excluded.bytes; "
+            "END"),
+        "messages_totals_ad": (
+            "AFTER DELETE ON messages BEGIN "
+            "UPDATE folder_totals SET messages = messages - 1, bytes = bytes - COALESCE(OLD.size, 0) "
+            "WHERE account_id = OLD.account_id AND folder = OLD.folder; "
+            "END"),
+        "messages_totals_au": (
+            "AFTER UPDATE OF account_id, folder, size ON messages "
+            "WHEN OLD.account_id IS NOT NEW.account_id OR OLD.folder IS NOT NEW.folder "
+            "OR COALESCE(OLD.size, 0) <> COALESCE(NEW.size, 0) BEGIN "
+            "UPDATE folder_totals SET messages = messages - 1, bytes = bytes - COALESCE(OLD.size, 0) "
+            "WHERE account_id = OLD.account_id AND folder = OLD.folder; "
+            "INSERT INTO folder_totals(account_id, folder, messages, bytes) "
+            "VALUES (NEW.account_id, NEW.folder, 1, COALESCE(NEW.size, 0)) "
+            "ON CONFLICT(account_id, folder) DO UPDATE SET messages = messages + 1, bytes = bytes + excluded.bytes; "
+            "END"),
+        "accounts_totals_ad": (
+            "AFTER DELETE ON accounts BEGIN DELETE FROM folder_totals WHERE account_id = OLD.id; END"),
+    }
+
+    def _message_totals(self, conn: sqlite3.Connection) -> None:
+        """Счётчики писем по папкам (1.15.0): триггеры и — один раз — пересчёт по уже сохранённым письмам.
+
+        Пересчёт и создание триггеров — одной транзакцией: письмо, записанное
+        между ними, не потерялось бы и не посчиталось бы дважды. На архиве в
+        десятки миллионов писем первый запуск новой версии занимает до минуты.
+        """
+        try:
+            have = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='trigger'")}
+            marked = conn.execute("SELECT 1 FROM meta WHERE key=?", (self._TOTALS_MARK,)).fetchone()
+            if marked and all(name in have for name in self._TOTALS_TRIGGERS):
+                return
+            started = time.monotonic()
+            conn.commit()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._recount_totals(conn)
+                for name, body in self._TOTALS_TRIGGERS.items():
+                    conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+                    conn.execute(f"CREATE TRIGGER {name} {body}")
+                conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)", (self._TOTALS_MARK, utcnow_iso()))
+                conn.commit()
+            except BaseException:
+                self._safe_rollback(conn)
+                raise
+            took = time.monotonic() - started
+            if took > 1:
+                log.info("Счётчики писем по ящикам и папкам заполнены за %.0f с (один раз после обновления).", took)
+        except sqlite3.Error as exc:
+            log.error("Не удалось завести счётчики писем по папкам: %s", exc)
+
+    @staticmethod
+    def _recount_totals(conn: sqlite3.Connection) -> None:
+        conn.execute("DELETE FROM folder_totals")
+        conn.execute("INSERT INTO folder_totals(account_id, folder, messages, bytes) "
+                     "SELECT account_id, folder, COUNT(*), COALESCE(SUM(size), 0) FROM messages "
+                     "GROUP BY account_id, folder")
+
+    def recount_message_totals(self) -> None:
+        """Пересчитать счётчики писем по всей базе (после ручной правки базы или для проверки)."""
+        with self.transaction() as conn:
+            self._recount_totals(conn)
+
+    def message_totals_mismatch(self, account_id: Optional[int] = None) -> List[Tuple[int, str, int, int, int, int]]:
+        """Где счётчики разошлись с письмами: (ящик, папка, писем по счётчику, писем на деле, байт…)."""
+        where, params = ("", ()) if account_id is None else (" WHERE account_id=?", (account_id,))
+        real = {(r[0], r[1]): (r[2], r[3]) for r in self.query(
+            "SELECT account_id, folder, COUNT(*), COALESCE(SUM(size), 0) FROM messages" + where +
+            " GROUP BY account_id, folder", params)}
+        kept = {(r[0], r[1]): (r[2], r[3]) for r in self.query(
+            "SELECT account_id, folder, messages, bytes FROM folder_totals" + where, params) if r[2] or r[3]}
+        out = []
+        for key in sorted(set(real) | set(kept)):
+            a, b = kept.get(key, (0, 0)), real.get(key, (0, 0))
+            if a != b:
+                out.append((key[0], key[1], a[0], b[0], a[1], b[1]))
+        return out
 
     def schedules_allow_global(self) -> bool:
         """Разрешены ли расписания без ящика (прошла ли миграция 1.5.0)."""
@@ -770,11 +865,22 @@ class Database:
         """
         if not value:
             return ""
+        # Расшифровка (Fernet: HMAC + AES) — десятки микросекунд, а список ящиков читается целиком на каждый
+        # запрос дашборда и раздела «Почтовые ящики»: на тысячах ящиков это заметная доля ответа. Шифротекст
+        # при каждом сохранении новый, поэтому запомненная расшифровка не устаревает.
+        key = (id(self.secret), value)
+        plain = self._plain_cache.get(key)
+        if plain is not None:
+            return plain
         try:
-            return self.secret.decrypt(value)
+            plain = self.secret.decrypt(value)
         except Exception:  # noqa: BLE001
             broken[0] = True
             return ""
+        if len(self._plain_cache) >= 20000:
+            self._plain_cache.clear()
+        self._plain_cache[key] = plain
+        return plain
 
     def _account_from_row(self, row: sqlite3.Row) -> models.Account:
         broken = [False]
@@ -1220,7 +1326,8 @@ class Database:
         return self.query_one("SELECT * FROM messages WHERE id=?", (pk,))
 
     def account_folders(self, account_id: int) -> List[str]:
-        rows = self.query("SELECT DISTINCT folder FROM messages WHERE account_id=? ORDER BY folder", (account_id,))
+        rows = self.query("SELECT folder FROM folder_totals WHERE account_id=? AND messages > 0 ORDER BY folder",
+                          (account_id,))
         return [r["folder"] for r in rows]
 
     def message_exists(self, account_id: int, folder: str, uidvalidity: int, uid: int) -> bool:
@@ -1396,21 +1503,25 @@ class Database:
             "SELECT 1 FROM messages WHERE account_id=? AND sha256=? AND folder=? LIMIT 1",
             (account_id, sha256, folder)) is not None
 
+    # Счётчики писем и байт — из folder_totals (их ведут триггеры, см. _message_totals): COUNT/SUM по
+    # messages на архиве в миллионы писем — секунды на каждый запрос интерфейса.
     def count_messages(self, account_id: Optional[int] = None) -> int:
         if account_id is None:
-            return int(self.scalar("SELECT COUNT(*) FROM messages") or 0)
-        return int(self.scalar("SELECT COUNT(*) FROM messages WHERE account_id=?", (account_id,)) or 0)
+            return int(self.scalar("SELECT COALESCE(SUM(messages),0) FROM folder_totals") or 0)
+        return int(self.scalar("SELECT COALESCE(SUM(messages),0) FROM folder_totals WHERE account_id=?",
+                               (account_id,)) or 0)
 
     def count_folder_messages(self, account_id: int, folder: Optional[str] = None) -> int:
         if folder:
-            return int(self.scalar("SELECT COUNT(*) FROM messages WHERE account_id=? AND folder=?",
-                                   (account_id, folder)) or 0)
+            return int(self.scalar("SELECT COALESCE(SUM(messages),0) FROM folder_totals WHERE account_id=? AND "
+                                   "folder=?", (account_id, folder)) or 0)
         return self.count_messages(account_id)
 
     def sum_message_bytes(self, account_id: Optional[int] = None) -> int:
         if account_id is None:
-            return int(self.scalar("SELECT COALESCE(SUM(size),0) FROM messages") or 0)
-        return int(self.scalar("SELECT COALESCE(SUM(size),0) FROM messages WHERE account_id=?", (account_id,)) or 0)
+            return int(self.scalar("SELECT COALESCE(SUM(bytes),0) FROM folder_totals") or 0)
+        return int(self.scalar("SELECT COALESCE(SUM(bytes),0) FROM folder_totals WHERE account_id=?",
+                               (account_id,)) or 0)
 
     def list_messages(self, account_id: int, folder: Optional[str] = None, limit: int = 500, offset: int = 0) -> List[sqlite3.Row]:
         # Сортировка с добавочным «id»: без него у писем с одинаковым (или
@@ -1540,24 +1651,25 @@ class Database:
         отдельные count/sum на ящик давали полторы тысячи запросов к той же
         базе, в которую в это время пишет копирование.
         """
-        rows = self.query("SELECT account_id, COUNT(*) AS cnt, COALESCE(SUM(size),0) AS bytes "
-                          "FROM messages GROUP BY account_id")
+        rows = self.query("SELECT account_id, SUM(messages) AS cnt, SUM(bytes) AS bytes FROM folder_totals "
+                          "GROUP BY account_id HAVING SUM(messages) > 0")
         return {int(r["account_id"]): {"messages": int(r["cnt"]), "bytes": int(r["bytes"])}
                 for r in rows}
 
     def last_runs_by_account(self) -> Dict[int, sqlite3.Row]:
-        """Последний прогон каждого ящика одним запросом."""
+        """Последний прогон каждого ящика одним запросом.
+
+        По индексу (account_id, id) — один шаг на ящик: GROUP BY по всей истории прогонов (сотни тысяч строк
+        за год) на каждом обновлении дашборда был заметен."""
         rows = self.query(
-            "SELECT r.* FROM runs r JOIN (SELECT account_id, MAX(id) AS last_id FROM runs "
-            "GROUP BY account_id) m ON m.last_id = r.id")
+            "SELECT r.* FROM accounts a JOIN runs r ON r.id = "
+            "(SELECT MAX(id) FROM runs WHERE account_id = a.id)")
         return {int(r["account_id"]): r for r in rows}
 
     def folders_summary(self, account_id: int) -> List[sqlite3.Row]:
         return self.query(
-            """SELECT folder, COUNT(*) AS cnt, COALESCE(SUM(size),0) AS bytes
-               FROM messages WHERE account_id=? GROUP BY folder ORDER BY folder""",
-            (account_id,),
-        )
+            "SELECT folder, messages AS cnt, bytes FROM folder_totals WHERE account_id=? AND messages > 0 "
+            "ORDER BY folder", (account_id,))
 
     # ======================================================================
     #  Очередь заданий
@@ -1674,8 +1786,14 @@ class Database:
             params += exclude_types
         return int(self.scalar(sql, tuple(params)) or 0)
 
-    def count_jobs_by_status(self) -> Dict[str, int]:
-        rows = self.query("SELECT status, COUNT(*) AS c FROM jobs GROUP BY status")
+    def count_jobs_by_status(self, active_only: bool = False) -> Dict[str, int]:
+        """Число заданий по состоянию; ``active_only`` — только идущие и ждущие (по индексу, без обхода всей
+        истории: живое обновление спрашивает это каждые полторы секунды)."""
+        if active_only:
+            rows = self.query("SELECT status, COUNT(*) AS c FROM jobs WHERE status IN (?, ?) GROUP BY status",
+                              (models.JobStatus.RUNNING, models.JobStatus.QUEUED))
+        else:
+            rows = self.query("SELECT status, COUNT(*) AS c FROM jobs GROUP BY status")
         return {r["status"]: r["c"] for r in rows}
 
     def update_job_progress(self, job_id: int, current: int, total: int, message: str = "",
@@ -2321,10 +2439,14 @@ class Database:
 
     def distinct_folder_count(self, account_id: Optional[int] = None) -> int:
         if account_id is None:
-            return int(self.scalar(
-                "SELECT COUNT(*) FROM (SELECT DISTINCT account_id, folder FROM messages)") or 0)
-        return int(self.scalar(
-            "SELECT COUNT(DISTINCT folder) FROM messages WHERE account_id=?", (account_id,)) or 0)
+            return int(self.scalar("SELECT COUNT(*) FROM folder_totals WHERE messages > 0") or 0)
+        return int(self.scalar("SELECT COUNT(*) FROM folder_totals WHERE account_id=? AND messages > 0",
+                               (account_id,)) or 0)
+
+    def folder_counts_by_account(self) -> Dict[int, int]:
+        """Сколько папок с письмами у каждого ящика — одним запросом."""
+        return {int(r[0]): int(r[1]) for r in self.query(
+            "SELECT account_id, COUNT(*) FROM folder_totals WHERE messages > 0 GROUP BY account_id")}
 
     def jobs_type_status_counts(self, account_id: Optional[int] = None) -> List[sqlite3.Row]:
         """Счётчики заданий по типу и статусу; при заданном ящике — только его задания."""
@@ -2603,6 +2725,17 @@ CREATE INDEX IF NOT EXISTS idx_messages_date ON messages(account_id, folder, int
 CREATE INDEX IF NOT EXISTS idx_messages_acc_date ON messages(account_id, internaldate);
 -- счётчики и суммы размеров по ящику (дашборд), крупнейшие письма
 CREATE INDEX IF NOT EXISTS idx_messages_acc_size ON messages(account_id, size);
+
+-- Сколько писем и байт в каждой папке каждого ящика. Ведут её триггеры на messages
+-- (см. Database._message_totals): дашборд, список ящиков, «Ящики на сервере» и
+-- аналитика берут счётчики отсюда, а не пересчитывают миллионы строк на каждый запрос.
+CREATE TABLE IF NOT EXISTS folder_totals (
+    account_id INTEGER NOT NULL,
+    folder     TEXT NOT NULL,
+    messages   INTEGER NOT NULL DEFAULT 0,
+    bytes      INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(account_id, folder)
+) WITHOUT ROWID;
 
 -- Письма, вычищенные по сроку хранения: их UID помнятся, чтобы бэкап не
 -- скачивал их снова, пока они лежат на сервере.

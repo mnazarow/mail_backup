@@ -11,7 +11,7 @@ import sqlite3
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
@@ -556,17 +556,21 @@ def state(request: Request, user: dict = Depends(auth_mod.require_user)):
             "last_run": ({"status": last["status"], "finished_at": last["finished_at"],
                           "messages_new": last["messages_new"]} if last else None),
         })
-    counts = svc.db.count_jobs_by_status()
-    active = [serialize_job(j, svc.db.account_names(), user) for j in svc.db.active_jobs()]
+    counts = svc.db.count_jobs_by_status(active_only=True)
+    names = svc.db.account_names()                     # один раз, а не на каждое задание
+    rows = svc.db.active_jobs()
+    queued_hidden = 0
     if user.get("role") == "mailbox":
         aid = user.get("account_id")
-        active = [j for j in active if j["account_id"] == aid]
+        active = [serialize_job(j, names, user) for j in rows if j["account_id"] == aid]
         # счётчики очереди — общесистемные: показываем только свои задания
         counts = {"running": sum(1 for j in active if j["status"] == "running"),
                   "queued": sum(1 for j in active if j["status"] == "queued")}
         total_msgs = svc.db.count_messages(aid)
         total_bytes = svc.db.sum_message_bytes(aid)
     else:
+        rows, queued_hidden = cap_active_jobs(rows)
+        active = [serialize_job(j, names, user) for j in rows]
         total_msgs = svc.db.count_messages()
         total_bytes = svc.db.sum_message_bytes()
     disk_free = _disk_free(svc.cfg.mail_root)
@@ -575,6 +579,7 @@ def state(request: Request, user: dict = Depends(auth_mod.require_user)):
         "accounts": acc_out,
         "job_counts": counts,
         "active_jobs": active,
+        "queued_hidden": queued_hidden,
         "totals": {"accounts": len(accounts), "messages": total_msgs,
                    "bytes": total_bytes, "bytes_h": human_size(total_bytes)},
         "disk": {"free": disk_free, "free_h": human_size(disk_free)},
@@ -1763,6 +1768,26 @@ def _job_scope_label(row) -> str:
             and params.get("account_ids"):
         return f"ящиков: {len(params['account_ids'])}"
     return ""
+
+
+#: Сколько ждущих заданий показывать в живом списке (идущие — все). Когда расписания ящиков ставят в очередь
+#: сотни заданий разом, полный список уходил каждой открытой вкладке каждые полторы секунды (сотни
+#: килобайт), а дашборд перерисовывал его целиком; весь список — в разделе «Задания».
+LIVE_QUEUED_LIMIT = 50
+
+
+def cap_active_jobs(jobs: list, limit: int = LIVE_QUEUED_LIMIT) -> Tuple[list, int]:
+    """Идущие задания — все, ждущие — первые ``limit`` (в порядке очереди); → (список, сколько ждущих скрыто).
+    Годится и для строк базы, и для уже готовых словарей."""
+    out, shown, hidden = [], 0, 0
+    for j in jobs:
+        if (j.get("status") if isinstance(j, dict) else j["status"]) == JobStatus.QUEUED:
+            if shown >= limit:
+                hidden += 1
+                continue
+            shown += 1
+        out.append(j)
+    return out, hidden
 
 
 def serialize_job(row, names: Optional[Dict[int, str]] = None, viewer: Optional[dict] = None) -> dict:
