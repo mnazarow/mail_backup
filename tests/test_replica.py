@@ -253,6 +253,40 @@ def test_quarantine_dirs_are_not_replicated(services, tmp_path):
     assert len([n for n in names if n.startswith("mailboxes")]) == 1
 
 
+def _recopy_from_scratch(svc, kept: int = 2):
+    """«Копирование с нуля»: прежние файлы — в карантин, в новой копии только то, что ещё есть на сервере."""
+    quarantine = svc.store.quarantine_account_files(1)[0]
+    _fill(svc, 1, kept, start=1)
+    return quarantine
+
+
+@pytest.mark.parametrize("verify", [False, True])
+def test_recopy_from_scratch_keeps_old_files_in_replica_until_quarantine_is_gone(services, tmp_path, verify):
+    svc = services
+    dest = tmp_path / "replica"
+    dest.mkdir()
+    _use_dir(svc, str(dest))
+    _fill(svc, 1, 6)
+    _fill(svc, 2, 3)
+    ReplicaRunner(svc).run()
+    before = {f for f in _target_files(str(dest)) if f.startswith("mailboxes")}
+    assert len(before) == 9
+    quarantine = _recopy_from_scratch(svc)           # на сервере осталось 2 письма из 6
+    victim = next(p for p in svc.store.iter_messages(2))[1]
+    os.unlink(svc.store.message_path(2, victim))     # у другого ящика удаление зеркалится как раньше
+    res = ReplicaRunner(svc, force_verify=verify).run()
+    after = {f for f in _target_files(str(dest)) if f.startswith("mailboxes")}
+    assert res["files_deleted"] == 1 and res["deletes_held"] >= 4 and res["deletes_held_accounts"] == 1
+    assert len([f for f in after if "account_1" in f]) >= 6, "прежние письма ящика из копии пропасть не должны"
+    assert len([f for f in after if "account_2" in f]) == 2
+    # карантин удалён (новая копия проверена) — прежние файлы уходят из копии обычным прогоном
+    svc.store.drop_quarantine(quarantine)
+    res = ReplicaRunner(svc).run()
+    final = {f for f in _target_files(str(dest)) if f.startswith("mailboxes")}
+    assert len([f for f in final if "account_1" in f]) == 2 and res["files_deleted"] >= 4
+    assert not res.get("deletes_held")
+
+
 # ---------------------------------------------------------------------------
 #  S3
 # ---------------------------------------------------------------------------
@@ -349,6 +383,15 @@ def test_rsync_replica_to_local_path(services, tmp_path):
     res = ReplicaRunner(svc).run()
     assert res["files_deleted"] == 1
     assert len(_target_files(str(dest / "mailboxes"))) == 2
+    # копирование с нуля: пока есть карантин, rsync в копии этого ящика ничего не удаляет
+    quarantine = svc.store.quarantine_account_files(1)[0]
+    _fill(svc, 1, 1, start=500)
+    res = ReplicaRunner(svc).run()
+    assert res["files_deleted"] == 0 and res["deletes_held_accounts"] == 1
+    assert len(_target_files(str(dest / "mailboxes"))) == 3
+    svc.store.drop_quarantine(quarantine)
+    assert ReplicaRunner(svc).run()["files_deleted"] == 2
+    assert len(_target_files(str(dest / "mailboxes"))) == 1
 
 
 # ---------------------------------------------------------------------------

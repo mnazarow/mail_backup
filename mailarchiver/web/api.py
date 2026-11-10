@@ -2681,7 +2681,9 @@ def get_logs(limit: int = 300, level: Optional[str] = None, user: dict = Depends
     заданий, поэтому доступен только администратору и оператору."""
     from ..logging_setup import memory_handler
     limit = max(1, min(2000, int(limit)))
-    return memory_handler.tail(limit=limit, level=level)
+    # оператору — без записей заданий, подробности которых от него скрыты и в «Очереди и заданиях»
+    only = roles.OPERATOR_JOB_TYPES if roles.is_operator(user) else None
+    return memory_handler.tail(limit=limit, level=level, job_types=only)
 
 
 @router.get("/stats")

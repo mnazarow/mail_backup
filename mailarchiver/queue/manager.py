@@ -25,7 +25,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
 from ..errors import JobCancelled, MailArchiverError, ValidationError
-from ..logging_setup import get_logger
+from ..logging_setup import get_logger, job_log_scope
 from ..models import JobStatus, JobType
 from ..util import clamp
 
@@ -62,6 +62,7 @@ class QueueManager:
         self._pool_size = 0                   # фактический размер пула (настройка могла измениться)
         self._running: Dict[int, dict] = {}   # job_id -> {account_id, type, started}
         self._to_requeue: Dict[int, dict] = {}  # job_id -> как вернуть в очередь после снятия с учёта
+        self._unsettled: Dict[int, Optional[dict]] = {}  # итог не записался в базу — доводит поллер
         # Ящики, которые сейчас обрабатывает задание без своего ящика (копирование
         # всех ящиков по очереди): account_id -> id задания. Пока ящик занят,
         # другие задания по нему не запускаются — как если бы по ящику шло своё.
@@ -229,6 +230,8 @@ class QueueManager:
         while not self._stop.is_set():
             submitted = False
             try:
+                if self._unsettled:
+                    self._settle_pending()
                 self._maybe_resize_pool()
                 while not self._stop.is_set():
                     with self._claim_lock:
@@ -281,25 +284,67 @@ class QueueManager:
         # Снимаем задание с учёта и ТОЛЬКО ПОТОМ возвращаем его в очередь —
         # иначе поллер мог бы захватить его вторым воркером до снятия.
         with self._lock:
-            self._running.pop(job_id, None)
+            info = self._running.pop(job_id, None) or {}
             requeue = self._to_requeue.pop(job_id, None)
             # Задание, занимавшее ящики (копирование по очереди), могло упасть,
             # не освободив текущий: освобождаем всё, что за ним числится.
             for account_id in [a for a, holder in self._held.items() if holder == job_id]:
                 self._held.pop(account_id, None)
-        if requeue is not None:
-            try:
-                self.db.requeue_job(job_id, run_after=requeue.get("run_after"),
-                                    refund_attempt=bool(requeue.get("refund")))
-            except Exception:  # noqa: BLE001
-                log.exception("Не удалось вернуть задание #%s в очередь", job_id)
+        if future.cancelled():
+            # Так и не начато (остановка службы): в базе оно «выполняется» и вернётся в очередь при запуске.
+            self._wake.set()
+            return
         exc = future.exception()
         if exc:
-            log.error("Задание #%s завершилось необработанной ошибкой: %s", job_id, exc)
+            with job_log_scope(info.get("type")):
+                log.error("Задание #%s завершилось необработанной ошибкой: %s", job_id, exc)
+        try:
+            self._settle(job_id, requeue)
+        except Exception:  # noqa: BLE001
+            # База не приняла итог (нет места, занята): запомним и доведём позже — иначе задание
+            # навсегда осталось бы «выполняется», и расписание этого ящика молча пропускалось бы.
+            log.exception("Не удалось записать итог задания #%s — повторю позже", job_id)
+            with self._lock:
+                self._unsettled[job_id] = requeue
         self._wake.set()
+
+    #: Чем заканчивается задание, итог которого не удалось записать вовремя.
+    LOST_RESULT_TEXT = ("Итог задания не удалось записать в базу (она была занята или кончилось место на диске). "
+                        "Что успело выполниться — в событиях задания и в журнале службы; запустите задание снова.")
+
+    def _settle(self, job_id: int, requeue: Optional[dict]) -> None:
+        """Довести состояние закончившего работу задания в базе: вернуть в очередь либо, если обработчик
+        вышел, а в базе оно всё ещё «выполняется» (запись итога сорвалась), закрыть как неудачное."""
+        if requeue is not None:
+            self.db.requeue_job(job_id, run_after=requeue.get("run_after"),
+                                refund_attempt=bool(requeue.get("refund")))
+            return
+        row = self.db.get_job(job_id)
+        if row is not None and row["status"] == JobStatus.RUNNING:
+            self.db.finish_job(job_id, JobStatus.FAILED, error=self.LOST_RESULT_TEXT)
+            self.db.add_job_event(job_id, "ERROR", self.LOST_RESULT_TEXT)
+            log.error("Задание #%s: итог не был записан — закрыто как неудачное.", job_id)
+
+    def _settle_pending(self) -> None:
+        """Повторить запись итогов, не удавшуюся в ``_on_done`` (вызывается из цикла поллера)."""
+        with self._lock:
+            pending = dict(self._unsettled)
+        for job_id, requeue in pending.items():
+            try:
+                self._settle(job_id, requeue)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Итог задания #%s всё ещё не записан: %s", job_id, exc)
+                continue
+            with self._lock:
+                self._unsettled.pop(job_id, None)
 
     # -- выполнение задания --------------------------------------------------
     def _run_job(self, job: dict) -> None:
+        # всё, что задание пишет в журнал, помечается его видом (кому что показывать — web/api.py: /logs)
+        with job_log_scope(job["type"]):
+            self._run_job_scoped(job)
+
+    def _run_job_scoped(self, job: dict) -> None:
         from .jobs import HANDLERS, JobContext  # локальный импорт против циклов
         job_id = job["id"]
         job_type = job["type"]

@@ -12,12 +12,38 @@ import logging
 import logging.handlers
 import os
 import sys
+import threading
 from collections import deque
-from typing import Deque, Dict, List
+from contextlib import contextmanager
+from typing import Deque, Dict, Iterable, List, Optional
 
 from .util import ensure_dir
 
 _MEMORY_CAPACITY = 2000
+
+#: Вид задания, которое выполняет текущий поток (см. job_log_scope).
+_job_scope = threading.local()
+
+
+@contextmanager
+def job_log_scope(job_type: Optional[str]):
+    """Всё, что поток запишет в журнал внутри блока, помечается видом задания.
+
+    По этой метке журнал в интерфейсе скрывает от оператора записи заданий, подробности которых ему
+    не положены (выгрузки, восстановление, анализ писем…): в них бывают темы писем и пути к файлам.
+    """
+    previous = getattr(_job_scope, "job_type", None)
+    _job_scope.job_type = job_type
+    try:
+        yield
+    finally:
+        _job_scope.job_type = previous
+
+
+def visible_to(records: Iterable[Dict], job_types: Iterable[str]) -> List[Dict]:
+    """Записи журнала без тех, что сделаны заданиями не из ``job_types`` (записи вне заданий остаются)."""
+    allowed = set(job_types)
+    return [r for r in records if not r.get("job_type") or r["job_type"] in allowed]
 
 
 class MemoryLogHandler(logging.Handler):
@@ -43,13 +69,18 @@ class MemoryLogHandler(logging.Handler):
                     "level": record.levelname,
                     "logger": record.name,
                     "message": self.format(record),
+                    "job_type": getattr(_job_scope, "job_type", None),
                 }
             )
         except Exception:  # pragma: no cover - защита от рекурсии
             pass
 
-    def tail(self, limit: int = 200, level: str | None = None) -> List[Dict]:
+    def tail(self, limit: int = 200, level: str | None = None,
+             job_types: Optional[Iterable[str]] = None) -> List[Dict]:
+        """``job_types`` — показать записи только этих видов заданий (и записи вне заданий)."""
         items = list(self.buffer)
+        if job_types is not None:
+            items = visible_to(items, job_types)
         if level:
             level = level.upper()
             order = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}

@@ -642,14 +642,37 @@ def restore_via_ftp(acc, params: Dict) -> bool:
     return not acc.password
 
 
+#: meta-ключ отметки продолжения восстановления: + id задания
+_RESTORE_CKPT = "restore_ckpt:"
+
+
 def handle_restore(ctx: JobContext) -> Dict:
     svc = ctx.services
     acc = svc.require_account(ctx.account_id)
     p = ctx.params
     ctx.event("INFO", f"Старт восстановления ящика «{acc.name}» (режим: {p.get('target_mode','original')}).")
-    restore_id = ctx.db.create_restore(acc.id, p, ctx.job_id)
+    # Отметка продолжения: прерванное перезапуском службы (или упавшее и повторённое) восстановление по
+    # IMAP идёт дальше со следующего письма, а не заливает уже залитое заново.
+    ckpt_key = f"{_RESTORE_CKPT}{ctx.job_id}"
+    resume = None
+    via_ftp = restore_via_ftp(acc, p)
+    if not via_ftp and not p.get("dry_run"):
+        try:
+            resume = json.loads(ctx.db.get_meta(ckpt_key) or "null")
+        except (TypeError, ValueError):
+            resume = None
+        if not isinstance(resume, dict):
+            resume = None
+    restore_id = int(resume.get("restore_id") or 0) if resume else 0
+    if restore_id:
+        ctx.db.update_restore(restore_id, status="pending", error="")
+    else:
+        restore_id = ctx.db.create_restore(acc.id, p, ctx.job_id)
 
-    if restore_via_ftp(acc, p):
+    def save_checkpoint(state: dict) -> None:
+        ctx.db.set_meta(ckpt_key, json.dumps(dict(state, restore_id=restore_id)))
+
+    if via_ftp:
         # Ящик Axigen без пароля: письма заливаются через службу FTP Backup.
         from ..axigen.actions import require_changes_allowed
         from ..axigen.common import load_settings as _axigen_settings
@@ -668,9 +691,11 @@ def handle_restore(ctx: JobContext) -> Dict:
         engine = FtpRestoreEngine(ctx.db, svc.store, st)
     else:
         engine = RestoreEngine(ctx.db, svc.store, svc.connect_options())
+    extra = {} if via_ftp else {"resume": resume, "checkpoint_cb": save_checkpoint}
     try:
         res = engine.run(
             acc,
+            **extra,
             folders=p.get("folders") or None,
             # Умолчание — БЕЗОПАСНЫЙ режим. Раньше здесь стояло "original":
             # задание без явных параметров (например из расписания, заведённого
@@ -685,6 +710,8 @@ def handle_restore(ctx: JobContext) -> Dict:
         )
     except JobCancelled:
         ctx.db.update_restore(restore_id, status=JobStatus.CANCELLED)
+        if ctx.db.is_cancel_requested(ctx.job_id):
+            ctx.db.delete_meta(ckpt_key)        # отменил человек: «Повторить» начнёт заново
         raise
     except MailArchiverError as exc:
         # Иначе строка в таблице restores навсегда оставалась бы в статусе
@@ -695,6 +722,7 @@ def handle_restore(ctx: JobContext) -> Dict:
         ctx.db.update_restore(restore_id, status=JobStatus.FAILED, error=str(exc)[:500])
         raise
 
+    ctx.db.delete_meta(ckpt_key)
     ctx.db.update_restore(restore_id, status=res.status_label, restored=res.restored, errors=res.errors,
                           error="; ".join(res.error_details[:5]))
     summary = f"Восстановлено {res.restored}, пропущено {res.skipped}, ошибок {res.errors}."

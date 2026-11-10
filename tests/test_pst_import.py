@@ -1225,6 +1225,10 @@ def test_import_api_accepts_target_and_validates_options(client, sample):
     assert params["target"] == "local" and params["target_prefix"] == "Архив 2025"
     assert params["skip_existing"] is False and params["engine"] == "builtin"
     assert params["ansi_codepage"] == "cp1250" and os.path.basename(params["pst_path"]).startswith("import_")
+    # сначала дождаться первого задания: остановка очереди прервала бы его и вернула в очередь
+    deadline = time.time() + 60
+    while time.time() < deadline and svc.db.get_job(job["id"])["status"] not in ("success", "partial", "failed"):
+        time.sleep(0.2)
     svc.queue.stop()                # дальше смотрим только параметры поставленных заданий
     # пустое поле префикса — это «не указано» (значение по умолчанию); без общей папки — только явно
     plain = json.loads(svc.db.get_job(post(target="local", target_prefix="").json()["job_id"])["params"])

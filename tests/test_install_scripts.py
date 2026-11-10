@@ -3527,6 +3527,54 @@ def test_uninstall_keeps_what_is_not_ours(sandbox):
 
 
 @needs_root
+def test_uninstall_removes_only_its_own_files_from_install_dir(sandbox):
+    """В каталоге установки удаляются app, venv и backups — а не весь каталог: чужое остаётся."""
+    sandbox.install_old()
+    foreign = os.path.join(sandbox.install_dir, "other-project", "важное.txt")
+    _write(foreign, "не наше\n")
+    os.makedirs(os.path.join(sandbox.install_dir, "backups", "app_20260101_000000"))
+    proc = sandbox.run("uninstall.sh", sandbox.sources(NEW, "src_new"))
+    assert proc.returncode == 0 and proc.stderr == "", _report(proc)
+    for part in ("app", "venv", "backups"):
+        assert not os.path.exists(os.path.join(sandbox.install_dir, part)), part
+    assert os.path.exists(foreign)
+    assert "Каталог %s оставлен" % sandbox.install_dir in proc.stdout and "other-project" in proc.stdout, \
+        _report(proc)
+
+
+@needs_root
+def test_uninstall_keeps_data_that_lives_inside_install_dir(sandbox):
+    """Данные внутри каталога приложения: без --purge они остаются, с --purge удаляется всё."""
+    sandbox.install_old()
+    inner = os.path.join(sandbox.app_dir, "data")
+    shutil.copytree(sandbox.data, inner)
+    db = os.path.join(inner, os.path.relpath(sandbox.db, sandbox.data))
+    src = sandbox.sources(NEW, "src_new")
+    proc = sandbox.run("uninstall.sh", src, MA_DATA_DIR=inner)
+    assert proc.returncode == 0, _report(proc)
+    assert os.path.exists(db), "архив внутри каталога установки не должен удаляться без --purge"
+    assert "%s НЕ удалён: внутри него каталог данных %s" % (sandbox.app_dir, inner) in proc.stdout, _report(proc)
+    assert not os.path.exists(os.path.join(sandbox.install_dir, "venv"))
+    assert "Данные сохранены: " + inner in proc.stdout
+    proc = sandbox.run("uninstall.sh", src, args=("--purge",), MA_DATA_DIR=inner)
+    assert proc.returncode == 0, _report(proc)
+    assert not os.path.exists(sandbox.install_dir)
+
+
+@needs_root
+def test_uninstall_takes_settings_from_unit_file(sandbox):
+    """--purge без MA_*: каталоги и пользователь — из unit-файла, а не значения по умолчанию."""
+    sandbox.install_old()
+    proc = sandbox.run("uninstall.sh", sandbox.sources(NEW, "src_new"), args=("--purge",), MA_INSTALL_DIR=None,
+                       MA_CONFIG_DIR=None, MA_DATA_DIR=None, MA_USER=None, MA_GROUP=None)
+    assert proc.returncode == 0 and proc.stderr == "", _report(proc)
+    assert "Каталог данных удалён: %s." % sandbox.data in proc.stdout, _report(proc)
+    for path in (sandbox.data, sandbox.config_dir, sandbox.install_dir):
+        assert not os.path.exists(path), path
+    assert "userdel " + USER in sandbox.calls("pkg_calls")
+
+
+@needs_root
 def test_uninstall_rejects_unknown_arguments(sandbox):
     """«uninstall.sh --check» (по привычке от update.sh) не должен ничего удалять."""
     sandbox.install_old()

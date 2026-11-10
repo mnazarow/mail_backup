@@ -31,7 +31,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import appendix  # noqa: E402
 import bodyindex  # noqa: E402
 import renumber  # noqa: E402
-from chapters import APPENDIX_FILE, APPENDIX_TITLE, CHAPTERS, MD_NUM, NOT_IN_MANUAL, REFS  # noqa: E402
+from chapters import (APPENDIX_FILE, APPENDIX_TITLE, CHAPTERS, MD_NUM, NOT_IN_MANUAL, REFS,  # noqa: E402
+                      local_numbers)
 
 ORIG, OUT, NEW_ROOT, OLD_ROOT = sys.argv[1:5]
 manifest = json.load(open(os.path.join(os.path.dirname(os.path.abspath(OUT)), "manifest.json"), encoding="utf-8"))
@@ -53,7 +54,7 @@ def read(p):
 
 
 def md(root, fname):
-    return read(os.path.join(root, "docs", "ru", fname))
+    return local_numbers(fname, read(os.path.join(root, "docs", "ru", fname)))
 
 
 def text(x):

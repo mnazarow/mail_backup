@@ -122,7 +122,7 @@ class FtpRestoreEngine(RestoreEngine):
         done = 0
         bytes_done = 0
         try:
-            for row in self._iter_messages(account.id, folders, limit):
+            for _folder_idx, row in self._iter_messages(account.id, folders, limit):
                 check_cancel()
                 target = self._resolve_target(row["folder"], "/", target_mode, target_folder, target_prefix)
                 state = run.folder(target)

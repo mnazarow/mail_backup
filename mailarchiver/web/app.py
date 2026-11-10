@@ -30,7 +30,7 @@ from .bulk_api import router as bulk_router
 from .axigen_api import router as axigen_router
 from .mailservers_api import router as mailservers_router
 from .server_api import router as server_router
-from .proxy import ProxyHeadersMiddleware, SecurityHeadersMiddleware
+from .proxy import BodyLimitMiddleware, ProxyHeadersMiddleware, SecurityHeadersMiddleware
 from .ws import router as ws_router
 
 log = get_logger("web")
@@ -148,6 +148,25 @@ def create_app() -> FastAPI:
                 pass
         return bool(_cfg.get("security", "auth_enabled", True))
 
+    def _user_of(scope):
+        """Пользователь по cookie запроса (без продления сессии) — для предела размера тела."""
+        svc = getattr(app.state, "services", None)
+        if svc is None:
+            return None
+        from http.cookies import SimpleCookie
+        jar = SimpleCookie()
+        for key, value in scope.get("headers", []):
+            if key.lower() == b"cookie":
+                try:
+                    jar.load(value.decode("latin-1"))
+                except Exception:  # noqa: BLE001 — кривой заголовок: считаем, что cookie нет
+                    return None
+        return auth_mod.user_from_cookies(svc, {k: m.value for k, m in jar.items()}, touch=False)
+
+    # Самый внутренний слой: его отказ (413) проходит через защитные заголовки, как любой ответ.
+    from .api import MAX_PST_UPLOAD_BYTES
+    app.add_middleware(BodyLimitMiddleware, user_getter=_user_of,
+                       big_paths=[("/import-pst", MAX_PST_UPLOAD_BYTES + 1024 * 1024)])
     app.add_middleware(SecurityHeadersMiddleware, public_url_getter=_public_url,
                        auth_enabled_getter=_auth_enabled)
     app.add_middleware(ProxyHeadersMiddleware, settings_getter=_proxy_settings,

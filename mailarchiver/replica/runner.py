@@ -48,6 +48,7 @@ from .targets import (README_NAME, DirTarget, ReplicaTarget, RsyncTarget, S3Targ
 log = get_logger("replica")
 
 ACCOUNT_DIR_RE = re.compile(r"^account_\d+$")
+QUARANTINE_DIR_RE = re.compile(r"^(account_\d+)_old_")
 DB_GROUP = "db"
 KNOWN_HOSTS_NAME = "replica_known_hosts"
 SSH_KEY_NAME = "replica_ssh_key"
@@ -578,8 +579,38 @@ class ReplicaRunner:
                        and os.path.isdir(os.path.join(self.mail_root, n))),
                       key=lambda n: int(n.split("_")[1]))
 
+    def _quarantined(self) -> List[str]:
+        """Каталоги ящиков (``account_N``), у которых есть карантин прежней копии (``account_N_old_…``).
+
+        После «копирования с нуля» прежние файлы ящика лежат в карантине, а карантин в копию не уходит:
+        зеркальное удаление стёрло бы их и в копии — и письма, которых на почтовом сервере уже нет,
+        остались бы в единственном экземпляре на этом же диске. Поэтому, пока карантин не удалён
+        (администратор убедился, что новая копия полна), в копии файлы такого ящика не удаляются.
+        """
+        try:
+            names = os.listdir(self.mail_root)
+        except OSError:
+            return []
+        found = {m.group(1) for m in map(QUARANTINE_DIR_RE.match, names) if m}
+        return sorted(found, key=lambda n: int(n.split("_")[1]))
+
+    def _note_held(self, held_groups: int, held_files: Optional[int]) -> None:
+        if not held_groups:
+            return
+        self.stats["deletes_held"] = int(held_files or 0)
+        self.stats["deletes_held_accounts"] = held_groups
+        count = f" ({held_files} файлов)" if held_files else ""
+        self._event("WARNING", f"В копии оставлены прежние файлы ящиков, копируемых заново: ящиков — "
+                               f"{held_groups}{count}. У них есть карантин прежней копии, а он в копию не "
+                               f"уходит — без этих файлов письма, которых уже нет на почтовом сервере, "
+                               f"остались бы только на этом диске. Файлы удалятся из копии после того, как "
+                               f"вы удалите карантин (раздел «Карантин»).")
+
     def _sync_mailboxes(self, target: ReplicaTarget, verify: bool) -> None:
         names = self._local_groups()
+        held = {f"mailboxes/{n}" for n in self._quarantined()} if self.mirror else set()
+        held_groups: set = set()
+        held_files = 0
         known_before = self.db.replica_count()
         self._delete_base = known_before
         local_groups = set()
@@ -600,7 +631,16 @@ class ReplicaRunner:
                 uploads = [rel for rel, v in local.items() if state.get(rel) != (v[0], v[1])]
                 deletes = [rel for rel in state if rel not in local]
             self._upload(target, grp, uploads, local)
-            self._pending_deletes.extend((grp, rel) for rel in deletes)
+            if grp in held:
+                if deletes:
+                    held_groups.add(grp)
+                    held_files += len(deletes)
+                    if verify:
+                        # сверка только что забыла эти файлы — запомним снова, чтобы после удаления
+                        # карантина их убрал и обычный прогон, а не только следующая полная сверка
+                        self.db.replica_upsert([(rel, grp, int(remote[rel]), 0) for rel in deletes])
+            else:
+                self._pending_deletes.extend((grp, rel) for rel in deletes)
             self._progress(index, len(names),
                            f"Ящиков {index}/{len(names)}: отправлено файлов {self.stats['files_up']} "
                            f"({human_size(self.stats['bytes_up'])})")
@@ -615,7 +655,13 @@ class ReplicaRunner:
                 rels = [rel for rel, _size in target.list(grp + "/")]
             else:
                 rels = list(self.db.replica_state_group(grp).keys())
+            if grp in held:
+                if rels:
+                    held_groups.add(grp)
+                    held_files += len(rels)
+                continue
             self._pending_deletes.extend((grp, rel) for rel in rels)
+        self._note_held(len(held_groups), held_files)
         self.stats["files_total"] = self.db.replica_count_prefix("mailboxes/")
 
     def _upload(self, target: ReplicaTarget, grp: str, rels: List[str],
@@ -748,9 +794,11 @@ class ReplicaRunner:
             max_delete = max(MIN_DELETE_CAP, int(total * self.max_delete_pct / 100))
         self._event("INFO", "Синхронизация писем (rsync)…")
         self._progress(0, 3, "Синхронизация писем (rsync)…")
+        protected = self._quarantined() if self.mirror else []
         code, out = target.sync_dir(self.mail_root, "mailboxes", delete=self.mirror, max_delete=max_delete,
                                     excludes=["/account_*_old_*", "*.part"], cancel=self._cancelled,
-                                    what="письма")
+                                    what="письма", protects=[f"/{name}/**" for name in protected])
+        self._note_held(len(protected), None)
         if code == -1:
             self._check_cancel()
             raise JobCancelled("Прервано.")

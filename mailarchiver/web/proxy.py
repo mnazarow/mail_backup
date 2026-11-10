@@ -491,3 +491,116 @@ class SecurityHeadersMiddleware:
             await send(message)
 
         await self.app(scope, receive, send_wrapper)
+
+
+# ---------------------------------------------------------------------------
+#  Предел размера тела запроса
+# ---------------------------------------------------------------------------
+#: Без входа: вход, первичная настройка, второй фактор — это десятки байт.
+BODY_LIMIT_ANONYMOUS = 256 * 1024
+#: После входа: обычные запросы интерфейса и загрузка списков (сотрудники, пароли ящиков — до 20 МБ).
+BODY_LIMIT_SIGNED_IN = 32 * 1024 * 1024
+
+_TOO_LARGE_BODY = json.dumps({
+    "error": True, "code": "too_large",
+    "message": "Запрос слишком большой.",
+    "hint": "Если вы загружали файл — войдите в систему заново и повторите; предельный размер файла указан "
+            "в окне загрузки."}, ensure_ascii=False).encode("utf-8")
+
+
+class _BodyTooLarge(Exception):
+    pass
+
+
+class BodyLimitMiddleware:
+    """Не читать тело запроса больше положенного — и решать это ДО обработчика.
+
+    FastAPI разбирает тело раньше, чем проверяет вход: без этого слоя кто угодно, кому доступен порт,
+    мог слать гигабайты — загрузка «файла PST» целиком ложилась на диск, а JSON на /api/login — в память,
+    и только потом приходил отказ. Предел зависит от того, вошёл ли отправитель: без действующей сессии —
+    ``BODY_LIMIT_ANONYMOUS``; с ней — ``BODY_LIMIT_SIGNED_IN``, а для путей из ``big_paths`` (загрузка PST) —
+    их собственный предел. Сессия проверяется, только когда тело больше «анонимного» предела.
+    """
+
+    def __init__(self, app, user_getter=None, big_paths=None,
+                 anonymous: int = BODY_LIMIT_ANONYMOUS, signed_in: int = BODY_LIMIT_SIGNED_IN):
+        self.app = app
+        self._user_getter = user_getter
+        self._big_paths = list(big_paths or [])          # [(окончание пути, предел байт)]
+        self._anonymous = int(anonymous)
+        self._signed_in = int(signed_in)
+
+    async def _limit_for(self, scope) -> int:
+        """Предел для отправителя, тело которого уже больше «анонимного»."""
+        user = None
+        if self._user_getter is not None:
+            from starlette.concurrency import run_in_threadpool
+            try:
+                user = await run_in_threadpool(self._user_getter, scope)
+            except Exception:      # noqa: BLE001 — не смогли проверить вход: считаем, что его нет
+                user = None
+        if not user:
+            return self._anonymous
+        path = scope.get("path", "")
+        for suffix, limit in self._big_paths:
+            if path.endswith(suffix):
+                return max(self._signed_in, int(limit))
+        return self._signed_in
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope.get("method", "").upper() not in _UNSAFE_METHODS:
+            await self.app(scope, receive, send)
+            return
+        state = {"limit": self._anonymous, "asked": False, "seen": 0, "rejected": False, "started": False}
+
+        async def fits(size: int) -> bool:
+            if size > state["limit"] and not state["asked"]:
+                state["asked"] = True
+                state["limit"] = await self._limit_for(scope)
+            return size <= state["limit"]
+
+        async def reject() -> None:
+            state["rejected"] = True
+            if state["started"]:
+                return
+            state["started"] = True
+            await send({"type": "http.response.start", "status": 413,
+                        "headers": [(b"content-type", b"application/json; charset=utf-8"),
+                                    (b"content-length", str(len(_TOO_LARGE_BODY)).encode()),
+                                    (b"connection", b"close")]})
+            await send({"type": "http.response.body", "body": _TOO_LARGE_BODY})
+
+        declared = None
+        for key, value in scope.get("headers", []):
+            if key.lower() == b"content-length":
+                try:
+                    declared = int(value)
+                except ValueError:
+                    declared = None
+        if declared is not None and not await fits(declared):
+            await reject()
+            return
+
+        async def limited_receive():
+            message = await receive()
+            if message.get("type") == "http.request":
+                state["seen"] += len(message.get("body") or b"")
+                if not await fits(state["seen"]):
+                    state["rejected"] = True
+                    raise _BodyTooLarge()
+            return message
+
+        async def guarded_send(message):
+            if state["rejected"]:
+                # Обработчик превратил обрыв чтения в свой ответ (FastAPI — в «400 ошибка разбора тела»):
+                # вместо него уходит наш 413, остальное отбрасывается.
+                await reject()
+                return
+            if message.get("type") == "http.response.start":
+                state["started"] = True
+            await send(message)
+
+        try:
+            await self.app(scope, limited_receive, guarded_send)
+        except _BodyTooLarge:
+            await reject()

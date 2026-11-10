@@ -17,7 +17,8 @@ from typing import Dict, List, Optional
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from ..logging_setup import get_logger, memory_handler
+from .. import roles
+from ..logging_setup import get_logger, memory_handler, visible_to
 from .api import cap_active_jobs, redact_job_for, serialize_job, visible_author
 from .proxy import check_origin, host_is_trusted
 from . import auth as auth_mod
@@ -232,6 +233,8 @@ def _personal_snapshot(snapshot: dict, user: dict) -> dict:
     if user.get("role") == auth_mod.ROLE_OPERATOR:
         # ход и ошибки выгрузок, восстановления и т. п. — без подробностей (как в /api/jobs)
         out["active_jobs"] = [redact_job_for(user, j) for j in out.get("active_jobs", [])]
+        if "logs" in out:               # и в журнале — без записей таких заданий (как в /api/logs)
+            out["logs"] = visible_to(out["logs"], roles.OPERATOR_JOB_TYPES)
     if user.get("role") not in auth_mod.STAFF_ROLES:
         # Общий лог сервиса (имена и хосты чужих ящиков, ошибки чужих заданий)
         # отдаём только администратору и оператору — как и /api/logs.

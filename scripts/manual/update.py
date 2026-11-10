@@ -35,7 +35,7 @@ import appendix  # noqa: E402
 import merge3  # noqa: E402
 import renumber  # noqa: E402
 from chapters import (APPENDIX_FILE, APPENDIX_TITLE, CHAPTERS, CONTINUE_LISTS, MD_NUM, NOT_IN_MANUAL,  # noqa: E402
-                      REFS, SHOT_CX, TABLE_WIDTHS)
+                      REFS, SHOT_CX, TABLE_WIDTHS, local_numbers)
 from docunits import Doc, classify, units  # noqa: E402
 from mdrender import Renderer, auto_widths, escape, make_link_resolver, parse, plain_links, text  # noqa: E402
 
@@ -325,7 +325,8 @@ def lazy_image(alt, path):
 
 for fname in FILES:
     num, title = CHAPTERS[fname]
-    old_md, new_md = read(md_path(OLD_ROOT, fname)), read(md_path(NEW_ROOT, fname))
+    old_md = local_numbers(fname, read(md_path(OLD_ROOT, fname)))
+    new_md = local_numbers(fname, read(md_path(NEW_ROOT, fname)))
     a, b = doc.chapter_range(f"{num}. ")
     assert doc.text(a).strip() == f"{num}. {title}", (doc.text(a), num, title)
     D = units([doc.xml(i) for i in range(a + 1, b)])

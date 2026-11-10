@@ -61,11 +61,27 @@ for arg in "$@"; do
 done
 
 APP_NAME="mailarchiver"
-APP_USER="${MA_USER:-mailarchiver}"
-INSTALL_DIR="${MA_INSTALL_DIR:-/opt/mailarchiver}"
-CONFIG_DIR="${MA_CONFIG_DIR:-/etc/mailarchiver}"
-DATA_DIR="${MA_DATA_DIR:-/var/lib/mailarchiver}"
 SERVICE_FILE="${MA_UNIT_FILE:-/etc/systemd/system/${APP_NAME}.service}"
+# Каталоги и пользователя, не заданные в MA_*, берём из unit-файла установки — как install.sh и
+# update.sh. Раньше брались значения по умолчанию: после установки с MA_DATA_DIR=/srv/mail
+# «uninstall.sh --purge» данных «не находил» (/var/lib/mailarchiver нет), сообщал об успехе и удалял
+# пользователя службы — архив оставался на диске с владельцем, которого больше нет.
+unit_val(){ [ -f "$SERVICE_FILE" ] || return 0; sed -n "s/^$1=//p" "$SERVICE_FILE" | head -n 1; }
+_unit_wd="$(unit_val WorkingDirectory)"
+_unit_cfg="$(unit_val 'Environment=MAILARCHIVER_CONFIG')"
+_unit_paths=()
+read -r -a _unit_paths <<< "$(unit_val ReadWritePaths)" || true
+_unit_data="${_unit_paths[0]:-}"
+while [ "${_unit_data#[-+]}" != "$_unit_data" ]; do _unit_data="${_unit_data#[-+]}"; done
+APP_USER="${MA_USER:-$(unit_val User)}"; APP_USER="${APP_USER:-mailarchiver}"
+INSTALL_DIR="${MA_INSTALL_DIR:-}"
+if [ -z "$INSTALL_DIR" ]; then
+  case "$_unit_wd" in */app) INSTALL_DIR="${_unit_wd%/app}" ;; *) INSTALL_DIR="/opt/mailarchiver" ;; esac
+fi
+if [ -n "${MA_CONFIG_DIR:-}" ]; then CONFIG_DIR="$MA_CONFIG_DIR"
+elif [ -n "$_unit_cfg" ]; then CONFIG_DIR="$(dirname "$_unit_cfg")"
+else CONFIG_DIR="/etc/mailarchiver"; fi
+DATA_DIR="${MA_DATA_DIR:-$_unit_data}"; DATA_DIR="${DATA_DIR:-/var/lib/mailarchiver}"
 RELAX_DROPIN="$SERVICE_FILE.d/50-relax-sandbox.conf"
 CLI_WRAPPER="${MA_CLI_WRAPPER:-/usr/local/bin/mailarchiver}"
 LOG_PREFIX="[MailArchiver uninstall]"
@@ -90,6 +106,49 @@ strip_slash(){
 }
 DATA_DIR="$(strip_slash "$DATA_DIR")"
 CONFIG_DIR="$(strip_slash "$CONFIG_DIR")"
+INSTALL_DIR="$(strip_slash "$INSTALL_DIR")"
+
+# Лежит ли $1 внутри каталога $2 (или это он сам) — по настоящим путям, ссылки раскрыты.
+is_inside(){
+  local inner outer
+  inner="$(readlink -m -- "$1" 2>/dev/null || true)"
+  outer="$(readlink -m -- "$2" 2>/dev/null || true)"
+  [ -n "$inner" ] && [ -n "$outer" ] || return 1
+  case "$inner/" in "$outer"/*) return 0 ;; esac
+  return 1
+}
+
+# Удалить файлы приложения. Удаляется только то, что ставит install.sh: app, venv и backups — а не
+# каталог установки целиком. Раньше здесь стоял «rm -rf "$INSTALL_DIR"»: если данные лежали внутри
+# каталога установки (или MA_INSTALL_DIR указывал на общий каталог, например /srv), вместе с программой
+# без вопросов удалялись архив писем и чужие файлы, а скрипт сообщал «Данные сохранены».
+APP_FILES_KEPT=0
+remove_app_files(){
+  [ -d "$INSTALL_DIR" ] || return 0
+  info "Удаляю файлы приложения ($INSTALL_DIR)…"
+  local part path keep rest
+  for part in app venv backups; do
+    path="$INSTALL_DIR/$part"
+    [ -e "$path" ] || [ -L "$path" ] || continue
+    keep=""
+    if [ -e "$DATA_DIR" ] && is_inside "$DATA_DIR" "$path"; then keep="каталог данных $DATA_DIR"
+    elif [ -e "$CONFIG_DIR" ] && is_inside "$CONFIG_DIR" "$path"; then keep="каталог конфигурации $CONFIG_DIR"; fi
+    if [ -n "$keep" ]; then
+      APP_FILES_KEPT=1
+      warn "$path НЕ удалён: внутри него $keep."
+      warn_more "Перенесите его в другое место и удалите $path сами (или запустите удаление с --purge)."
+      continue
+    fi
+    if [ -L "$path" ]; then rm -f -- "$path"; else rm -rf -- "$path"; fi
+  done
+  if rmdir -- "$INSTALL_DIR" 2>/dev/null; then
+    ok "Файлы приложения удалены."
+  elif [ "$APP_FILES_KEPT" = "0" ]; then
+    rest="$(ls -A -- "$INSTALL_DIR" 2>/dev/null | head -n 5 | tr '\n' ' ')"
+    ok "Файлы приложения удалены (app, venv, backups)."
+    warn "Каталог $INSTALL_DIR оставлен: в нём есть и другое (${rest% }) — не от MailArchiver, его не трогаю."
+  fi
+}
 
 # Почему каталог удалять нельзя (пусто — можно). $1 — путь, куда он ведёт на
 # самом деле. Защита от MA_DATA_DIR=/ и от ссылки, ведущей в корень или в
@@ -214,12 +273,6 @@ if [ -f "$CLI_WRAPPER" ] && grep -q "MailArchiver CLI" "$CLI_WRAPPER" 2>/dev/nul
   rm -f "$CLI_WRAPPER" && ok "Команда mailarchiver удалена."
 fi
 
-if [ -d "$INSTALL_DIR" ]; then
-  info "Удаляю файлы приложения ($INSTALL_DIR)…"
-  rm -rf "$INSTALL_DIR"
-  ok "Файлы приложения удалены."
-fi
-
 # Данные и конфигурация
 if [ "$PURGE" != "1" ] && [ -t 0 ]; then
   echo ""
@@ -239,7 +292,13 @@ if [ "$PURGE" = "1" ]; then
   purge_dir "Каталог конфигурации" "$CONFIG_DIR"
   # пользователя службы оставляем, если его файлы остались на месте
   if [ "$PURGE_FAILED" = "0" ]; then REMOVE_USER=1; fi
-else
+fi
+
+# Файлы приложения — после решения о данных: если данные лежат внутри каталога установки и их
+# оставляют, содержащий их каталог не удаляется.
+remove_app_files
+
+if [ "$PURGE" != "1" ]; then
   warn "Данные сохранены: $DATA_DIR"
   warn "Конфигурация сохранена: $CONFIG_DIR"
   echo "    Для полного удаления запустите: sudo bash scripts/uninstall.sh --purge"

@@ -534,12 +534,17 @@ class RsyncTarget(ReplicaTarget):
         return not names
 
     def sync_dir(self, src_dir: str, rel: str, *, delete: bool = False, max_delete: int = 0,
-                 excludes: Optional[List[str]] = None, cancel=None, what: str = "") -> Tuple[int, str]:
+                 excludes: Optional[List[str]] = None, cancel=None, what: str = "",
+                 protects: Optional[List[str]] = None) -> Tuple[int, str]:
+        """``protects`` — шаблоны, по которым в копии ничего не удаляется (правило rsync «P»), хотя
+        новые и изменённые файлы по ним отправляются как обычно."""
         args = ["-a", "--partial", "--stats", "--human-readable"]
         if delete:
             args += ["--delete", "--delete-after"]
             if max_delete > 0:
                 args.append(f"--max-delete={max_delete}")
+            for pattern in protects or []:
+                args.append(f"--filter=P {pattern}")
         for pattern in excludes or []:
             args.append(f"--exclude={pattern}")
         args += [src_dir.rstrip("/") + "/", self.remote_path(rel) + "/"]

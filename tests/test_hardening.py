@@ -525,7 +525,7 @@ def test_restore_iteration_stable_under_writes(services):
     eng = RestoreEngine(services.db, MaildirStore(services.cfg.mail_root), ConnectOptions())
     eng._PAGE = 4
     seen = []
-    for n, row in enumerate(eng._iter_messages(acc, None, 0)):
+    for n, (_folder_idx, row) in enumerate(eng._iter_messages(acc, None, 0)):
         seen.append(row["id"])
         if n == 4:      # в середине обхода приходят СВЕЖИЕ письма
             services.db.add_message_index_batch([

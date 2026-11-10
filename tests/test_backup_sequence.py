@@ -214,6 +214,9 @@ def test_queue_hold_blocks_and_releases_accounts(services):
     queue._running[100] = {"account_id": None, "type": JobType.BACKUP_ALL, "started": 0}
 
     class _Done:
+        def cancelled(self):
+            return False
+
         def exception(self):
             return None
 

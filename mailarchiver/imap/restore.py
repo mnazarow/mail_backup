@@ -209,9 +209,20 @@ class RestoreEngine:
             target_prefix: str = "", check_duplicates: bool = True,
             dry_run: bool = False, limit: int = 0,
             progress_cb: Optional[ProgressCB] = None, cancel_cb: Optional[CancelCB] = None,
-            event_cb: Optional[EventCB] = None) -> RestoreResult:
+            event_cb: Optional[EventCB] = None, resume: Optional[dict] = None,
+            checkpoint_cb: Optional[Callable[[dict], None]] = None) -> RestoreResult:
+        """``resume`` — отметка, оставленная прерванным прогоном этого же задания (см. ``checkpoint_cb``):
+        обход продолжается со следующего письма, счётчики — с прежних значений. Без неё задание, прерванное
+        перезапуском службы, начинало с первого письма и заливало уже залитое повторно (без проверки дублей —
+        всё, с ней — письма без Message-ID)."""
         result = RestoreResult(dry_run=dry_run)
         started = time.time()
+        resume = resume if isinstance(resume, dict) else None
+        if resume:
+            result.restored = int(resume.get("restored") or 0)
+            result.skipped = int(resume.get("skipped") or 0)
+            result.errors = int(resume.get("errors") or 0)
+            result.dup_check_unavailable = int(resume.get("dup_check_unavailable") or 0)
 
         def emit(level: str, msg: str) -> None:
             log.log({"INFO": 20, "WARNING": 30, "ERROR": 40}.get(level, 20), "[restore %s] %s", account.name, msg)
@@ -227,11 +238,18 @@ class RestoreEngine:
         # индекс в память (~190 МБ на 200 000 писем) и молча теряла всё, что
         # не поместилось в миллион самых новых писем.
         result.total = self._count_messages(account.id, folders, limit)
-        messages = self._iter_messages(account.id, folders, limit)
+        start_done = int(resume.get("done") or 0) if resume else 0
+        messages = self._iter_messages(account.id, folders, limit,
+                                       start_folder=int(resume.get("folder_idx") or 0) if resume else 0,
+                                       start_id=int(resume.get("last_id") or 0) if resume else 0,
+                                       already_sent=start_done)
         emit("INFO", f"К восстановлению отобрано писем: {result.total}"
                      + (" (сухой прогон)" if dry_run else ""))
+        if resume:
+            emit("INFO", f"Продолжение прерванного восстановления: уже обработано писем — {start_done} "
+                         f"(залито {result.restored}, пропущено {result.skipped}); они повторно не заливаются.")
         if progress_cb:
-            progress_cb(0, result.total, "Подготовка", 0, 0.0)
+            progress_cb(min(start_done, result.total), result.total, "Подготовка", 0, 0.0)
 
         if not result.total:
             return result
@@ -259,9 +277,21 @@ class RestoreEngine:
             failed_targets: Dict[str, int] = {}     # папки, которые не удалось создать
             dup_index = _DuplicateIndex(conn, emit)
 
-            done = 0
-            bytes_done = 0
-            for row in messages:
+            done = start_done
+            bytes_done = int(resume.get("bytes") or 0) if resume else 0
+
+            def checkpoint(folder_idx: int, row_id: int) -> None:
+                if checkpoint_cb is None or dry_run:
+                    return
+                try:
+                    checkpoint_cb({"folder_idx": folder_idx, "last_id": row_id, "done": done,
+                                   "bytes": bytes_done, "restored": result.restored, "skipped": result.skipped,
+                                   "errors": result.errors,
+                                   "dup_check_unavailable": result.dup_check_unavailable})
+                except Exception:  # noqa: BLE001 — отметка не должна ронять восстановление
+                    log.exception("[restore %s] не удалось записать отметку продолжения", account.name)
+
+            for folder_idx, row in messages:
                 check_cancel()
                 src_folder = row["folder"]
                 target = self._resolve_target(src_folder, delimiter, target_mode, target_folder, target_prefix)
@@ -272,6 +302,7 @@ class RestoreEngine:
                     failed_targets[target] += 1
                     result.add_error(f"UID {row['uid']} -> «{target}»: папка назначения недоступна")
                     done += 1
+                    checkpoint(folder_idx, row["id"])
                     continue
 
                 try:
@@ -282,6 +313,7 @@ class RestoreEngine:
                     # письмо обработано (пусть и с ошибкой) — иначе прогресс-бар
                     # не дойдёт до 100 %
                     done += 1
+                    checkpoint(folder_idx, row["id"])
                     continue
 
                 if dry_run:
@@ -328,6 +360,8 @@ class RestoreEngine:
                 elif outcome == "skipped":
                     session.progressed()
                 done += 1
+                # Отметка — после КАЖДОГО письма: запись одна и маленькая, а пропуск стоил бы повторов в ящике.
+                checkpoint(folder_idx, row["id"])
                 if done > result.total:
                     # индекс пополнился во время прогона: не даём прогрессу
                     # уйти за 100 % и показываем настоящее число
@@ -436,8 +470,12 @@ class RestoreEngine:
             total = min(total, limit)
         return total
 
-    def _iter_messages(self, account_id: int, folders: Optional[List[str]], limit: int):
-        """Генератор строк индекса: постранично по ``id``, без материализации.
+    def _iter_messages(self, account_id: int, folders: Optional[List[str]], limit: int, *,
+                       start_folder: int = 0, start_id: int = 0, already_sent: int = 0):
+        """Генератор пар (номер папки, строка индекса): постранично по ``id``, без материализации.
+
+        ``start_folder``/``start_id``/``already_sent`` — продолжение прерванного прогона: папки до
+        ``start_folder`` пропускаются, в ней самой — письма с id не больше ``start_id``.
 
         Обход именно по первичному ключу, а не по OFFSET. Прежний вариант
         сортировал по ``internaldate DESC``: письма, пришедшие во время
@@ -445,15 +483,19 @@ class RestoreEngine:
         выдавалась повторно (и при снятой галке «Пропускать дубли» заливалась
         на сервер дважды), а при удалении по ретеншну часть терялась.
         """
-        sent = 0
-        for fld in self._folder_targets(folders):
-            last_id = 0
+        sent = max(0, int(already_sent))
+        if limit and limit > 0 and sent >= limit:
+            return
+        for folder_idx, fld in enumerate(self._folder_targets(folders)):
+            if folder_idx < start_folder:
+                continue
+            last_id = start_id if folder_idx == start_folder else 0
             while True:
                 chunk = self.db.messages_after_id(account_id, last_id, folder=fld, limit=self._PAGE)
                 if not chunk:
                     break
                 for row in chunk:
-                    yield row
+                    yield folder_idx, row
                     sent += 1
                     if limit and limit > 0 and sent >= limit:
                         return
