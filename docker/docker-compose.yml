@@ -8,9 +8,11 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    image: mailarchiver:1.14.2
+    image: mailarchiver:1.15.0
     container_name: mailarchiver
     restart: unless-stopped
+    # При остановке идущие задания возвращаются в очередь — на это нужно до ~25 с (по умолчанию Docker ждёт 10)
+    stop_grace_period: 30s
     ports:
       # Только петлевой интерфейс: у сервиса нет TLS, а интерфейс даёт полный
       # доступ ко всем архивам почты. Наружу публикуйте через reverse proxy
@@ -27,6 +29,9 @@ services:
       MA_HOST: "0.0.0.0"
       MA_PORT: "8493"
       TZ: "Europe/Moscow"
+      # Задания и расписания — в отдельном процессе контейнера: интерфейс не тормозит во время копий
+      # (то же, что server.worker_process в config.yaml; ещё ~60–100 МБ памяти).
+      # MAILARCHIVER_WORKER_PROCESS: "1"
       # Автосоздание администратора при первом запуске — НЕОБЯЗАТЕЛЬНО.
       # Пароль в этом файле НЕ ЗАДАН намеренно: он попал бы в репозиторий.
       # Задайте его одним из двух способов:

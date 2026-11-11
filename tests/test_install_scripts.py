@@ -373,6 +373,9 @@ SITE = "@SITE@"
 args = sys.argv[1:]
 with open("@CALLS@", "a", encoding="utf-8") as fh:
     fh.write(" ".join(args) + "\n")
+if os.environ.get("PIP_CONSTRAINT"):         # MA_CONSTRAINTS доходит до pip
+    with open("@CALLS@" + "_constraint", "a", encoding="utf-8") as fh:
+        fh.write(os.environ["PIP_CONSTRAINT"] + "\n")
 if [a for a in args if not a.startswith("-")][:2] == ["config", "list"]:
     if os.environ.get("FAKE_PIP_INDEX_URL"):
         print("global.index-url='%s'" % os.environ["FAKE_PIP_INDEX_URL"])
@@ -1464,6 +1467,29 @@ def test_update_health_check_uses_configured_address():
         shutil.rmtree(base, ignore_errors=True)
         for stash in box.stashes:
             shutil.rmtree(stash, ignore_errors=True)
+
+
+@needs_root
+def test_constraints_file_goes_to_pip(sandbox):
+    """MA_CONSTRAINTS — точные версии библиотек: путь (абсолютный) получает каждый вызов pip;
+    нечитаемый файл — отказ до остановки службы."""
+    sandbox.install_old()
+    src = sandbox.sources(NEW, "src_new")
+    sandbox.forget_calls()
+    before = sandbox.snapshot(src)
+    proc = sandbox.run("update.sh", src, MA_CONSTRAINTS=os.path.join(sandbox.base, "нет-такого.txt"))
+    assert proc.returncode == 2 and "MA_CONSTRAINTS" in proc.stderr and "не читается" in proc.stderr, _report(proc)
+    _untouched(sandbox, before, proc, src)
+    cons = os.path.join(sandbox.base, "constraints.txt")
+    _write(cons, "fastapi==0.115.6\n")
+    proc = sandbox.run("update.sh", src, MA_CONSTRAINTS=os.path.relpath(cons, src))   # относительно каталога запуска
+    assert proc.returncode == 0, _report(proc)
+    with open(os.path.join(sandbox.state, "pip_calls_constraint"), encoding="utf-8") as fh:
+        seen = set(fh.read().split())
+    assert seen == {os.path.realpath(cons)}
+    assert sandbox.wait_version() == NEW
+    usage = sandbox.run("update.sh", src, args=("--help",)).stdout
+    assert "MA_CONSTRAINTS=ФАЙЛ" in usage
 
 
 @needs_root

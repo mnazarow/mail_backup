@@ -647,15 +647,30 @@ _RESTORE_CKPT = "restore_ckpt:"
 
 
 def handle_restore(ctx: JobContext) -> Dict:
+    """Восстановление писем из архива в ящик по IMAP (или через FTP Backup Axigen).
+
+    Задание числится за ящиком, ИЗ архива которого берутся письма (ctx.account_id). С 1.15.0 можно
+    вернуть отдельные письма (``message_ids``) — в тот же ящик или, по решению администратора, в другой
+    (``target_account_id``).
+    """
     svc = ctx.services
-    acc = svc.require_account(ctx.account_id)
     p = ctx.params
-    ctx.event("INFO", f"Старт восстановления ящика «{acc.name}» (режим: {p.get('target_mode','original')}).")
+    source = svc.require_account(ctx.account_id)
+    message_ids = [int(i) for i in (p.get("message_ids") or [])] or None
+    target_id = int(p.get("target_account_id") or 0) or source.id
+    acc = svc.require_account(target_id) if target_id != source.id else source
+    if message_ids is not None:
+        where = (f"в ящик «{acc.name}»" if acc.id == source.id
+                 else f"из архива ящика «{source.name}» в ящик «{acc.name}»")
+        ctx.event("INFO", f"Старт восстановления писем ({len(message_ids)}) {where} "
+                          f"(режим: {p.get('target_mode', 'original')}).")
+    else:
+        ctx.event("INFO", f"Старт восстановления ящика «{acc.name}» (режим: {p.get('target_mode','original')}).")
     # Отметка продолжения: прерванное перезапуском службы (или упавшее и повторённое) восстановление по
     # IMAP идёт дальше со следующего письма, а не заливает уже залитое заново.
     ckpt_key = f"{_RESTORE_CKPT}{ctx.job_id}"
     resume = None
-    via_ftp = restore_via_ftp(acc, p)
+    via_ftp = restore_via_ftp(acc, p) and message_ids is None
     if not via_ftp and not p.get("dry_run"):
         try:
             resume = json.loads(ctx.db.get_meta(ckpt_key) or "null")
@@ -667,7 +682,7 @@ def handle_restore(ctx: JobContext) -> Dict:
     if restore_id:
         ctx.db.update_restore(restore_id, status="pending", error="")
     else:
-        restore_id = ctx.db.create_restore(acc.id, p, ctx.job_id)
+        restore_id = ctx.db.create_restore(source.id, p, ctx.job_id)
 
     def save_checkpoint(state: dict) -> None:
         ctx.db.set_meta(ckpt_key, json.dumps(dict(state, restore_id=restore_id)))
@@ -692,6 +707,8 @@ def handle_restore(ctx: JobContext) -> Dict:
     else:
         engine = RestoreEngine(ctx.db, svc.store, svc.connect_options())
     extra = {} if via_ftp else {"resume": resume, "checkpoint_cb": save_checkpoint}
+    if message_ids is not None:
+        extra.update(message_ids=message_ids, source_account_id=source.id)
     try:
         res = engine.run(
             acc,

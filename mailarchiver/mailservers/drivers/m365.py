@@ -26,7 +26,7 @@ import time
 import urllib.parse
 import uuid
 from datetime import date, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from ...errors import ValidationError
 from ..base import (AlreadyExists, Cap, Driver, Field, ImapAuth, NotFound, ServerAuthError, ServerError, Status,

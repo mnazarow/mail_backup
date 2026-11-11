@@ -27,7 +27,12 @@ async function api(path, opts={}){
   if(o.body && !(o.body instanceof FormData)){ o.headers['Content-Type']='application/json'; o.body=JSON.stringify(o.body); }
   o.headers['X-Requested-With']='fetch';
   if(bg) o.headers['X-MA-Background']='1';
-  const res = await fetch('/api'+path, o);
+  let res;
+  try{ res = await fetch('/api'+path, o); }
+  catch(e){
+    // сеть пропала или сервер перезапускается: у fetch на это английское «Failed to fetch»
+    const err=new Error('Нет связи с сервером. Проверьте сеть и повторите.'); err.network=true; err.bg=bg; throw err;
+  }
   let data=null; const ct=res.headers.get('content-type')||'';
   if(ct.includes('application/json')) data=await res.json();
   // HTTPException с объектом в detail: поднимаем поля наверх (message/code/hint)
@@ -36,7 +41,7 @@ async function api(path, opts={}){
   }
   if(!res.ok){
     const msg = (data && (data.message||(typeof data.detail==='string'?data.detail:''))) || ('Ошибка '+res.status);
-    const err = new Error(msg); err.data=data; err.status=res.status;
+    const err = new Error(msg); err.data=data; err.status=res.status; err.bg=bg;
     if(data && data.code==='2fa_required' && State.user && !State.enrolling2fa){ twoFactorModal({mandatory:true}); }
     if(res.status===401 && State.user && !AUTH_PATHS.has(path.split('?')[0])) sessionGone();
     throw err;
@@ -51,6 +56,14 @@ function toast(title, message='', type='success', ttl=4200){
   setTimeout(()=>{ t.style.opacity='0'; t.style.transform='translateX(20px)'; setTimeout(()=>t.remove(),200); }, ttl);
 }
 function toastErr(e){ toast('Ошибка', (e&&e.message)||String(e), 'error', 6000); const hint=e&&e.data&&e.data.hint; if(hint) toast('Подсказка', hint, 'warn', 7000); }
+// Ошибка запроса, которую обработчик кнопки не перехватил (окно «Детали», окна ящика и экспорта и т. п.):
+// раньше при сбое сети такие кнопки молча ничего не делали. Фоновые запросы и конец сеанса — без сообщения.
+window.addEventListener('unhandledrejection', (ev)=>{
+  const e=ev.reason;
+  if(!e || e.bg || e.status===401 || e.name==='AbortError' || State.sessionGone) return;
+  if(!(e instanceof Error)) return;
+  toastErr(e);
+});
 
 /** Сессия закончилась (тайм-аут, выход в другой вкладке, смена пароля):
  *  останавливаем живое обновление и возвращаемся к форме входа. Раньше раздел
@@ -58,6 +71,7 @@ function toastErr(e){ toast('Ошибка', (e&&e.message)||String(e), 'error', 
 function sessionGone(){
   if(State.sessionGone) return;
   State.sessionGone=true;
+  State.leaveGuard=null;          // сеанс кончился — сохранить уже нельзя, вопрос при перезагрузке не нужен
   try{ if(State.ws) State.ws.close(); }catch(_){}
   if(State.wsTimer){ clearInterval(State.wsTimer); State.wsTimer=null; }
   if(State.checkLoginsTimer){ clearInterval(State.checkLoginsTimer); }
@@ -73,6 +87,7 @@ function toggleTheme(){
   try{ localStorage.setItem('ma-theme', next); }catch(e){}
   // перерисовать графики под новую тему (canvas не наследует CSS-переменные)
   if(State.redraw){ requestAnimationFrame(()=>{ try{ State.redraw(); }catch(e){} }); }
+  if(State.view==='docs' && State.docTheme){ try{ State.docTheme(); }catch(e){} }
 }
 
 // ---------- Подсказка по параметру ----------
@@ -345,6 +360,7 @@ const NAV = [
   {id:'users', icon:'👥', title:'Пользователи', roles:'a'},
   {id:'security', icon:'🔐', title:'Безопасность', roles:'a'},
   {id:'audit', icon:'🛡️', title:'Аудит', roles:'a'},
+  {id:'docs', icon:'📖', title:'Документация', roles:'aom'},
 ];
 const ROLE_LABELS = {admin:'администратор', operator:'оператор', mailbox:'вход по ящику'};
 function isMailbox(){ return !!State.user && State.user.role === 'mailbox'; }
@@ -357,13 +373,18 @@ function navAllowed(item){ return !item.sep && item.roles.includes(roleCode()) &
 /** Сотрудник (вход по ящику) может отменять и повторять только свои задания:
  *  копирование по расписанию запускает не он, и снимать его ему нельзя.
  *  Оператор — только копирование и проверки (не «с нуля», не выгрузки). */
+/** Ящики сотрудника (вход по ящику): все ящики его карточки, вошедший — первым. */
+function myAccounts(){
+  if(!isMailbox()) return [];
+  const list=State.user.accounts||[];
+  return list.length ? list : [{id:State.user.account_id, name:State.user.account_name||'мой ящик'}];
+}
 function canTouchJob(j){
-  if(isMailbox()) return !!j && j.created_by === State.user.username;
+  // своё задание — запущенное под логином любого из своих ящиков: войти можно паролем любого
+  if(isMailbox()) return !!j && (State.user.logins||[State.user.username]).includes(j.created_by);
   if(isOperator()) return !!j && !!j.operator_can_manage;
   return true;
 }
-/** Сообщение там, где оператору нужно обратиться к администратору. */
-const ADMIN_ONLY_HINT = 'Доступно администратору';
 
 // Клик и Enter по значку «?» открывают подсказку: на тач-экране навести
 // курсор невозможно, а помощь по параметрам нужна именно там.
@@ -377,8 +398,36 @@ document.addEventListener('focusin', (e)=>{ const ic=e.target.closest && e.targe
 document.addEventListener('click', (e)=>{
   const ic=e.target.closest && e.target.closest('.help-ic');
   document.querySelectorAll('.help-ic.show').forEach(el=>{ if(el!==ic) el.classList.remove('show'); });
-  if(ic){ placeHelp(ic); ic.classList.toggle('show'); }
+  // «?» внутри подписи, связанной с полем: щелчок открывает подсказку, а не переключает флажок и не ставит
+  // курсор в поле
+  if(ic){ placeHelp(ic); ic.classList.toggle('show'); if(ic.closest('label')) e.preventDefault(); }
 });
+// Подписи полей форм. Формы собираются из разметки «.form-row > label + поле», и у большинства подпись не
+// была связана с полем: экранный диктор читал «поле ввода» без названия, а щелчок по подписи не ставил курсор.
+// Связываем сами: поле без id и без aria-label получает id, подпись — for.
+let fieldSeq=0;
+function linkFormLabels(root){
+  if(!root || !root.querySelectorAll) return;
+  const rows = root.matches && root.matches('.form-row') ? [root] : root.querySelectorAll('.form-row');
+  rows.forEach(row=>{
+    const label=row.querySelector(':scope > label');
+    if(!label || label.htmlFor || label.querySelector('input,select,textarea')) return;
+    const fields=row.querySelectorAll('input:not([type=hidden]),select,textarea');
+    if(fields.length!==1) return;
+    const f=fields[0];
+    if(f.getAttribute('aria-label') || f.getAttribute('aria-labelledby')) return;
+    if(!f.id) f.id='fld-'+(++fieldSeq);
+    label.htmlFor=f.id;
+  });
+}
+new MutationObserver(list=>{ for(const m of list) m.addedNodes.forEach(n=>{ if(n.nodeType===1) linkFormLabels(n); }); })
+  .observe(document.documentElement, {childList:true, subtree:true});
+// Ссылки-кнопки (href="#") никуда не переходят: без этого щелчок менял адрес на «#» и открывал дашборд.
+// Раньше в href у них был код («javascript:» с void(0)), но такие ссылки запрещает политика безопасности страницы.
+document.addEventListener('click', (e)=>{
+  const a=e.target && e.target.closest ? e.target.closest('a[href="#"]') : null;
+  if(a) e.preventDefault();
+}, true);
 // Переключатели «вкл/выкл» (.switch): сам флажок скрыт, поэтому щелчок по дорожке
 // или по подписи рядом переключает его явно. Без этого флажок включался только
 // с клавиатуры (Tab + пробел), а мышью — никак.
@@ -421,7 +470,7 @@ async function startApp(){
         <div class="spacer"></div>
         <span id="schedInd" class="small muted"></span>
         <button class="btn ghost sm" id="themeBtn" title="Сменить тему">🌓</button>
-        <a class="btn ghost sm" href="/static/docs/index.html" target="_blank" title="Документация">📖 <span class="hide-narrow">Документация</span></a>
+        <a class="btn ghost sm" id="docsBtn" href="#/docs" title="Справка к этому разделу">📖 <span class="hide-narrow">Справка</span></a>
       </header>
       <div class="content" id="content"></div>
     </main>
@@ -439,12 +488,16 @@ async function startApp(){
   };
   $('#navToggle').onclick=()=>setNav(!sidebar.classList.contains('open'));
   navBack.onclick=()=>setNav(false);
-  nav.addEventListener('click', ()=>setNav(false));   // выбрали раздел — меню закрылось
+  $('#nav').addEventListener('click', ()=>setNav(false));   // выбрали раздел — меню закрылось
   window.addEventListener('hashchange', ()=>setNav(false));
   $('#themeBtn').onclick=toggleTheme;
+  // «📖 Справка» открывает в разделе «Документация» главу про тот раздел, где сейчас человек
+  $('#docsBtn').onclick=(e)=>{ e.preventDefault(); if(State.view!=='docs') location.hash=docsHref(DOC_ANCHORS[State.view]||''); };
   $('#logout').onclick=async(e)=>{ e.preventDefault(); try{await api('/logout',{method:'POST'});}catch(_){} location.reload(); };
   $('#profileLink').onclick=(e)=>{ e.preventDefault(); if(isMailbox()) return toast('Вход по ящику','Защита такого входа — пароль самого почтового ящика.','warn'); twoFactorModal({}); };
   window.addEventListener('hashchange', route);
+  // закрытие вкладки или перезагрузка при несохранённых настройках — стандартный вопрос браузера
+  window.addEventListener('beforeunload', (e)=>{ if(State.leaveGuard && State.leaveGuard()){ e.preventDefault(); e.returnValue=''; } });
   if(State.user.must_enroll_2fa){ twoFactorModal({mandatory:true}); return; }
   let rzT=null;
   window.addEventListener('resize', ()=>{ if(!State.redraw) return; clearTimeout(rzT); rzT=setTimeout(()=>{ try{State.redraw();}catch(e){} }, 220); });
@@ -477,10 +530,17 @@ function route(){
   // сотруднику и оператору доступны только их разделы
   const allowed = NAV.filter(navAllowed).map(n=>n.id);
   if(!allowed.includes(view)) view = isMailbox()?'mail':'dashboard';
+  // Уход из раздела с несохранёнными изменениями (настройки) — только после подтверждения: раньше они
+  // молча пропадали. Отказ возвращает адрес прежнего раздела, не перерисовывая его.
+  if(State.leaveGuard && State.view && State.view!==view){
+    const warn=State.leaveGuard();
+    if(warn && !window.confirm(warn)){ history.replaceState(null, '', '#/'+State.view); setActiveNav(State.view); return; }
+  }
+  State.leaveGuard=null;
   State.view=view; setActiveNav(view); State.redraw=null;
   const content=$('#content');
   // почтовому клиенту нужна вся ширина экрана — три колонки в 1240px тесно
-  content.classList.toggle('wide', view==='mail');
+  content.classList.toggle('wide', view==='mail' || view==='docs');
   // Каждый переход рисует в СВОЙ контейнер. Медленный ответ прежнего раздела
   // (аналитика, поиск) раньше дорисовывался поверх нового: заголовок «Логи»,
   // а на экране аналитика. Теперь он пишет в уже отцепленный узел.
@@ -488,7 +548,7 @@ function route(){
   const c=h('<div class="view-host"><div class="empty"><div class="spinner"></div></div></div>');
   content.appendChild(c);
   State.routeSeq=(State.routeSeq||0)+1;
-  const map={dashboard:viewDashboard,analytics:viewAnalytics,mailanalytics:viewMailAnalytics,mail:viewMail,accounts:viewAccounts,employees:viewEmployees,jobs:viewJobs,exports:viewExports,schedules:viewSchedules,axigen:viewAxigen,mailservers:viewMailservers,server:viewServer,logs:viewLogs,settings:viewSettings,users:viewUsers,security:viewSecurity,audit:viewAudit};
+  const map={dashboard:viewDashboard,analytics:viewAnalytics,mailanalytics:viewMailAnalytics,mail:viewMail,accounts:viewAccounts,employees:viewEmployees,jobs:viewJobs,exports:viewExports,schedules:viewSchedules,axigen:viewAxigen,mailservers:viewMailservers,server:viewServer,logs:viewLogs,settings:viewSettings,users:viewUsers,security:viewSecurity,audit:viewAudit,docs:viewDocs};
   (map[view]||viewDashboard)(c).catch(toastErr);
 }
 
@@ -627,7 +687,7 @@ async function viewDashboard(c){
 
   const grid=h(`<div class="grid cols-2">
     <div class="card"><div class="section-title"><h3>📈 Активность</h3><span class="muted small">новые письма за 30 дней</span></div><div class="an-chart" id="chartBox"></div></div>
-    <div class="card"><div class="section-title"><h3>📬 ${isMailbox()?'Мой ящик':'Ящики'}</h3>${isMailbox()?'':`<span class="tag">${s.totals.accounts}</span><div class="spacer"></div>${isAdmin()?'<button class="btn sm primary" id="addAcc">+ Добавить</button>':''}`}</div><div id="accList"></div></div>
+    <div class="card"><div class="section-title"><h3>📬 ${isMailbox()?(myAccounts().length>1?'Мои ящики':'Мой ящик'):'Ящики'}</h3>${isMailbox()?'':`<span class="tag">${s.totals.accounts}</span><div class="spacer"></div>${isAdmin()?'<button class="btn sm primary" id="addAcc">+ Добавить</button>':''}`}</div><div id="accList"></div></div>
   </div>`);
   c.appendChild(grid);
   const addAcc=$('#addAcc', grid); if(addAcc) addAcc.onclick=()=>accountModal();
@@ -701,18 +761,23 @@ function renderAccountMini(accounts, box){
 // ===================================================================
 //  Сотрудники
 // ===================================================================
-const Emp = { query:'', status:'', offset:0, limit:100 };
+const Emp = { query:'', status:'', offset:0, limit:100, seq:0 };
 
 async function viewEmployees(c){
   let d;
+  const seq=++Emp.seq;      // ответ на прежний запрос (быстрый ввод в поиске) список не перерисовывает
   const q = new URLSearchParams({limit:Emp.limit, offset:Emp.offset});
   if(Emp.query) q.set('query', Emp.query);
   if(Emp.status) q.set('status', Emp.status);
   try{ d = await api('/employees?'+q.toString()); }
-  catch(e){ toastErr(e); c.innerHTML='<div class="card"><div class="empty">Не удалось загрузить список сотрудников</div></div>'; return; }
+  catch(e){ if(seq!==Emp.seq) return; toastErr(e); c.innerHTML='<div class="card"><div class="empty">Не удалось загрузить список сотрудников</div></div>'; return; }
   // Сведения об источнике не критичны: если запрос не прошёл, список всё равно показываем.
   let src=null; try{ src=(await api('/employees/source')).source; }catch(e){}
+  if(seq!==Emp.seq) return;
   const cnt = d.counts||{};
+  // Раздел перерисовывается целиком: поле поиска, в котором человек печатает, сохраняет фокус и всё, что
+  // успели напечатать, пока шёл запрос (раньше фокус пропадал после каждой паузы в наборе).
+  const oldQ=$('#empQ',c), hadFocus=!!oldQ && document.activeElement===oldQ, typed=oldQ?oldQ.value:'';
   c.innerHTML='';
 
   const head=h(`<div class="section-title"><h2 style="margin:0">Сотрудники</h2>
@@ -772,8 +837,13 @@ async function viewEmployees(c){
     <span class="muted small">показано ${d.employees.length} из ${d.total}</span></div>`);
   c.appendChild(bar);
   let t=null;
-  $('#empQ',bar).oninput=(e)=>{ clearTimeout(t); t=setTimeout(()=>{ Emp.query=e.target.value.trim(); Emp.offset=0; viewEmployees(c); }, 400); };
+  const qi=$('#empQ',bar);
+  qi.oninput=(e)=>{ clearTimeout(t); t=setTimeout(()=>{ Emp.query=e.target.value.trim(); Emp.offset=0; viewEmployees(c); }, 400); };
   $('#empStatus',bar).onchange=(e)=>{ Emp.status=e.target.value; Emp.offset=0; viewEmployees(c); };
+  if(hadFocus){
+    qi.value=typed; qi.focus(); qi.setSelectionRange(typed.length, typed.length);
+    if(typed.trim()!==Emp.query) qi.oninput({target:qi});      // допечатали, пока шёл запрос
+  }
 
   if(!d.employees.length){
     c.appendChild(h(`<div class="card"><div class="empty"><div class="big">🧑‍💼</div>
@@ -782,13 +852,16 @@ async function viewEmployees(c){
   }
 
   const wrap=h(`<div class="card table-wrap"><table class="tbl"><thead><tr>
-    <th>ФИО</th><th>E-mail</th><th>Должность</th><th>Отдел</th><th>Почтовый ящик</th><th>Статус</th><th></th>
+    <th>ФИО</th><th>E-mail</th><th>Должность</th><th>Отдел</th><th>Почтовые ящики</th><th>Статус</th><th></th>
   </tr></thead><tbody></tbody></table></div>`);
   const tb=wrap.querySelector('tbody');
   d.employees.forEach(e=>{
-    const box = e.account_id
-      ? `<span class="tag" title="${esc(e.account_name)}">${esc(trunc(e.account_name||'ящик',20))}</span>
-         <span class="badge ${e.account_enabled?'success':'queued'}" title="${e.account_enabled?'Ящик участвует в копировании':'Ящик выключен: задайте пароль и включите его в разделе «Почтовые ящики»'}">${e.account_enabled?'вкл':'выкл'}</span>`
+    // У сотрудника может быть несколько ящиков: показываем первые два и «ещё N».
+    const boxes=e.accounts||[];
+    const box = boxes.length
+      ? boxes.slice(0,2).map(a=>`<div class="nowrap"><span class="tag" title="${esc(a.name)} — ${esc(a.username)}">${esc(trunc(a.name||'ящик',20))}</span>
+         <span class="badge ${a.enabled?'success':'queued'}" title="${a.enabled?'Ящик участвует в копировании':'Ящик выключен: задайте пароль и включите его в разделе «Почтовые ящики»'}">${a.enabled?'вкл':'выкл'}</span></div>`).join('')
+        + (boxes.length>2?`<div class="muted small">и ещё ${boxes.length-2}</div>`:'')
       : '<span class="muted small">—</span>';
     const tr=h(`<tr>
       <td><strong>${esc(e.full_name)}</strong>${e.external_id?`<div class="muted small">таб. № ${esc(e.external_id)}</div>`:''}</td>
@@ -853,10 +926,11 @@ function employeeModal(e){
       <label>Завести почтовый ящик для резервного копирования</label></div>
       <div class="hint">Ящик создаётся <b>выключенным</b> и без пароля — задайте пароль и включите его в разделе «Почтовые ящики».
       Адрес ящика берётся из поля E-mail, сервер — из настроек (раздел «Сотрудники»).</div>`:
-      (e.account_id?`<div class="hint">Привязанный ящик: <b>${esc(e.account_name||'')}</b> ${e.account_enabled?'(включён)':'(выключен)'}</div>`:'')}`;
+      '<div id="e-boxes" style="margin-top:6px"></div>'}`;
   const m=modal(isNew?'Новый сотрудник':`Сотрудник: ${e.full_name}`, body,
     {wide:true, footer:`<button class="btn ghost" data-c>Отмена</button><button class="btn primary" data-save>Сохранить</button>`});
   const g=x=>m.body.querySelector(x);
+  if(!isNew) employeeBoxes(e, g('#e-boxes'));
   m.foot.querySelector('[data-c]').onclick=m.close;
   m.foot.querySelector('[data-save]').onclick=async()=>{
     const payload={full_name:g('#e-name').value.trim(), email:g('#e-mail').value.trim(), position:g('#e-pos').value.trim(),
@@ -872,14 +946,89 @@ function employeeModal(e){
       } else {
         const r=await api(`/employees/${e.id}`,{method:'PUT',body:payload});
         if(r.dismissed && r.dismissed.account){
-          const d=r.dismissed; const what={final_backup:'последняя копия ящика поставлена в очередь, затем копирование выключится', disabled:'копирование ящика выключено', kept:'копирование ящика продолжается', already_disabled:'копирование ящика уже было выключено'}[d.action]||'';
-          toast('Сотрудник уволен', `Архив ящика «${d.account}» удерживается ${d.hold_until==='9999-12-31'?'бессрочно':'до '+holdDate(d.hold_until)}; ${what}.`, 'success', 9000);
+          const d=r.dismissed, many=(d.accounts||[]).length>1;
+          const what=({final_backup:`последняя копия ${many?'ящиков':'ящика'} поставлена в очередь, затем копирование выключится`, disabled:`копирование ${many?'ящиков':'ящика'} выключено`, kept:`копирование ${many?'ящиков':'ящика'} продолжается`, already_disabled:`копирование ${many?'ящиков':'ящика'} уже было выключено`, mixed:'копирование ящиков выключается после последней копии (подробности — в аудите)'})[d.action]||'';
+          toast('Сотрудник уволен', `Архив ${many?'ящиков':'ящика'} «${d.account}» удерживается ${d.hold_until==='9999-12-31'?'бессрочно':'до '+holdDate(d.hold_until)}; ${what}.`, 'success', 9000);
         } else if(r.rehired && r.rehired.account){
           toast('Сотрудник снова работает', `Удержание снято${r.rehired.enabled?', копирование ящика снова включено':''}.`);
         } else toast('Сохранено');
       }
       m.close(); route();
     }catch(err){ toastErr(err); }
+  };
+}
+
+/** Ящики сотрудника в его карточке: список, «отвязать», «привязать существующий», «завести ещё один». */
+// Перенос ящика: вошедший паролем ящика видит все ящики владельца — открытые сеансы этого ящика
+// завершаются, а пароль, который знает прежний владелец, лучше сменить на почтовом сервере.
+const MOVE_NOTE='Открытые сеансы этого ящика будут завершены. Кто знает его пароль, увидит архив всех ящиков нового владельца — если ящиком пользовался прежний владелец, смените пароль на почтовом сервере.';
+async function employeeBoxes(e, box){
+  if(!box) return;
+  box.innerHTML='<div class="muted small">Загрузка ящиков…</div>';
+  let emp;
+  try{ emp=await api(`/employees/${e.id}`); }catch(err){ box.innerHTML=`<div class="hint warnbox">${esc(err.message)}</div>`; return; }
+  const boxes=emp.accounts||[];
+  box.innerHTML=`<h4 style="margin:8px 0 6px">📬 Почтовые ящики сотрудника (${boxes.length})</h4>
+    ${boxes.length?`<div class="table-wrap"><table class="tbl"><tbody>${boxes.map(a=>`<tr>
+      <td><strong>${esc(a.name)}</strong><div class="small muted">${esc(a.username)}</div></td>
+      <td><span class="badge ${a.enabled?'success':'queued'}">${a.enabled?'включён':'выключен'}</span>${a.hold_until?`<div class="small muted">🔒 ${a.hold_until==='9999-12-31'?'бессрочно':'до '+esc(holdDate(a.hold_until))}</div>`:''}</td>
+      <td class="small muted">${a.last_backup_at?'копия '+esc(fmtDate(a.last_backup_at)):'копий ещё нет'}</td>
+      <td style="text-align:right"><button class="btn sm ghost" data-unlink="${a.id}" title="Ящик и его архив остаются; он просто перестаёт числиться за сотрудником">Отвязать</button></td></tr>`).join('')}</tbody></table></div>`
+      :'<div class="muted small">Ящиков нет — почта сотрудника не копируется.</div>'}
+    <div class="btn-row" style="margin-top:8px">
+      <button class="btn sm" data-add>+ Завести ящик</button>
+      <button class="btn sm ghost" data-link>🔗 Привязать существующий</button></div>
+    <div class="hint" style="margin-top:6px">Сотрудник, вошедший паролем любого своего ящика, видит архив всех ящиков из этого списка. Не привязывайте ящик, пароль которого знает кто-то ещё (общий ящик отдела): тот увидит и остальные.</div>`;
+  const reload=()=>employeeBoxes(e, box);
+  box.querySelectorAll('[data-unlink]').forEach(b=>b.onclick=async()=>{
+    const a=boxes.find(x=>String(x.id)===b.dataset.unlink)||{};
+    if(!await confirmDlg('Отвязать ящик?', `Ящик «${a.name}» перестанет числиться за сотрудником «${e.full_name}». Сам ящик и его архив остаются, синхронизация не заведёт его заново.`, {okText:'Отвязать'})) return;
+    try{ await api(`/employees/${e.id}/accounts/${a.id}`, {method:'DELETE'}); toast('Ящик отвязан'); reload(); }catch(err){ toastErr(err); }
+  });
+  box.querySelector('[data-add]').onclick=()=>{
+    const m=modal('Завести ящик сотруднику', `
+      <div class="form-row"><label for="na-mail">Адрес ящика</label><input id="na-mail" type="text" placeholder="i.ivanov@example.ru" value="${boxes.length?'':esc(e.email||'')}"></div>
+      <div class="hint">Ящик заводится по шаблону ящиков сотрудников (сервер, логин, папки, расписание) — обычно выключенным и без пароля. Если ящик с таким логином уже есть, он будет привязан.</div>`,
+      {footer:`<button class="btn ghost" data-c>Отмена</button><button class="btn primary" data-go>Завести</button>`});
+    m.foot.querySelector('[data-c]').onclick=m.close;
+    const go=async(move)=>{
+      const email=m.body.querySelector('#na-mail').value.trim();
+      if(!email) return toastErr({message:'Укажите адрес ящика.'});
+      try{
+        const r=await api(`/employees/${e.id}/accounts`, {method:'POST', body:{email, move:!!move}});
+        m.close();
+        toast(r.action==='created'?'Ящик заведён':r.action==='owned_already'?'Этот ящик уже у сотрудника':'Ящик привязан', r.action==='created'?'Задайте пароль и включите его в разделе «Почтовые ящики».':''); reload();
+      }catch(err){
+        if(!move && /уже принадлежит/.test(err.message||'') && await confirmDlg('Перенести ящик?', `${err.message} Перенести его этому сотруднику? ${MOVE_NOTE}`, {okText:'Перенести', okClass:'primary'})) return go(true);
+        toastErr(err);
+      }
+    };
+    m.foot.querySelector('[data-go]').onclick=()=>go(false);
+  };
+  box.querySelector('[data-link]').onclick=async()=>{
+    let accs;
+    try{ accs=await api('/accounts'); State.accounts=accs; }catch(err){ return toastErr(err); }
+    const mine=new Set(boxes.map(a=>a.id));
+    const m=modal('Привязать ящик', `
+      <div class="form-row"><input id="la-q" type="text" placeholder="Найти ящик по названию или адресу" aria-label="Найти ящик" style="margin-bottom:8px">
+      <select id="la-sel" size="8" aria-label="Ящик"></select></div>
+      <div class="hint">Ящик принадлежит одному сотруднику: ящик, уже числящийся за другим, будет перенесён (с подтверждением).</div>`,
+      {footer:`<button class="btn ghost" data-c>Отмена</button><button class="btn primary" data-go>Привязать</button>`});
+    const q=m.body.querySelector('#la-q'), sel=m.body.querySelector('#la-sel');
+    const fill=()=>{ const t=q.value.trim().toLowerCase();
+      sel.innerHTML=accs.filter(a=>!mine.has(a.id) && (!t || (a.name||'').toLowerCase().includes(t) || (a.username||'').toLowerCase().includes(t))).slice(0,300)
+        .map(a=>`<option value="${a.id}">${esc(a.name)} — ${esc(a.username)}${a.employee_name?' · сейчас: '+esc(a.employee_name):''}</option>`).join(''); };
+    fill(); q.oninput=fill;
+    m.foot.querySelector('[data-c]').onclick=m.close;
+    const go=async(move)=>{
+      const id=parseInt(sel.value||'0'); if(!id) return toastErr({message:'Выберите ящик.'});
+      try{ await api(`/employees/${e.id}/link-account?account_id=${id}${move?'&move=true':''}`, {method:'POST'}); m.close(); toast('Ящик привязан'); reload(); }
+      catch(err){
+        if(!move && /уже принадлежит/.test(err.message||'') && await confirmDlg('Перенести ящик?', `${err.message} Перенести его сотруднику «${e.full_name}»? ${MOVE_NOTE}`, {okText:'Перенести', okClass:'primary'})) return go(true);
+        toastErr(err);
+      }
+    };
+    m.foot.querySelector('[data-go]').onclick=()=>go(false);
   };
 }
 
@@ -1189,7 +1338,6 @@ async function viewAccounts(c){
   const tab = staff && /[?&]bulk\b/.test(location.hash) ? 'bulk' : 'list';
   const enabledCnt=accs.filter(a=>a.enabled).length;
   const disabledCnt=accs.length-enabledCnt;
-  const noPwCnt=accs.filter(a=>!a.has_password).length;
   // выбор ящиков живёт между перерисовками, но ящики, которых уже нет, из него уходят
   const known=new Set(accs.map(a=>a.id));
   Acc.sel.forEach(id=>{ if(!known.has(id)) Acc.sel.delete(id); });
@@ -1301,10 +1449,10 @@ async function viewAccounts(c){
       const hold = holdTags(a) + (a.quarantines ? ` <span class="tag" title="Прежние копии после копирования «с нуля»${admin?' (меню ⋯ → «Прежние копии»)':' — разбирает администратор'}: ${a.quarantines}">🧺 прежние копии</span>` : '');
       const tr=h(`<tr class="${Acc.sel.has(a.id)?'selected':''}">
         ${staff?`<td class="chk"><input type="checkbox" data-sel ${Acc.sel.has(a.id)?'checked':''} aria-label="Выбрать ящик ${esc(a.name)}"></td>`:''}
-        <td><strong>${esc(a.name)}</strong><div class="small muted nowrap">${esc(a.host)}:${a.port} · ${esc(a.security)}${a.auth_type==='oauth2'?' · OAuth2':(a.auth_type==='master'?' · через администратора':'')}</div></td>
+        <td><strong>${esc(a.name)}</strong><div class="small muted nowrap">${esc(a.host)}:${a.port} · ${esc(a.security)}${a.auth_type==='oauth2'?' · OAuth2':(a.auth_type==='master'?' · через администратора':'')}</div>${a.employee_name?`<div class="small muted" title="Сотрудник, которому принадлежит ящик">👤 ${esc(a.employee_name)}</div>`:''}</td>
         <td class="small login">${esc(a.username).replace('@','<wbr>@')}</td>
         <td>${loginCell(a)}</td>
-        <td class="bk">${backupCell(a, '<a href="javascript:void(0)" data-runs>история</a>')}</td>
+        <td class="bk">${backupCell(a, '<a href="#" data-runs>история</a>')}</td>
         <td>${state}${hold?'<div style="margin-top:4px">'+hold+'</div>':''}</td>
         <td style="text-align:right;white-space:nowrap">
           <button class="btn sm" data-test title="Проверить подключение к ящику"><span class="ic-only">🔌</span><span class="lbl">Проверить</span></button>
@@ -1509,7 +1657,7 @@ async function quarantineModal(a, changed=false){
   let reopening=false;
   const JOBWHAT={quarantine_rescue:'возврат писем в архив', quarantine_check:'сравнение с новой копией', cleanup:'удаление прежней копии'};
   const banner = job ? `<div class="hint" style="margin-bottom:12px">⏳ ${job.status==='queued'?'В очереди':'Идёт'} ${JOBWHAT[job.type]||'задание'} —
-      <a href="javascript:void(0)" data-jobinfo="${job.id}">задание №${job.id}</a>. Итог появится здесь.</div>` : '';
+      <a href="#" data-jobinfo="${job.id}">задание №${job.id}</a>. Итог появится здесь.</div>` : '';
   const m=modal(`Прежние копии: ${a.name}`, list.length ? `
     <p class="muted" style="margin-top:0">При пересоздании копии «с нуля» прежние письма не удаляются, а переносятся
       в карантин. Письма, которых на сервере уже нет, остаются только здесь. <b>🔍 Сравнить</b> покажет, есть ли такие;
@@ -1698,7 +1846,7 @@ function accountMenu(a){
   m.body.querySelectorAll('[data-a]').forEach(b=>b.onclick=async()=>{
     const act=b.dataset.a; m.close();
     if(act==='backup') backupNow(a.id, a.name);
-    else if(act==='mail'){ State.mailAccount=a.id; location.hash='#/mail'; }
+    else if(act==='mail'){ openMailbox(a.id); }
     else if(act==='edit') accountModal(a.id);
     else if(act==='export') exportModal(a);
     else if(act==='restore') restoreModal(a);
@@ -1784,7 +1932,7 @@ async function viewBulk(c, accs){
         <div class="small muted" id="bLinfo"></div>
       </div>
     </div>
-    <div class="bulk-total"><span id="bTotal"></span> <a href="javascript:void(0)" id="bShow" class="small"></a>
+    <div class="bulk-total"><span id="bTotal"></span> <a href="#" id="bShow" class="small"></a>
       <span class="spacer"></span>
       <button class="btn sm" id="bExport" title="Выгрузить список этих ящиков в Excel">📊 Список в Excel</button></div>
     <div id="bList" class="bulk-list" style="display:none"></div></div>`);
@@ -1975,7 +2123,7 @@ function bulkWireResults(root, r, preview){
       const js=x.job_status?` <span class="badge ${esc(x.job_status)}">${esc(STATUS_LBL[x.job_status]||x.job_status)}</span>`:'';
       return `<tr><td><b>${esc(x.name)}</b><div class="small muted">${esc(x.username||'')}</div></td>
         <td><span class="tag ${cls}">${esc(preview?pv:done)}</span>${js}</td>
-        <td class="small">${esc(x.detail||'')}${x.job_id?` <a href="javascript:void(0)" class="small" data-job="${x.job_id}">задание №${x.job_id}</a>`:''}</td></tr>`;
+        <td class="small">${esc(x.detail||'')}${x.job_id?` <a href="#" class="small" data-job="${x.job_id}">задание №${x.job_id}</a>`:''}</td></tr>`;
     }).join('') + (list.length>max?`<tr><td colspan="3" class="muted small">… показаны первые ${max} из ${fmtNum(list.length)}</td></tr>`:'')
       + (list.length?'':'<tr><td colspan="3" class="empty">Нет строк</td></tr>');
     rows.querySelectorAll('[data-job]').forEach(a=>a.onclick=()=>jobDetails(parseInt(a.dataset.job,10)));
@@ -2409,13 +2557,6 @@ async function retentionModal(a){
   m.foot.querySelector('[data-save]').onclick=()=>{ const v=m.body.querySelector('#ret-custom').value; apply(v===''?-1:parseInt(v)); };
 }
 
-async function foldersModal(a){
-  const acc=await api(`/accounts/${a.id}`);
-  const rows=(acc.folders||[]).map(f=>`<tr><td>${esc(f.folder)}</td><td>${f.count}</td><td>${esc(f.bytes_h)}</td></tr>`).join('')
-    || '<tr><td colspan="3" class="muted">Нет локальных копий. Сначала выполните бэкап.</td></tr>';
-  modal(`Папки: ${a.name}`, `<div class="table-wrap"><table class="tbl"><thead><tr><th>Папка</th><th>Писем</th><th>Размер</th></tr></thead><tbody>${rows}</tbody></table></div>`);
-}
-
 // ---------- Экспорт ----------
 async function exportModal(a){
   const engines=State.engines.length?State.engines:await api('/export/engines');
@@ -2677,18 +2818,36 @@ function importModal(a){
 // ===================================================================
 //  Очередь и задания
 // ===================================================================
+// Отбор по состоянию и «Показать ещё»: раньше были видны только последние 80 заданий, и после ночного
+// копирования тысяч ящиков утренние отказы терялись среди удачных.
+const JobsView={status:'', limit:80};
+const JOBS_PAGE=80, JOBS_MAX=1000;
+function jobsQuery(){ return `/jobs?limit=${JobsView.limit}${JobsView.status?'&status='+encodeURIComponent(JobsView.status):''}`; }
 async function viewJobs(c){
-  const jobs=await api('/jobs?limit=80');
+  const jobs=await api(jobsQuery());
   c.innerHTML='';
-  c.appendChild(h(`<div class="section-title"><h2 style="margin:0">Очередь и задания</h2><div class="spacer"></div><span class="muted small">обновляется автоматически</span></div>`));
+  const opts=[['','Все'],['failed','С ошибкой'],['partial','Частично'],['running','Выполняются'],['queued','В очереди'],
+    ['cancelled','Отменены'],['success','Успешные']];
+  c.appendChild(h(`<div class="section-title"><h2 style="margin:0">Очередь и задания</h2><div class="spacer"></div>
+    <select id="jobsStatus" aria-label="Отбор по состоянию" style="width:auto;padding:6px 10px">${opts.map(([v,t])=>`<option value="${v}" ${v===JobsView.status?'selected':''}>${t}</option>`).join('')}</select>
+    <span class="muted small">обновляется автоматически</span></div>`));
   const wrap=h('<div class="card table-wrap"><table class="tbl"><thead><tr><th>#</th><th>Тип</th><th>Ящик</th><th>Статус</th><th>Прогресс</th><th>Создано</th><th></th></tr></thead><tbody id="jobsBody"></tbody></table></div>');
   c.appendChild(wrap);
+  const more=h('<div style="margin-top:10px;text-align:center"><button class="btn" id="jobsMore">Показать ещё</button></div>');
+  c.appendChild(more);
+  const syncMore=(n)=>{ more.hidden = n<JobsView.limit || JobsView.limit>=JOBS_MAX; };
+  $('#jobsStatus',c).onchange=(e)=>{ JobsView.status=e.target.value; JobsView.limit=JOBS_PAGE; jobsMissingSeen=new Set(); route(); };
+  $('#jobsMore',c).onclick=async()=>{
+    JobsView.limit=Math.min(JOBS_MAX, JobsView.limit+JOBS_PAGE);
+    try{ const list=await api(jobsQuery()); jobsRefreshAt=Date.now(); renderJobsRows(list); syncMore(list.length); }catch(e){ toastErr(e); }
+  };
   jobsRefreshAt = Date.now();
   renderJobsRows(jobs);
+  syncMore(jobs.length);
 }
 function renderJobsRows(jobs){
   const tb=$('#jobsBody'); if(!tb) return; tb.innerHTML='';
-  if(!jobs.length){ tb.innerHTML='<tr><td colspan="7" class="empty">Заданий пока нет</td></tr>'; return; }
+  if(!jobs.length){ tb.innerHTML=`<tr><td colspan="7" class="empty">${JobsView.status?'Таких заданий нет':'Заданий пока нет'}</td></tr>`; return; }
   jobs.forEach(j=>{
     const prog=jobProgressHtml(j);
     const tr=h(`<tr data-job="${j.id}">
@@ -2739,7 +2898,7 @@ async function updateJobsLive(d){
     jobsMissingSeen=missing;
     if(!fresh) return;
   }
-  try{ jobsRefreshAt=now; const jobs=await api('/jobs?limit=80',{bg:true}); if(State.view==='jobs') renderJobsRows(jobs); }catch(e){}
+  try{ jobsRefreshAt=now; const jobs=await api(jobsQuery(),{bg:true}); if(State.view==='jobs') renderJobsRows(jobs); }catch(e){}
 }
 
 /** Разметка ячейки прогресса — общая для первой отрисовки и живого обновления. */
@@ -2851,20 +3010,34 @@ async function jobDetails(id){
 // ===================================================================
 //  Экспорты (список готовых файлов)
 // ===================================================================
+const EXPORTS_PAGE=200;
 async function viewExports(c){
-  const list=await api('/exports');
-  const mine = isMailbox() && State.user.account_id ? {id:State.user.account_id, name:State.user.account_name||'мой ящик'} : null;
+  const list=await api('/exports?limit='+EXPORTS_PAGE);
+  // у сотрудника может быть несколько ящиков: выгрузить можно любой из них
+  const mineList = isMailbox() && State.user.account_id ? myAccounts() : [];
+  const mine = mineList.length ? mineList[0] : null;
+  const mineLabel = mineList.length>1 ? 'Выгрузить ящик' : 'Выгрузить мой ящик';
   c.innerHTML=''; c.appendChild(h(`<div class="section-title"><h2 style="margin:0">Готовые экспорты</h2><div class="spacer"></div>
-    ${mine?'<button class="btn primary" id="expMine">📤 Выгрузить мой ящик</button>':''}</div>`));
-  if(mine) $('#expMine',c).onclick=()=>exportModal(mine);
+    ${mine?`<button class="btn primary" id="expMine">📤 ${mineLabel}</button>`:''}</div>`));
+  if(mine) $('#expMine',c).onclick=()=>{
+    if(mineList.length===1) return exportModal(mine);
+    const m=modal('Какой ящик выгрузить', `<div class="form-row"><label for="xm-acc">Ящик</label><select id="xm-acc">
+      ${mineList.map(a=>`<option value="${a.id}">${esc(a.name)}${a.username?' — '+esc(a.username):''}</option>`).join('')}</select></div>`,
+      {footer:`<button class="btn ghost" data-c>Отмена</button><button class="btn primary" data-go>Далее</button>`});
+    m.foot.querySelector('[data-c]').onclick=m.close;
+    m.foot.querySelector('[data-go]').onclick=()=>{
+      const id=parseInt(m.body.querySelector('#xm-acc').value); m.close();
+      exportModal(mineList.find(a=>a.id===id)||mine);
+    };
+  };
   if(!list.length){
-    const how = mine ? 'Нажмите «Выгрузить мой ящик».' : 'Откройте «Почтовые ящики» → меню ящика (⋯) → «Экспорт».';
+    const how = mine ? `Нажмите «${mineLabel}».` : 'Откройте «Почтовые ящики» → меню ящика (⋯) → «Экспорт».';
     c.appendChild(h(`<div class="card"><div class="empty"><div class="big">📤</div>Экспортов пока нет.<br>${how}</div></div>`)); return;
   }
   const wrap=h('<div class="card table-wrap"><table class="tbl"><thead><tr><th>Файл</th><th>Ящик</th><th>Формат</th><th>Размер</th><th>Статус</th><th>Создан</th><th></th></tr></thead><tbody></tbody></table></div>');
   const tb=wrap.querySelector('tbody');
-  list.forEach(e=>{
-    const tr=h(`<tr>
+  const addRows=(rows)=>rows.forEach(e=>{
+    const tr=h(`<tr data-id="${e.id}">
       <td class="mono small">${esc(e.filename||'—')}</td>
       <td class="small">${esc(e.account_name||accName(e.account_id))||'—'}</td>
       <td><span class="tag">${esc(e.format)} · ${esc(e.engine)}</span></td>
@@ -2878,7 +3051,19 @@ async function viewExports(c){
     if(del) del.onclick=async()=>{ if(await confirmDlg('Удалить экспорт?','Файл будет удалён с диска.')){ try{await api(`/exports/${e.id}`,{method:'DELETE'});toast('Удалено');route();}catch(err){toastErr(err);} } };
     tb.appendChild(tr);
   });
+  addRows(list);
   c.appendChild(wrap);
+  // «Показать ещё»: раньше были видны только последние 200 выгрузок
+  const more=h('<div style="margin-top:10px;text-align:center"><button class="btn">Показать ещё</button></div>');
+  more.hidden=list.length<EXPORTS_PAGE;
+  c.appendChild(more);
+  more.querySelector('button').onclick=async()=>{
+    const last=tb.querySelector('tr[data-id]:last-child');
+    try{
+      const rows=await api(`/exports?limit=${EXPORTS_PAGE}&before_id=${last?last.dataset.id:''}`);
+      addRows(rows); more.hidden=rows.length<EXPORTS_PAGE;
+    }catch(e){ toastErr(e); }
+  };
 }
 
 // ===================================================================
@@ -3234,6 +3419,8 @@ async function viewSettings(c){
   applyDeps();
   // grid layout
   $$('.settings-grid',c).forEach(g=>{ g.style.display='grid'; g.style.gap='4px 24px'; g.style.gridTemplateColumns='repeat(auto-fill,minmax(300px,1fr))'; });
+  State.leaveGuard=()=>Object.keys(changed).length
+    ? `Несохранённые изменения настроек (${Object.keys(changed).length}) пропадут. Уйти без сохранения?` : '';
   $('#saveAll').onclick=async()=>{
     if(!Object.keys(changed).length) return toast('Нет изменений','','warn');
     try{
@@ -3525,14 +3712,159 @@ function userModal(){
   m.foot.querySelector('[data-c]').onclick=m.close;
   m.foot.querySelector('[data-ok]').onclick=async()=>{try{await api('/users',{method:'POST',body:{username:m.body.querySelector('#u-name').value,password:m.body.querySelector('#u-pass').value,role:m.body.querySelector('#u-role').value}});toast('Создан');m.close();route();}catch(e){toastErr(e);}};
 }
+// ===================================================================
+//  Документация — встроенная справка внутри интерфейса
+// ===================================================================
+//: Глава справки для каждого раздела: «📖 Справка» в шапке открывает её.
+const DOC_ANCHORS={dashboard:'dashboard', analytics:'analytics', mailanalytics:'mailanalytics', mail:'mailview',
+  accounts:'mailboxes', employees:'employees', jobs:'jobs', exports:'export', schedules:'schedules', axigen:'axigen',
+  mailservers:'mailservers', server:'serverbulk', logs:'jobs', settings:'settings', users:'roles',
+  security:'secjournal', audit:'audit'};
+function docsHref(anchor){ return '#/docs'+(anchor?'?a='+encodeURIComponent(anchor):''); }
+/** Отпечаток файлов интерфейса (из адреса app.js): справка после обновления не берётся из кеша браузера. */
+function assetTag(){
+  const sc=document.querySelector('script[src*="/static/js/app.js"]');
+  const m=sc && /[?&]v=([^&]+)/.exec(sc.getAttribute('src')||'');
+  return m?m[1]:'';
+}
+//: Подсветка найденного — во фрейме справки.
+const DOC_EMBED_CSS=`mark.ma-hit{background:#ffe58a;color:inherit;border-radius:3px;padding:0 1px}
+mark.ma-hit.cur{background:#ffb35c;box-shadow:0 0 0 2px #ff9f43}`;
+//: Тёмная тема справки (сама страница справки — светлая): те же переменные, что у неё в :root.
+const DOC_DARK_CSS=`:root{--bg:#0f141b;--soft:#19212c;--bd:#2a3442;--tx:#e3e9f1;--dim:#9aa7b8;--pri:#7aa7ff}
+body{background:var(--bg)} .note{background:#132340} .warn{background:#33280f} .tip{background:#10291c}
+.card{background:var(--soft)} .pname code{background:var(--bg)} img.shot{box-shadow:none}
+.badge.ok{background:#10291c} .badge.exp{background:#33280f}
+mark.ma-hit{background:#8a6d12;color:#fff} mark.ma-hit.cur{background:#c2610c;box-shadow:0 0 0 2px #c2610c}`;
+
+/** Найти в справке все вхождения текста (без учёта регистра, ё = е) и подсветить их → список подсветок. */
+function docFind(doc, query){
+  doc.querySelectorAll('mark.ma-hit').forEach(m=>{ const p=m.parentNode; p.replaceChild(doc.createTextNode(m.textContent), m); p.normalize(); });
+  const norm=t=>t.toLowerCase().replace(/ё/g,'е');
+  const needle=norm((query||'').trim());
+  if(needle.length<2) return [];
+  const root=doc.querySelector('main')||doc.body;
+  const walker=doc.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  const nodes=[]; while(walker.nextNode()) nodes.push(walker.currentNode);
+  const marks=[];
+  for(const node of nodes){
+    if(!node.parentElement || node.parentElement.closest('script,style')) continue;
+    const low=norm(node.nodeValue);
+    if(low.length!==node.nodeValue.length) continue;          // редкие буквы, у которых строчная длиннее
+    let idx=low.indexOf(needle), cur=node, done=0;
+    while(idx>=0 && marks.length<1000){
+      const hit=cur.splitText(idx-done);
+      cur=hit.splitText(needle.length);
+      const m=doc.createElement('mark'); m.className='ma-hit';
+      hit.parentNode.replaceChild(m, hit); m.appendChild(hit);
+      marks.push(m);
+      done=idx+needle.length;
+      idx=low.indexOf(needle, done);
+    }
+  }
+  return marks;
+}
+
+async function viewDocs(c){
+  const params=new URLSearchParams(location.hash.split('?')[1]||'');
+  const anchor=(params.get('a')||'').replace(/[^a-z0-9_-]/gi,'');
+  c.innerHTML='';
+  const bar=h(`<div class="docs-bar">
+    <select id="docToc" aria-label="Глава документации"><option value="">Оглавление…</option></select>
+    <input id="docQ" type="search" placeholder="Поиск по документации" aria-label="Поиск по документации" autocomplete="off">
+    <span id="docCnt" class="muted small" aria-live="polite"></span>
+    <button class="btn ghost sm" id="docPrev" title="Предыдущее (Shift+Enter)" aria-label="Предыдущее совпадение" disabled>↑</button>
+    <button class="btn ghost sm" id="docNext" title="Следующее (Enter)" aria-label="Следующее совпадение" disabled>↓</button>
+    <span class="spacer" style="flex:1"></span>
+    <a class="btn ghost sm" id="docNew" target="_blank" rel="noopener" title="Открыть справку отдельной страницей">↗ <span class="hide-narrow">В новой вкладке</span></a></div>`);
+  const frame=h('<iframe class="docs-frame" title="Документация MailArchiver"></iframe>');
+  c.appendChild(bar); c.appendChild(frame);
+  const page='/static/docs/index.html';
+  const v=assetTag();
+  const setNew=(a)=>{ $('#docNew',bar).href=page+(a?'#'+a:''); };
+  setNew(anchor);
+  frame.src=page+(v?'?v='+encodeURIComponent(v):'')+(anchor?'#'+anchor:'');
+  const toc=$('#docToc',bar), q=$('#docQ',bar), cnt=$('#docCnt',bar), prev=$('#docPrev',bar), next=$('#docNext',bar);
+  let hits=[], cur=-1;
+  const show=(i)=>{
+    if(!hits.length) return;
+    if(hits[cur]) hits[cur].classList.remove('cur');
+    cur=(i+hits.length)%hits.length;
+    hits[cur].classList.add('cur');
+    hits[cur].scrollIntoView({block:'center'});
+    cnt.textContent=`${cur+1} из ${hits.length}${hits.length>=1000?'+':''}`;
+  };
+  frame.onload=()=>{
+    let doc; try{ doc=frame.contentDocument; }catch(e){ doc=null; }
+    if(!doc || !doc.body) return;
+    const style=doc.createElement('style'); style.id='ma-embed';
+    doc.head.appendChild(style);
+    State.docTheme=()=>{ style.textContent=DOC_EMBED_CSS+(document.documentElement.getAttribute('data-theme')==='dark'?DOC_DARK_CSS:''); };
+    State.docTheme();
+    // оглавление — из оглавления самой справки (на узком экране оно у неё скрыто)
+    const seen=new Set();
+    doc.querySelectorAll('.toc a[href^="#"]').forEach(a=>{
+      const id=a.getAttribute('href').slice(1), text=a.textContent.trim();
+      if(!id || seen.has(id+text)) return; seen.add(id+text);
+      const o=document.createElement('option'); o.value=id; o.textContent=text; toc.appendChild(o);
+    });
+    if(anchor) toc.value=anchor;
+    const go=(id)=>{
+      const el=id && doc.getElementById(id);
+      if(el) el.scrollIntoView({block:'start'});
+      history.replaceState(null, '', docsHref(id));
+      setNew(id);
+    };
+    toc.onchange=()=>{ if(toc.value) go(toc.value); };
+    // переход по оглавлению внутри справки — адрес раздела запоминает главу (перезагрузка, «Назад»)
+    try{ frame.contentWindow.addEventListener('hashchange', ()=>{
+      const id=(frame.contentWindow.location.hash||'').slice(1);
+      if(State.view!=='docs') return;
+      history.replaceState(null, '', docsHref(id)); setNew(id);
+      if([...toc.options].some(o=>o.value===id)) toc.value=id;
+    }); }catch(e){}
+    let t=null;
+    q.oninput=()=>{ clearTimeout(t); t=setTimeout(()=>{
+      hits=docFind(doc, q.value); cur=-1;
+      prev.disabled=next.disabled=!hits.length;
+      cnt.textContent = q.value.trim().length<2 ? '' : (hits.length ? '' : 'не найдено');
+      if(hits.length) show(0);
+    }, 250); };
+    q.onkeydown=(e)=>{ if(e.key==='Enter'){ e.preventDefault(); show(cur+(e.shiftKey?-1:1)); } };
+    prev.onclick=()=>show(cur-1); next.onclick=()=>show(cur+1);
+    if(params.get('q')){ q.value=params.get('q'); q.oninput(); }
+  };
+}
+
+const AUDIT_PAGE=200;
 async function viewAudit(c){
-  const rows=await api('/audit');
+  // Поиск по пользователю, действию и подробностям и «Показать ещё»: раньше были видны только последние
+  // 200 записей без отбора — найти, кто и когда удалил ящик месяц назад, было нельзя.
+  let q='', seq=0;
   c.innerHTML=''; c.appendChild(h('<div class="section-title"><h2 style="margin:0">Аудит действий</h2></div>'));
+  const bar=h(`<div class="an-toolbar"><input id="auQ" type="search" aria-label="Поиск в аудите" placeholder="Поиск: пользователь, действие, ящик, адрес…"
+    style="width:360px;padding:8px 11px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg-elev);color:var(--text)"></div>`);
   const wrap=h('<div class="card table-wrap"><table class="tbl"><thead><tr><th>Время</th><th>Пользователь</th><th>Действие</th><th>Детали</th></tr></thead><tbody></tbody></table></div>');
-  const tb=wrap.querySelector('tbody');
-  rows.forEach(r=>tb.appendChild(h(`<tr><td class="small muted">${fmtDate(r.ts)}</td><td>${esc(r.user)}</td><td><span class="tag">${esc(r.action)}</span></td><td class="small">${esc(r.detail)}</td></tr>`)));
-  if(!rows.length) tb.innerHTML='<tr><td colspan="4" class="empty">Записей нет</td></tr>';
-  c.appendChild(wrap);
+  const more=h('<div style="margin-top:10px;text-align:center"><button class="btn" hidden>Показать ещё</button></div>');
+  const tb=wrap.querySelector('tbody'), btn=more.querySelector('button');
+  c.appendChild(bar); c.appendChild(wrap); c.appendChild(more);
+  const load=async(append)=>{
+    const my=++seq;
+    const last=append ? tb.querySelector('tr[data-id]:last-child') : null;
+    const params=new URLSearchParams({limit:AUDIT_PAGE});
+    if(q) params.set('q', q);
+    if(last) params.set('before_id', last.dataset.id);
+    const rows=await api('/audit?'+params.toString());
+    if(my!==seq) return;
+    if(!append) tb.innerHTML='';
+    rows.forEach(r=>tb.appendChild(h(`<tr data-id="${r.id}"><td class="small muted">${fmtDate(r.ts)}</td><td>${esc(r.user)}</td><td><span class="tag">${esc(r.action)}</span></td><td class="small">${esc(r.detail)}</td></tr>`)));
+    if(!tb.children.length) tb.innerHTML=`<tr><td colspan="4" class="empty">${q?'Ничего не найдено':'Записей нет'}</td></tr>`;
+    btn.hidden=rows.length<AUDIT_PAGE;
+  };
+  let t=null;
+  bar.querySelector('#auQ').oninput=(e)=>{ clearTimeout(t); t=setTimeout(()=>{ q=e.target.value.trim(); load(false).catch(toastErr); }, 350); };
+  btn.onclick=()=>load(true).catch(toastErr);
+  await load(false);
 }
 
 // ===================================================================
@@ -3594,21 +3926,35 @@ async function viewSecurity(c){
 // ===================================================================
 //  Почта (просмотр писем)
 // ===================================================================
-const Mail = { acc:null, folder:null, offset:0, total:0, limit:50, msg:null, search:null, openAfter:null };
+// picked — выбранные письма для «Восстановить выбранные»: ключ «ящик:id» → {acc, id, subject}
+const Mail = { acc:null, folder:null, offset:0, total:0, limit:50, msg:null, search:null, openAfter:null, picked:new Map(),
+  // номера последних запросов: ответ на прежний запрос (щёлкнули письмо А, потом Б, а А ответило позже)
+  // не перерисовывает то, что уже показано по новому
+  seqFolders:0, seqList:0, seqMsg:0 };
 
 async function viewMail(c){
   c.innerHTML='';
-  let accId = isMailbox() ? State.user.account_id : (State.mailAccount||null);
+  const mine=myAccounts();
+  let accId = isMailbox()
+    ? ((State.mailAccount && mine.find(a=>a.id===State.mailAccount)) ? State.mailAccount : mine[0].id)
+    : (State.mailAccount||null);
   let accounts = [];
-  const head=h(`<div class="section-title"><h2 style="margin:0">📧 Почта</h2><div class="spacer"></div><span id="mailAccWrap"></span></div>`);
+  const head=h(`<div class="section-title"><h2 style="margin:0">📧 Почта</h2><div class="spacer"></div><span id="mailAccWrap" class="btn-row"></span></div>`);
   c.appendChild(head);
   if(isMailbox() && accId){
+    State.mailAccount=accId;
+    // У сотрудника может быть несколько ящиков (все ящики его карточки) — переключатель между ними.
+    if(mine.length>1){
+      const sel=h(`<select id="mailAcc" aria-label="Ящик" style="width:auto;padding:7px 12px">${mine.map(a=>`<option value="${a.id}" ${a.id===accId?'selected':''}>${esc(a.name)}</option>`).join('')}</select>`);
+      sel.onchange=()=>{ State.mailAccount=parseInt(sel.value); Mail.folder=null; Mail.offset=0; Mail.picked.clear(); viewMail(c); };
+      head.querySelector('#mailAccWrap').appendChild(sel);
+    }
     // Сотруднику — выгрузка и восстановление своего ящика прямо отсюда: меню
     // ящика в разделе «Почтовые ящики» ему недоступно.
-    const mine={id:accId, name:State.user.account_name||'мой ящик'};
+    const cur=mine.find(a=>a.id===accId)||{id:accId, name:'мой ящик'};
     const acts=h(`<span class="btn-row"><button class="btn sm" id="mbExport">📤 Выгрузить</button><button class="btn sm" id="mbRestore">♻️ Восстановить в ящик</button></span>`);
-    acts.querySelector('#mbExport').onclick=()=>exportModal(mine);
-    acts.querySelector('#mbRestore').onclick=()=>restoreModal(mine);
+    acts.querySelector('#mbExport').onclick=()=>exportModal(cur);
+    acts.querySelector('#mbRestore').onclick=()=>restoreModal(cur);
     head.querySelector('#mailAccWrap').appendChild(acts);
   }
   if(!isMailbox()){
@@ -3617,13 +3963,14 @@ async function viewMail(c){
     if(!accId || !accounts.find(a=>a.id===accId)) accId=accounts[0].id;
     State.mailAccount=accId;
     const sel=h(`<select id="mailAcc" style="width:auto;padding:7px 12px">${accounts.map(a=>`<option value="${a.id}" ${a.id===accId?'selected':''}>${esc(a.name)}</option>`).join('')}</select>`);
-    sel.onchange=()=>{ State.mailAccount=parseInt(sel.value); Mail.folder=null; Mail.offset=0; viewMail(c); };
+    sel.onchange=()=>{ State.mailAccount=parseInt(sel.value); Mail.folder=null; Mail.offset=0; Mail.picked.clear(); viewMail(c); };
     head.querySelector('#mailAccWrap').appendChild(sel);
   }
+  if(Mail.acc!==accId && !(Mail.search && Mail.search.scope==='all')) Mail.picked.clear();
   Mail.acc=accId;
   const sbar=h(`<div class="mail-search">
     <input type="search" id="msq" placeholder="Поиск по письмам: слова, «фраза в кавычках», тема:, от:, вложение:" value="${esc(Mail.search?Mail.search.q:'')}">
-    ${isMailbox()?'':`<select id="msScope"><option value="account">в этом ящике</option><option value="all" ${Mail.search&&Mail.search.scope==='all'?'selected':''}>во всех ящиках</option></select>`}
+    ${isMailbox()&&mine.length<2?'':`<select id="msScope" aria-label="Где искать"><option value="account">в этом ящике</option><option value="all" ${Mail.search&&Mail.search.scope==='all'?'selected':''}>${isMailbox()?'во всех моих ящиках':'во всех ящиках'}</option></select>`}
     <label class="small" style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="msAttach" ${Mail.search&&Mail.search.attach?'checked':''}> с вложениями</label>
     <button class="btn sm primary" id="msGo">🔎 Найти</button>
     <button class="btn sm ghost" id="msClear" ${Mail.search?'':'style="display:none"'}>✕ Сбросить</button>
@@ -3645,6 +3992,9 @@ async function viewMail(c){
     else if(st.pending>0) info.textContent=`Проиндексировано ${fmtNum(st.indexed)} из ${fmtNum(st.total)} писем — остальные индексируются в фоне.`;
     else if(!st.bodies) info.textContent='Поиск по теме, адресам и вложениям (текст писем не индексируется).';
   }).catch(()=>{});
+  // Выбранные письма: «Восстановить выбранные» — вернуть их на почтовый сервер.
+  c.appendChild(h('<div id="mpick" class="mail-pick" role="status" aria-live="polite" hidden></div>'));
+  renderPickBar();
   const layout=h(`<div class="mail-layout">
     <div class="mail-folders" id="mfolders"><div class="empty" style="padding:20px"><div class="spinner"></div></div></div>
     <div class="mail-list" id="mlist"><div class="empty">Выберите папку</div></div>
@@ -3654,10 +4004,144 @@ async function viewMail(c){
   await loadMailFolders(accId);
 }
 
+/** Возвращать письма на сервер может администратор и сам сотрудник (оператор писем не видит). */
+function canRestoreMessages(){ return isAdmin() || isMailbox(); }
+
+/** Флажок выбора письма в списке (для «Восстановить выбранные»). */
+function pickBox(acc, id, subject){
+  if(!canRestoreMessages()) return '';
+  return `<input type="checkbox" class="msg-pick" data-pick ${Mail.picked.has(acc+':'+id)?'checked':''} aria-label="Выбрать письмо «${esc(trunc(subject||'без темы',60))}»">`;
+}
+function wirePick(el, acc, id, subject){
+  const cb=el.querySelector('input[data-pick]'); if(!cb) return;
+  // щелчок по флажку не открывает письмо
+  cb.onclick=(e)=>e.stopPropagation();
+  cb.onkeydown=(e)=>e.stopPropagation();
+  cb.onchange=()=>{
+    const k=acc+':'+id;
+    if(cb.checked) Mail.picked.set(k,{acc, id, subject}); else Mail.picked.delete(k);
+    renderPickBar();
+    const list=el.parentElement; if(list) list.dispatchEvent(new Event('pickchange'));
+  };
+}
+/** Полоса «Выбрано: N · Восстановить · Снять выбор». */
+function renderPickBar(){
+  const bar=$('#mpick'); if(!bar) return;
+  const n=Mail.picked.size;
+  bar.hidden=!n;
+  if(!n){ bar.innerHTML=''; return; }
+  const accs=new Set([...Mail.picked.values()].map(p=>p.acc));
+  bar.innerHTML=`<span>Выбрано: <b>${fmtNum(n)}</b> ${plural(n,'письмо','письма','писем')}${accs.size>1?` из ${accs.size} ${plural(accs.size,'ящика','ящиков','ящиков')}`:''}</span>
+    <button class="btn sm primary" data-go>♻️ Восстановить выбранные</button>
+    <button class="btn sm ghost" data-clear>✕ Снять выбор</button>`;
+  bar.querySelector('[data-go]').onclick=()=>messagesRestoreModal([...Mail.picked.values()], ()=>{
+    Mail.picked.clear(); renderPickBar();
+    document.querySelectorAll('#mlist input[data-pick], #mlist input[data-pickall]').forEach(x=>{ x.checked=false; x.indeterminate=false; });
+  });
+  bar.querySelector('[data-clear]').onclick=()=>{
+    Mail.picked.clear(); renderPickBar();
+    document.querySelectorAll('#mlist input[data-pick], #mlist input[data-pickall]').forEach(x=>{ x.checked=false; x.indeterminate=false; });
+  };
+}
+
+/** Восстановить отдельные письма: в тот же ящик или (администратору) в другой.
+ *  items — [{acc, id, subject}], письма могут быть из разных ящиков (поиск во всех ящиках). */
+async function messagesRestoreModal(items, onDone){
+  if(!items.length) return;
+  const groups=new Map();
+  items.forEach(it=>{ if(!groups.has(it.acc)) groups.set(it.acc, []); groups.get(it.acc).push(it.id); });
+  const names=new Map((isMailbox()?myAccounts():(State.accounts||[])).map(a=>[a.id, a.name]));
+  if(isAdmin() && !(State.accounts||[]).length){
+    try{ State.accounts=await api('/accounts'); (State.accounts||[]).forEach(a=>names.set(a.id, a.name)); }catch(e){ /* список для «в другой ящик» — необязателен */ }
+  }
+  // srcPlain — для confirmDlg и toast (они экранируют сами), srcText — для разметки окна
+  const srcPlain=groups.size===1
+    ? `из ящика «${names.get(items[0].acc)||''}»`
+    : `из ${groups.size} ${plural(groups.size,'ящика','ящиков','ящиков')}`;
+  const srcText=esc(srcPlain);
+  const one=items.length===1;
+  const body=`
+    <p style="margin-top:0">${one?`Письмо «${esc(trunc(items[0].subject||'без темы',90))}»`:`Писем: <b>${fmtNum(items.length)}</b>`} ${srcText} ${one?'будет снова загружено':'будут снова загружены'} на почтовый сервер${isAdmin()?'':' — в тот же ящик'}.</p>
+    ${isAdmin()?`<fieldset class="form-row" style="border:0;padding:0;margin:0 0 12px">
+      <legend style="font-weight:600;margin-bottom:6px">Куда</legend>
+      <label class="small" style="display:flex;gap:8px;align-items:center"><input type="radio" name="rm-where" value="same" checked> ${groups.size===1?'В тот же ящик':'Каждое — в свой ящик'}</label>
+      <label class="small" style="display:flex;gap:8px;align-items:center;margin-top:4px"><input type="radio" name="rm-where" value="other"> В другой ящик (например, коллеге уволенного сотрудника)</label>
+      <div id="rm-otherrow" class="form-row" style="display:none;margin:8px 0 0 24px">
+        <input id="rm-filter" type="text" placeholder="Найти ящик по названию или адресу" aria-label="Найти ящик" style="margin-bottom:6px">
+        <select id="rm-target" size="6" aria-label="Ящик, в который вернуть письма"></select>
+        <div class="hint">Переписка одного человека окажется в ящике другого — действие записывается в аудит.</div></div>
+    </fieldset>`:''}
+    <div class="form-row"><label for="rm-mode">В какую папку</label><select id="rm-mode">
+      <option value="original">${one?'В ту же папку, где оно лежало':'В те же папки, где письма лежали'}</option>
+      <option value="single">Все в одну папку</option>
+      <option value="prefixed">В папки с префиксом (повторяют исходные)</option></select></div>
+    <div class="form-row" id="rm-singlerow" style="display:none"><label for="rm-single">Имя папки</label><input id="rm-single" type="text" value="Восстановлено"></div>
+    <div class="form-row" id="rm-prefixrow" style="display:none"><label for="rm-prefix">Префикс</label><input id="rm-prefix" type="text" value="Восстановлено">
+      <div class="hint">Например, письмо из INBOX попадёт в папку «<span id="rm-prefixex">Восстановлено</span>/INBOX».</div></div>
+    <div class="form-row check"><span class="switch"><input type="checkbox" id="rm-dup" checked><span class="track"></span></span><label for="rm-dup">Не загружать письма, которые уже есть в папке</label></div>
+    <div class="hint">Восстановление идёт заданием в очереди; ход и итог — в «Очереди и заданиях».</div>`;
+  const m=modal(one?'Восстановить письмо':'Восстановить выбранные письма', body,
+    {wide:true, footer:`<button class="btn ghost" data-c>Отмена</button><button class="btn primary" data-go>Восстановить</button>`});
+  const g=x=>m.body.querySelector(x);
+  const fillTargets=()=>{
+    const sel=g('#rm-target'); if(!sel) return;
+    const q=(g('#rm-filter').value||'').trim().toLowerCase();
+    const list=(State.accounts||[]).filter(a=>!q || (a.name||'').toLowerCase().includes(q) || (a.username||'').toLowerCase().includes(q)).slice(0,200);
+    const keep=sel.value;
+    sel.innerHTML=list.map(a=>`<option value="${a.id}">${esc(a.name)} — ${esc(a.username||'')}${a.employee_name?' · '+esc(a.employee_name):''}</option>`).join('');
+    if(keep && list.find(a=>String(a.id)===keep)) sel.value=keep;
+  };
+  if(g('#rm-target')){ fillTargets(); g('#rm-filter').oninput=fillTargets; }
+  m.body.querySelectorAll('input[name=rm-where]').forEach(r=>r.onchange=()=>{
+    const other=m.body.querySelector('input[name=rm-where]:checked').value==='other';
+    const row=g('#rm-otherrow'); if(row) row.style.display=other?'block':'none';
+    // в чужом ящике удобнее отдельная папка: по умолчанию — с префиксом
+    if(other && g('#rm-mode').value==='original'){ g('#rm-mode').value='prefixed'; g('#rm-mode').onchange(); }
+  });
+  g('#rm-mode').onchange=()=>{ const v=g('#rm-mode').value; g('#rm-singlerow').style.display=v==='single'?'block':'none'; g('#rm-prefixrow').style.display=v==='prefixed'?'block':'none'; };
+  g('#rm-prefix').oninput=()=>{ g('#rm-prefixex').textContent=g('#rm-prefix').value.trim()||'…'; };
+  m.foot.querySelector('[data-c]').onclick=m.close;
+  m.foot.querySelector('[data-go]').onclick=async()=>{
+    const where=(m.body.querySelector('input[name=rm-where]:checked')||{}).value||'same';
+    const mode=g('#rm-mode').value;
+    const req={target_mode:mode, target_folder:g('#rm-single').value.trim(), target_prefix:g('#rm-prefix').value.trim(),
+               check_duplicates:g('#rm-dup').checked};
+    if(mode==='single' && !req.target_folder) return toastErr({message:'Укажите имя папки.'});
+    if(mode==='prefixed' && !req.target_prefix) return toastErr({message:'Укажите префикс папок.'});
+    let target=null;
+    if(where==='other'){
+      target=parseInt((g('#rm-target')||{}).value||'0');
+      if(!target) return toastErr({message:'Выберите ящик, в который вернуть письма.'});
+      const tname=names.get(target)||((State.accounts||[]).find(a=>a.id===target)||{}).name||'';
+      if(!await confirmDlg('Вернуть письма в другой ящик?',
+          `${fmtNum(items.length)} ${plural(items.length,'письмо','письма','писем')} ${srcPlain} появятся в ящике «${tname}». Действие записывается в аудит.`,
+          {okText:'Вернуть', okClass:'primary'})) return;
+    }
+    const btn=m.foot.querySelector('[data-go]'); btn.disabled=true;
+    const jobs=[];
+    try{
+      for(const [acc, ids] of groups){
+        const b=Object.assign({message_ids:ids}, req);
+        if(target && target!==acc) b.target_account_id=target;
+        const r=await api(`/accounts/${acc}/restore-messages`, {method:'POST', body:b});
+        jobs.push(r.job_id);
+      }
+      m.close();
+      toast('Восстановление запущено', `${fmtNum(items.length)} ${plural(items.length,'письмо','письма','писем')} — ${jobs.length>1?'задания':'задание'} №${jobs.join(', №')}; ход — в «Очереди и заданиях».`, 'success', 8000);
+      if(onDone) onDone();
+    }catch(e){
+      btn.disabled=false;
+      toastErr(jobs.length ? {message:`${e.message} (уже запущено: №${jobs.join(', №')})`, hint:e.hint} : e);
+    }
+  };
+}
+
 async function loadMailFolders(accId){
   const box=$('#mfolders'); if(!box) return;
+  const seq=++Mail.seqFolders;
   let data;
-  try{ data=await api(`/accounts/${accId}/mailfolders`); }catch(e){ box.innerHTML=`<div class="empty small">${esc(e.message)}</div>`; return; }
+  try{ data=await api(`/accounts/${accId}/mailfolders`); }catch(e){ if(seq===Mail.seqFolders) box.innerHTML=`<div class="empty small">${esc(e.message)}</div>`; return; }
+  if(seq!==Mail.seqFolders) return;
   if(!data.folders.length){ box.innerHTML='<div class="empty small" style="padding:16px">Нет локальных копий.<br>Сделайте бэкап ящика.</div>'; return; }
   box.innerHTML='';
   if(!Mail.folder || !data.folders.find(f=>f.folder===Mail.folder)) Mail.folder=data.folders[0].folder;
@@ -3695,9 +4179,10 @@ async function loadSearchResults(accId, append){
   data.results.forEach(r=>{
     const el=h(`<div class="msg-item" tabindex="0" role="button">
       ${S.scope==='all'?`<div class="msg-acc">${esc(r.account_name||'')} · ${esc(r.folder)}</div>`:`<div class="msg-acc">${esc(r.folder)}</div>`}
-      <div class="msg-top"><span class="msg-from">${esc(r.from||'—')}</span><span>${r.has_attach?'📎':''}</span><span>${esc(fmtDateShort(r.date))}</span></div>
+      <div class="msg-top">${pickBox(r.account_id, r.id, r.subject)}<span class="msg-from">${esc(r.from||'—')}</span><span>${r.has_attach?'📎':''}</span><span>${esc(fmtDateShort(r.date))}</span></div>
       <div class="msg-subj">${esc(r.subject||'(без темы)')}</div>
       ${r.snippet?`<div class="msg-snip">${markSnippet(r.snippet)}</div>`:''}</div>`);
+    wirePick(el, r.account_id, r.id, r.subject);
     el.onclick=()=>{ box.querySelectorAll('.msg-item').forEach(x=>x.classList.remove('active')); el.classList.add('active'); loadMailMessage(r.account_id, r.id); };
     el.onkeydown=(e)=>{ if(e.key==='Enter'||e.key===' '){ e.preventDefault(); el.click(); } };
     box.appendChild(el);
@@ -3712,12 +4197,15 @@ async function loadSearchResults(accId, append){
 async function loadMailMessages(accId){
   const box=$('#mlist'); if(!box) return;
   box.innerHTML='<div class="empty" style="padding:20px"><div class="spinner"></div></div>';
+  const seq=++Mail.seqList;
   let data;
   try{ data=await api(`/accounts/${accId}/messages?folder=${encodeURIComponent(Mail.folder)}&limit=${Mail.limit}&offset=${Mail.offset}`); }
-  catch(e){ box.innerHTML=`<div class="empty small">${esc(e.message)}</div>`; return; }
+  catch(e){ if(seq===Mail.seqList) box.innerHTML=`<div class="empty small">${esc(e.message)}</div>`; return; }
+  if(seq!==Mail.seqList) return;
   Mail.total=data.total;
   box.innerHTML='';
   const bar=h(`<div style="padding:8px 12px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px;font-size:.82rem" class="muted">
+    ${canRestoreMessages()&&data.messages.length?'<input type="checkbox" class="msg-pick" data-pickall aria-label="Выбрать все письма на странице" title="Выбрать все на странице">':''}
     <span>${fmtNum(data.total)} ${plural(data.total||0,'письмо','письма','писем')}</span><span class="spacer" style="flex:1"></span>
     <button class="btn ghost sm" ${Mail.offset<=0?'disabled':''} data-prev>←</button>
     <span>${Math.floor(Mail.offset/Mail.limit)+1}/${Math.max(1,Math.ceil(data.total/Mail.limit))}</span>
@@ -3726,11 +4214,27 @@ async function loadMailMessages(accId){
   bar.querySelector('[data-prev]').onclick=()=>{ Mail.offset=Math.max(0,Mail.offset-Mail.limit); loadMailMessages(accId); };
   bar.querySelector('[data-next]').onclick=()=>{ Mail.offset+=Mail.limit; loadMailMessages(accId); };
   if(!data.messages.length){ box.appendChild(h('<div class="empty">Папка пуста</div>')); return; }
+  const all=bar.querySelector('[data-pickall]');
+  // список (#mlist) живёт между страницами: прежний обработчик снимаем, иначе они копились бы
+  if(box._pickSync){ box.removeEventListener('pickchange', box._pickSync); box._pickSync=null; }
+  if(all){
+    const sync=()=>{ const n=data.messages.filter(m=>Mail.picked.has(accId+':'+m.id)).length;
+      all.checked=n===data.messages.length; all.indeterminate=n>0&&n<data.messages.length; };
+    sync();
+    all.onchange=()=>{
+      data.messages.forEach(m=>{ const k=accId+':'+m.id; if(all.checked) Mail.picked.set(k,{acc:accId,id:m.id,subject:m.subject}); else Mail.picked.delete(k); });
+      box.querySelectorAll('input[data-pick]').forEach(x=>{ x.checked=all.checked; });
+      renderPickBar();
+    };
+    box._pickSync=sync;
+    box.addEventListener('pickchange', sync);
+  }
   data.messages.forEach(m=>{
     const el=h(`<div class="msg-item ${m.seen?'':'unread'}" data-id="${m.id}" tabindex="0" role="button">
-      <div class="msg-top"><span class="msg-from">${m.flagged?'⭐ ':''}${m.answered?'↩ ':''}${esc(m.from||'—')}</span><span>${m.has_attach?'📎':''}</span><span>${esc(fmtDateShort(m.date))}</span></div>
+      <div class="msg-top">${pickBox(accId, m.id, m.subject)}<span class="msg-from">${m.flagged?'⭐ ':''}${m.answered?'↩ ':''}${esc(m.from||'—')}</span><span>${m.has_attach?'📎':''}</span><span>${esc(fmtDateShort(m.date))}</span></div>
       <div class="msg-subj">${esc(m.subject)}</div>
       <div class="muted small">${esc(m.size_h)}</div></div>`);
+    wirePick(el, accId, m.id, m.subject);
     el.onclick=()=>{ box.querySelectorAll('.msg-item').forEach(x=>x.classList.remove('active')); el.classList.add('active'); el.classList.remove('unread'); loadMailMessage(accId, m.id); };
     el.onkeydown=(e)=>{
       if(e.key==='Enter'||e.key===' '){ e.preventDefault(); el.click(); }
@@ -3780,8 +4284,12 @@ function fmtDateShort(iso){ if(!iso) return ''; try{ const d=new Date(iso); retu
 async function loadMailMessage(accId, pk){
   const box=$('#mreader'); if(!box) return;
   box.innerHTML='<div class="empty" style="padding:40px"><div class="spinner"></div></div>';
+  // на узком экране письмо стоит под списком: без прокрутки нажатие на письмо выглядело как «ничего не произошло»
+  if(window.matchMedia && matchMedia('(max-width:1100px)').matches) box.scrollIntoView({block:'start', behavior:'smooth'});
+  const seq=++Mail.seqMsg;
   let m;
-  try{ m=await api(`/accounts/${accId}/messages/${pk}`); }catch(e){ box.innerHTML=`<div class="empty">${esc(e.message)}</div>`; return; }
+  try{ m=await api(`/accounts/${accId}/messages/${pk}`); }catch(e){ if(seq===Mail.seqMsg) box.innerHTML=`<div class="empty">${esc(e.message)}</div>`; return; }
+  if(seq!==Mail.seqMsg) return;
   const hd=m.headers||{};
   // Картинки, уже показанные в тексте письма (cid:), в списке вложений не дублируем.
   const visibleAtts=(m.attachments||[]).filter(a=>!a.inline);
@@ -3797,6 +4305,7 @@ async function loadMailMessage(accId, pk){
       <div class="rmeta"><b>Дата:</b> ${esc(hd.date||'')}</div>
       <div style="margin-top:10px" class="btn-row">
         <a class="btn sm" href="/api/accounts/${accId}/messages/${pk}/raw" download>⬇ Скачать .eml</a>
+        ${canRestoreMessages()?'<button class="btn sm" data-restore-one>♻️ Восстановить письмо</button>':''}
       </div>
     </div>
     ${(m.truncated||m.notice)?`<div class="hint" style="margin-bottom:12px;border-color:var(--warn)">📦 ${esc(m.notice||'Письмо слишком большое для показа в браузере.')}</div>`:''}
@@ -3805,6 +4314,8 @@ async function loadMailMessage(accId, pk){
     <div id="mbody"></div>
   </div>`);
   box.appendChild(el);
+  const one=el.querySelector('[data-restore-one]');
+  if(one) one.onclick=()=>messagesRestoreModal([{acc:accId, id:pk, subject:hd.subject||''}]);
   const bodyBox=el.querySelector('#mbody');
   const showText=()=>{ bodyBox.innerHTML=''; bodyBox.appendChild(h(`<div class="mail-body-text">${esc(m.text||'(пустое тело)')}</div>`)); };
   // Внешние картинки в письме по умолчанию НЕ грузим: это трекинг-пиксели,
@@ -4159,6 +4670,13 @@ function renderDedup(body, r, st, redraws){
   }
 }
 
+/** Открыть ящик в разделе «Почта» с первой папки и первой страницы (раньше — с папки и страницы,
+ *  открытых в прежнем ящике: чужая папка подменялась первой, а номер страницы оставался). */
+function openMailbox(accId){
+  State.mailAccount=accId; Mail.folder=null; Mail.offset=0; Mail.search=null;
+  if(location.hash==='#/mail') route(); else location.hash='#/mail';
+}
+
 /** Открыть письмо в разделе «Почта» (из отчётов аналитики). */
 function openMailMessage(accId, msgId, folder){
   State.mailAccount=accId; Mail.folder=folder||null; Mail.offset=0; Mail.search=null; Mail.openAfter={acc:accId, id:msgId};
@@ -4456,7 +4974,7 @@ async function axOverview(box, st){
     ${doms?`<h4 style="margin:14px 0 6px">Домены</h4><div class="table-wrap"><table class="tbl"><tbody>${doms}</tbody></table></div>`:''}</div>`));
   const set=st.settings, ls=st.last_sync;
   grid.appendChild(h(`<div class="card"><div class="section-title"><h3>🔁 Сверка и доступ</h3></div>
-    <div class="kv"><span class="k">Последняя сверка</span><span>${ls?`${esc(fmtDate(ls.finished_at))} — <span class="badge ${esc(ls.status)}">${esc(STATUS_LBL[ls.status]||ls.status)}</span> <a href="javascript:void(0)" data-job="${ls.job_id}" class="small">задание №${ls.job_id}</a><div class="small muted">${esc(ls.summary||'')}</div>`:'не было'}</span></div>
+    <div class="kv"><span class="k">Последняя сверка</span><span>${ls?`${esc(fmtDate(ls.finished_at))} — <span class="badge ${esc(ls.status)}">${esc(STATUS_LBL[ls.status]||ls.status)}</span> <a href="#" data-job="${ls.job_id}" class="small">задание №${ls.job_id}</a><div class="small muted">${esc(ls.summary||'')}</div>`:'не было'}</span></div>
     <div class="kv"><span class="k">По расписанию</span><span>${set.sync_enabled?`да, <span class="mono">${esc(set.sync_cron||'')}</span> (${esc(cronHuman(set.sync_cron||''))})`:'нет'}</span></div>
     <div class="kv"><span class="k">Слежение за сервером</span><span>${set.monitor_enabled?'каждые 15 минут':'выключено'}</span></div>
     <div class="kv"><span class="k">CLI</span><span>${esc(set.host)}:${set.cli_port} · ${set.cli_tls==='tls'?'SSL'+(set.cli_cert?' · сертификат по отпечатку':''):(set.loopback?'без шифрования (эта же машина)':(set.allow_plaintext?'<span class="tag err">без шифрования</span>':'<span class="tag warn">нужен SSL</span>'))}</span></div>
@@ -4514,7 +5032,7 @@ async function axAccounts(box, st){
       : `<div class="empty">${rows.length?'Ничего не подходит под отбор.':'Учётных записей ещё нет — нажмите «Сверить учётные записи».'}</div>`;
     const selected=[...Ax.sel].map(e=>byEmail.get(e)).filter(Boolean);
     const noBox=selected.filter(r=>!r.mailbox && !r.deleted_at).length, withBox=selected.filter(r=>r.mailbox).length;
-    selInfo.innerHTML=selected.length?`Отмечено: <b>${fmtNum(selected.length)}</b> (с ящиком в архиве — ${fmtNum(withBox)}, без ящика — ${fmtNum(noBox)}) · <a href="javascript:void(0)" data-clear>снять отметки</a>`:'Отметьте учётные записи флажками, чтобы завести им ящики или выполнить действие.';
+    selInfo.innerHTML=selected.length?`Отмечено: <b>${fmtNum(selected.length)}</b> (с ящиком в архиве — ${fmtNum(withBox)}, без ящика — ${fmtNum(noBox)}) · <a href="#" data-clear>снять отметки</a>`:'Отметьте учётные записи флажками, чтобы завести им ящики или выполнить действие.';
     const cl=selInfo.querySelector('[data-clear]'); if(cl) cl.onclick=()=>{ Ax.sel.clear(); draw(); };
     wrap.querySelectorAll('[data-sel]').forEach(cb=>cb.onchange=()=>{ cb.checked?Ax.sel.add(cb.dataset.sel):Ax.sel.delete(cb.dataset.sel); draw(); });
     const all=wrap.querySelector('[data-all]'); if(all) all.onchange=()=>{ shown.forEach(r=>all.checked?Ax.sel.add(r.email):Ax.sel.delete(r.email)); draw(); };
@@ -4617,7 +5135,7 @@ function axigenAccountModal(r, st){
   const q=x=>m.body.querySelector(x), f=x=>m.foot.querySelector(x);
   f('[data-c]').onclick=m.close;
   if(q('[data-open]')) q('[data-open]').onclick=()=>{ m.close(); accountModal(b.id); };
-  if(q('[data-mail]')) q('[data-mail]').onclick=()=>{ m.close(); State.mailAccount=b.id; location.hash='#/mail'; };
+  if(q('[data-mail]')) q('[data-mail]').onclick=()=>{ m.close(); openMailbox(b.id); };
   if(q('[data-backup]')) q('[data-backup]').onclick=()=>backupNow(b.id, b.name);
   if(q('[data-addbox]')) q('[data-addbox]').onclick=()=>{ m.close(); axigenAddMailboxes([r.email]); };
   m.body.querySelectorAll('[data-act]').forEach(btn=>btn.onclick=()=>{ m.close(); bulkDialog(btn.dataset.act, [b.id], btn.dataset.act==='axigen_use_ftp'?{to:b.auth_type==='axigen_ftp'?'password':'axigen_ftp'}:{}, {onDone:()=>{ if(State.view==='axigen') setTimeout(route, 400); }}); });
@@ -4629,8 +5147,9 @@ function axigenAccountModal(r, st){
 }
 
 function axShowPasswordOnce(title, email, password){
-  modal(title, `<p class="small">Новый пароль учётной записи <b>${esc(email)}</b>. Он показывается <b>один раз</b> и нигде не сохраняется (кроме карточки ящика, который копируется по IMAP) — передайте его сотруднику.</p>
-    <input type="text" class="mono" readonly value="${esc(password)}" style="width:100%" onclick="this.select()">`);
+  const m=modal(title, `<p class="small">Новый пароль учётной записи <b>${esc(email)}</b>. Он показывается <b>один раз</b> и нигде не сохраняется (кроме карточки ящика, который копируется по IMAP) — передайте его сотруднику.</p>
+    <input type="text" class="mono" readonly value="${esc(password)}" style="width:100%" aria-label="Новый пароль">`);
+  const inp=m.body.querySelector('input'); inp.onclick=()=>inp.select();
 }
 
 function axigenPasswordModal(email){
@@ -4970,7 +5489,7 @@ async function viewServer(c){
   else if(!ax.allow_changes) notes.push('Изменения учётных записей Axigen выключены — действия, которые их меняют, недоступны. Включите «Разрешить изменения на сервере» в «Настройки → Сервер Axigen».');
   if(ax.enabled && !ax.last_sync) notes.push('Сверки с Axigen ещё не было — нажмите «Сверить с Axigen», чтобы увидеть учётные записи сервера.');
   notes.forEach(t=>c.appendChild(h(`<div class="hint" style="margin-bottom:10px">💡 ${esc(t)}</div>`)));
-  if((data.running||[]).length) c.appendChild(h(`<div class="hint warnbox" style="margin-bottom:10px">⚙️ Идёт действие с ящиками на сервере: ${data.running.map(j=>`<a href="javascript:void(0)" data-job="${j.id}">задание №${j.id}</a>`).join(', ')}. Новое встанет в очередь за ним.</div>`));
+  if((data.running||[]).length) c.appendChild(h(`<div class="hint warnbox" style="margin-bottom:10px">⚙️ Идёт действие с ящиками на сервере: ${data.running.map(j=>`<a href="#" data-job="${j.id}">задание №${j.id}</a>`).join(', ')}. Новое встанет в очередь за ним.</div>`));
   c.querySelectorAll('[data-job]').forEach(a=>a.onclick=()=>jobDetails(parseInt(a.dataset.job,10)));
   const sync=$('#srvSync',c); if(sync) sync.onclick=async()=>{ sync.disabled=true; try{ const r=await api('/axigen/sync',{method:'POST'}); toast(r.already?'Сверка уже идёт':'Сверка запущена', `Задание №${r.job_id}`); axWatchJob(r.job_id); }catch(e){ toastErr(e); sync.disabled=false; } };
   $('#srvXls',c).onclick=()=>apiDownload('/server/targets/export', {}, 'server_mailboxes.xlsx').catch(toastErr);

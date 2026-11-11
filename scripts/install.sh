@@ -30,6 +30,9 @@
 #    MA_WHEELS          каталог с пакетами .whl для установки без интернета
 #                       (по умолчанию — wheels/ рядом с исходниками, если есть)
 #    MA_INDEX_URL       свой индекс пакетов (зеркало PyPI) для установки из сети
+#    MA_CONSTRAINTS     файл ограничений pip — точные версии библиотек (напр. из выпуска)
+#    MA_PYTHON          интерпретатор для службы (по умолчанию — python3, если он
+#                       3.10 или новее, иначе самый новый из python3.14…python3.10)
 #    MA_UNIT_FILE, MA_CLI_WRAPPER — пути unit-файла и команды mailarchiver
 # ============================================================================
 set -Eeuo pipefail
@@ -60,6 +63,9 @@ usage(){
   MA_WHEELS=КАТАЛОГ        пакеты .whl для установки без интернета (по умолчанию —
                            каталог wheels рядом с исходниками, если он есть)
   MA_INDEX_URL=URL         свой индекс пакетов (зеркало PyPI) для установки из сети
+  MA_CONSTRAINTS=ФАЙЛ      точные версии библиотек (файл ограничений pip со страницы выпуска)
+  MA_PYTHON=ПУТЬ           интерпретатор Python 3.10+ (по умолчанию — python3 или самый
+                           новый из python3.14…python3.10)
   MA_UNIT_FILE, MA_CLI_WRAPPER
                            пути unit-файла и команды mailarchiver
 EOF
@@ -299,8 +305,43 @@ sys_deps_failed(){
 # пакетов не нужен. На сервере без интернета «apt-get update» только ждал бы
 # недоступные репозитории.
 system_python_ready(){
-  [ -n "$WHEELS_DIR" ] && command -v python3 >/dev/null 2>&1 \
-    && python3 -c 'import venv, ensurepip' >/dev/null 2>&1
+  [ -n "$WHEELS_DIR" ] || return 1
+  pick_python
+  command -v "$PYTHON" >/dev/null 2>&1 && "$PYTHON" -c 'import venv, ensurepip' >/dev/null 2>&1
+}
+
+# Интерпретатор для службы. На RHEL 8/9, Debian 11 и Ubuntu 20.04 «python3» — 3.6–3.9, а рядом бывает
+# поставлен python3.11/3.12: берём python3, если он подходит, иначе самый новый подходящий. MA_PYTHON —
+# явный выбор, без подбора.
+PYTHON=""
+pick_python(){
+  if [ -n "${MA_PYTHON:-}" ]; then PYTHON="$MA_PYTHON"; return 0; fi
+  local cand
+  for cand in python3 python3.14 python3.13 python3.12 python3.11 python3.10; do
+    if command -v "$cand" >/dev/null 2>&1 \
+        && "$cand" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; then
+      PYTHON="$cand"; return 0
+    fi
+  done
+  PYTHON="python3"
+}
+
+# Системный python3 старше 3.10 (RHEL 8/9 и производные): ставим из репозитория дистрибутива более новую
+# версию рядом — системный python3 при этом не меняется.
+install_newer_python(){
+  pick_python
+  if [ -n "${MA_PYTHON:-}" ] || "$PYTHON" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' \
+      >/dev/null 2>&1; then
+    return 0
+  fi
+  local v
+  for v in 3.12 3.11; do
+    if $PKG install -y "python$v" "python$v-pip" >/dev/null 2>&1; then
+      info "Системный python3 старше 3.10 — поставлен python$v (системный python3 не меняется)."
+      pick_python
+      return 0
+    fi
+  done
 }
 
 PKG=""
@@ -331,6 +372,7 @@ install_system_deps(){
       ;;
     dnf|yum)
       $PKG install -y python3 python3-pip ca-certificates || sys_deps_failed "$PKG"
+      install_newer_python
       $PKG install -y libpst >/dev/null 2>&1 || warn "libpst не установлен (не обязателен: это запасной способ импорта .pst, основной встроен)"
       $PKG install -y rsync openssh-clients >/dev/null 2>&1 || warn "rsync/openssh-clients не установлены (нужны только для копии архива на сервер по SSH)"
       ;;
@@ -352,11 +394,14 @@ install_system_deps(){
 }
 
 check_python(){
-  if ! command -v python3 >/dev/null 2>&1; then err "python3 не найден после установки."; exit 1; fi
-  local ver; ver="$(python3 -c 'import sys;print("%d.%d"%sys.version_info[:2])')"
+  pick_python
+  if ! command -v "$PYTHON" >/dev/null 2>&1; then err "$PYTHON не найден после установки."; exit 1; fi
+  local ver; ver="$("$PYTHON" -c 'import sys;print("%d.%d"%sys.version_info[:2])')"
   local major minor; major="${ver%%.*}"; minor="${ver##*.}"
   if [ "$major" -lt 3 ] || { [ "$major" -eq 3 ] && [ "$minor" -lt 10 ]; }; then
-    err "Требуется Python >= 3.10, найден $ver. Установите более новую версию."
+    err "Требуется Python >= 3.10, найден $ver ($PYTHON)."
+    err_more "Поставьте Python 3.10–3.14 из репозитория дистрибутива (например, python3.11 или python3.12)"
+    err_more "и укажите его: sudo MA_PYTHON=/usr/bin/python3.12 bash scripts/install.sh"
     exit 1
   fi
   # Сервис проверен на 3.10–3.14. На более новых версиях установка, скорее всего,
@@ -365,9 +410,9 @@ check_python(){
     warn "Python $ver новее проверенных версий (3.10–3.14)."
     warn "Если установка зависимостей не удастся — используйте Python 3.12–3.14."
   fi
-  ok "Python $ver подходит."
+  ok "Python $ver подходит ($PYTHON)."
   # пакеты автономного архива годятся только под свою версию Python и архитектуру
-  check_wheels_fit python3 || true
+  check_wheels_fit "$PYTHON" || true
 }
 
 create_user(){
@@ -419,7 +464,7 @@ copy_source(){
 
 setup_venv(){
   info "Создание виртуального окружения и установка зависимостей…"
-  python3 -m venv "$VENV_DIR" || { err "Не удалось создать venv (установлен ли python3-venv?)"; exit 1; }
+  "$PYTHON" -m venv "$VENV_DIR" || { err "Не удалось создать venv $PYTHON (установлен ли python3-venv?)"; exit 1; }
   if [ -n "$WHEELS_DIR" ]; then
     # Без сети pip, setuptools и wheel не обновляем: всё ставится из готовых
     # пакетов, собирать ничего не нужно.
@@ -635,7 +680,7 @@ main(){
   if [ -f "$SERVICE_FILE" ]; then UNIT_EXISTED=1; fi
   ROLLBACK_ENABLED=1
   if system_python_ready; then
-    info "Установка без сети: python3 с модулями venv и ensurepip уже есть — менеджер пакетов не вызывается (необязательные pst-utils, rsync и ssh при необходимости установите сами)."
+    info "Установка без сети: $PYTHON с модулями venv и ensurepip уже есть — менеджер пакетов не вызывается (необязательные pst-utils, rsync и ssh при необходимости установите сами)."
   else
     detect_pkg_manager
     install_system_deps

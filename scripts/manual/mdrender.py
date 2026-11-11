@@ -405,7 +405,6 @@ def parse(md):
     lines = md.split("\n")
     blocks = []
     i, n = 0, len(lines)
-    list_indent = None                      # отступ продолжения текущего пункта списка
     while i < n:
         line = lines[i]
         if not line.strip():
@@ -423,8 +422,6 @@ def parse(md):
             i += 1                           # закрывающая ```
             blocks.append({"kind": "code", "lines": code, "indent": indent, "raw": lines[start:i]})
             continue
-        if not line.startswith(" "):
-            list_indent = None
         if re.fullmatch(r"\s*(-{3,}|\*{3,}|_{3,})\s*", line):
             i += 1                           # горизонтальная черта: в руководстве её нет
             continue

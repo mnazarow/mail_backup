@@ -73,6 +73,9 @@ class QueueManager:
         # успел бы запустить по нему второе задание.
         self._claim_lock = threading.Lock()
         self._wake = threading.Event()
+        # сверка «выполняется» в базе с тем, что очередь выполняет на самом деле
+        self._orphan_seen: set = set()
+        self._orphan_checked = 0.0
 
     # -- параметры (устойчивы к некорректным значениям настроек) -------------
     def max_workers(self) -> int:
@@ -232,6 +235,7 @@ class QueueManager:
             try:
                 if self._unsettled:
                     self._settle_pending()
+                self._reconcile_running()
                 self._maybe_resize_pool()
                 while not self._stop.is_set():
                     with self._claim_lock:
@@ -256,6 +260,29 @@ class QueueManager:
             if not submitted:
                 self._wake.wait(timeout=1.0)
                 self._wake.clear()
+
+    #: Как часто сверять задания «выполняется» в базе с выполняемыми очередью (секунды).
+    RECONCILE_EVERY_S = 60.0
+
+    def _reconcile_running(self) -> None:
+        """Задание «выполняется» в базе, а очередь его не выполняет (сбой учёта, сорвавшаяся запись) —
+        вернуть в очередь, а не держать «выполняется» до перезапуска службы: по ящику с таким заданием
+        не запускались бы копии. Задание признаётся потерянным, только если так было на двух сверках
+        подряд — мгновения между снятием с учёта и записью итога сверка не трогает."""
+        now = time.monotonic()
+        if now - self._orphan_checked < self.RECONCILE_EVERY_S:
+            return
+        self._orphan_checked = now
+        rows = self.db.query("SELECT id FROM jobs WHERE status=?", (JobStatus.RUNNING,))
+        with self._lock:
+            known = set(self._running) | set(self._unsettled) | set(self._to_requeue)
+        candidates = {int(r["id"]) for r in rows} - known
+        confirmed = candidates & self._orphan_seen
+        self._orphan_seen = candidates - confirmed
+        if confirmed:
+            log.warning("Задания %s числились выполняющимися, но очередь их не выполняла — возвращены в "
+                        "очередь.", sorted(confirmed))
+            self.db.reset_orphan_jobs(only_ids=sorted(confirmed))
 
     def _maybe_resize_pool(self) -> None:
         """Привести размер пула к текущей настройке (только когда он свободен)."""

@@ -8,7 +8,7 @@ import sqlite3
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 from fastapi import HTTPException, Request, Response
 
@@ -17,7 +17,7 @@ from ..logging_setup import get_logger
 # Роли (подробно — :mod:`mailarchiver.roles`). Администратор — всё. Оператор
 # следит за копированием и запускает его, но не читает письма, не меняет
 # настроек и ничего не удаляет. Пользователь-ящик (сотрудник, вошедший по
-# паролю своего ящика) видит только свой ящик.
+# паролю своего ящика) видит только свои ящики — все ящики своей карточки сотрудника.
 from ..roles import ROLE_ADMIN, ROLE_MAILBOX, ROLE_OPERATOR, STAFF_ROLES
 from .proxy import client_ip
 from ..security import (
@@ -174,14 +174,34 @@ def user_from_token(services, token: str, touch: bool = True) -> Optional[dict]:
         if acc is None or not acc.enabled:
             services.db.delete_session(token)
             return None
-        return {"id": 0, "username": acc.username, "role": "mailbox",
-                "account_id": row["account_id"], "account_name": acc.name}
+        return mailbox_user(services, acc)
     user = services.db.get_user_by_id(row["user_id"])
     if user is None or user["disabled"]:
         services.db.delete_session(token)
         return None
     return {"id": user["id"], "username": user["username"], "role": user["role"],
             "totp_enabled": bool(_row_get(user, "totp_enabled", 0))}
+
+
+def mailbox_user(services, acc) -> dict:
+    """Пользователь, вошедший паролем ящика ``acc``.
+
+    С 1.15.0 у сотрудника может быть несколько ящиков: вошедший паролем любого из них видит все ящики
+    своей карточки (``account_ids``; вошедший — первым), пока числится работающим. Список
+    пересчитывается на каждом запросе — отвязанный ящик или увольнение закрывают доступ сразу.
+    ``logins`` — логины этих ящиков: «своё задание» — запущенное под любым из них.
+    """
+    ids, logins = services.db.mailbox_scope(acc.id)
+    return {"id": 0, "username": acc.username, "role": "mailbox", "account_id": acc.id,
+            "account_name": acc.name, "account_ids": ids, "logins": logins}
+
+
+def mailbox_ids(user: dict) -> List[int]:
+    """Ящики, открытые пользователю-ящику (вошедший — первым)."""
+    ids = user.get("account_ids")
+    if ids:
+        return [int(i) for i in ids]
+    return [int(user["account_id"])] if user.get("account_id") is not None else []
 
 
 def _row_get(row, key: str, default=None):
@@ -342,12 +362,26 @@ def guard_password_check(services, username: str, ip: str) -> None:
     _brute_force_guard(services, username, ip)
 
 
+#: Хеш, который проверяется вместо пароля несуществующего (или отключённого) пользователя: без этой
+#: проверки неверный пароль к существующему логину отвечал на ~0,2 с дольше, чем к несуществующему, —
+#: по времени ответа можно было перебрать логины администраторов.
+_DUMMY_HASH: List[str] = []
+
+
+def _dummy_hash() -> str:
+    if not _DUMMY_HASH:
+        _DUMMY_HASH.append(hash_password(new_token(16)))
+    return _DUMMY_HASH[0]
+
+
 def do_login(services, request: Request, response: Response, username: str, password: str) -> dict:
     """Проверить учётные данные с защитой от подбора и создать сессию."""
     username = (username or "").strip()
     ip = client_ip(request)
     throttle = _brute_force_guard(services, username, ip)
     user = services.db.get_user_by_name(username)
+    if user is None or user["disabled"]:
+        verify_password(password, _dummy_hash())          # столько же времени, сколько настоящая проверка
     # 1) вход администратора/пользователя веб-интерфейса
     if user is not None and not user["disabled"] and verify_password(password, user["password_hash"]):
         if _row_get(user, "totp_enabled", 0):
@@ -393,8 +427,7 @@ def do_login(services, request: Request, response: Response, username: str, pass
         services.db.clear_login_failures(username, ip=ip)
         services.db.add_audit(username, "login_mailbox", f"{ip} account={acc.id}")
         create_session(services, response, 0, request, role="mailbox", account_id=acc.id)
-        return {"id": 0, "username": acc.username, "role": "mailbox",
-                "account_id": acc.id, "account_name": acc.name}
+        return mailbox_user(services, acc)
     services.db.add_audit(username, "login_failed", ip)
     if throttle:
         # замедляем только неудачный ответ: правильный пароль проходит сразу,

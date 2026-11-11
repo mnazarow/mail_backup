@@ -230,10 +230,14 @@ def dismissed_map(svc) -> Dict[str, str]:
     try:
         rows = svc.db.query("SELECT email, dismissed_at FROM employees WHERE dismissed_at IS NOT NULL "
                             "AND dismissed_at != '' AND email IS NOT NULL AND email != ''")
+        # и все ящики уволенных: у сотрудника их может быть несколько (1.15.0)
+        rows += svc.db.query("SELECT a.username AS email, e.dismissed_at FROM accounts a "
+                             "JOIN employees e ON e.id = a.employee_id WHERE e.dismissed_at IS NOT NULL "
+                             "AND e.dismissed_at != '' AND a.username LIKE '%@%'")
     except Exception:  # noqa: BLE001 — справочника сотрудников может не быть в старой базе
         return out
     for r in rows:
-        out[str(r["email"]).strip().lower()] = r["dismissed_at"]
+        out.setdefault(str(r["email"]).strip().lower(), r["dismissed_at"])
     return out
 
 

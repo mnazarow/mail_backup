@@ -565,7 +565,7 @@ class AliasAddAction(ServerAction):
         ctx.data["claimed"] = {}
 
     def _alias(self, ctx, t) -> str:
-        employee = ctx.db.get_employee_by_email(t.email)
+        employee = ctx.db.employee_by_address(t.email)
         return render_alias(ctx.params.get("template") or "", t.axigen, employee)
 
     def check(self, ctx, t):
@@ -708,7 +708,7 @@ class ContactAction(ServerAction):
     def _wanted(self, ctx, t) -> Dict[str, str]:
         out: Dict[str, str] = {}
         if ctx.params.get("source") == "employees":
-            emp = ctx.db.get_employee_by_email(t.email)
+            emp = ctx.db.employee_by_address(t.email)
             if emp is None:
                 return {}
             out.update(split_full_name(emp["full_name"] or "", ctx.params.get("name_order") or "last_first"))
@@ -732,7 +732,7 @@ class ContactAction(ServerAction):
         return clean
 
     def check(self, ctx, t):
-        if ctx.params.get("source") == "employees" and ctx.db.get_employee_by_email(t.email) is None:
+        if ctx.params.get("source") == "employees" and ctx.db.employee_by_address(t.email) is None:
             return "сотрудника с этим адресом нет в разделе «Сотрудники»"
         return "" if self._wanted(ctx, t) else "нечего записывать (у сотрудника не заполнены нужные поля)"
 

@@ -30,7 +30,7 @@ from .bulk_api import router as bulk_router
 from .axigen_api import router as axigen_router
 from .mailservers_api import router as mailservers_router
 from .server_api import router as server_router
-from .proxy import BodyLimitMiddleware, ProxyHeadersMiddleware, SecurityHeadersMiddleware
+from .proxy import SECURITY_HEADERS, BodyLimitMiddleware, ProxyHeadersMiddleware, SecurityHeadersMiddleware
 from .ws import router as ws_router
 
 log = get_logger("web")
@@ -71,6 +71,16 @@ def _starlette_request_first() -> bool:
 
 
 _REQUEST_FIRST = _starlette_request_first()
+
+
+#: Политика безопасности самой страницы интерфейса: скрипты — только файлы с этого сервера (ни встроенных,
+#: ни чужих — внедрённый в страницу скрипт не выполнится), соединения — только со своим сервером.
+#: Стили встроенные разрешены (атрибуты style в разметке). Картинки снаружи — только для HTML-писем по
+#: кнопке «Показать картинки»: у фрейма письма своя, более строгая политика, и действуют обе.
+PAGE_CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data: blob: https: http:; font-src 'self' data:; connect-src 'self' ws: wss:; "
+            "frame-src 'self' blob: data:; object-src 'none'; base-uri 'none'; form-action 'self'; "
+            "frame-ancestors 'none'")
 
 
 def render_template(request: Request, name: str, context: dict):
@@ -233,10 +243,16 @@ def create_app() -> FastAPI:
     @app.exception_handler(Exception)
     async def _unhandled(request: Request, exc: Exception):
         log.exception("Необработанная ошибка запроса %s", request.url.path)
+        # Ответ 500 Starlette отдаёт снаружи всех слоёв, мимо SecurityHeadersMiddleware: защитные
+        # заголовки (и запрет кеширования ответов API) ставим сами.
+        headers = dict(SECURITY_HEADERS)
+        if request.url.path.startswith("/api/"):
+            headers["Cache-Control"] = "no-store"
         return JSONResponse(status_code=500,
                             content={"error": True, "code": "internal",
                                      "message": "Внутренняя ошибка сервера. Подробности в логах.",
-                                     "hint": None})
+                                     "hint": None},
+                            headers=headers)
 
     # --- корневые маршруты ---
     asset_tag = _asset_tag()
@@ -245,19 +261,24 @@ def create_app() -> FastAPI:
     async def index(request: Request):
         # Версию анониму не отдаём (как и /health): для сброса кеша браузера
         # хватает отпечатка самих файлов интерфейса.
-        return render_template(request, "index.html", {"asset": asset_tag, "title": APP_TITLE})
+        response = render_template(request, "index.html", {"asset": asset_tag, "title": APP_TITLE})
+        response.headers["Content-Security-Policy"] = PAGE_CSP
+        return response
 
     @app.get("/health")
-    async def health(request: Request):
+    def health(request: Request):
         """Проба живости для systemd/Docker/балансировщика.
 
         Версия сервиса и состояние планировщика отдаются только тому, кто
         вошёл: раньше любой, кто дотянулся до порта, узнавал точную версию
         (и, значит, список известных для неё уязвимостей).
+
+        Обычная (не async) функция: проверка cookie идёт в базу, и в цикле событий она останавливала бы
+        все запросы и WebSocket на время ожидания базы. Сессию проба не продлевает.
         """
         svc = getattr(request.app.state, "services", None)
         try:
-            user = auth_mod.current_user(request)
+            user = auth_mod.user_from_cookies(svc, request.cookies, touch=False) if svc is not None else None
         except Exception:  # noqa: BLE001
             user = None
         if user is None:

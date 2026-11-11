@@ -210,8 +210,15 @@ class RestoreEngine:
             dry_run: bool = False, limit: int = 0,
             progress_cb: Optional[ProgressCB] = None, cancel_cb: Optional[CancelCB] = None,
             event_cb: Optional[EventCB] = None, resume: Optional[dict] = None,
-            checkpoint_cb: Optional[Callable[[dict], None]] = None) -> RestoreResult:
-        """``resume`` — отметка, оставленная прерванным прогоном этого же задания (см. ``checkpoint_cb``):
+            checkpoint_cb: Optional[Callable[[dict], None]] = None,
+            message_ids: Optional[List[int]] = None, source_account_id: Optional[int] = None) -> RestoreResult:
+        """Залить письма из архива в ящик ``account`` по IMAP.
+
+        ``message_ids`` — восстановить только эти письма (1.15.0), а не папки целиком: id из индекса
+        архива. ``source_account_id`` — из архива какого ящика их брать (по умолчанию — из архива
+        самого ``account``); так администратор возвращает письма уволенного в ящик коллеги.
+
+        ``resume`` — отметка, оставленная прерванным прогоном этого же задания (см. ``checkpoint_cb``):
         обход продолжается со следующего письма, счётчики — с прежних значений. Без неё задание, прерванное
         перезапуском службы, начинало с первого письма и заливало уже залитое повторно (без проверки дублей —
         всё, с ней — письма без Message-ID)."""
@@ -233,16 +240,30 @@ class RestoreEngine:
             if cancel_cb and cancel_cb():
                 raise JobCancelled("Восстановление отменено пользователем.")
 
-        # Письма берём из индекса ПОТОКОМ (генератор с постраничным обходом):
-        # прежняя выборка list_messages(limit=1 000 000) материализовала весь
-        # индекс в память (~190 МБ на 200 000 писем) и молча теряла всё, что
-        # не поместилось в миллион самых новых писем.
-        result.total = self._count_messages(account.id, folders, limit)
+        source_id = int(source_account_id or account.id)
         start_done = int(resume.get("done") or 0) if resume else 0
-        messages = self._iter_messages(account.id, folders, limit,
-                                       start_folder=int(resume.get("folder_idx") or 0) if resume else 0,
-                                       start_id=int(resume.get("last_id") or 0) if resume else 0,
-                                       already_sent=start_done)
+        if message_ids is not None:
+            # Отдельные письма: в индексе их ищем по id и только в архиве ящика-источника.
+            wanted = sorted({int(i) for i in message_ids})
+            present = self.db.message_ids_present(source_id, wanted)
+            missing = len(wanted) - len(present)
+            result.total = len(present)
+            if missing and not resume:
+                result.add_error(f"Писем нет в архиве: {missing}")
+                emit("WARNING", f"Выбрано писем: {len(wanted)}, из них в архиве уже нет {missing} (удалены по "
+                                f"сроку хранения или при пересборке копии) — они не восстанавливаются.")
+            messages = ((0, row) for row in self.db.messages_by_ids(
+                source_id, [i for i in present if i > (int(resume.get("last_id") or 0) if resume else 0)]))
+        else:
+            # Письма берём из индекса ПОТОКОМ (генератор с постраничным обходом):
+            # прежняя выборка list_messages(limit=1 000 000) материализовала весь
+            # индекс в память (~190 МБ на 200 000 писем) и молча теряла всё, что
+            # не поместилось в миллион самых новых писем.
+            result.total = self._count_messages(source_id, folders, limit)
+            messages = self._iter_messages(source_id, folders, limit,
+                                           start_folder=int(resume.get("folder_idx") or 0) if resume else 0,
+                                           start_id=int(resume.get("last_id") or 0) if resume else 0,
+                                           already_sent=start_done)
         emit("INFO", f"К восстановлению отобрано писем: {result.total}"
                      + (" (сухой прогон)" if dry_run else ""))
         if resume:
@@ -306,7 +327,7 @@ class RestoreEngine:
                     continue
 
                 try:
-                    raw = self.store.read_message(account.id, row["stored_path"])
+                    raw = self.store.read_message(source_id, row["stored_path"])
                 except MailArchiverError as exc:
                     result.add_error(f"{row['stored_path']}: {exc.message}")
                     emit_msg("ERROR", f"Файл копии недоступен: {exc.message}")

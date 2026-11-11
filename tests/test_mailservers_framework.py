@@ -421,7 +421,6 @@ def test_monitor_problems_and_metrics(mem):
     names = {m[0] for m in monitor.metrics(svc)}
     assert "mailarchiver_mailserver_up" in names and "mailarchiver_mailserver_problems" in names
     # без проверки сертификата и без отпечатка — предупреждение
-    conn = msstore.get_server(svc.db, sid)
     msstore.set_setting(svc.db, sid, "verify_tls", False)
     assert any(p["kind"] == "tls_unverified" for p in monitor.problems(svc))
 

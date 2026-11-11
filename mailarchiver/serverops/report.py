@@ -19,7 +19,7 @@ from ..errors import MailArchiverError, ValidationError
 from ..util import human_size
 from . import base
 from . import targets as tg
-from .base import Ctx, ServerAction
+from .base import ServerAction
 
 #: Сколько самых больших папок называть в отчёте.
 TOP_FOLDERS = 5

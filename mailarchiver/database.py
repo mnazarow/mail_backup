@@ -19,7 +19,7 @@ import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from . import models
 from .logging_setup import get_logger
@@ -38,13 +38,26 @@ _ENCRYPTED_SETTINGS = {"notifications.smtp_password", "employees.source_url_pass
                        "axigen.admin_password", "axigen.ftp_password"}
 
 
-#: Выборка сотрудника вместе с названием и состоянием привязанного ящика:
-#: интерфейсу нужны account_name/account_enabled, а отдельный запрос на строку
-#: превратил бы список в N+1 обращений к БД.
+#: Выборка сотрудника вместе с ОСНОВНЫМ ящиком и числом всех его ящиков.
+#:
+#: С 1.15.0 у сотрудника может быть несколько ящиков: связь хранится в accounts.employee_id, а прежняя
+#: колонка employees.account_id больше не читается (в старых базах она остаётся как была). Под именем
+#: ``account_id`` выборка отдаёт основной ящик — тот, чей логин совпадает с адресом сотрудника, иначе
+#: заведённый первым, — поэтому колонки сотрудника перечислены явно, без ``e.*``. Весь список ящиков —
+#: :meth:`Database.employee_accounts` / :meth:`Database.employee_accounts_map`.
 _EMPLOYEE_SELECT = (
-    "SELECT e.*, a.name AS account_name, a.enabled AS account_enabled, a.hold_until AS account_hold_until "
-    "FROM employees e LEFT JOIN accounts a ON a.id = e.account_id"
+    "SELECT e.id, e.external_id, e.full_name, e.email, e.position, e.department, e.phone, e.status, "
+    "e.notes, e.source, e.created_at, e.updated_at, e.last_seen_at, e.had_account, e.dismissed_at, "
+    "e.known_logins, a.id AS account_id, a.name AS account_name, a.enabled AS account_enabled, "
+    "a.hold_until AS account_hold_until, "
+    "(SELECT COUNT(*) FROM accounts c WHERE c.employee_id = e.id) AS account_count "
+    "FROM employees e LEFT JOIN accounts a ON a.id = ("
+    "SELECT p.id FROM accounts p WHERE p.employee_id = e.id "
+    "ORDER BY (p.username = e.email COLLATE NOCASE) DESC, p.id LIMIT 1)"
 )
+#: Колонки ящика в списках ящиков сотрудника.
+_EMPLOYEE_ACCOUNT_COLS = ("id, employee_id, name, username, enabled, hold_until, hold_reason, dismissed_at, "
+                          "auto_disabled, login_status, last_backup_at, last_backup_status")
 
 
 def _row_str(row, key: str) -> str:
@@ -54,6 +67,31 @@ def _row_str(row, key: str) -> str:
     except (IndexError, KeyError):
         return ""
     return "" if value is None else str(value)
+
+
+def _account_cond(account_id) -> Tuple[str, List[Any]]:
+    """Условие по ящику: один id или список id (ящики сотрудника, вошедшего паролем ящика)."""
+    if isinstance(account_id, (list, tuple, set, frozenset)):
+        ids = sorted({int(i) for i in account_id})
+        if not ids:
+            return "0", []
+        return f"account_id IN ({','.join('?' * len(ids))})", list(ids)
+    return "account_id=?", [int(account_id)]
+
+
+def _split_logins(text: Optional[str]) -> Set[str]:
+    """known_logins сотрудника: JSON-список логинов → множество (в нижнем регистре)."""
+    if not text:
+        return set()
+    try:
+        items = json.loads(text)
+    except (TypeError, ValueError):
+        return set()
+    return {str(x).strip().lower() for x in items if str(x).strip()} if isinstance(items, list) else set()
+
+
+def _join_logins(logins) -> str:
+    return json.dumps(sorted({str(x).strip().lower() for x in logins if str(x).strip()}), ensure_ascii=False)
 
 
 def _row_opt_int(row, key: str):
@@ -291,6 +329,11 @@ class Database:
             ("employees", "dismissed_at", "TEXT"),
             # копирование через подключение к почтовому серверу (1.14.0)
             ("accounts", "server_id", "INTEGER"),
+            # несколько ящиков у сотрудника: ящик ссылается на сотрудника (1.15.0)
+            ("accounts", "employee_id", "INTEGER REFERENCES employees(id) ON DELETE SET NULL"),
+            # логины ящиков, которые у сотрудника уже были: удалённый или отвязанный ящик синхронизация
+            # не заводит снова (1.15.0; раньше — один флаг had_account на весь справочник сотрудника)
+            ("employees", "known_logins", "TEXT DEFAULT ''"),
         ]
         changed = False
         # Индекс (account_id, folder) полностью покрыт уникальным ключом
@@ -324,9 +367,11 @@ class Database:
             # поиск ящика по логину — на каждой строке синхронизации сотрудников
             conn.execute("CREATE INDEX IF NOT EXISTS idx_accounts_username ON accounts(username COLLATE NOCASE)")
             # история заданий по виду и по ящику (раздел «Задания», аналитика, карточка ящика): без индекса
-            # редкий вид или ящик без свежих заданий означал обход всей истории (1.15.0)
+            # редкий вид или ящик без свежих заданий означал обход всей истории (1.14.1)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_type ON jobs(type, id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_account ON jobs(account_id, id)")
+            # ящики сотрудника (карточка, вход сотрудника во все свои ящики) (1.15.0)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_accounts_employee ON accounts(employee_id)")
             conn.commit()
         except sqlite3.Error as exc:
             self._safe_rollback(conn)
@@ -349,6 +394,55 @@ class Database:
         self._drop_legacy_retention_schedules(conn)
         self._schedules_allow_global(conn)
         self._message_totals(conn)
+        self._employee_accounts(conn)
+
+    #: Отметка в meta: привязки «сотрудник — ящик» перенесены в accounts.employee_id.
+    _EMPLOYEE_ACCOUNTS_MARK = "employee_accounts_v1"
+
+    def _employee_accounts(self, conn: sqlite3.Connection) -> None:
+        """Один раз (1.15.0): связь «сотрудник — ящик» переезжает из employees.account_id в
+        accounts.employee_id, где у сотрудника может быть сколько угодно ящиков.
+
+        Ящик принадлежит одному сотруднику. Если прежде один ящик был привязан к нескольким карточкам
+        (общий ящик), он остаётся за тем, чей адрес совпадает с логином ящика, иначе — за работающим,
+        иначе — за заведённым первым. Логины, которые у сотрудника уже были, переходят в known_logins:
+        удалённый администратором ящик синхронизация по-прежнему не заводит заново.
+        """
+        try:
+            if conn.execute("SELECT 1 FROM meta WHERE key=?", (self._EMPLOYEE_ACCOUNTS_MARK,)).fetchone():
+                return
+            conn.commit()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                shared = conn.execute(
+                    "SELECT COUNT(*) FROM (SELECT account_id FROM employees WHERE account_id IS NOT NULL "
+                    "GROUP BY account_id HAVING COUNT(*) > 1)").fetchone()[0]
+                conn.execute(
+                    "UPDATE accounts SET employee_id = ("
+                    "SELECT e.id FROM employees e WHERE e.account_id = accounts.id "
+                    "ORDER BY (e.email = accounts.username COLLATE NOCASE) DESC, (e.status = 'active') DESC, e.id "
+                    "LIMIT 1) WHERE employee_id IS NULL "
+                    "AND EXISTS (SELECT 1 FROM employees e WHERE e.account_id = accounts.id)")
+                for row in conn.execute(
+                        "SELECT e.id, e.email, e.had_account, a.username FROM employees e "
+                        "LEFT JOIN accounts a ON a.id = e.account_id "
+                        "WHERE e.had_account = 1 OR e.account_id IS NOT NULL").fetchall():
+                    logins = {x for x in ((row[1] or "") if row[2] else "", row[3] or "") if x}
+                    if logins:
+                        conn.execute("UPDATE employees SET known_logins=? WHERE id=?",
+                                     (_join_logins(logins), row[0]))
+                conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+                             (self._EMPLOYEE_ACCOUNTS_MARK, utcnow_iso()))
+                conn.commit()
+            except BaseException:
+                self._safe_rollback(conn)
+                raise
+            if shared:
+                log.warning("Общих ящиков, привязанных к нескольким сотрудникам: %s. С 1.15.0 ящик принадлежит "
+                            "одному сотруднику — он оставлен за тем, чей адрес совпадает с логином ящика "
+                            "(иначе — за работающим или заведённым первым). Проверьте раздел «Сотрудники».", shared)
+        except sqlite3.Error as exc:
+            log.error("Не удалось перенести привязки сотрудников к ящикам: %s", exc)
 
     #: Отметка в meta: счётчики писем по папкам заполнены (дальше их ведут триггеры).
     _TOTALS_MARK = "folder_totals_v1"
@@ -381,7 +475,7 @@ class Database:
     }
 
     def _message_totals(self, conn: sqlite3.Connection) -> None:
-        """Счётчики писем по папкам (1.15.0): триггеры и — один раз — пересчёт по уже сохранённым письмам.
+        """Счётчики писем по папкам (1.14.1): триггеры и — один раз — пересчёт по уже сохранённым письмам.
 
         Пересчёт и создание триггеров — одной транзакцией: письмо, записанное
         между ними, не потерялось бы и не посчиталось бы дважды. На архиве в
@@ -409,7 +503,18 @@ class Database:
             if took > 1:
                 log.info("Счётчики писем по ящикам и папкам заполнены за %.0f с (один раз после обновления).", took)
         except sqlite3.Error as exc:
-            log.error("Не удалось завести счётчики писем по папкам: %s", exc)
+            log.error("Не удалось завести счётчики писем по папкам: %s. Повторю при ежечасном обслуживании; "
+                      "до тех пор число писем в интерфейсе может быть неверным.", exc)
+
+    def ensure_message_totals(self) -> bool:
+        """Счётчики писем заведены (иначе — завести сейчас). Ежечасное обслуживание вызывает это, чтобы
+        неудача первого заполнения (база занята, нет места) не оставляла нули до перезапуска службы.
+        → True, если счётчики в порядке."""
+        conn = self.connect()
+        if conn.execute("SELECT 1 FROM meta WHERE key=?", (self._TOTALS_MARK,)).fetchone():
+            return True
+        self._message_totals(conn)
+        return bool(conn.execute("SELECT 1 FROM meta WHERE key=?", (self._TOTALS_MARK,)).fetchone())
 
     @staticmethod
     def _recount_totals(conn: sqlite3.Connection) -> None:
@@ -920,6 +1025,7 @@ class Database:
             dismissed_at=_row_str(row, "dismissed_at"),
             auto_disabled=bool(_row_int(row, "auto_disabled")),
             server_id=_row_opt_int(row, "server_id"),
+            employee_id=_row_opt_int(row, "employee_id"),
         )
 
     def set_account_hold(self, account_id: int, hold_until: str, reason: str = "manual") -> None:
@@ -1043,7 +1149,22 @@ class Database:
                      (self.secret.encrypt(refresh_token) if refresh_token else "", utcnow_iso(),
                       account_id))
 
+    #: Сколько писем индекса удалять за один заход при удалении ящика.
+    DELETE_BATCH = 5000
+
     def delete_account(self, account_id: int) -> None:
+        """Удалить ящик из базы со всем, что на него ссылается.
+
+        Письма индекса (а с ними — строки поиска и счётчики, их ведут триггеры) удаляются пачками: одним
+        оператором ящик в 300 тыс. писем держал блокировку записи ~7 с, и всё это время стояли запись копий
+        остальных ящиков и интерфейс. Между пачками блокировка отпускается.
+        """
+        while True:
+            cur = self.execute("DELETE FROM messages WHERE id IN "
+                               "(SELECT id FROM messages WHERE account_id=? LIMIT ?)",
+                               (int(account_id), self.DELETE_BATCH))
+            if (cur.rowcount or 0) < self.DELETE_BATCH:
+                break
         self.execute("DELETE FROM accounts WHERE id=?", (account_id,))
 
     # ======================================================================
@@ -1053,7 +1174,7 @@ class Database:
     #: синхронизации. Белый список нужен, чтобы update_employee нельзя было
     #: заставить переписать служебные колонки (id, created_at и т.п.).
     EMPLOYEE_FIELDS = ("external_id", "full_name", "email", "position", "department",
-                       "phone", "status", "account_id", "notes", "source", "last_seen_at", "dismissed_at")
+                       "phone", "status", "notes", "source", "last_seen_at", "dismissed_at")
 
     @staticmethod
     def _employee_filter(query: Optional[str], status: Optional[str]) -> tuple:
@@ -1083,12 +1204,15 @@ class Database:
         now = utcnow_iso()
         cur = self.execute(
             """INSERT INTO employees(external_id, full_name, email, position, department, phone,
-                                     status, account_id, notes, source, created_at, updated_at, last_seen_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                     status, notes, source, created_at, updated_at, last_seen_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
             (external_id, full_name, email, position, department, phone,
-             status or "active", account_id, notes, source, now, now, last_seen_at),
+             status or "active", notes, source, now, now, last_seen_at),
         )
-        return int(cur.lastrowid)
+        employee_id = int(cur.lastrowid)
+        if account_id:
+            self.link_employee_account(employee_id, int(account_id))
+        return employee_id
 
     def update_employee(self, employee_id: int, **fields: Any) -> None:
         """Обновить карточку сотрудника. Изменяются ТОЛЬКО переданные поля."""
@@ -1114,6 +1238,17 @@ class Database:
             return None
         return self.query_one(
             f"{_EMPLOYEE_SELECT} WHERE e.email=? COLLATE NOCASE ORDER BY e.id LIMIT 1", (email,))
+
+    def employee_by_address(self, email: str) -> Optional[sqlite3.Row]:
+        """Чей это адрес: сотрудник с таким основным адресом, иначе — владелец ящика с таким логином.
+
+        Для шаблонов (псевдонимы, ФИО на сервере): адрес дополнительного ящика тоже принадлежит
+        сотруднику. Синхронизация так НЕ ищет — там опознание только по основному адресу.
+        """
+        return self.get_employee_by_email(email) or (self.query_one(
+            f"{_EMPLOYEE_SELECT} WHERE e.id = (SELECT employee_id FROM accounts "
+            "WHERE username=? COLLATE NOCASE AND employee_id IS NOT NULL ORDER BY id LIMIT 1)", (email,))
+            if email else None)
 
     def get_employee_by_external_id(self, external_id: str) -> Optional[sqlite3.Row]:
         if not external_id:
@@ -1158,11 +1293,11 @@ class Database:
             """SELECT
                    COALESCE(SUM(CASE WHEN status='active'   THEN 1 ELSE 0 END), 0) AS active,
                    COALESCE(SUM(CASE WHEN status='archived' THEN 1 ELSE 0 END), 0) AS archived,
-                   COALESCE(SUM(CASE WHEN status='active' AND account_id IS NOT NULL THEN 1 ELSE 0 END), 0)
-                       AS with_account,
-                   COALESCE(SUM(CASE WHEN status='active' AND account_id IS NULL THEN 1 ELSE 0 END), 0)
-                       AS without_account
-               FROM employees"""
+                   COALESCE(SUM(CASE WHEN status='active' AND has THEN 1 ELSE 0 END), 0) AS with_account,
+                   COALESCE(SUM(CASE WHEN status='active' AND NOT has THEN 1 ELSE 0 END), 0) AS without_account
+               FROM (SELECT e.status,
+                            EXISTS(SELECT 1 FROM accounts a WHERE a.employee_id = e.id) AS has
+                     FROM employees e)"""
         )
         return {
             "active": int(row["active"] or 0),
@@ -1177,17 +1312,102 @@ class Database:
         self.execute("DELETE FROM employees WHERE id=?", (employee_id,))
 
     def set_employee_account(self, employee_id: int, account_id: Optional[int]) -> None:
-        """Привязать сотрудника к ящику (None — отвязать).
-
-        Привязка отмечает «ящик у сотрудника был»: если его потом удалят или
-        отвяжут, синхронизация не заведёт ящик заново.
-        """
+        """Совместимость с прежним кодом: ``account_id`` — добавить сотруднику ящик,
+        None — отвязать ВСЕ его ящики (сами ящики не удаляются)."""
         if account_id is None:
-            self.execute("UPDATE employees SET account_id=NULL, updated_at=? WHERE id=?",
-                         (utcnow_iso(), employee_id))
+            for acc in self.employee_accounts(employee_id):
+                self.unlink_employee_account(int(acc["id"]))
             return
-        self.execute("UPDATE employees SET account_id=?, had_account=1, updated_at=? WHERE id=?",
-                     (account_id, utcnow_iso(), employee_id))
+        self.link_employee_account(employee_id, int(account_id))
+
+    # -- ящики сотрудника (1.15.0) ------------------------------------------
+    def employee_accounts(self, employee_id: int) -> List[sqlite3.Row]:
+        """Все ящики сотрудника: основной (логин = адрес сотрудника) первым, дальше — по порядку заведения."""
+        return self.query(
+            f"SELECT a.{_EMPLOYEE_ACCOUNT_COLS.replace(', ', ', a.')} FROM accounts a "
+            "JOIN employees e ON e.id = a.employee_id WHERE a.employee_id=? "
+            "ORDER BY (a.username = e.email COLLATE NOCASE) DESC, a.id", (employee_id,))
+
+    def employee_accounts_map(self, employee_ids: Sequence[int]) -> Dict[int, List[sqlite3.Row]]:
+        """Ящики нескольких сотрудников одним запросом на сотню (для списка в разделе «Сотрудники»)."""
+        out: Dict[int, List[sqlite3.Row]] = {}
+        ids = [int(i) for i in employee_ids if i]
+        for start in range(0, len(ids), 500):
+            part = ids[start:start + 500]
+            for row in self.query(
+                    f"SELECT a.{_EMPLOYEE_ACCOUNT_COLS.replace(', ', ', a.')} FROM accounts a "
+                    f"JOIN employees e ON e.id = a.employee_id "
+                    f"WHERE a.employee_id IN ({','.join('?' * len(part))}) "
+                    "ORDER BY a.employee_id, (a.username = e.email COLLATE NOCASE) DESC, a.id", tuple(part)):
+                out.setdefault(int(row["employee_id"]), []).append(row)
+        return out
+
+    def employee_of_account(self, account_id: int) -> Optional[sqlite3.Row]:
+        """Карточка сотрудника, которому принадлежит ящик (или None)."""
+        return self.query_one(
+            f"{_EMPLOYEE_SELECT} WHERE e.id = (SELECT employee_id FROM accounts WHERE id=?)", (account_id,))
+
+    def link_employee_account(self, employee_id: int, account_id: int) -> Optional[int]:
+        """Записать ящик за сотрудником. Ящик принадлежит одному сотруднику: если он числился за другим,
+        он переходит к этому. Возвращает id прежнего владельца (или None).
+
+        Логин ящика запоминается в known_logins: если ящик потом удалят или отвяжут, синхронизация
+        не заведёт его заново.
+
+        Сеансы, открытые паролем этого ящика, при смене владельца завершаются: вошедший им видит все ящики
+        владельца (:meth:`mailbox_scope`), и уже открытый сеанс прежнего владельца иначе сразу получил бы
+        архив нового.
+        """
+        row = self.query_one("SELECT employee_id, username FROM accounts WHERE id=?", (account_id,))
+        if row is None:
+            return None
+        previous = row["employee_id"]
+        with self.transaction() as conn:
+            conn.execute("UPDATE accounts SET employee_id=? WHERE id=?", (employee_id, account_id))
+            if previous is None or int(previous) != int(employee_id):
+                conn.execute("DELETE FROM sessions WHERE role='mailbox' AND account_id=?", (int(account_id),))
+            known = conn.execute("SELECT known_logins FROM employees WHERE id=?", (employee_id,)).fetchone()
+            logins = _split_logins(known[0] if known else "") | {(row["username"] or "").lower()}
+            conn.execute("UPDATE employees SET known_logins=?, had_account=1, updated_at=? WHERE id=?",
+                         (_join_logins(logins), utcnow_iso(), employee_id))
+        return int(previous) if previous is not None and int(previous) != int(employee_id) else None
+
+    def unlink_employee_account(self, account_id: int) -> None:
+        """Ящик больше не числится за сотрудником (сам ящик и его архив остаются)."""
+        self.execute("UPDATE accounts SET employee_id=NULL WHERE id=?", (account_id,))
+
+    def remember_employee_logins(self, employee_id: int, logins) -> None:
+        """Добавить логины в known_logins сотрудника (ящики по ним синхронизация больше не заводит)."""
+        with self.transaction() as conn:
+            known = conn.execute("SELECT known_logins FROM employees WHERE id=?", (employee_id,)).fetchone()
+            if known is None:
+                return
+            merged = _split_logins(known[0]) | {str(x).lower() for x in logins if x}
+            conn.execute("UPDATE employees SET known_logins=? WHERE id=?", (_join_logins(merged), employee_id))
+
+    @staticmethod
+    def employee_known_logins(row) -> Set[str]:
+        """Логины ящиков, которые у сотрудника уже были (строка выборки сотрудника)."""
+        try:
+            text = row["known_logins"]
+        except (IndexError, KeyError):
+            text = ""
+        return _split_logins(text)
+
+    def mailbox_scope(self, account_id: int) -> Tuple[List[int], List[str]]:
+        """Ящики, открытые сотруднику, вошедшему паролем ящика ``account_id``: сам ящик и — пока сотрудник
+        числится работающим — все остальные его ящики. → (id ящиков, логины); вошедший ящик — первым.
+
+        Считается на каждом запросе: отвязанный ящик или уволенный сотрудник закрывают доступ сразу.
+        """
+        rows = self.query(
+            "SELECT a2.id, a2.username FROM accounts a "
+            "JOIN employees e ON e.id = a.employee_id AND e.status = 'active' "
+            "JOIN accounts a2 ON a2.employee_id = e.id WHERE a.id=? ORDER BY a2.id", (account_id,))
+        ids = [int(account_id)] + [int(r["id"]) for r in rows if int(r["id"]) != int(account_id)]
+        own = self.scalar("SELECT username FROM accounts WHERE id=?", (account_id,)) or ""
+        logins = [own] + [r["username"] or "" for r in rows if int(r["id"]) != int(account_id)]
+        return ids, [x for x in logins if x]
 
     # ======================================================================
     #  Состояние папок и индекс сообщений
@@ -1508,8 +1728,9 @@ class Database:
     def count_messages(self, account_id: Optional[int] = None) -> int:
         if account_id is None:
             return int(self.scalar("SELECT COALESCE(SUM(messages),0) FROM folder_totals") or 0)
-        return int(self.scalar("SELECT COALESCE(SUM(messages),0) FROM folder_totals WHERE account_id=?",
-                               (account_id,)) or 0)
+        cond, params = _account_cond(account_id)
+        return int(self.scalar(f"SELECT COALESCE(SUM(messages),0) FROM folder_totals WHERE {cond}",
+                               tuple(params)) or 0)
 
     def count_folder_messages(self, account_id: int, folder: Optional[str] = None) -> int:
         if folder:
@@ -1520,8 +1741,9 @@ class Database:
     def sum_message_bytes(self, account_id: Optional[int] = None) -> int:
         if account_id is None:
             return int(self.scalar("SELECT COALESCE(SUM(bytes),0) FROM folder_totals") or 0)
-        return int(self.scalar("SELECT COALESCE(SUM(bytes),0) FROM folder_totals WHERE account_id=?",
-                               (account_id,)) or 0)
+        cond, params = _account_cond(account_id)
+        return int(self.scalar(f"SELECT COALESCE(SUM(bytes),0) FROM folder_totals WHERE {cond}",
+                               tuple(params)) or 0)
 
     def list_messages(self, account_id: int, folder: Optional[str] = None, limit: int = 500, offset: int = 0) -> List[sqlite3.Row]:
         # Сортировка с добавочным «id»: без него у писем с одинаковым (или
@@ -1538,6 +1760,26 @@ class Database:
             "LIMIT ? OFFSET ?",
             (account_id, limit, offset),
         )
+
+    def message_ids_present(self, account_id: int, ids: Sequence[int]) -> List[int]:
+        """Какие из ``ids`` есть в индексе архива ящика ``account_id`` (по возрастанию)."""
+        out: List[int] = []
+        ids = sorted({int(i) for i in ids})
+        for start in range(0, len(ids), 500):
+            part = ids[start:start + 500]
+            out.extend(int(r[0]) for r in self.query(
+                f"SELECT id FROM messages WHERE account_id=? AND id IN ({','.join('?' * len(part))})",
+                (account_id, *part)))
+        return sorted(out)
+
+    def messages_by_ids(self, account_id: int, ids: Sequence[int]):
+        """Строки индекса по id — только писем этого ящика, по возрастанию id, порциями (генератор)."""
+        ids = sorted({int(i) for i in ids})
+        for start in range(0, len(ids), 500):
+            part = ids[start:start + 500]
+            yield from self.query(
+                f"SELECT * FROM messages WHERE account_id=? AND id IN ({','.join('?' * len(part))}) ORDER BY id",
+                (account_id, *part))
 
     def messages_after_id(self, account_id: int, after_id: int = 0, folder: Optional[str] = None,
                           limit: int = 5000) -> List[sqlite3.Row]:
@@ -1765,7 +2007,8 @@ class Database:
         if job_type:
             conds.append("type=?"); params.append(job_type)
         if account_id is not None:
-            conds.append("account_id=?"); params.append(account_id)
+            cond, extra = _account_cond(account_id)
+            conds.append(cond); params.extend(extra)
         where = (" WHERE " + " AND ".join(conds)) if conds else ""
         params += [limit, offset]
         return self.query(f"SELECT * FROM jobs{where} ORDER BY id DESC LIMIT ? OFFSET ?", tuple(params))
@@ -1847,15 +2090,24 @@ class Database:
     #: больше — вероятно, оно само и роняет службу (например, нехваткой памяти).
     MAX_JOB_RESTARTS = 3
 
-    def reset_orphan_jobs(self) -> int:
+    #: Чем отмечается задание, которое числилось выполняющимся, но очередь его не выполняла.
+    ORPHAN_REQUEUED_TEXT = ("Задание числилось выполняющимся, но очередь его не выполняла (сбой учёта) — "
+                            "возвращено в очередь (попытка не засчитана).")
+
+    def reset_orphan_jobs(self, only_ids: Optional[Sequence[int]] = None) -> int:
         """При старте: задания в статусе RUNNING прерваны перезапуском — вернуть в очередь.
 
         Попытка при этом не засчитывается: задание не провалилось, его прервали.
         Раньше задание с одной попыткой (экспорт, очистка) после обновления
         службы объявлялось проваленным.
+
+        ``only_ids`` — только эти задания (очередь нашла «выполняющиеся» в базе задания, которых у неё нет).
         """
         rows = self.query("SELECT id, type, restarts, cancel_requested FROM jobs WHERE status=?",
                           (models.JobStatus.RUNNING,))
+        if only_ids is not None:
+            wanted = {int(i) for i in only_ids}
+            rows = [r for r in rows if int(r["id"]) in wanted]
         count = 0
         for r in rows:
             restarts = int(r["restarts"] or 0) + 1
@@ -1871,8 +2123,8 @@ class Database:
             else:
                 self.execute("UPDATE jobs SET restarts=? WHERE id=?", (restarts, r["id"]))
                 self.requeue_job(r["id"], refund_attempt=True)
-                self.add_job_event(r["id"], "WARNING", "Задание было прервано перезапуском службы и "
-                                                       "продолжится (попытка не засчитана).")
+                self.add_job_event(r["id"], "WARNING", self.ORPHAN_REQUEUED_TEXT if only_ids is not None else
+                                   "Задание было прервано перезапуском службы и продолжится (попытка не засчитана).")
             count += 1
         return count
 
@@ -2053,7 +2305,8 @@ class Database:
     def list_schedules(self, account_id: Optional[int] = None, only_enabled: bool = False) -> List[sqlite3.Row]:
         conds, params = [], []
         if account_id is not None:
-            conds.append("account_id=?"); params.append(account_id)
+            cond, extra = _account_cond(account_id)
+            conds.append(cond); params.extend(extra)
         if only_enabled:
             conds.append("enabled=1")
         where = (" WHERE " + " AND ".join(conds)) if conds else ""
@@ -2090,10 +2343,20 @@ class Database:
     def get_export(self, export_id: int) -> Optional[sqlite3.Row]:
         return self.query_one("SELECT * FROM exports WHERE id=?", (export_id,))
 
-    def list_exports(self, account_id: Optional[int] = None, limit: int = 100) -> List[sqlite3.Row]:
+    def list_exports(self, account_id: Optional[int] = None, limit: int = 100,
+                     before_id: Optional[int] = None) -> List[sqlite3.Row]:
+        """Выгрузки, новые первыми; ``before_id`` — следующая страница (после этой выгрузки)."""
+        conds: List[str] = []
+        params: List[Any] = []
         if account_id is not None:
-            return self.query("SELECT * FROM exports WHERE account_id=? ORDER BY id DESC LIMIT ?", (account_id, limit))
-        return self.query("SELECT * FROM exports ORDER BY id DESC LIMIT ?", (limit,))
+            cond, extra = _account_cond(account_id)
+            conds.append(cond)
+            params.extend(extra)
+        if before_id:
+            conds.append("id < ?")
+            params.append(int(before_id))
+        where = (" WHERE " + " AND ".join(conds)) if conds else ""
+        return self.query(f"SELECT * FROM exports{where} ORDER BY id DESC LIMIT ?", (*params, int(limit)))
 
     def delete_export(self, export_id: int) -> None:
         self.execute("DELETE FROM exports WHERE id=?", (export_id,))
@@ -2295,8 +2558,9 @@ class Database:
         start = today - timedelta(days=max(1, int(days)) - 1)
         conds, params = ["day>=?"], [start.isoformat()]
         if account_id is not None:
-            conds.append("account_id=?")
-            params.append(account_id)
+            cond, extra = _account_cond(account_id)
+            conds.append(cond)
+            params.extend(extra)
         rows = self.query(
             "SELECT day, SUM(messages) AS messages, SUM(bytes) AS bytes, SUM(jobs) AS jobs, "
             f"SUM(errors) AS errors FROM stats_daily WHERE {' AND '.join(conds)} GROUP BY day",
@@ -2372,8 +2636,8 @@ class Database:
     def employees_by_account(self) -> Dict[int, sqlite3.Row]:
         """Карточка сотрудника каждого ящика (для шаблонов имён и выгрузки списка)."""
         return {int(r["account_id"]): r for r in self.query(
-            "SELECT account_id, full_name, email, position, department, phone, status, dismissed_at "
-            "FROM employees WHERE account_id IS NOT NULL ORDER BY id")}
+            "SELECT a.id AS account_id, e.full_name, e.email, e.position, e.department, e.phone, e.status, "
+            "e.dismissed_at FROM accounts a JOIN employees e ON e.id = a.employee_id ORDER BY a.id")}
 
     def schedules_by_account(self) -> Dict[int, List[sqlite3.Row]]:
         """Расписания каждого ящика (общие расписания без ящика сюда не входят)."""
@@ -2382,8 +2646,23 @@ class Database:
             out.setdefault(int(r["account_id"]), []).append(r)
         return out
 
-    def list_audit(self, limit: int = 200) -> List[sqlite3.Row]:
-        return self.query("SELECT * FROM audit ORDER BY id DESC LIMIT ?", (limit,))
+    def list_audit(self, limit: int = 200, before_id: Optional[int] = None,
+                   query: Optional[str] = None) -> List[sqlite3.Row]:
+        """Записи аудита, новые первыми. ``before_id`` — продолжить список со следующей после этой записи
+        (страница «Показать ещё»), ``query`` — текст в пользователе, действии или подробностях."""
+        conds: List[str] = []
+        params: List[Any] = []
+        if before_id:
+            conds.append("id < ?")
+            params.append(int(before_id))
+        text = (query or "").strip()
+        if text:
+            escaped = text.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            conds.append("(" + " OR ".join(f"ma_lower({c}) LIKE ? ESCAPE '\\'" for c in ("user", "action", "detail"))
+                         + ")")
+            params.extend([f"%{escaped}%"] * 3)
+        where = (" WHERE " + " AND ".join(conds)) if conds else ""
+        return self.query(f"SELECT * FROM audit{where} ORDER BY id DESC LIMIT ?", (*params, int(limit)))
 
     # ======================================================================
     #  Агрегаты для раздела «Аналитика»
@@ -2643,7 +2922,8 @@ CREATE TABLE IF NOT EXISTS accounts (
     hold_reason               TEXT DEFAULT '',   -- dismissed | manual
     dismissed_at              TEXT,              -- когда сотрудник уволен
     auto_disabled             INTEGER NOT NULL DEFAULT 0, -- копирование выключено увольнением
-    server_id                 INTEGER                      -- подключение к почтовому серверу (auth_type=server)
+    server_id                 INTEGER,                     -- подключение к почтовому серверу (auth_type=server)
+    employee_id               INTEGER REFERENCES employees(id) ON DELETE SET NULL  -- чей это ящик (1.15.0)
 );
 
 -- Сотрудники организации. Ящик (accounts) необязателен: сотрудник может
@@ -2666,6 +2946,7 @@ CREATE TABLE IF NOT EXISTS employees (
     last_seen_at TEXT,
     had_account  INTEGER NOT NULL DEFAULT 0,
     dismissed_at TEXT,
+    known_logins TEXT DEFAULT '',          -- логины ящиков, которые у сотрудника уже были (1.15.0)
     FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE SET NULL
 );
 -- поиск сотрудника по почте идёт с COLLATE NOCASE — индексу нужна та же сортировка

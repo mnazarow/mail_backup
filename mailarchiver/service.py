@@ -47,6 +47,10 @@ class Services:
         self.queue = QueueManager(self)
         self.scheduler = SchedulerService(self)
         self._started = False
+        #: Процесс заданий (server.worker_process): в веб-процессе — WorkerHost, иначе None.
+        self.worker = None
+        #: «web» — служба (или консоль), «worker» — дочерний процесс заданий.
+        self.role = "web"
 
     # -- жизненный цикл ------------------------------------------------------
     def setup(self, *, generate_key: bool = False) -> None:
@@ -91,7 +95,11 @@ class Services:
             set_level(str(self.rt("logging", "level") or "INFO"))
         except Exception:  # noqa: BLE001
             pass
-        return self._apply_encryption(strict=strict, allow_generate=generate_key)
+        state = self._apply_encryption(strict=strict, allow_generate=generate_key)
+        if self.worker is not None:
+            # процесс заданий пишет письма сам — те же настройки хранилища и шифрования нужны и ему
+            self.worker.notify("settings")
+        return state
 
     def _apply_encryption(self, strict: bool, allow_generate: bool = False) -> dict:
         from .errors import StorageError
@@ -180,16 +188,28 @@ class Services:
             log.info("Закрыто незавершённых записей прогонов: %d.", stale_runs)
         if orphans:
             log.warning("Обнаружено прерванных заданий при старте: %s (возвращены в очередь/помечены)", orphans)
-        self.queue.start()
-        self.scheduler.start()
+        from .worker import QueueProxy, SchedulerProxy, WorkerHost, worker_process_enabled
+        if self.role == "web" and worker_process_enabled(self.cfg):
+            # Задания и расписания — в отдельном процессе: веб-интерфейс не делит с ними интерпретатор
+            # (GIL) и не тормозит, пока идут копии. Здесь — их заместители (см. mailarchiver/worker.py).
+            self.worker = WorkerHost(self)
+            self.worker.start()
+            self.queue = QueueProxy(self.worker, self)
+            self.scheduler = SchedulerProxy(self.worker)
+        else:
+            self.queue.start()
+            self.scheduler.start()
         self._started = True
         log.info("Сервис запущен.")
 
     def stop(self) -> None:
         if not self._started:
             return
-        self.scheduler.stop()
-        self.queue.stop()
+        if self.worker is not None:
+            self.worker.stop()
+        else:
+            self.scheduler.stop()
+            self.queue.stop()
         self._started = False
         log.info("Сервис остановлен.")
 

@@ -2092,7 +2092,7 @@ def bulk_create(svc, user: dict, text: str, *, host: str, port: int = 993, secur
         raise ValidationError("Список пуст.", hint="По одному адресу в строке; пароль — через «;» или табуляцию.")
     existing = {(a.username or "").lower(): a for a in svc.db.list_accounts()}
     employees = {}
-    for row in svc.db.query("SELECT id, full_name, email, account_id FROM employees WHERE email IS NOT NULL AND email<>''"):
+    for row in svc.db.query("SELECT id, full_name, email FROM employees WHERE email IS NOT NULL AND email<>''"):
         employees.setdefault((row["email"] or "").lower(), row)
     results: List[Dict[str, Any]] = []
     seen = set()
@@ -2123,8 +2123,9 @@ def bulk_create(svc, user: dict, text: str, *, host: str, port: int = 993, secur
                 name=name[:200], host=host, port=int(port), username=email, password=item["password"],
                 auth_type=auth_type, security=security, enabled=on))
             entry["id"] = acc_id
-            if emp is not None and not emp["account_id"]:
-                svc.db.set_employee_account(int(emp["id"]), acc_id)
+            if emp is not None:
+                # у сотрудника может быть несколько ящиков (1.15.0): новый ящик с его адресом — его
+                svc.db.link_employee_account(int(emp["id"]), acc_id)
             if cron:
                 svc.db.create_schedule(acc_id, ScheduleKind.CRON, JobType.BACKUP, cron, 0, True, {})
         results.append(entry)

@@ -182,6 +182,11 @@ async def ws_live(websocket: WebSocket):
                     await websocket.send_text(json.dumps({"type": "error", "message": "unauthorized"}))
                     await websocket.close(code=4401)
                     return
+            elif user.get("role") == auth_mod.ROLE_MAILBOX and user.get("account_id") is not None:
+                # Ящики сотрудника — на каждом снимке, как и в REST: отвязанный ящик или увольнение закрывают
+                # их сразу, а не к следующей полной перепроверке сеанса (~30 с). Запрос — по индексу.
+                ids, logins = await asyncio.to_thread(services.db.mailbox_scope, int(user["account_id"]))
+                user = dict(user, account_ids=ids, logins=logins)
             version, snapshot = await _hub.next_snapshot(version)
             await websocket.send_text(json.dumps(_personal_snapshot(snapshot, user), ensure_ascii=False))
     except WebSocketDisconnect:
@@ -216,11 +221,12 @@ def collect_live(services, user: dict) -> dict:
 def _personal_snapshot(snapshot: dict, user: dict) -> dict:
     """Персональный вид готового снимка: фильтрация по роли и ящику."""
     out = dict(snapshot)
-    if user.get("role") == "mailbox":
+    if user.get("role") == "mailbox":  # сотрудник — только задания своих ящиков
         # как и в /api/state: пользователь-ящик видит только свои задания
-        aid = user.get("account_id")
+        aids = set(auth_mod.mailbox_ids(user))
         own = [dict(j, created_by=visible_author(j.get("created_by", ""), user))
-               for j in snapshot.get("active_jobs", []) if j["account_id"] == aid]
+               for j in snapshot.get("active_jobs", [])
+               if j["account_id"] in aids and int(j.get("target_account_id") or j["account_id"]) in aids]
         out["active_jobs"] = own
         out["queued_hidden"] = 0
         # Счётчики очереди — тоже общесистемные данные: пользователь-ящик

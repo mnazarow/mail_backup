@@ -1,11 +1,39 @@
+# В образ попадает только то, что нужно для работы службы: всё, что ниже, — нет.
 venv/
 .venv/
 __pycache__/
 *.pyc
 .git/
+.github/
+.pytest_cache/
+.ruff_cache/
+tests/
+
+# данные, ключи и локальные настройки — никогда не в образ
 data/
 *.db
+*.db-journal
+*.db-wal
+*.db-shm
 *.log
+secret.key
+*.key
+*.pem
+.env
+config/config.yaml
+
+# архивы выпусков, пакеты для установки без сети, выгрузки, черновики
+*.tar.gz
+*.zip
+*.whl
+wheels/
+exports/
+build/
+tmp/
+*.pst
+*.mbox
+Claude outputs/
+
+# документация для людей (встроенная справка — в mailarchiver/web/static/docs)
+docs/*.docx
 docs/ru/screenshots/*.png
-.pytest_cache/
-tests/

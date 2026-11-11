@@ -816,14 +816,17 @@ def test_autoreply(google):
     assert vac["responseBodyPlainText"].endswith("petrova@company.ru") and "startTime" not in vac
     assert msstore.get_account(svc.db, google.sid, "ivanov@company.ru")["autoreply"] is True
     assert ("ivanov@company.ru", SCOPE_BASIC) in g.issued                  # от имени владельца ящика
-    _res, items = act(svc, "srv_autoreply", [google.iv], mode="on", subject="", text="Отпуск", start="2026-11-01",
-                      end="2026-11-10")
+    # даты — от сегодняшней: автоответ с прошедшей датой окончания сервер показывает выключенным
+    first = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+    start, end = first.date().isoformat(), (first + timedelta(days=9)).date().isoformat()
+    _res, items = act(svc, "srv_autoreply", [google.iv], mode="on", subject="", text="Отпуск", start=start,
+                      end=end)
     vac = g.vacation["ivanov@company.ru"]
-    assert vac["startTime"] == str(int(datetime(2026, 11, 1, tzinfo=timezone.utc).timestamp() * 1000))
-    assert vac["endTime"] == str(int(datetime(2026, 11, 11, tzinfo=timezone.utc).timestamp() * 1000))
-    assert "с 2026-11-01 по 2026-11-10" in items[google.iv]["detail"]
+    assert vac["startTime"] == str(int(first.timestamp() * 1000))
+    assert vac["endTime"] == str(int((first + timedelta(days=10)).timestamp() * 1000))
+    assert f"с {start} по {end}" in items[google.iv]["detail"]
     got = driver(g).get_autoreply("ivanov@company.ru")
-    assert (got["enabled"], got["start"], got["end"], got["text"]) == (True, "2026-11-01", "2026-11-10", "Отпуск")
+    assert (got["enabled"], got["start"], got["end"], got["text"]) == (True, start, end, "Отпуск")
     _res, items = act(svc, "srv_autoreply", [google.iv], mode="off")
     assert items[google.iv]["status"] == "success" and g.vacation["ivanov@company.ru"] == {"enableAutoReply": False}
     assert msstore.get_account(svc.db, google.sid, "ivanov@company.ru")["autoreply"] is False

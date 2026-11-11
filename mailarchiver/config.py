@@ -43,6 +43,9 @@ DEFAULTS: Dict[str, Any] = {
         # допустимы сети вида 10.0.0.0/8). Настоящий адрес клиента берётся как ПЕРВЫЙ
         # СПРАВА недоверенный хоп X-Forwarded-For. «*» отключает проверку (небезопасно).
         "trusted_proxies": "127.0.0.1, ::1",
+        # Очередь заданий и планировщик — в отдельном процессе (тот же unit systemd): веб-интерфейс не
+        # делит интерпретатор с копированием и не тормозит, пока идут копии. Меняется перезапуском.
+        "worker_process": False,
     },
     "security": {
         "auth_enabled": True,          # требовать вход в веб-интерфейс
@@ -369,7 +372,7 @@ VALUE_CHOICES: Dict[str, tuple] = {
 #: интерфейс недоступным после перезапуска, а исправить это из него же нельзя.
 FILE_ONLY_SETTINGS = frozenset({
     "server.host", "server.port", "server.workers", "logging.to_stdout",
-    "paths.data_dir", "database.busy_timeout_ms", "database.wal", "export.tmp_dir",
+    "paths.data_dir", "database.busy_timeout_ms", "database.wal", "export.tmp_dir", "server.worker_process",
 })
 
 #: Параметры, которые больше ничего не делают (оставлены в DEFAULTS, чтобы

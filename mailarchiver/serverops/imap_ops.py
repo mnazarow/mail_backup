@@ -31,7 +31,6 @@ from ..errors import DiskSpaceError, JobCancelled, MailArchiverError, Validation
 from ..imap.client import FolderInfo, ImapConnection, folder_matches
 from ..logging_setup import get_logger
 from ..models import Account, AuthType, JobStatus
-from ..util import human_size
 from . import base
 from . import targets as tg
 from .base import Ctx, ServerAction

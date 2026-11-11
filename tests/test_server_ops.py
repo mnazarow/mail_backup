@@ -12,9 +12,9 @@ from imap_fake import ImapWorld, raw_message
 from mailarchiver import bulk, models
 from mailarchiver.errors import ValidationError
 from mailarchiver.imap import client as client_mod
-from mailarchiver.models import AuthType, JobStatus, JobType
+from mailarchiver.models import AuthType, JobType
 from mailarchiver.queue.jobs import JobContext
-from mailarchiver.serverops import base, report, secrets
+from mailarchiver.serverops import base, report
 from mailarchiver.serverops import targets as tg
 
 ADMIN = {"username": "tester", "role": "admin"}

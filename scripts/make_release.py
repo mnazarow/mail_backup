@@ -28,7 +28,8 @@
 них нет лишнего); без git — всё, кроме перечисленного ниже.
 
 Перед записью архив проверяется: права, обязательные файлы и то, что номер
-версии одинаков в ``VERSION``, ``pyproject.toml`` и ``mailarchiver/version.py``.
+версии одинаков в ``VERSION``, ``pyproject.toml``, ``mailarchiver/version.py`` и
+файлах Docker (``docker/Dockerfile``, ``docker/docker-compose.yml``).
 """
 from __future__ import annotations
 
@@ -138,8 +139,11 @@ def _versions() -> dict[str, str]:
     found = {}
     with open(os.path.join(ROOT, "VERSION"), encoding="utf-8") as fh:
         found["VERSION"] = fh.read().strip()
+    # номер версии в образе Docker (метка и тег в docker-compose) раньше не сверялся и отставал
     for rel, pattern in (("pyproject.toml", r'(?m)^version\s*=\s*"([^"]+)"'),
-                         ("mailarchiver/version.py", r'(?m)^__version__\s*=\s*"([^"]+)"')):
+                         ("mailarchiver/version.py", r'(?m)^__version__\s*=\s*"([^"]+)"'),
+                         ("docker/Dockerfile", r'org\.opencontainers\.image\.version="([^"]+)"'),
+                         ("docker/docker-compose.yml", r'(?m)^\s*image:\s*mailarchiver:(\S+)')):
         path = os.path.join(ROOT, rel)
         if os.path.isfile(path):
             with open(path, encoding="utf-8") as fh:

@@ -384,7 +384,7 @@ def _taken(ctx, t) -> set:
 
 def _alias_name(ctx, t) -> str:
     from .axigen_ops import render_alias
-    employee = ctx.db.get_employee_by_email(t.email)
+    employee = ctx.db.employee_by_address(t.email)
     row = dict(t.server, name=t.email.split("@", 1)[0])
     return render_alias(ctx.params.get("template") or "", row, employee)
 
@@ -497,7 +497,7 @@ def _contact_change(action, ctx, t) -> Dict[str, str]:
 
 
 def _contact_check(action, ctx, t):
-    if ctx.params.get("source") == "employees" and ctx.db.get_employee_by_email(t.email) is None:
+    if ctx.params.get("source") == "employees" and ctx.db.employee_by_address(t.email) is None:
         return "сотрудника с этим адресом нет в разделе «Сотрудники»"
     if not _contact_wanted(action, ctx, t):
         return "нечего записывать (у сотрудника не заполнены нужные поля, или сервер их не принимает)"

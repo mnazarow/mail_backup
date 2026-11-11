@@ -147,6 +147,10 @@ def run_maintenance(svc) -> Dict[str, int]:
     db = svc.db
     now = datetime.now(timezone.utc)
     out: Dict[str, int] = {}
+    try:
+        db.ensure_message_totals()            # первое заполнение счётчиков могло не удаться при запуске
+    except Exception:  # noqa: BLE001
+        log.exception("Не удалось завести счётчики писем по папкам")
     db.purge_expired_sessions()
     out["jobs"] = db.purge_jobs_by_age(_iso(now - timedelta(days=JOBS_OK_DAYS)),
                                        _iso(now - timedelta(days=JOBS_FAILED_DAYS)), JOBS_MAX)

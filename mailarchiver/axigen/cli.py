@@ -24,7 +24,7 @@
 from __future__ import annotations
 
 import re
-import select
+import selectors
 import socket
 import time
 import unicodedata
@@ -36,6 +36,18 @@ from .common import (AxigenAuthError, AxigenCommandError, AxigenConnectionError,
 from .parse import Reply, split_reply
 
 log = get_logger("axigen.cli")
+
+
+def _wait_readable(sock, timeout: float) -> bool:
+    """Дождаться данных в сокете (не дольше ``timeout`` секунд).
+
+    Не ``select.select``: он принимает только дескрипторы меньше 1024, а в службе, где открыты базы, сокеты
+    IMAP и соединения вкладок, номер нового сокета бывает и больше — тогда каждое обращение к CLI падало
+    с «filedescriptor out of range in select()».
+    """
+    with selectors.DefaultSelector() as sel:
+        sel.register(sock, selectors.EVENT_READ)
+        return bool(sel.select(timeout))
 
 #: Сколько ждать продолжения ответа, если перед приглашением нет итога команды.
 QUIET_S = 0.4
@@ -382,7 +394,7 @@ class AxigenCLI:
                     hint="Сервер перегружен или команда слишком долгая; увеличьте «Таймаут» в настройках Axigen.")
             wait = min(remaining, QUIET_S if m else remaining)
             try:
-                ready, _, _ = select.select([self.sock], [], [], wait)
+                ready = _wait_readable(self.sock, wait)
             except (OSError, ValueError) as exc:
                 raise AxigenConnectionError(f"CLI Axigen: связь оборвалась ({exc}).", cause=exc) from exc
             if not ready and not getattr(self.sock, "pending", lambda: 0)():

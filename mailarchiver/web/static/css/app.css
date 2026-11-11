@@ -19,6 +19,11 @@
   --danger: #d64545;
   --danger-soft: #fbe6e6;
   --info: #2b8ca6;
+  /* текст на светлых плашках «успешно»/«частично» и фон основных кнопок — с контрастом не ниже 4.5:1 */
+  --success-text: #16753e;
+  --warn-text: #8f5600;
+  --primary-strong: #2f6fed;
+  --primary-strong-hover: #245bd0;
   --shadow: 0 1px 3px rgba(20,30,50,.08), 0 6px 20px rgba(20,30,50,.06);
   --radius: 10px;
   --radius-sm: 7px;
@@ -42,10 +47,17 @@
   --danger: #ec6a6a;
   --danger-soft: #2c1717;
   --info: #52b6cf;
+  --success-text: #35c47c;
+  --warn-text: #e5a83b;
+  /* белый текст на #4d86f7 — 3.46:1; кнопка темнее, а ссылки и выделение — прежнего светлого цвета */
+  --primary-strong: #2f6fed;
+  --primary-strong-hover: #245bd0;
   --shadow: 0 1px 3px rgba(0,0,0,.4), 0 8px 26px rgba(0,0,0,.35);
 }
 
 * { box-sizing: border-box; }
+/* атрибут hidden скрывает всегда — и у элементов со своим display (.btn и т. п.) */
+[hidden] { display: none !important; }
 html, body { height: 100%; }
 body {
   margin: 0;
@@ -109,8 +121,8 @@ code, .mono { font-family: var(--mono); font-size: .86em; }
   cursor: pointer; font-size: .9rem; transition: .12s; white-space: nowrap;
 }
 .btn:hover { border-color: var(--primary); color: var(--primary); }
-.btn.primary { background: var(--primary); border-color: var(--primary); color: #fff; }
-.btn.primary:hover { background: var(--primary-hover); border-color: var(--primary-hover); color:#fff; }
+.btn.primary { background: var(--primary-strong); border-color: var(--primary-strong); color: #fff; }
+.btn.primary:hover { background: var(--primary-strong-hover); border-color: var(--primary-strong-hover); color:#fff; }
 .btn.danger { color: var(--danger); border-color: transparent; background: var(--danger-soft); }
 .btn.danger:hover { background: var(--danger); color:#fff; }
 .btn.ghost { border-color: transparent; background: transparent; color: var(--text-dim); }
@@ -160,11 +172,11 @@ table.tbl tr:last-child td { border-bottom: none; }
 
 /* ---------- Badges ---------- */
 .badge { display: inline-flex; align-items: center; gap: 5px; padding: 2px 9px; border-radius: 20px; font-size: .76rem; font-weight: 600; white-space: nowrap; }
-.badge.success { background: var(--success-soft); color: var(--success); }
+.badge.success { background: var(--success-soft); color: var(--success-text); }
 .badge.failed { background: var(--danger-soft); color: var(--danger); }
 .badge.running { background: var(--primary-soft); color: var(--primary); }
 .badge.queued { background: var(--bg-soft); color: var(--text-dim); }
-.badge.partial, .badge.cancelled { background: var(--warn-soft); color: var(--warn); }
+.badge.partial, .badge.cancelled { background: var(--warn-soft); color: var(--warn-text); }
 
 /* ---------- Progress ---------- */
 .progress { height: 8px; border-radius: 6px; background: var(--bg-soft); overflow: hidden; }
@@ -209,7 +221,7 @@ table.tbl tr:last-child td { border-bottom: none; }
 /* у правого края экрана подсказка раскрывается влево — иначе её обрезало окно */
 .help-ic.flip .help-pop { left: auto; right: 0; }
 .help-pop .t { font-weight: 700; margin-bottom: 4px; }
-.help-pop .rec { margin-top: 7px; color: var(--success); }
+.help-pop .rec { margin-top: 7px; color: var(--success-text); }
 .help-pop .ex { margin-top: 5px; color: var(--text-dim); }
 .help-pop .ex code { background: var(--bg-soft); padding: 1px 5px; border-radius: 4px; }
 
@@ -245,8 +257,8 @@ table.tbl tr:last-child td { border-bottom: none; }
 .muted { color: var(--text-dim); }
 .small { font-size: .82rem; }
 .tag { display:inline-block; padding: 1px 7px; background: var(--bg-soft); border-radius: 5px; font-size: .78rem; color: var(--text-dim); }
-.tag.ok { background: var(--success-soft); color: var(--success); }
-.tag.warn { background: var(--warn-soft); color: var(--warn); }
+.tag.ok { background: var(--success-soft); color: var(--success-text); }
+.tag.warn { background: var(--warn-soft); color: var(--warn-text); }
 .tag.bad, .tag.err { background: var(--danger-soft); color: var(--danger); }
 .tag { white-space: nowrap; }
 .nowrap { white-space: nowrap; }
@@ -301,7 +313,7 @@ canvas { max-width: 100%; }
 .mail-folder:hover { background: var(--bg-soft); color: var(--text); }
 .mail-folder.active { background: var(--primary-soft); color: var(--primary); font-weight: 600; }
 .mail-folder .cnt { margin-left: auto; font-size: .74rem; background: var(--bg-soft); padding: 0 7px; border-radius: 10px; }
-.mail-folder.active .cnt { background: #fff; }
+.mail-folder.active .cnt { background: var(--bg-elev); }
 .mail-list { border-right: 1px solid var(--border); overflow-y: auto; max-height: 72vh; }
 .msg-item { padding: 10px 12px; border-bottom: 1px solid var(--border); cursor: pointer; }
 .mail-search { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; }
@@ -321,6 +333,11 @@ canvas { max-width: 100%; }
 .msg-item .msg-top { display: flex; align-items: center; gap: 6px; font-size: .82rem; color: var(--text-dim); }
 .msg-item .msg-from { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .msg-item .msg-subj { font-size: .9rem; margin: 2px 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* выбор писем для «Восстановить выбранные» (1.15.0) */
+.msg-pick { width: 16px; height: 16px; margin: 0 2px 0 0; flex: none; cursor: pointer; accent-color: var(--primary); }
+.mail-pick { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 8px 12px; margin-bottom: 10px;
+  border: 1px solid var(--primary); border-radius: var(--radius-sm); background: var(--primary-soft); font-size: .9rem; }
+.mail-pick[hidden] { display: none; }
 .mail-reader { padding: 18px 20px; overflow-y: auto; max-height: 72vh; }
 .mail-reader .rhead { border-bottom: 1px solid var(--border); padding-bottom: 12px; margin-bottom: 14px; }
 .mail-reader .rsubj { font-size: 1.25rem; font-weight: 650; margin-bottom: 8px; }
@@ -376,7 +393,7 @@ canvas { max-width: 100%; }
   border: 1px solid transparent; border-bottom: 0; margin-bottom: -1px; display: inline-flex; align-items: center; gap: 6px; }
 .tabs a:hover { color: var(--text); background: var(--bg-soft); text-decoration: none; }
 .tabs a.active { color: var(--primary); background: var(--bg-elev); border-color: var(--border); }
-.tabs .count { background: var(--primary); color: #fff; border-radius: 10px; font-size: .72rem; padding: 0 7px; line-height: 1.5; }
+.tabs .count { background: var(--primary-strong); color: #fff; border-radius: 10px; font-size: .72rem; padding: 0 7px; line-height: 1.5; }
 
 /* ---------- Выбор ящиков в списке ---------- */
 .acc-tbl th.chk, .acc-tbl td.chk { width: 34px; padding-right: 0; }
@@ -489,3 +506,10 @@ table.tbl select[data-role]:focus { outline: none; border-color: var(--primary);
 /* Почтовые серверы */
 .card.ms-bad { border-color: var(--danger); }
 .ms-types .bulk-tiles { grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
+
+/* Раздел «Документация»: справка во фрейме на всю высоту окна, над ней — оглавление и поиск */
+.docs-bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+.docs-bar select { width: auto; max-width: 320px; padding: 7px 10px; }
+.docs-bar input[type=search] { width: 300px; max-width: 100%; padding: 8px 11px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg-elev); color: var(--text); }
+.docs-frame { display: block; width: 100%; height: calc(100vh - 170px); min-height: 420px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-elev); }
+@media(max-width:700px){ .docs-bar select, .docs-bar input[type=search] { flex: 1 1 100%; max-width: none; } .docs-frame { height: calc(100vh - 220px); } }

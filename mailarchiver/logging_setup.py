@@ -40,6 +40,19 @@ def job_log_scope(job_type: Optional[str]):
         _job_scope.job_type = previous
 
 
+class JobTypeFilter(logging.Filter):
+    """Записывает вид задания потока в саму запись (``record.job_type``).
+
+    Нужен, когда запись обрабатывается не в том потоке, где сделана: записи процесса заданий
+    (``server.worker_process``) попадают в журнал веб-процесса через очередь, и там метки потока уже нет.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if getattr(record, "job_type", None) is None:
+            record.job_type = getattr(_job_scope, "job_type", None)
+        return True
+
+
 def visible_to(records: Iterable[Dict], job_types: Iterable[str]) -> List[Dict]:
     """Записи журнала без тех, что сделаны заданиями не из ``job_types`` (записи вне заданий остаются)."""
     allowed = set(job_types)
@@ -69,7 +82,7 @@ class MemoryLogHandler(logging.Handler):
                     "level": record.levelname,
                     "logger": record.name,
                     "message": self.format(record),
-                    "job_type": getattr(_job_scope, "job_type", None),
+                    "job_type": getattr(record, "job_type", None) or getattr(_job_scope, "job_type", None),
                 }
             )
         except Exception:  # pragma: no cover - защита от рекурсии

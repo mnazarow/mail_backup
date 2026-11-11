@@ -155,6 +155,31 @@ def looks_like_email(value: str) -> bool:
     return bool(_EMAIL_RE.match(value or ""))
 
 
+#: Разделители адресов в одной ячейке: «ivanov@x.ru; i.ivanov@x.ru», запятая, перевод строки.
+_EMAIL_SPLIT_RE = re.compile(r"[;,\s]+")
+
+
+def split_emails(value: Any) -> Tuple[List[str], List[str]]:
+    """Адреса из ячейки: ``(правильные, неправильные)`` — без повторов, в порядке записи.
+
+    С 1.15.0 у сотрудника может быть несколько ящиков, и в выгрузке они пишутся в одну ячейку через
+    «;» (или запятую). Первый адрес — основной: по нему сотрудник опознаётся при синхронизации;
+    по остальным ему заводятся (или привязываются) дополнительные ящики.
+    """
+    good: List[str] = []
+    bad: List[str] = []
+    for part in _EMAIL_SPLIT_RE.split(_cell(value)):
+        email = normalize_email(part)
+        if not email:
+            continue
+        if looks_like_email(email):
+            if email not in good:
+                good.append(email)
+        else:
+            bad.append(part.strip())
+    return good, bad
+
+
 # ---------------------------------------------------------------------------
 #  Чтение файла
 # ---------------------------------------------------------------------------
@@ -874,7 +899,7 @@ def _map_header(header: Sequence[str], table: Sequence[Sequence[str]],
         values = values_of(col)
         if not values:
             return False
-        hits = sum(1 for v in values if looks_like_email(normalize_email(v)))
+        hits = sum(1 for v in values if split_emails(v)[0])
         return hits >= max(1, EMAIL_COLUMN_SHARE * len(values))
 
     if "email" not in mapping.values():
@@ -996,11 +1021,13 @@ def _rows_from_table(table: Sequence[Sequence[str]]) -> Tuple[List[dict], List[d
         if not item["phone"]:
             item["phone"] = item["phone_mobile"] or item["phone_work"] or item["phone_ext"]
 
-        email = normalize_email(item["email"])
-        if email and not looks_like_email(email):
-            problems.append({"row": line_no, "reason": f"некорректный e-mail: «{item['email'][:100]}»"})
-            email = ""
-        item["email"] = email
+        emails, wrong = split_emails(item["email"])
+        if wrong:
+            problems.append({"row": line_no, "reason": f"некорректный e-mail: «{', '.join(wrong)[:100]}»"
+                                                       + (" — остальные адреса строки приняты" if emails else "")})
+        item["email"] = emails[0] if emails else ""
+        # дополнительные адреса — по ним сотруднику заводятся (привязываются) ещё ящики
+        item["extra_emails"] = emails[1:]
 
         # Сотрудник, помеченный в файле как не работающий, в справочник не
         # добавляется и ящик ему не заводится. Уже заведённые карточки при этом
@@ -1232,10 +1259,29 @@ def _row_value(row, key: str, default=None):
         return default
 
 
+def account_login_for(tpl: Dict[str, Any], full_name: str, email: str, row: Optional[dict] = None,
+                      main_email: str = "") -> str:
+    """Логин ящика, который шаблон заведёт сотруднику для адреса ``email``.
+
+    :param main_email: основной адрес сотрудника, если ``email`` — дополнительный. Шаблон логина без адреса
+        (``{last_name}``, ``{external_id}``) дал бы всем адресам сотрудника один логин — основного ящика;
+        тогда логином дополнительного ящика становится сам адрес.
+    """
+    values = account_placeholders(full_name, email, row)
+    login = (render_account_field(tpl["username_template"], values) or email).strip()
+    if main_email and email and main_email.lower() != email.lower():
+        main_values = account_placeholders(full_name, main_email, row)
+        main_login = (render_account_field(tpl["username_template"], main_values) or main_email).strip()
+        if login.lower() == main_login.lower():
+            login = email
+    return login
+
+
 def ensure_account_for_employee(svc, employee_id: int, full_name: str, email: str,
                                 row: Optional[dict] = None,
                                 tpl: Optional[Dict[str, Any]] = None,
-                                create: bool = True) -> Tuple[Optional[int], str]:
+                                create: bool = True, main_email: str = "",
+                                link_existing: bool = True) -> Tuple[Optional[int], str]:
     """Завести (или найти) почтовый ящик для сотрудника и привязать его.
 
     Ящик создаётся по ШАБЛОНУ из настроек раздела «Сотрудники»: сервер, порт,
@@ -1247,8 +1293,16 @@ def ensure_account_for_employee(svc, employee_id: int, full_name: str, email: st
         подстановкам в шаблонах названия и заметки;
     :param create: заводить ли новый ящик, если подходящего нет (False — только
         привязать существующий);
+    :param main_email: основной адрес сотрудника, когда ``email`` — дополнительный (см. :func:`account_login_for`);
+    :param link_existing: привязывать ли уже заведённый ничей ящик. Синхронизация по дополнительным адресам
+        этого не делает: привязка открывает сотруднику архив ящика, а строка выгрузки — не решение администратора;
     :returns: ``(account_id, action)``, где action — ``"created"``,
-        ``"linked"``, ``"no_host"`` (ящик нужен, но заводить нельзя) или ``""``.
+        ``"linked"``, ``"no_host"`` (ящик нужен, но заводить нельзя), ``"owned"`` (ящик с таким
+        логином уже есть и принадлежит другому сотруднику — не отбираем), ``"unowned"`` (ящик есть, ничей,
+        а привязывать нельзя) или ``""`` (уже его).
+
+    У сотрудника может быть несколько ящиков (1.15.0): функция заводит или привязывает ОДИН — для
+    адреса ``email``; для дополнительных адресов её вызывают по разу на адрес.
     """
     if not email:
         return None, ""
@@ -1256,8 +1310,8 @@ def ensure_account_for_employee(svc, employee_id: int, full_name: str, email: st
     # 600 строк его пересчёт для каждой строки — тысячи лишних запросов, поэтому
     # вызывающий код передаёт готовый шаблон.
     tpl = account_template(svc) if tpl is None else tpl
+    username = account_login_for(tpl, full_name, email, row, main_email)
     values = account_placeholders(full_name, email, row)
-    username = render_account_field(tpl["username_template"], values) or email
 
     existing = svc.db.get_account_by_username(username)
     if existing is None and username != email:
@@ -1265,7 +1319,18 @@ def ensure_account_for_employee(svc, employee_id: int, full_name: str, email: st
         # проверяем и по адресу, иначе сотруднику создали бы второй ящик.
         existing = svc.db.get_account_by_username(email)
     if existing is not None:
-        svc.db.set_employee_account(employee_id, existing.id)
+        owner = existing.employee_id
+        if owner is not None and int(owner) != int(employee_id):
+            # Ящик чужой: синхронизация не переписывает его на другого (так общий ящик, указанный в двух
+            # строках выгрузки, «гулял» бы между людьми). Перенести можно вручную в карточке сотрудника.
+            return existing.id, "owned"
+        if owner is not None:
+            svc.db.remember_employee_logins(employee_id, [username, email])
+            return existing.id, ""
+        if not link_existing:
+            return existing.id, "unowned"
+        svc.db.link_employee_account(employee_id, existing.id)
+        svc.db.remember_employee_logins(employee_id, [email])
         return existing.id, "linked"
     if not create:
         return None, "no_host"
@@ -1288,8 +1353,13 @@ def ensure_account_for_employee(svc, employee_id: int, full_name: str, email: st
     )
     if via_server:
         acc.server_id = int(server_id)
+    # Второй ящик того же сотрудника получил бы то же название («Иванов Иван») — в списках их было бы
+    # не различить. Дополнительные ящики называются с адресом.
+    if any((other["name"] or "") == acc.name for other in svc.db.employee_accounts(employee_id)):
+        acc.name = f"{acc.name} ({email})"[:200]
     account_id = svc.db.create_account(acc)
-    svc.db.set_employee_account(employee_id, account_id)
+    svc.db.link_employee_account(employee_id, account_id)
+    svc.db.remember_employee_logins(employee_id, [email])
 
     if tpl["schedule_enabled"] and tpl.get("sequence_covers"):
         log.info("Ящику %s своё расписание не заведено: все ящики копируются по очереди общим расписанием.",
@@ -1342,6 +1412,19 @@ def sync_employees(svc, rows: Sequence[dict], *, create_accounts: bool,
         _SYNC_LOCK.release()
 
 
+def _shown(items: Sequence[str], limit: int = 10) -> str:
+    """Первые ``limit`` значений через запятую и «и ещё N»."""
+    return ", ".join(items[:limit]) + (f" и ещё {len(items) - limit}" if len(items) > limit else "")
+
+
+def _main_address_of_other(db, address: str, employee_id: int, file_main_emails=()) -> bool:
+    """``address`` — основной адрес другого сотрудника: в справочнике или в строках этой же выгрузки."""
+    other = db.get_employee_by_email(address)
+    if other is not None:
+        return int(other["id"]) != int(employee_id)
+    return address in file_main_emails
+
+
 def _sync_employees_locked(svc, rows: Sequence[dict], *, create_accounts: bool,
                            progress_cb: Optional[Callable[..., None]] = None) -> Dict[str, Any]:
     db = svc.db
@@ -1350,6 +1433,13 @@ def _sync_employees_locked(svc, rows: Sequence[dict], *, create_accounts: bool,
         "skipped_inactive": 0, "total_rows": len(rows), "problems": [],
         "duplicate_emails": [], "duplicate_rows": 0, "warnings": [],
     }
+    # адреса, ящики которых уже числятся за другими сотрудниками: синхронизация их не отбирает
+    owned_elsewhere: List[str] = []
+    # дополнительные адреса, которые — основные у других сотрудников, и ничьи ящики по дополнительным адресам
+    foreign_main: List[str] = []
+    unowned_found: List[str] = []
+    # основные адреса всех строк файла: сотрудник ниже по файлу ещё не заведён, а его адрес уже занят
+    file_main_emails = {normalize_email(r.get("email")) for r in rows if r.get("email")}
     seen_emails: Dict[str, int] = {}
     tpl = account_template(svc) if create_accounts else None
     # По умолчанию «заводить ящики» включено, а сервер не задан: раньше первая
@@ -1435,16 +1525,14 @@ def _sync_employees_locked(svc, rows: Sequence[dict], *, create_accounts: bool,
         }
         if existing is None:
             employee_id = db.create_employee(source="file", last_seen_at=utcnow_iso(), **values)
-            account_id = None
-            had_account = False
+            known_logins: set = set()
             result["created"] += 1
             if not email and not external_id:
                 unidentified.setdefault(values["full_name"].lower(), []).append(employee_id)
                 matched_by_name.add(employee_id)
         else:
             employee_id = int(existing["id"])
-            account_id = existing["account_id"]
-            had_account = bool(_row_value(existing, "had_account", 0))
+            known_logins = db.employee_known_logins(existing)
             # Пустые поля файла не затирают заполненные в карточке.
             changes = {k: v for k, v in values.items() if v and v != (existing[k] or "")}
             changes["last_seen_at"] = utcnow_iso()
@@ -1455,25 +1543,59 @@ def _sync_employees_locked(svc, rows: Sequence[dict], *, create_accounts: bool,
             # «Обновлён» = встретился в файле (created + updated = разобранные строки).
             result["updated"] += 1
 
-        # Ящик заводится, только если его у сотрудника не было никогда: ящик,
-        # удалённый (или отвязанный) администратором, ночная синхронизация
-        # больше не пересоздаёт.
-        if create_accounts and email and account_id is None and not had_account:
-            _, action = ensure_account_for_employee(svc, employee_id, values["full_name"], email,
-                                                     row=values, tpl=tpl, create=can_create)
-            if action == "no_host":
-                no_host_skipped += 1
-            elif action == "created":
-                result["accounts_created"] += 1
-                schedules_created = schedules_created or bool(tpl and tpl["schedule_enabled"])
-            elif action == "linked":
-                result["accounts_linked"] += 1
+        # Ящик на адрес заводится, только если ящика с таким логином у сотрудника не было никогда:
+        # удалённый (или отвязанный) администратором ящик ночная синхронизация больше не пересоздаёт.
+        # Адресов в строке может быть несколько (основной и дополнительные) — ящик на каждый.
+        if create_accounts and tpl is not None:
+            for addr in [email] + [a for a in (row.get("extra_emails") or []) if a != email]:
+                if not addr:
+                    continue
+                extra = addr != email
+                if extra and _main_address_of_other(db, addr, employee_id, file_main_emails):
+                    # Основной адрес другого сотрудника, указанный дополнительным (опечатка, общий ящик в двух
+                    # строках): его ящик — тому, у кого адрес основной, иначе первая строка файла забрала бы
+                    # чужую почту.
+                    if addr not in foreign_main:
+                        foreign_main.append(addr)
+                    continue
+                main = email if extra else ""
+                if addr in known_logins or account_login_for(tpl, values["full_name"], addr, values,
+                                                             main).lower() in known_logins:
+                    continue
+                _, action = ensure_account_for_employee(svc, employee_id, values["full_name"], addr,
+                                                         row=values, tpl=tpl, create=can_create,
+                                                         main_email=main, link_existing=not extra)
+                if action == "no_host":
+                    no_host_skipped += 1
+                elif action == "created":
+                    result["accounts_created"] += 1
+                    schedules_created = schedules_created or bool(tpl and tpl["schedule_enabled"])
+                elif action == "linked":
+                    result["accounts_linked"] += 1
+                elif action == "owned" and addr not in owned_elsewhere:
+                    owned_elsewhere.append(addr)
+                elif action == "unowned" and addr not in unowned_found:
+                    unowned_found.append(addr)
 
         if progress_cb is not None:
             progress_cb(num, total, f"Обработано {num}/{total}")
 
     _apply_dismissals(svc, result, to_dismiss, to_rehire, rows_total=total)
 
+    if owned_elsewhere:
+        result["warnings"].append(
+            f"Ящики не привязаны ({len(owned_elsewhere)}): они уже числятся за другими сотрудниками — "
+            f"{_shown(owned_elsewhere)}. Ящик принадлежит одному сотруднику; перенести его можно в карточке "
+            f"сотрудника.")
+    if foreign_main:
+        result["warnings"].append(
+            f"Дополнительные адреса пропущены ({len(foreign_main)}): это основные адреса других сотрудников — "
+            f"{_shown(foreign_main)}. Проверьте выгрузку.")
+    if unowned_found:
+        result["warnings"].append(
+            f"Ящики не привязаны ({len(unowned_found)}): они уже есть в архиве и ни за кем не числятся — "
+            f"{_shown(unowned_found)}. Привязка открывает сотруднику архив ящика, поэтому делается вручную — "
+            f"в карточке сотрудника («Привязать существующий»).")
     if no_host_skipped:
         result["warnings"].append(
             f"Ящики не заведены ({no_host_skipped}): в шаблоне ящиков не указан IMAP-сервер "
@@ -1548,51 +1670,69 @@ def hold_until_for_dismissal(svc, today: Optional[_date] = None) -> str:
 
 
 def dismiss_employee(svc, employee_id: int, *, by: str = "system", reason: str = "") -> Dict[str, Any]:
-    """Сотрудник уволен: архив его ящика удерживается, копирование — после
-    последней копии выключается (employees.dismissed_action)."""
+    """Сотрудник уволен: архив ВСЕХ его ящиков удерживается, копирование — после последней копии
+    выключается (employees.dismissed_action).
+
+    Итог: ``accounts`` — по ящику {name, action, job_id?}; ``account`` — названия через запятую (или
+    None, если ящиков нет); ``action`` — общее действие, если у всех ящиков оно одно, иначе ``mixed``.
+    """
     emp = svc.db.get_employee(employee_id)
     if emp is None:
         return {}
     now = utcnow_iso()
     svc.db.update_employee(employee_id, status="archived", dismissed_at=now)
-    out: Dict[str, Any] = {"employee": emp["full_name"], "account": None, "action": "", "hold_until": ""}
-    acc = svc.db.get_account(emp["account_id"]) if emp["account_id"] else None
-    if acc is not None:
-        until = hold_until_for_dismissal(svc)
+    out: Dict[str, Any] = {"employee": emp["full_name"], "account": None, "accounts": [], "action": "",
+                           "hold_until": ""}
+    until = hold_until_for_dismissal(svc)
+    policy = str(svc.rt("employees", "dismissed_action") or "final_backup_disable")
+    from .accountops import after_hold_set
+    for link in svc.db.employee_accounts(employee_id):
+        acc = svc.db.get_account(int(link["id"]))
+        if acc is None:
+            continue
         if not (acc.hold_until and acc.hold_until > until):
             # Ручное удержание дольше «увольнительного» не сокращаем.
             svc.db.set_account_hold(acc.id, until, "dismissed")
         # Сроки хранения больше не действуют: письма, не скачанные (или удалённые
         # очисткой) по сроку и ещё лежащие на сервере, скачает последняя копия.
-        from .accountops import after_hold_set
         after_hold_set(svc, acc.id)
-        out["hold_until"] = max(until, acc.hold_until or "")
-        svc.db.mark_account_dismissed(acc.id, now)
-        out["account"] = acc.name
-        action = str(svc.rt("employees", "dismissed_action") or "final_backup_disable")
+        out["hold_until"] = max(out["hold_until"], until, acc.hold_until or "")
+        if not acc.dismissed_at:
+            # Ящик, перешедший от уже уволенного коллеги, сохраняет дату ТОГО увольнения: по ней возврат
+            # этого сотрудника отличит его ящики от чужих (см. rehire_employee).
+            svc.db.mark_account_dismissed(acc.id, now)
+        item: Dict[str, Any] = {"id": acc.id, "name": acc.name, "action": ""}
         if not acc.enabled:
-            out["action"] = "already_disabled"
-        elif action == "final_backup_disable":
+            item["action"] = "already_disabled"
+        elif policy == "final_backup_disable":
             if account_has_credentials(acc) and not acc.secret_broken and getattr(svc, "queue", None) is not None:
                 try:
                     attempts = int(svc.rt("backup", "retry_attempts") or 1)
                 except (TypeError, ValueError):
                     attempts = 1
-                out["job_id"] = svc.queue.enqueue(JobType.BACKUP, acc.id, {"final": True}, priority=3,
-                                                  max_attempts=attempts, created_by=by)
-                out["action"] = "final_backup"
+                item["job_id"] = svc.queue.enqueue(JobType.BACKUP, acc.id, {"final": True}, priority=3,
+                                                   max_attempts=attempts, created_by=by)
+                item["action"] = "final_backup"
             else:
                 svc.db.set_account_auto_disabled(acc.id, True)
-                out["action"] = "disabled"
+                item["action"] = "disabled"
         else:
-            out["action"] = "kept"
+            item["action"] = "kept"
+        out["accounts"].append(item)
+    if out["accounts"]:
+        out["account"] = ", ".join(i["name"] for i in out["accounts"])
+        actions = {i["action"] for i in out["accounts"]}
+        out["action"] = actions.pop() if len(actions) == 1 else "mixed"
+        if len(out["accounts"]) == 1 and "job_id" in out["accounts"][0]:
+            out["job_id"] = out["accounts"][0]["job_id"]
     detail = emp["full_name"]
-    if acc is not None:
+    if out["accounts"]:
         what = {"final_backup": "последняя копия, затем копирование выключится",
                 "disabled": "копирование выключено", "kept": "копирование продолжается",
-                "already_disabled": "копирование ящика уже было выключено"}.get(out["action"], "")
+                "already_disabled": "копирование ящика уже было выключено"}
         until_text = "бессрочно" if out["hold_until"] == HOLD_FOREVER else f"до {out['hold_until']}"
-        detail += f": ящик «{acc.name}», архив удерживается {until_text}; {what}"
+        boxes = "; ".join(f"«{i['name']}» — {what.get(i['action'], '')}" for i in out["accounts"])
+        detail += f": архив удерживается {until_text}; " + ("ящик " if len(out["accounts"]) == 1 else "ящики: ") + boxes
     if reason:
         detail += f" ({reason})"
     svc.db.add_audit(by, "employee_dismissed", detail[:900])
@@ -1600,22 +1740,37 @@ def dismiss_employee(svc, employee_id: int, *, by: str = "system", reason: str =
 
 
 def rehire_employee(svc, employee_id: int, *, by: str = "system") -> Dict[str, Any]:
-    """Сотрудник снова работает: снять «увольнительное» удержание и вернуть копирование."""
+    """Сотрудник снова работает: снять «увольнительное» удержание и вернуть копирование всех его ящиков."""
     emp = svc.db.get_employee(employee_id)
     if emp is None:
         return {}
+    since = _row_value(emp, "dismissed_at") or ""
     svc.db.update_employee(employee_id, status="active", dismissed_at=None)
-    acc = svc.db.get_account(emp["account_id"]) if emp["account_id"] else None
-    out: Dict[str, Any] = {"employee": emp["full_name"], "account": acc.name if acc else None, "enabled": False}
-    if acc is not None:
+    out: Dict[str, Any] = {"employee": emp["full_name"], "account": None, "accounts": [], "enabled": False}
+    for link in svc.db.employee_accounts(employee_id):
+        acc = svc.db.get_account(int(link["id"]))
+        if acc is None:
+            continue
+        if acc.dismissed_at and acc.dismissed_at != since:
+            # Ящик отмечен при ДРУГОМ увольнении — например, перешёл к сотруднику от уволенного коллеги:
+            # удержание его архива возврат этого сотрудника не снимает.
+            continue
         if acc.hold_reason == "dismissed":
             svc.db.set_account_hold(acc.id, "", "")
         svc.db.mark_account_dismissed(acc.id, None)
+        enabled = False
         if acc.auto_disabled:
             svc.db.set_account_auto_disabled(acc.id, False)
-            out["enabled"] = True
-    svc.db.add_audit(by, "employee_rehired", emp["full_name"] + (
-        f": ящик «{acc.name}»" + (", копирование снова включено" if out["enabled"] else "") if acc else ""))
+            enabled = True
+        out["accounts"].append({"id": acc.id, "name": acc.name, "enabled": enabled})
+        out["enabled"] = out["enabled"] or enabled
+    if out["accounts"]:
+        out["account"] = ", ".join(i["name"] for i in out["accounts"])
+    tail = ""
+    if out["accounts"]:
+        tail = (": ящик " if len(out["accounts"]) == 1 else ": ящики ") + ", ".join(
+            f"«{i['name']}»" + (" (копирование снова включено)" if i["enabled"] else "") for i in out["accounts"])
+    svc.db.add_audit(by, "employee_rehired", (emp["full_name"] + tail)[:900])
     return out
 
 
@@ -1799,8 +1954,10 @@ def apply_passwords(svc, rows: Sequence[dict], *, enable: bool = False,
         password = row.get("password") or ""
         account = svc.db.get_account_by_username(email)
         if account is None:
+            # Логин ящика может не совпадать с адресом: тогда ищем через сотрудника. Если ящиков у него
+            # несколько, неизвестно, какому из них этот пароль, — такая строка не применяется.
             employee = svc.db.get_employee_by_email(email)
-            if employee is not None and employee["account_id"]:
+            if employee is not None and employee["account_id"] and int(employee["account_count"] or 0) == 1:
                 account = svc.db.get_account(int(employee["account_id"]))
         if account is None:
             result["not_found"].append(email)

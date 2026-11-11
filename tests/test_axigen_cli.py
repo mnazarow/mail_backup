@@ -609,3 +609,30 @@ def test_prompt_like_data_line_does_not_end_the_reply_early(srv, world):
         reply = cli.run("LIST Folders")
         assert reply.ok is True and "<#>" in reply.text
         cli.to_root()
+
+
+def test_cli_waits_on_sockets_above_1023():
+    """select.select не принимает дескрипторы ≥ 1024: в службе с множеством открытых файлов обращение к CLI
+    падало «filedescriptor out of range in select()». Ожидание данных — через selectors."""
+    import os
+    resource = pytest.importorskip("resource")
+    from mailarchiver.axigen.cli import _wait_readable
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft < 1200:
+        if hard != resource.RLIM_INFINITY and hard < 1200:
+            pytest.skip("предел открытых файлов меньше 1200")
+        resource.setrlimit(resource.RLIMIT_NOFILE, (1200, hard))
+    a, b = socket.socketpair()
+    high = None
+    try:
+        high = socket.socket(fileno=os.dup2(a.fileno(), 1150))
+        assert _wait_readable(high, 0.05) is False
+        b.sendall(b"+OK\r\n")
+        assert _wait_readable(high, 2) is True
+    finally:
+        if high is not None:
+            high.close()
+        a.close()
+        b.close()
+        if soft < 1200:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))

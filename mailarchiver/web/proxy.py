@@ -225,6 +225,12 @@ SECURITY_HEADERS = {
     "Cross-Origin-Opener-Policy": "same-origin",
 }
 
+#: Встроенная справка показывается внутри интерфейса (раздел «Документация») — во фрейме той же страницы.
+#: Ей разрешено встраивание, но только самим MailArchiver (тот же источник), а не чужими сайтами.
+EMBEDDABLE_PREFIXES = ("/static/docs/",)
+_EMBEDDABLE_HEADERS = dict(SECURITY_HEADERS, **{"X-Frame-Options": "SAMEORIGIN",
+                                                "Content-Security-Policy": "frame-ancestors 'self'"})
+
 
 #: Порт по умолчанию для схемы.
 _DEFAULT_PORTS = {"http": "80", "https": "443", "ws": "80", "wss": "443"}
@@ -477,12 +483,13 @@ class SecurityHeadersMiddleware:
             return
 
         no_store = path.startswith("/api/")
+        extra = _EMBEDDABLE_HEADERS if path.startswith(EMBEDDABLE_PREFIXES) else SECURITY_HEADERS
 
         async def send_wrapper(message):
             if message["type"] == "http.response.start":
                 headers = list(message.get("headers", []))
                 present = {k.decode("latin-1").lower() for k, _ in headers}
-                for name, value in SECURITY_HEADERS.items():
+                for name, value in extra.items():
                     if name.lower() not in present:
                         headers.append((name.encode("latin-1"), value.encode("latin-1")))
                 if no_store and "cache-control" not in present:

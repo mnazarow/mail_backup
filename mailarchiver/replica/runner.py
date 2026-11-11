@@ -41,6 +41,9 @@ from ..logging_setup import get_logger
 from ..util import human_size
 from ..version import __version__
 from . import snapshots
+
+#: Снимок базы, снятый не раньше этого (секунды), повторно не снимается — например, ежедневный из обслуживания.
+SNAPSHOT_MAX_AGE_S = 600
 from .s3 import S3Config
 from .targets import (README_NAME, DirTarget, ReplicaTarget, RsyncTarget, S3Target,
                       parse_rsync_stats)
@@ -535,7 +538,9 @@ class ReplicaRunner:
     # -- снимок базы -------------------------------------------------------------------------
     def _snapshot(self) -> None:
         try:
-            info = snapshots.ensure_fresh(self.svc, 3600)
+            # Снимок не старше 10 минут: снимок часовой давности при восстановлении «не знал» бы о письмах,
+            # скопированных за этот час, хотя их файлы в копии уже есть.
+            info = snapshots.ensure_fresh(self.svc, SNAPSHOT_MAX_AGE_S)
         except MailArchiverError as exc:
             self._error(f"Снимок базы не снят: {exc.message}")
             return

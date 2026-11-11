@@ -212,6 +212,9 @@ class Account:
     auto_disabled: bool = False
     #: подключение к почтовому серверу, через которое копируется ящик (``auth_type = server``)
     server_id: Optional[int] = None
+    #: сотрудник, которому принадлежит ящик (у сотрудника их может быть несколько). Только для чтения:
+    #: create_account/update_account его не меняют — привязка идёт через Database.link_employee_account.
+    employee_id: Optional[int] = None
 
     def on_hold(self, today: Optional[str] = None) -> bool:
         """Удерживается ли архив ящика (очистка по сроку не действует)."""

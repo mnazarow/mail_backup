@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 from ..errors import JobCancelled, MailArchiverError, ValidationError
 from ..logging_setup import get_logger
