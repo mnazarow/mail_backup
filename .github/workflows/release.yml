@@ -1,9 +1,12 @@
-# Выпуск: метка вида v1.10.0 → тесты → архив → GitHub Release.
+# Выпуск: метка вида v1.10.0 → тесты (и скрипты установки от root) → черновик GitHub Release →
+# автономные архивы, каждый проверен установкой без сети → выпуск публикуется. Если хоть что-то не
+# прошло, выпуск остаётся черновиком и его никто не скачает.
 #
 #   git tag v1.10.0 && git push origin v1.10.0
 #
 # К выпуску прикладываются обычный архив (scripts/make_release.py — права в нём
-# не зависят от машины сборки), руководство .docx и автономные архивы для
+# не зависят от машины сборки), точные версии библиотек, с которыми прошли тесты
+# (constraints — для MA_CONSTRAINTS), руководство .docx и автономные архивы для
 # серверов без интернета — по одному на каждую версию Python (пакеты внутри
 # собраны под неё и под x86_64).
 name: release
@@ -34,10 +37,20 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install --no-deps -e .
-          pip install "pytest>=8" "httpx>=0.28"
+          pip install "pytest>=8" "httpx>=0.28" "httpx2>=2.16; python_version >= '3.11'"
           python -m pytest -q
+      - name: Тесты скриптов установки и обновления от root
+        run: sudo env "PATH=$PATH" MA_REQUIRE_SCRIPT_TESTS=1 python -m pytest -q -rs tests/test_install_scripts.py
       - name: Архив выпуска
         run: python scripts/make_release.py dist
+      - name: Точные версии библиотек, с которыми прошли тесты
+        # для установки ровно этого набора: sudo MA_CONSTRAINTS=файл bash scripts/install.sh (или update.sh);
+        # набор собран на Python 3.12 — на другом Python какой-то версии может не быть
+        run: |
+          out="dist/mailarchiver-$(cat VERSION)-constraints-py3.12.txt"
+          { echo "# MailArchiver $(cat VERSION): библиотеки, с которыми прошли тесты выпуска (Python 3.12)"
+            pip freeze --exclude-editable; } > "$out"
+          grep -qi '^fastapi==' "$out"
       - name: Что нового — из CHANGELOG.md
         run: |
           awk -v head="## [$(cat VERSION)]" '
@@ -51,11 +64,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          files=(dist/*.tar.gz)
+          files=(dist/*.tar.gz dist/*-constraints-*.txt)
           for doc in docs/*.docx; do [ -f "$doc" ] && files+=("$doc"); done
           # руководство Word лежит в репозитории (docs/MailArchiver_Руководство.docx); без него — предупреждение
           [ "${#files[@]}" -gt 1 ] || echo "::warning::В docs/ нет руководства .docx — выпуск без него"
-          gh release create "$GITHUB_REF_NAME" "${files[@]}" \
+          gh release create "$GITHUB_REF_NAME" "${files[@]}" --draft \
             --title "MailArchiver $(cat VERSION)" --notes-file notes.md
 
   offline:
@@ -96,3 +109,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "$GITHUB_REF_NAME" dist/mailarchiver-*-offline-*.tar.gz
+
+  publish:
+    name: Опубликовать выпуск
+    needs: offline
+    runs-on: ubuntu-latest
+    steps:
+      - name: Черновик → выпуск
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false

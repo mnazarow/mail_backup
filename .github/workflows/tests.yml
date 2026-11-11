@@ -6,7 +6,10 @@
 #             нужен root, иначе они пропускаются — здесь пропуск считается отказом;
 #  install  — настоящие установка и обновление на systemd самой машины сборки:
 #             прежняя версия из архива в репозитории → проверка → обновление до
-#             текущей → служба отвечает на /health → удаление.
+#             текущей → служба отвечает на /health → удаление; задания в отдельном
+#             процессе под настоящей защитой systemd;
+#  docker   — образ собирается, контейнер отвечает на /health (и с заданиями в
+#             отдельном процессе) и останавливается вовремя и без ошибки.
 name: tests
 
 on:
@@ -41,7 +44,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install --no-deps -e .
-          pip install "pytest>=8" "httpx>=0.28"
+          # httpx2 — клиент тестов Starlette 1.x (с httpx — предупреждение); на Python 3.10 его нет
+          pip install "pytest>=8" "httpx>=0.28" "httpx2>=2.16; python_version >= '3.11'"
           pip check
       - name: Тесты
         run: python -m pytest -q -rs
@@ -59,7 +63,11 @@ jobs:
       - name: Синтаксис скриптов
         run: |
           for f in scripts/*.sh docker/*.sh; do bash -n "$f"; done
-          if command -v shellcheck >/dev/null; then shellcheck -S error scripts/*.sh; fi
+          if command -v shellcheck >/dev/null; then shellcheck -S warning -e SC2034 scripts/*.sh docker/*.sh; fi
+      - name: Ошибки в коде Python (неопределённые имена, лишние импорты, синтаксис)
+        run: |
+          pip install "ruff>=0.6"
+          ruff check --select F,E9 mailarchiver tests scripts
       - name: Тесты скриптов от root
         # MA_REQUIRE_SCRIPT_TESTS=1: если тесты не могут запуститься (нет root,
         # нет пользователя nobody), это отказ, а не тихий пропуск
@@ -140,9 +148,53 @@ jobs:
           sudo bash scripts/install.sh </dev/null
           systemctl is-active mailarchiver
           curl -fsS http://127.0.0.1:8493/health
+      - name: Задания в отдельном процессе (под защитой systemd)
+        run: |
+          sudo grep -q '^  worker_process: false' /etc/mailarchiver/config.yaml
+          sudo sed -i 's/^  worker_process: false/  worker_process: true/' /etc/mailarchiver/config.yaml
+          sudo mailarchiver check-config
+          sudo systemctl restart mailarchiver
+          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:8493/health && break; sleep 1; done
+          curl -fsS http://127.0.0.1:8493/health
+          main="$(systemctl show mailarchiver -p MainPID --value)"
+          pgrep -P "$main" -f spawn_main          # дочерний процесс заданий запущен
+          sudo journalctl -u mailarchiver --since "-2min" --no-pager | grep "в отдельном процессе"
+          sudo systemctl stop mailarchiver
+          test "$(systemctl show mailarchiver -p Result --value)" = success   # без принудительного завершения
+          if pgrep -f spawn_main; then echo "процесс заданий пережил остановку службы"; exit 1; fi
+          sudo sed -i 's/^  worker_process: true/  worker_process: false/' /etc/mailarchiver/config.yaml
+          sudo systemctl start mailarchiver
       - name: Журнал службы (при отказе)
         if: failure()
         run: |
           systemctl status mailarchiver --no-pager -l || true
           sudo journalctl -u mailarchiver -n 200 --no-pager || true
           ls -la /opt/mailarchiver /var/lib/mailarchiver /etc/mailarchiver || true
+
+  docker:
+    name: Образ Docker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Сборка образа
+        run: docker build -f docker/Dockerfile -t mailarchiver:ci .
+      - name: Контейнер отвечает, задания — в том же и в отдельном процессе
+        run: |
+          set -e
+          for mode in 0 1; do
+            docker run -d --name "ma$mode" -e MAILARCHIVER_WORKER_PROCESS="$mode" -p "127.0.0.1:$((8500+mode)):8493" mailarchiver:ci
+            for i in $(seq 1 60); do curl -fsS "http://127.0.0.1:$((8500+mode))/health" && break; sleep 1; done
+            curl -fsS "http://127.0.0.1:$((8500+mode))/health"
+            test "$(docker exec "ma$mode" mailarchiver version | grep -o '[0-9][0-9.]*' | head -1)" = "$(cat VERSION)"
+            spawned="$(docker top "ma$mode" | grep -c spawn_main || true)"
+            if [ "$mode" = 1 ]; then test "$spawned" -ge 1; else test "$spawned" = 0; fi
+            # остановка: идущие задания возвращаются в очередь, контейнер выходит сам и с кодом 0
+            docker stop -t 30 "ma$mode"
+            test "$(docker inspect -f '{{.State.ExitCode}}' "ma$mode")" = 0
+            docker logs "ma$mode" 2>&1 | grep -q "Сервис остановлен"
+          done
+      - name: Журналы контейнеров (при отказе)
+        if: failure()
+        run: |
+          docker logs ma0 || true
+          docker logs ma1 || true
