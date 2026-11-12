@@ -33,6 +33,7 @@ import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
 from .logging_setup import get_logger
+from .sso import SsoError, ensure_user as _sso_ensure_user, role_from, values as _sso_values
 
 log = get_logger("oidc")
 
@@ -47,7 +48,7 @@ _cache_lock = threading.Lock()
 DISCOVERY_TTL_S = 3600
 
 
-class OidcError(Exception):
+class OidcError(SsoError):
     """Вход не удался — текст для журнала и аудита (пользователю — общий ответ)."""
 
 
@@ -305,24 +306,14 @@ def _claim(claims: Dict, path: str):
 
 
 def _values(v) -> List[str]:
-    if v is None:
-        return []
-    if isinstance(v, str):
-        return [x.strip() for x in v.replace(";", ",").split(",") if x.strip()]
-    if isinstance(v, (list, tuple)):
-        return [str(x).strip() for x in v if str(x).strip()]
-    return [str(v)]
+    return _sso_values(v)
 
 
 def role_of(svc, claims: Dict) -> str:
-    have = {x.lower() for x in _values(_claim(claims, str(svc.rt("oidc", "role_claim") or "groups")))}
-    if have & {x.lower() for x in _values(svc.rt("oidc", "admin_values"))}:
-        return "admin"
-    if have & {x.lower() for x in _values(svc.rt("oidc", "operator_values"))}:
-        return "operator"
-    if bool(svc.rt("oidc", "employee_login")) and claims.get("email") and claims.get("email_verified", True):
-        return "mailbox"
-    return ""
+    email = claims.get("email") if claims.get("email_verified", True) else ""
+    return role_from(_values(_claim(claims, str(svc.rt("oidc", "role_claim") or "groups"))),
+                     svc.rt("oidc", "admin_values"), svc.rt("oidc", "operator_values"),
+                     bool(svc.rt("oidc", "employee_login")), str(email or ""))
 
 
 def finish(svc, query: Dict[str, str], cookie: str, request) -> Dict:
@@ -392,26 +383,5 @@ def check(svc) -> Dict:
 
 
 def ensure_user(svc, info: Dict) -> Optional[Dict]:
-    """Учётная запись архива для пользователя поставщика. None — входить нельзя (локальный, отключён)."""
-    from .security import hash_password, new_token
-    from .web.auth import _row_get
-    username, role = info["username"], info["role"]
-    existing = svc.db.get_user_by_name(username)
-    if existing is not None and _row_get(existing, "auth_source", "local") != "oidc":
-        raise OidcError(f"в архиве уже есть локальный пользователь {username} — через единый вход он не входит")
-    if role not in ("admin", "operator"):
-        if existing is not None and not existing["disabled"]:
-            svc.db.set_user_disabled(int(existing["id"]), True, by="oidc")
-            svc.db.add_audit("system", "user_disable", f"{username}: у поставщика больше нет прав на архив (OIDC)")
-        return None
-    if existing is None:
-        uid = svc.db.create_user(username, hash_password(new_token(24)), role)
-        svc.db.execute("UPDATE users SET auth_source='oidc' WHERE id=?", (uid,))
-        svc.db.add_audit("system", "user_create", f"{username}: из единого входа (OIDC), роль {role}")
-        return dict(svc.db.get_user_by_id(uid))
-    if existing["disabled"] and _row_get(existing, "disabled_by", "") not in ("", "oidc"):
-        raise OidcError(f"{username} отключён администратором")
-    if existing["role"] != role or existing["disabled"]:
-        svc.db.execute("UPDATE users SET role=?, disabled=0, disabled_by='' WHERE id=?", (role, existing["id"]))
-        svc.db.add_audit("system", "user_role", f"{username}: роль из единого входа — {role}")
-    return dict(svc.db.get_user_by_id(int(existing["id"])))
+    """Учётная запись архива для пользователя поставщика. None — прав на архив нет (см. :mod:`sso`)."""
+    return _sso_ensure_user(svc, info, "oidc", error=OidcError)

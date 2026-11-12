@@ -201,6 +201,10 @@ class ProxyHeadersMiddleware:
 
 #: Методы, меняющие состояние: для них требуется «свой» Origin.
 _UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+#: Куда браузер приходит POST-запросом с чужого сайта по протоколу (1.23.0): ответ поставщика SAML на
+#: /api/auth/saml/acs. Точка не читает cookie и проверяет подписанный ответ сама, поэтому проверка Origin ей
+#: не нужна (а с ней вход через SAML невозможен: Origin — адрес поставщика).
+CROSS_SITE_POST_PATHS = frozenset({"/api/auth/saml/acs"})
 
 _BAD_HOST_BODY = json.dumps({
     "error": True, "code": "bad_host",
@@ -480,6 +484,7 @@ class SecurityHeadersMiddleware:
                 await send({"type": "http.response.body", "body": body})
                 return
         if scope.get("method", "").upper() in _UNSAFE_METHODS and \
+                not (scope.get("method", "").upper() == "POST" and path in CROSS_SITE_POST_PATHS) and \
                 not check_origin(scope, self._public_url(), require_marker=True):
             body = _BAD_ORIGIN_BODY
             await send({"type": "http.response.start", "status": 403,

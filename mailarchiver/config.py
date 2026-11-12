@@ -272,6 +272,24 @@ DEFAULTS: Dict[str, Any] = {
         "redirect_uri": "",           # '' — <server.public_url или адрес запроса>/api/auth/oidc/callback
         "verify_ssl": True,
     },
+    "saml": {
+        # Единый вход через SAML 2.0 (1.23.0): ADFS, Entra ID, Keycloak, Shibboleth, Okta…
+        "enabled": False,
+        "idp_metadata_url": "",       # адрес описания поставщика (FederationMetadata.xml, …/protocol/saml/descriptor)
+        "idp_entity_id": "",          # идентификатор поставщика ('' — из описания)
+        "idp_sso_url": "",            # адрес входа (HTTP-Redirect) ('' — из описания)
+        "idp_cert": "",               # сертификат подписи поставщика (PEM или base64; '' — из описания)
+        "sp_entity_id": "",           # идентификатор архива ('' — <адрес интерфейса>/api/auth/saml/metadata)
+        "acs_url": "",                # адрес приёма ответа ('' — <адрес интерфейса>/api/auth/saml/acs)
+        "username_attribute": "",     # атрибут с логином ('' — NameID)
+        "email_attribute": "",        # атрибут с адресом почты ('' — email, mail, emailaddress…)
+        "role_attribute": "groups",   # атрибут с группами/ролями
+        "admin_values": [],           # группы администраторов архива
+        "operator_values": [],        # группы операторов
+        "employee_login": False,      # остальные — сотрудники: архив своих ящиков по адресу почты
+        "button_text": "Войти через SAML",
+        "verify_ssl": True,           # проверять сертификат https при чтении описания поставщика
+    },
     "mailadmin": {
         # Вход в ящики учётной записью администратора почты — без паролей сотрудников.
         # Работает, если почтовый сервер это умеет: Dovecot (master users), Cyrus и

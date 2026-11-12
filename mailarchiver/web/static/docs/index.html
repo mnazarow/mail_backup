@@ -2845,6 +2845,99 @@ cron-выражение подставится само. Для особых с�
     <p class="pmeta">Пример: <code>true</code> · По умолчанию: <code>true</code></p>
   </div></div>
 </div>
+<h3 class="pg">🪪 Единый вход (SAML 2.0)</h3>
+<div class="ptable">
+<div class="prow">
+  <div class="pname"><span class="ptitle">Вход через SAML</span><code>saml.enabled</code></div>
+  <div class="pdesc"><p>На странице входа появляется кнопка входа через поставщика SAML 2.0 (ADFS, Entra ID, Keycloak, Shibboleth, Okta). Архив — поставщик услуг: передайте поставщику его описание (адрес — в блоке «Проверка» ниже) или идентификатор и адрес приёма ответа. Ответ поставщика должен быть подписан (утверждение или весь ответ), шифрование утверждений не поддерживается.</p>
+    <p class="prec">💡 Включите, если в организации есть ADFS или другой поставщик SAML, а OpenID Connect он не умеет.</p>
+    <p class="pmeta">Пример: <code>true</code> · По умолчанию: <code>false</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Адрес описания поставщика</span><code>saml.idp_metadata_url</code></div>
+  <div class="pdesc"><p>Описание поставщика (metadata): отсюда берутся его идентификатор, адрес входа и сертификат подписи; перечитывается раз в час — смена сертификата у поставщика подхватывается сама. ADFS — https://adfs.company.ru/FederationMetadata/2007-06/FederationMetadata.xml, Keycloak — https://sso.company.ru/realms/company/protocol/saml/descriptor, Entra ID — «Federation Metadata Url» приложения. Только https.</p>
+    <p class="prec">💡 Укажите адрес описания — тогда три поля ниже можно не заполнять.</p>
+    <p class="pmeta">Пример: <code>https://adfs.company.ru/FederationMetadata/2007-06/FederationMetadata.xml</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Идентификатор поставщика</span><code>saml.idp_entity_id</code></div>
+  <div class="pdesc"><p>entityID поставщика (Issuer в его ответах). Пусто — из описания.</p>
+    <p class="prec">💡 Пусто, если указан адрес описания.</p>
+    <p class="pmeta">Пример: <code>http://adfs.company.ru/adfs/services/trust</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Адрес входа у поставщика</span><code>saml.idp_sso_url</code></div>
+  <div class="pdesc"><p>Куда отправлять браузер с запросом входа (привязка HTTP-Redirect). Пусто — из описания.</p>
+    <p class="prec">💡 Пусто, если указан адрес описания.</p>
+    <p class="pmeta">Пример: <code>https://adfs.company.ru/adfs/ls/</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Сертификат подписи поставщика</span><code>saml.idp_cert</code></div>
+  <div class="pdesc"><p>Сертификат, которым поставщик подписывает ответы (PEM или base64 одной строкой). Если задан — доверяется только он, сертификаты из описания не используются. Сертификат из самого ответа архив не принимает никогда.</p>
+    <p class="prec">💡 Пусто, если указан адрес описания; задайте, если описание недоступно серверу архива.</p>
+    <p class="pmeta">Пример: <code>MIIC8DCCAdigAwIBAgIQ…</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Идентификатор архива (SP entityID)</span><code>saml.sp_entity_id</code></div>
+  <div class="pdesc"><p>Под этим именем архив заведён у поставщика (у ADFS — «идентификатор доверяющей стороны», у Keycloak — Client ID). Пусто — адрес описания архива: &lt;адрес интерфейса&gt;/api/auth/saml/metadata.</p>
+    <p class="prec">💡 Пусто.</p>
+    <p class="pmeta">Пример: <code>https://mail-archive.company.ru/api/auth/saml/metadata</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Адрес приёма ответа (ACS)</span><code>saml.acs_url</code></div>
+  <div class="pdesc"><p>Куда поставщик возвращает браузер с ответом (привязка HTTP-POST). Пусто — &lt;адрес интерфейса&gt;/api/auth/saml/acs; без «Адреса интерфейса» — адрес, по которому открыт архив.</p>
+    <p class="prec">💡 Пусто; заполните «Адрес интерфейса» в разделе «Сервер и сеть».</p>
+    <p class="pmeta">Пример: <code>https://mail-archive.company.ru/api/auth/saml/acs</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Атрибут с логином</span><code>saml.username_attribute</code></div>
+  <div class="pdesc"><p>Логин пользователя в архиве. Пусто — NameID ответа. Для ADFS обычно http://schemas.xmlsoap.org/ws/2005/05/identity/claims/upn или NameID.</p>
+    <p class="prec">💡 Пусто.</p>
+    <p class="pmeta">Пример: <code>uid</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Атрибут с адресом почты</span><code>saml.email_attribute</code></div>
+  <div class="pdesc"><p>Адрес почты (нужен для входа сотрудников в свои ящики). Пусто — ищутся email, mail, emailaddress и urn:oid:0.9.2342.19200300.100.1.3, иначе NameID, если он похож на адрес.</p>
+    <p class="prec">💡 Пусто.</p>
+    <p class="pmeta">Пример: <code>http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Атрибут с группами</span><code>saml.role_attribute</code></div>
+  <div class="pdesc"><p>Атрибут, значения которого сравниваются с группами администраторов и операторов (без учёта регистра). ADFS — http://schemas.microsoft.com/ws/2008/06/identity/claims/role или groups, Entra ID — http://schemas.microsoft.com/ws/2008/06/identity/claims/groups (идентификаторы групп), Keycloak — имя сопоставления групп.</p>
+    <p class="prec">💡 Атрибут групп вашего поставщика.</p>
+    <p class="pmeta">Пример: <code>groups</code> · По умолчанию: <code>groups</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Группы администраторов</span><code>saml.admin_values</code></div>
+  <div class="pdesc"><p>Значения атрибута групп, дающие роль администратора архива (одно совпадение).</p>
+    <p class="prec">💡 Одна отдельная группа.</p>
+    <p class="pmeta">Пример: <code>mail-archive-admins</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Группы операторов</span><code>saml.operator_values</code></div>
+  <div class="pdesc"><p>Значения атрибута групп, дающие роль оператора.</p>
+    <p class="prec">💡 Группа дежурных.</p>
+    <p class="pmeta">Пример: <code>mail-archive-operators</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Сотрудники входят через SAML</span><code>saml.employee_login</code></div>
+  <div class="pdesc"><p>Кто не входит в группы архива, но передан с адресом почты, входит сотрудником в архив своих ящиков (ящик находится по адресу — логину ящика или адресу сотрудника в справочнике).</p>
+    <p class="prec">💡 Включите, если сотрудникам нужен свой архив и «Почта».</p>
+    <p class="pmeta">Пример: <code>true</code> · По умолчанию: <code>false</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Надпись на кнопке</span><code>saml.button_text</code></div>
+  <div class="pdesc"><p>Текст кнопки на странице входа.</p>
+    <p class="prec">💡 Название поставщика.</p>
+    <p class="pmeta">Пример: <code>Войти через ADFS</code> · По умолчанию: <code>Войти через SAML</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Проверять сертификат https описания</span><code>saml.verify_ssl</code></div>
+  <div class="pdesc"><p>Проверять сертификат сервера, с которого читается описание поставщика. Выключать только на стенде.</p>
+    <p class="prec">💡 Включено.</p>
+    <p class="pmeta">Пример: <code>true</code> · По умолчанию: <code>true</code></p>
+  </div></div>
+</div>
 <h3 class="pg">🗝️ Вход в ящики через администратора почты</h3>
 <div class="ptable">
 <div class="prow">
@@ -3160,7 +3253,18 @@ cron-выражение подставится само. Для особых с�
 срок и <code>nonce</code> проверяются. Учётная запись архива заводится сама и отключается, когда у поставщика
 пропадают группы архива; второй фактор проверяет поставщик.</p>
 <img class="shot" src="img/78_login_sso.png" alt="Вход через единый вход">
-<div class="cap">Страница входа с кнопкой единого входа</div>
+<div class="cap">Страница входа с кнопками единого входа: OpenID Connect и SAML</div>
+<h3 id="saml">Единый вход (SAML 2.0)</h3>
+<p>«Настройки → 🪪 Единый вход (SAML 2.0)» — вход через ADFS, Entra ID, Keycloak, Shibboleth и других поставщиков
+SAML. Достаточно адреса описания поставщика (metadata): из него берутся адрес входа и сертификат подписи. Кнопка
+«Проверить поставщика» показывает сертификаты и что указать у поставщика — идентификатор архива
+<code>…/api/auth/saml/metadata</code> и адрес приёма ответа <code>…/api/auth/saml/acs</code> (или импортировать
+описание архива по первому адресу). Подпись ответа проверяется только сертификатом поставщика, разбирается
+только подписанная часть; проверяются получатель, адрес возврата, ответ на запрос архива, сроки и повтор.
+Зашифрованные утверждения и вход, начатый поставщиком, не принимаются. Роль — по атрибуту групп, как у OpenID
+Connect.</p>
+<img class="shot" src="img/82_settings_saml.png" alt="Настройки SAML">
+<div class="cap">Проверка поставщика SAML: сертификат подписи и что указать у поставщика</div>
 <h3 id="apitokens">API-токены</h3>
 <p>Для скриптов и интеграций администратор выпускает токен в разделе «Пользователи → 🔑 API-токены»: имя,
 владелец, роль (администратор или оператор — не выше роли владельца) и срок. Токен показывается один раз; запрос

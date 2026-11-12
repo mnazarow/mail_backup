@@ -186,6 +186,7 @@ async function viewSettings(c){
     if(sec.section==='journal') journalCard(card);
     if(sec.section==='drill') drillCard(card);
     if(sec.section==='oidc') oidcCard(card, ()=>Object.keys(changed).some(k=>k.startsWith('oidc.')));
+    if(sec.section==='saml') samlCard(card, ()=>Object.keys(changed).some(k=>k.startsWith('saml.')));
     if(sec.section==='audit') auditForwardCard(card, ()=>Object.keys(changed).some(k=>k.startsWith('audit.syslog')));
     if(sec.section==='axigen') axigenSettingsCard(card, ()=>Object.keys(changed).some(k=>k.startsWith('axigen.')));
   });
@@ -429,6 +430,27 @@ function oidcCard(card, unsaved){
   card.appendChild(box);
 }
 
+/** Блок «Проверка» в «Единый вход (SAML 2.0)» (1.23.0): поставщик, сертификаты и что указать у поставщика. */
+function samlCard(card, unsaved){
+  const box=h(`<div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border)">
+    <h4 style="margin:0 0 8px">🪪 Проверка</h4>
+    <div class="small muted">Читается описание поставщика (или настройки, заданные вручную) и его сертификаты подписи. Ниже — что указать у поставщика: идентификатор архива и адрес приёма ответа (или дать ему адрес описания архива).</div>
+    <div class="btn-row" style="margin-top:8px"><button class="btn sm" data-t>Проверить поставщика</button><a class="btn sm ghost" href="/api/auth/saml/metadata" target="_blank" rel="noopener">📄 Описание архива (XML)</a></div><div data-r class="small" style="margin-top:8px"></div></div>`);
+  box.querySelector('[data-t]').onclick=async()=>{
+    if(unsaved()) return toast('Сначала сохраните настройки','Проверка идёт с сохранёнными значениями.','warn');
+    const out=box.querySelector('[data-r]'); out.innerHTML='<div class="spinner"></div>';
+    try{ const r=await api('/saml/check',{method:'POST'});
+      const certs=(r.certs||[]).map(c=>`<div>🔏 ${esc(c.subject)} · до ${esc(fmtDate(c.until))} · SHA-256 <code style="font-size:.75rem;word-break:break-all">${esc(c.sha256)}</code></div>`).join('');
+      out.innerHTML=(r.ok?`<span class="tag ok">поставщик найден</span> ${esc(r.entity_id)} · вход: ${esc(r.sso_url)}${certs}${r.cert_warning?`<div style="color:var(--warn-text)">⚠️ ${esc(r.cert_warning)}</div>`:''}`:`<span class="tag err">ошибка</span> ${esc(r.error)}`)
+        +`<table class="tbl small" style="margin-top:8px"><tbody>
+          <tr><td>Идентификатор архива (entityID)</td><td><code style="user-select:all">${esc(r.sp_entity_id)}</code></td></tr>
+          <tr><td>Адрес приёма ответа (ACS, HTTP-POST)</td><td><code style="user-select:all">${esc(r.acs_url)}</code></td></tr>
+          <tr><td>Описание архива</td><td><code style="user-select:all">${esc(r.metadata_url)}</code></td></tr></tbody></table>`;
+    }catch(e){ out.textContent=''; toastErr(e); }
+  };
+  card.appendChild(box);
+}
+
 /** Блок «Проверка восстановления»: последний результат и запуск сейчас (1.21.0). */
 async function drillCard(card){
   let st; try{ st=await api('/drill'); }catch(e){ return; }
@@ -548,7 +570,7 @@ async function viewUsers(c){
       : `<select data-role aria-label="Роль пользователя ${esc(u.username)}" title="Сменить роль (сеансы пользователя будут завершены)">
           <option value="admin" ${u.role==='admin'?'selected':''}>администратор</option>
           <option value="operator" ${u.role==='operator'?'selected':''}>оператор</option></select>`;
-    const tr=h(`<tr><td><strong>${esc(u.username)}</strong>${u.auth_source==='ldap'?' <span class="tag" title="Входит доменным паролем; роль — по группе каталога LDAP">🏢 из каталога</span>':''}${u.auth_source==='oidc'?' <span class="tag" title="Входит через единый вход (OpenID Connect); роль — по группам у поставщика">🔑 единый вход</span>':''}${u.disabled?(u.disabled_by==='ldap'?' <span class="tag" title="Отключён сверкой с каталогом: нет в каталоге, отключён в нём или вне групп архива. Включится сам при входе, если права вернут.">выключен каталогом</span>':u.disabled_by==='oidc'?' <span class="tag" title="У поставщика единого входа больше нет групп архива. Включится сам при входе, если права вернут.">выключен единым входом</span>':' <span class="tag" title="Отключён администратором: вход через каталог его не включит">выключен</span>'):''}</td><td>${roleCell}</td>
+    const tr=h(`<tr><td><strong>${esc(u.username)}</strong>${u.auth_source==='ldap'?' <span class="tag" title="Входит доменным паролем; роль — по группе каталога LDAP">🏢 из каталога</span>':''}${u.auth_source==='oidc'?' <span class="tag" title="Входит через единый вход (OpenID Connect); роль — по группам у поставщика">🔑 единый вход</span>':''}${u.auth_source==='saml'?' <span class="tag" title="Входит через единый вход (SAML 2.0); роль — по группам у поставщика">🪪 SAML</span>':''}${u.disabled?(u.disabled_by==='ldap'?' <span class="tag" title="Отключён сверкой с каталогом: нет в каталоге, отключён в нём или вне групп архива. Включится сам при входе, если права вернут.">выключен каталогом</span>':(u.disabled_by==='oidc'||u.disabled_by==='saml')?' <span class="tag" title="У поставщика единого входа больше нет групп архива. Включится сам при входе, если права вернут.">выключен единым входом</span>':' <span class="tag" title="Отключён администратором: вход через каталог его не включит">выключен</span>'):''}</td><td>${roleCell}</td>
       <td>${u.totp_enabled?'<span class="tag ok">🔐 вкл.</span>':'<span class="tag">нет</span>'}</td>
       <td class="small muted">${fmtDate(u.created_at)}</td><td class="small muted">${fmtDate(u.last_login)}</td>
       <td style="text-align:right;white-space:nowrap"><button class="btn sm" data-pw>Пароль</button><button class="btn sm" data-logout title="Завершить все открытые сеансы этого пользователя (его текущие cookie перестанут действовать)">Завершить сеансы</button>${u.totp_enabled && u.id!==State.user.id?'<button class="btn sm" data-reset2fa title="Отключить двухфакторный вход (например, пользователь потерял телефон)">Сбросить 2FA</button>':''}<button class="btn danger sm" data-del>✕</button></td></tr>`);

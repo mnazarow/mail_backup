@@ -173,12 +173,15 @@ async function boot(){
     if(ns.needs_setup) return renderSetup();
     if(!ns.auth_enabled){ try{ State.user=await api('/me'); }catch(_){ State.user={username:'admin',role:'admin'}; } return startApp(); }
     try{ State.user = await api('/me'); startApp(); }
-    catch(e){ renderLogin(ns.oidc||{}); }
+    catch(e){ State.sso={oidc:ns.oidc||{}, saml:ns.saml||{}}; renderLogin(State.sso); }
   }catch(e){ root().innerHTML=`<div class="auth-wrap"><div class="card auth-card"><h2>Сервис недоступен</h2><p class="muted">${esc(e.message)}</p></div></div>`; }
 }
 
 function renderLogin(sso){
-  sso=sso||{};
+  sso=sso||State.sso||{};
+  const oidc=sso.oidc||{}, saml=sso.saml||{};
+  const ssoBtns=[oidc.enabled?`<a class="btn" id="lsso" href="/api/auth/oidc/start" style="width:100%;justify-content:center">🔑 ${esc(oidc.button||'Войти через единый вход')}</a>`:'',
+    saml.enabled?`<a class="btn" id="lsaml" href="/api/auth/saml/start" style="width:100%;justify-content:center${oidc.enabled?';margin-top:8px':''}">🪪 ${esc(saml.button||'Войти через SAML')}</a>`:''].join('');
   root().innerHTML='';
   const ssoFailed=/[?&]sso_error=/.test(location.search);
   const card=h(`<div class="auth-wrap"><div class="card auth-card">
@@ -187,7 +190,7 @@ function renderLogin(sso){
     <div class="form-row"><label>Пользователь</label><input id="lu" type="text" autocomplete="username" autofocus></div>
     <div class="form-row"><label>Пароль</label><input id="lp" type="password" autocomplete="current-password"></div>
     <button class="btn primary" id="lb" style="width:100%;justify-content:center">Войти</button>
-    ${sso.enabled?`<div class="auth-or small muted">или</div><a class="btn" id="lsso" href="/api/auth/oidc/start" style="width:100%;justify-content:center">🔑 ${esc(sso.button||'Войти через единый вход')}</a>`:''}
+    ${ssoBtns?`<div class="auth-or small muted">или</div>${ssoBtns}`:''}
     ${ssoFailed?'<div class="hint" style="margin-top:10px;border-color:var(--danger)">Единый вход не удался. Попробуйте ещё раз; если не помогает — сообщите администратору (подробности — в аудите архива).</div>':''}
   </div></div>`);
   root().appendChild(card);

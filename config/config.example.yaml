@@ -287,6 +287,23 @@ oidc:                        # единый вход OpenID Connect (docs/ru/08-
   redirect_uri: ""           # '' — <адрес интерфейса>/api/auth/oidc/callback
   verify_ssl: true
 
+saml:                        # единый вход SAML 2.0 (docs/ru/08-security.md), 1.23.0
+  enabled: false
+  idp_metadata_url: ""       # https://adfs.company.ru/FederationMetadata/2007-06/FederationMetadata.xml
+  idp_entity_id: ""          # '' — из описания поставщика
+  idp_sso_url: ""            # '' — из описания (HTTP-Redirect)
+  idp_cert: ""               # сертификат подписи поставщика (PEM/base64); '' — из описания
+  sp_entity_id: ""           # '' — <адрес интерфейса>/api/auth/saml/metadata
+  acs_url: ""                # '' — <адрес интерфейса>/api/auth/saml/acs
+  username_attribute: ""     # '' — NameID
+  email_attribute: ""        # '' — email, mail, emailaddress…
+  role_attribute: "groups"
+  admin_values: []
+  operator_values: []
+  employee_login: false
+  button_text: "Войти через SAML"
+  verify_ssl: true
+
 mailadmin:                   # вход в ящики через администратора почты (docs/ru/16-mailadmin.md)
   enabled: false
   host: ""                   # IMAP-сервер, для которого действует вход администратора

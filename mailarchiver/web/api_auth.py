@@ -1,4 +1,4 @@
-"""API: первичная настройка, вход (пароль, единый вход OpenID Connect, 2FA), «о себе».
+"""API: первичная настройка, вход (пароль, единый вход OpenID Connect и SAML, 2FA), «о себе».
 
 Часть REST API веб-интерфейса (до 1.22.0 — один файл api.py; маршруты собирает api.py).
 """
@@ -22,21 +22,44 @@ router = APIRouter(prefix="/api")
 # =====================================================================
 @router.get("/needs-setup")
 def needs_setup(request: Request):
-    from .. import oidc
+    from .. import oidc, saml
     svc = svc_dep(request)
     return {"needs_setup": svc.db.count_users() == 0, "auth_enabled": bool(svc.rt("security", "auth_enabled")),
             "oidc": {"enabled": oidc.enabled(svc),
-                     "button": str(svc.rt("oidc", "button_text") or "Войти через единый вход")}}
+                     "button": str(svc.rt("oidc", "button_text") or "Войти через единый вход")},
+            "saml": {"enabled": saml.enabled(svc) and saml.available(),
+                     "button": str(svc.rt("saml", "button_text") or "Войти через SAML")}}
 
 
 # ---- единый вход (OpenID Connect, 1.22.0) --------------------------------
-def _sso_fail(svc, request: Request, text: str) -> RedirectResponse:
-    from .. import oidc
+def _sso_fail(svc, request: Request, text: str, kind: str = "oidc") -> RedirectResponse:
+    from .. import oidc, saml
     ip = auth_mod.client_ip(request)
-    log.warning("Единый вход не удался (%s): %s", ip, text)
-    svc.db.add_audit("-", "login_oidc_error", f"{ip}: {text}"[:500])
+    log.warning("Единый вход (%s) не удался (%s): %s", kind, ip, text)
+    svc.db.add_audit("-", f"login_{kind}_error", f"{ip}: {text}"[:500])
     resp = RedirectResponse("/?sso_error=1#/", status_code=303)
-    resp.delete_cookie(oidc.COOKIE, path=oidc.COOKIE_PATH)
+    mod = saml if kind == "saml" else oidc
+    resp.delete_cookie(mod.COOKIE, path=mod.COOKIE_PATH)
+    return resp
+
+
+def _sso_session(svc, request: Request, resp, info: dict, mod, label: str):
+    """Проверенный пользователь поставщика → сеанс архива (администратор, оператор или сотрудник)."""
+    from .. import ldapauth
+    ip = auth_mod.client_ip(request)
+    if info["role"] in ("admin", "operator"):
+        user = mod.ensure_user(svc, info)
+        svc.db.set_last_login(int(user["id"]))
+        svc.db.add_audit(info["username"], "login", f"{ip} ({label})")
+        auth_mod.create_session(svc, resp, int(user["id"]), request, role=user["role"])
+        return resp
+    mod.ensure_user(svc, info)                         # прав на архив нет — учётную запись единого входа отключить
+    acc = ldapauth.mailbox_for(svc, info["email"]) if info["role"] == "mailbox" else None
+    if acc is None:
+        raise mod.SsoError(f"{info['username']}: нет прав на архив" +
+                           (" и ящика с адресом " + info["email"] if info["role"] == "mailbox" else ""))
+    svc.db.add_audit(info["username"], "login_mailbox", f"{ip} account={acc.id} ({label})")
+    auth_mod.create_session(svc, resp, 0, request, role="mailbox", account_id=acc.id)
     return resp
 
 
@@ -59,30 +82,16 @@ def oidc_start(request: Request):
 @router.get("/auth/oidc/callback", name="oidc_callback")
 def oidc_callback(request: Request):
     """Возврат с поставщика: код → проверенный id_token → сессия архива."""
-    from .. import ldapauth, oidc
+    from .. import oidc
     svc = svc_dep(request)
     if not oidc.enabled(svc):
         raise HTTPException(404, "Единый вход не настроен")
-    ip = auth_mod.client_ip(request)
     try:
         info = oidc.finish(svc, dict(request.query_params), request.cookies.get(oidc.COOKIE, ""), request)
         resp = RedirectResponse("/#/", status_code=303)
         resp.delete_cookie(oidc.COOKIE, path=oidc.COOKIE_PATH)
-        if info["role"] in ("admin", "operator"):
-            user = oidc.ensure_user(svc, info)
-            svc.db.set_last_login(int(user["id"]))
-            svc.db.add_audit(info["username"], "login", f"{ip} (OIDC)")
-            auth_mod.create_session(svc, resp, int(user["id"]), request, role=user["role"])
-            return resp
-        oidc.ensure_user(svc, info)                    # прав на архив нет — учётную запись из OIDC отключить
-        acc = ldapauth.mailbox_for(svc, info["email"]) if info["role"] == "mailbox" else None
-        if acc is None:
-            raise oidc.OidcError(f"{info['username']}: нет прав на архив" +
-                                 (" и ящика с адресом " + info["email"] if info["role"] == "mailbox" else ""))
-        svc.db.add_audit(info["username"], "login_mailbox", f"{ip} account={acc.id} (OIDC)")
-        auth_mod.create_session(svc, resp, 0, request, role="mailbox", account_id=acc.id)
-        return resp
-    except oidc.OidcError as exc:
+        return _sso_session(svc, request, resp, info, oidc, "OIDC")
+    except oidc.SsoError as exc:
         return _sso_fail(svc, request, str(exc))
 
 
@@ -94,6 +103,71 @@ def oidc_check(request: Request, user: dict = Depends(auth_mod.require_admin)):
     res = oidc.check(svc)
     res["redirect_uri"] = oidc.redirect_uri(svc, request)
     return res
+
+
+# ---- единый вход (SAML 2.0, 1.23.0) ---------------------------------------
+@router.get("/auth/saml/metadata", include_in_schema=False)
+def saml_metadata(request: Request):
+    """Описание архива для поставщика SAML (импортируется в ADFS, Entra ID, Keycloak)."""
+    from .. import saml
+    svc = svc_dep(request)
+    return Response(saml.sp_metadata(svc, request), media_type="application/samlmetadata+xml",
+                    headers={"Content-Disposition": 'inline; filename="mailarchiver-sp-metadata.xml"'})
+
+
+@router.get("/auth/saml/start", name="saml_start")
+def saml_start(request: Request):
+    from .. import saml
+    svc = svc_dep(request)
+    if not saml.enabled(svc) or not saml.available():
+        raise HTTPException(404, "Вход через SAML не настроен")
+    try:
+        url, cookie = saml.start(svc, request)
+    except saml.SamlError as exc:
+        return _sso_fail(svc, request, str(exc), "saml")
+    resp = RedirectResponse(url, status_code=303)
+    resp.set_cookie(saml.COOKIE, cookie, max_age=saml.STATE_TTL_S, path=saml.COOKIE_PATH, httponly=True,
+                    samesite="lax", secure=str(request.url.scheme).lower() == "https")
+    return resp
+
+
+@router.post("/auth/saml/acs", name="saml_acs")
+async def saml_acs(request: Request):
+    """Ответ поставщика (POST с его сайта, без cookie): проверить и передать браузеру одноразовый номер."""
+    from starlette.concurrency import run_in_threadpool
+    from .. import saml
+    svc = svc_dep(request)
+    if not saml.enabled(svc) or not saml.available():
+        raise HTTPException(404, "Вход через SAML не настроен")
+    form = await request.form()
+    try:
+        info = await run_in_threadpool(saml.consume, svc, str(form.get("SAMLResponse") or ""), request)
+        ticket = await run_in_threadpool(saml.park, svc, info)
+    except saml.SamlError as exc:
+        return await run_in_threadpool(_sso_fail, svc, request, str(exc), "saml")
+    return RedirectResponse("/api/auth/saml/finish?t=" + ticket, status_code=303)
+
+
+@router.get("/auth/saml/finish", name="saml_finish")
+def saml_finish(request: Request, t: str = ""):
+    from .. import saml
+    svc = svc_dep(request)
+    if not saml.enabled(svc):
+        raise HTTPException(404, "Вход через SAML не настроен")
+    try:
+        info = saml.claim(svc, t, request.cookies.get(saml.COOKIE, ""))
+        resp = RedirectResponse("/#/", status_code=303)
+        resp.delete_cookie(saml.COOKIE, path=saml.COOKIE_PATH)
+        return _sso_session(svc, request, resp, info, saml, "SAML")
+    except saml.SamlError as exc:
+        return _sso_fail(svc, request, str(exc), "saml")
+
+
+@router.post("/saml/check")
+def saml_check(request: Request, user: dict = Depends(auth_mod.require_admin)):
+    """Проверка настроек SAML: описание поставщика, сертификаты, что указать у поставщика."""
+    from .. import saml
+    return saml.check(svc_dep(request), request)
 
 
 @router.post("/setup")

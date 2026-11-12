@@ -1,0 +1,42 @@
+{
+  "realm": "corp",
+  "enabled": true,
+  "sslRequired": "none",
+  "groups": [{"name": "mail-archive-admins"}, {"name": "mail-archive-operators"}],
+  "users": [
+    {"username": "anna", "enabled": true, "email": "anna@corp.test", "emailVerified": true,
+     "firstName": "Anna", "lastName": "Admin", "groups": ["/mail-archive-admins"],
+     "credentials": [{"type": "password", "value": "Passw0rd-1", "temporary": false}]},
+    {"username": "petr", "enabled": true, "email": "petr@corp.test", "emailVerified": true,
+     "firstName": "Petr", "lastName": "Operator", "groups": ["/mail-archive-operators"],
+     "credentials": [{"type": "password", "value": "Passw0rd-1", "temporary": false}]},
+    {"username": "ivanov", "enabled": true, "email": "ivanov@corp.test", "emailVerified": true,
+     "firstName": "Ivan", "lastName": "Ivanov",
+     "credentials": [{"type": "password", "value": "Passw0rd-1", "temporary": false}]}
+  ],
+  "clients": [
+    {"clientId": "mailarchiver", "name": "MailArchiver (OIDC)", "protocol": "openid-connect", "enabled": true,
+     "publicClient": false, "clientAuthenticatorType": "client-secret", "secret": "kc-secret",
+     "standardFlowEnabled": true, "directAccessGrantsEnabled": false, "implicitFlowEnabled": false,
+     "redirectUris": ["http://testserver/api/auth/oidc/callback"],
+     "attributes": {"pkce.code.challenge.method": "S256"},
+     "protocolMappers": [
+       {"name": "groups", "protocol": "openid-connect", "protocolMapper": "oidc-group-membership-mapper",
+        "config": {"claim.name": "groups", "full.path": "false", "id.token.claim": "true",
+                   "access.token.claim": "true", "userinfo.token.claim": "true"}}]},
+    {"clientId": "http://testserver/api/auth/saml/metadata", "name": "MailArchiver (SAML)", "protocol": "saml",
+     "enabled": true, "frontchannelLogout": false,
+     "redirectUris": ["http://testserver/api/auth/saml/acs"],
+     "attributes": {"saml.client.signature": "false", "saml.server.signature": "true",
+                    "saml.assertion.signature": "true", "saml.signature.algorithm": "RSA_SHA256",
+                    "saml.encrypt": "false", "saml.authnstatement": "true",
+                    "saml_name_id_format": "username", "saml.force.name.id.format": "true",
+                    "saml_assertion_consumer_url_post": "http://testserver/api/auth/saml/acs"},
+     "protocolMappers": [
+       {"name": "groups", "protocol": "saml", "protocolMapper": "saml-group-membership-mapper",
+        "config": {"attribute.name": "groups", "friendly.name": "groups", "attribute.nameformat": "Basic",
+                   "single": "false", "full.path": "false"}},
+       {"name": "email", "protocol": "saml", "protocolMapper": "saml-user-property-mapper",
+        "config": {"user.attribute": "email", "attribute.name": "email", "attribute.nameformat": "Basic"}}]}
+  ]
+}

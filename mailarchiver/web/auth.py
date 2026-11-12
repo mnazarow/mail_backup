@@ -243,8 +243,8 @@ def two_factor_required(services, user: dict) -> bool:
         return False
     if user.get("totp_enabled"):
         return False
-    if user.get("auth_source") == "oidc":
-        return False        # единый вход (1.22.0): второй фактор проверяет поставщик удостоверений
+    if user.get("auth_source") in ("oidc", "saml"):
+        return False        # единый вход (1.22.0, SAML — 1.23.0): второй фактор проверяет поставщик удостоверений
     try:
         return bool(services.rt("security", "require_2fa"))
     except Exception:  # noqa: BLE001

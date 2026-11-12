@@ -8,11 +8,15 @@
 #           MA_IT=1 python -m pytest tests/integration
 #           sudo scripts/integration/stand.sh stop
 # Postfix настраивается в системном экземпляре (/etc/postfix) — запускайте стенд на тестовой машине (CI).
+# Keycloak (1.23.0, по желанию): MA_STAND_KEYCLOAK=<каталог распакованного Keycloak 26> — поставщик единого входа
+# OpenID Connect и SAML на http://127.0.0.1:8180, область corp из keycloak-realm.json (нужна Java 21).
 set -euo pipefail
 
 DIR="${MA_STAND_DIR:-/tmp/ma-stand}"
 PY="${MA_STAND_PYTHON:-python3}"
-IMAP_PORT=1143; LMTP_PORT=24024; SIEVE_PORT=14190; SMTP_PORT=2526; LDAP_PORT=3389; DAV_PORT=5232
+IMAP_PORT=1143; LMTP_PORT=24024; SIEVE_PORT=14190; SMTP_PORT=2526; LDAP_PORT=3389; DAV_PORT=5232; KC_PORT=8180
+KC_HOME="${MA_STAND_KEYCLOAK:-}"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 JOURNAL_PORT="${MA_IT_JOURNAL_PORT:-2525}"
 PASS="Passw0rd-1"; MASTER_PASS="Master-Pass-1"
 
@@ -110,7 +114,7 @@ plugin {
   sieve = file:~/sieve;active=~/.dovecot.sieve
 }
 EOF
-  dovecot -c "$DIR/dovecot.conf"
+  dovecot -c "$DIR/dovecot.conf" </dev/null >>"$DIR/dovecot.log" 2>&1   # без чужого stdout/stderr: иначе «stand.sh start | …» не закончится
 }
 
 start_postfix() {
@@ -124,7 +128,7 @@ start_postfix() {
     echo "127.0.0.1:$SMTP_PORT inet n - n - - smtpd" >> /etc/postfix/master.cf
   fi
   postfix check || true
-  postfix start 2>/dev/null || postfix reload
+  postfix start </dev/null >/dev/null 2>&1 || postfix reload </dev/null >/dev/null 2>&1
 }
 
 start_ldap() {
@@ -145,7 +149,7 @@ rootpw admin-pass
 directory $DIR/ldap-db
 overlay memberof
 EOF
-  slapd -f "$DIR/slapd.conf" -h "ldap://127.0.0.1:$LDAP_PORT/"
+  slapd -f "$DIR/slapd.conf" -h "ldap://127.0.0.1:$LDAP_PORT/" </dev/null >>"$DIR/slapd.log" 2>&1
   for _ in $(seq 1 50); do
     ldapsearch -x -H "ldap://127.0.0.1:$LDAP_PORT" -b "" -s base >/dev/null 2>&1 && break; sleep 0.2
   done
@@ -219,8 +223,30 @@ start_radicale() {
   for u in ivanov petrov; do echo "$u@corp.test:$PASS" >> "$DIR/htpasswd"; done
   nohup "$PY" -m radicale --server-hosts "127.0.0.1:$DAV_PORT" --storage-filesystem-folder "$DIR/radicale" \
     --auth-type htpasswd --auth-htpasswd-filename "$DIR/htpasswd" --auth-htpasswd-encryption plain \
-    --logging-level warning > "$DIR/radicale.log" 2>&1 &
+    --logging-level warning </dev/null > "$DIR/radicale.log" 2>&1 &
   echo $! > "$DIR/radicale.pid"
+}
+
+start_keycloak() {
+  [ -n "$KC_HOME" ] || return 0
+  [ -x "$KC_HOME/bin/kc.sh" ] || die "в MA_STAND_KEYCLOAK=$KC_HOME нет bin/kc.sh"
+  mkdir -p "$KC_HOME/data/import"
+  rm -rf "$KC_HOME/data/h2"                      # каждый запуск — с чистой областью из файла
+  cp "$HERE/keycloak-realm.json" "$KC_HOME/data/import/corp-realm.json"
+  KC_BOOTSTRAP_ADMIN_USERNAME=admin KC_BOOTSTRAP_ADMIN_PASSWORD="$MASTER_PASS" \
+    nohup "$KC_HOME/bin/kc.sh" start-dev --http-host 127.0.0.1 --http-port "$KC_PORT" \
+    --hostname "http://127.0.0.1:$KC_PORT" --import-realm </dev/null > "$DIR/keycloak.log" 2>&1 &
+  echo $! > "$DIR/keycloak.pid"
+}
+
+wait_keycloak() {
+  [ -n "$KC_HOME" ] || return 0
+  for _ in $(seq 1 180); do
+    curl -fsS --noproxy '*' "http://127.0.0.1:$KC_PORT/realms/corp/.well-known/openid-configuration" \
+      >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  die "Keycloak не запустился (см. $DIR/keycloak.log)"
 }
 
 wait_port() {
@@ -235,6 +261,10 @@ stop_all() {
   postfix stop 2>/dev/null || true
   [ -f "$DIR/slapd.pid" ] && kill "$(cat "$DIR/slapd.pid")" 2>/dev/null || true
   [ -f "$DIR/radicale.pid" ] && kill "$(cat "$DIR/radicale.pid")" 2>/dev/null || true
+  if [ -f "$DIR/keycloak.pid" ]; then
+    pkill -P "$(cat "$DIR/keycloak.pid")" 2>/dev/null || true
+    kill "$(cat "$DIR/keycloak.pid")" 2>/dev/null || true
+  fi
   sleep 1
 }
 
@@ -248,9 +278,9 @@ case "${1:-}" in
       done
     fi
     rm -rf "$DIR"; mkdir -p "$DIR"; chmod 755 "$DIR"
-    start_dovecot; start_postfix; start_ldap; start_radicale
+    start_dovecot; start_postfix; start_ldap; start_radicale; start_keycloak
     wait_port $IMAP_PORT dovecot; wait_port $LMTP_PORT lmtp; wait_port $SIEVE_PORT managesieve
-    wait_port $SMTP_PORT postfix; wait_port $LDAP_PORT slapd; wait_port $DAV_PORT radicale
+    wait_port $SMTP_PORT postfix; wait_port $LDAP_PORT slapd; wait_port $DAV_PORT radicale; wait_keycloak
     cat > "$DIR/env" <<EOF
 MA_IT=1
 MA_IT_IMAP=127.0.0.1:$IMAP_PORT
@@ -263,12 +293,13 @@ MA_IT_PASS=$PASS
 MA_IT_MASTER=archiver:$MASTER_PASS
 MA_IT_DIR=$DIR
 EOF
+    if [ -n "$KC_HOME" ]; then echo "MA_IT_KEYCLOAK=http://127.0.0.1:$KC_PORT" >> "$DIR/env"; fi
     chmod 644 "$DIR/env"
     echo "стенд запущен: $DIR/env"
     ;;
   stop) stop_all; echo "стенд остановлен" ;;
   status)
-    for p in $IMAP_PORT $LMTP_PORT $SIEVE_PORT $SMTP_PORT $LDAP_PORT $DAV_PORT; do
+    for p in $IMAP_PORT $LMTP_PORT $SIEVE_PORT $SMTP_PORT $LDAP_PORT $DAV_PORT $KC_PORT; do
       (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null && echo "$p открыт" || echo "$p закрыт"
     done ;;
   *) echo "использование: $0 start|stop|status" >&2; exit 2 ;;

@@ -1874,6 +1874,106 @@ PARAM_HELP: Dict[str, dict] = {
         "help": "Выключать только для проверки на стенде.",
         "recommend": "Включено.", "example": "true", "default": "true",
     },
+    # --- единый вход SAML 2.0 (1.23.0) ---
+    "saml.enabled": {
+        "title": "Вход через SAML",
+        "help": ("На странице входа появляется кнопка входа через поставщика SAML 2.0 (ADFS, Entra ID, Keycloak, "
+                 "Shibboleth, Okta). Архив — поставщик услуг: передайте поставщику его описание (адрес — в блоке "
+                 "«Проверка» ниже) или идентификатор и адрес приёма ответа. Ответ поставщика должен быть "
+                 "подписан (утверждение или весь ответ), шифрование утверждений не поддерживается."),
+        "recommend": "Включите, если в организации есть ADFS или другой поставщик SAML, а OpenID Connect он не умеет.",
+        "example": "true", "default": "false",
+    },
+    "saml.idp_metadata_url": {
+        "title": "Адрес описания поставщика",
+        "help": ("Описание поставщика (metadata): отсюда берутся его идентификатор, адрес входа и сертификат "
+                 "подписи; перечитывается раз в час — смена сертификата у поставщика подхватывается сама. ADFS — "
+                 "https://adfs.company.ru/FederationMetadata/2007-06/FederationMetadata.xml, Keycloak — "
+                 "https://sso.company.ru/realms/company/protocol/saml/descriptor, Entra ID — «Federation Metadata "
+                 "Url» приложения. Только https."),
+        "recommend": "Укажите адрес описания — тогда три поля ниже можно не заполнять.",
+        "example": "https://adfs.company.ru/FederationMetadata/2007-06/FederationMetadata.xml", "default": "",
+    },
+    "saml.idp_entity_id": {
+        "title": "Идентификатор поставщика",
+        "help": "entityID поставщика (Issuer в его ответах). Пусто — из описания.",
+        "recommend": "Пусто, если указан адрес описания.", "example": "http://adfs.company.ru/adfs/services/trust",
+        "default": "",
+    },
+    "saml.idp_sso_url": {
+        "title": "Адрес входа у поставщика",
+        "help": "Куда отправлять браузер с запросом входа (привязка HTTP-Redirect). Пусто — из описания.",
+        "recommend": "Пусто, если указан адрес описания.", "example": "https://adfs.company.ru/adfs/ls/",
+        "default": "",
+    },
+    "saml.idp_cert": {
+        "title": "Сертификат подписи поставщика",
+        "help": ("Сертификат, которым поставщик подписывает ответы (PEM или base64 одной строкой). Если задан — "
+                 "доверяется только он, сертификаты из описания не используются. Сертификат из самого ответа "
+                 "архив не принимает никогда."),
+        "recommend": "Пусто, если указан адрес описания; задайте, если описание недоступно серверу архива.",
+        "example": "MIIC8DCCAdigAwIBAgIQ…", "default": "",
+    },
+    "saml.sp_entity_id": {
+        "title": "Идентификатор архива (SP entityID)",
+        "help": ("Под этим именем архив заведён у поставщика (у ADFS — «идентификатор доверяющей стороны», у "
+                 "Keycloak — Client ID). Пусто — адрес описания архива: <адрес интерфейса>/api/auth/saml/metadata."),
+        "recommend": "Пусто.", "example": "https://mail-archive.company.ru/api/auth/saml/metadata", "default": "",
+    },
+    "saml.acs_url": {
+        "title": "Адрес приёма ответа (ACS)",
+        "help": ("Куда поставщик возвращает браузер с ответом (привязка HTTP-POST). Пусто — <адрес интерфейса>/"
+                 "api/auth/saml/acs; без «Адреса интерфейса» — адрес, по которому открыт архив."),
+        "recommend": "Пусто; заполните «Адрес интерфейса» в разделе «Сервер и сеть».",
+        "example": "https://mail-archive.company.ru/api/auth/saml/acs", "default": "",
+    },
+    "saml.username_attribute": {
+        "title": "Атрибут с логином",
+        "help": ("Логин пользователя в архиве. Пусто — NameID ответа. Для ADFS обычно "
+                 "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/upn или NameID."),
+        "recommend": "Пусто.", "example": "uid", "default": "",
+    },
+    "saml.email_attribute": {
+        "title": "Атрибут с адресом почты",
+        "help": ("Адрес почты (нужен для входа сотрудников в свои ящики). Пусто — ищутся email, mail, emailaddress "
+                 "и urn:oid:0.9.2342.19200300.100.1.3, иначе NameID, если он похож на адрес."),
+        "recommend": "Пусто.", "example": "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress",
+        "default": "",
+    },
+    "saml.role_attribute": {
+        "title": "Атрибут с группами",
+        "help": ("Атрибут, значения которого сравниваются с группами администраторов и операторов (без учёта "
+                 "регистра). ADFS — http://schemas.microsoft.com/ws/2008/06/identity/claims/role или groups, Entra "
+                 "ID — http://schemas.microsoft.com/ws/2008/06/identity/claims/groups (идентификаторы групп), "
+                 "Keycloak — имя сопоставления групп."),
+        "recommend": "Атрибут групп вашего поставщика.", "example": "groups", "default": "groups",
+    },
+    "saml.admin_values": {
+        "title": "Группы администраторов",
+        "help": "Значения атрибута групп, дающие роль администратора архива (одно совпадение).",
+        "recommend": "Одна отдельная группа.", "example": "mail-archive-admins", "default": "",
+    },
+    "saml.operator_values": {
+        "title": "Группы операторов",
+        "help": "Значения атрибута групп, дающие роль оператора.",
+        "recommend": "Группа дежурных.", "example": "mail-archive-operators", "default": "",
+    },
+    "saml.employee_login": {
+        "title": "Сотрудники входят через SAML",
+        "help": ("Кто не входит в группы архива, но передан с адресом почты, входит сотрудником в архив своих ящиков "
+                 "(ящик находится по адресу — логину ящика или адресу сотрудника в справочнике)."),
+        "recommend": "Включите, если сотрудникам нужен свой архив и «Почта».", "example": "true", "default": "false",
+    },
+    "saml.button_text": {
+        "title": "Надпись на кнопке",
+        "help": "Текст кнопки на странице входа.", "recommend": "Название поставщика.",
+        "example": "Войти через ADFS", "default": "Войти через SAML",
+    },
+    "saml.verify_ssl": {
+        "title": "Проверять сертификат https описания",
+        "help": "Проверять сертификат сервера, с которого читается описание поставщика. Выключать только на стенде.",
+        "recommend": "Включено.", "example": "true", "default": "true",
+    },
 }
 
 # Порядок и группировка секций для страницы настроек
@@ -1955,6 +2055,10 @@ SETTINGS_SECTIONS: List[dict] = [
      "keys": ["enabled", "issuer", "client_id", "client_secret", "scopes", "username_claim", "role_claim",
               "admin_values", "operator_values", "employee_login", "use_userinfo", "button_text", "redirect_uri",
               "verify_ssl"]},
+    {"section": "saml", "title": "Единый вход (SAML 2.0)", "icon": "🪪",
+     "keys": ["enabled", "idp_metadata_url", "idp_entity_id", "idp_sso_url", "idp_cert", "sp_entity_id", "acs_url",
+              "username_attribute", "email_attribute", "role_attribute", "admin_values", "operator_values",
+              "employee_login", "button_text", "verify_ssl"]},
     {"section": "mailadmin", "title": "Вход в ящики через администратора почты", "icon": "🗝️",
      "keys": ["enabled", "host", "user", "password", "mode", "separator"]},
     {"section": "axigen", "title": "Сервер Axigen", "icon": "📮",

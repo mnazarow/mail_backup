@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mailarchiver"
-version = "1.22.0"
+version = "1.23.0"
 description = "Сервис резервного копирования почтовых ящиков по IMAP с веб-интерфейсом, очередью, планировщиком и экспортом в .pst"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -23,6 +23,7 @@ dependencies = [
     "cryptography>=44.0",
     "PyYAML>=6.0.3,<7",
     "openpyxl>=3.1,<4",
+    "signxml>=5.3,<6",
 ]
 
 [project.optional-dependencies]

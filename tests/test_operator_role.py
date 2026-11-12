@@ -41,6 +41,9 @@ SELF_ROUTES = {
     ("POST", "/api/me/2fa/enable"), ("POST", "/api/me/2fa/disable"), ("POST", "/api/me/2fa/recovery"),
     # единый вход (1.22.0): начало и возврат от поставщика — до входа, роли ещё нет
     ("GET", "/api/auth/oidc/start"), ("GET", "/api/auth/oidc/callback"),
+    # SAML (1.23.0): описание архива, начало, ответ поставщика, завершение — тоже до входа
+    ("GET", "/api/auth/saml/metadata"), ("GET", "/api/auth/saml/start"), ("POST", "/api/auth/saml/acs"),
+    ("GET", "/api/auth/saml/finish"),
 }
 
 

@@ -297,6 +297,9 @@ class Database:
             # уведомления о новой почте на устройства сотрудников (Web Push, 1.22.0)
             from .webpush import ensure_schema as _ensure_webpush
             _ensure_webpush(conn)
+            # единый вход: одноразовые отметки (SAML, 1.23.0)
+            from .sso import ensure_schema as _ensure_sso
+            _ensure_sso(conn)
         self._encrypt_plain_settings()
 
     def _encrypt_plain_settings(self) -> None:
