@@ -50,6 +50,36 @@ jobs:
       - name: Тесты
         run: python -m pytest -q -rs
 
+  postgres:
+    # Весь набор тестов на PostgreSQL (1.24.0): у каждого теста своя схема, после теста она удаляется
+    name: Тесты на PostgreSQL 16
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: ci-password
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Зависимости
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install --no-deps -e .
+          pip install "pytest>=8" "pytest-xdist>=3.5" "httpx>=0.28" "httpx2>=2.16"
+          sudo apt-get install -y postgresql-client
+      - name: Тесты
+        env:
+          MA_TEST_PG: postgresql://postgres:ci-password@127.0.0.1:5432/postgres
+        run: python -m pytest -q -rs -n 4 --dist loadfile
+
   scripts:
     name: Скрипты установки и обновления (песочница)
     runs-on: ubuntu-latest
