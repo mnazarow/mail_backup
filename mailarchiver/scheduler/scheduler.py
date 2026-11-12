@@ -78,6 +78,10 @@ class SchedulerService:
             self._sched.add_job(self._search_index_tick, IntervalTrigger(minutes=10), id="search_index",
                                 replace_existing=True, coalesce=True, misfire_grace_time=600,
                                 next_run_time=datetime.now(timezone.utc) + timedelta(minutes=3))
+            # индекс ответов на письма (раздел «Ответы на письма») — тоже каждые 10 минут
+            self._sched.add_job(self._reply_index_tick, IntervalTrigger(minutes=10), id="reply_index",
+                                replace_existing=True, coalesce=True, misfire_grace_time=600,
+                                next_run_time=datetime.now(timezone.utc) + timedelta(minutes=4))
             # состояние сервера Axigen — каждые 15 минут (сама проверка смотрит, включена ли она)
             self._sched.add_job(self._axigen_monitor_tick, IntervalTrigger(minutes=15), id="axigen_monitor",
                                 replace_existing=True, coalesce=True, max_instances=1, misfire_grace_time=600,
@@ -527,6 +531,22 @@ class SchedulerService:
             return svc.queue.enqueue(JobType.SEARCH_INDEX, None, {}, priority=8, created_by="scheduler")
         except Exception:  # noqa: BLE001
             log.exception("Ошибка при постановке индексации поиска")
+            return None
+
+    def _reply_index_tick(self) -> Optional[int]:
+        """Индекс ответов на письма: новые письма — в индекс (раздел «Ответы на письма»)."""
+        svc = self.services
+        try:
+            if not bool(svc.rt("replies", "enabled")):
+                return None
+            from ..replies import pending_count
+            if pending_count(svc.db) <= 0:
+                return None
+            if any(job["type"] == JobType.REPLY_INDEX for job in svc.db.active_jobs()):
+                return None
+            return svc.queue.enqueue(JobType.REPLY_INDEX, None, {}, priority=9, created_by="scheduler")
+        except Exception:  # noqa: BLE001
+            log.exception("Ошибка при постановке индекса ответов")
             return None
 
     # -- обслуживание --------------------------------------------------------

@@ -254,6 +254,9 @@ class Database:
             # подключения к почтовым серверам (1.14.0)
             from .mailservers.store import ensure_schema as _ensure_mailservers
             _ensure_mailservers(conn)
+            # индекс ответов на письма — раздел «Ответы на письма» (1.16.0)
+            from .replies import ensure_schema as _ensure_replies
+            _ensure_replies(conn)
         self._encrypt_plain_settings()
 
     def _encrypt_plain_settings(self) -> None:

@@ -21,7 +21,7 @@ import os
 import re
 import secrets
 import shlex
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import yaml
 
@@ -143,6 +143,16 @@ DEFAULTS: Dict[str, Any] = {
         "index_bodies": True,          # искать и по тексту писем (иначе — тема, адреса, вложения)
         "index_bodies_encrypted": False,  # индексировать текст, даже если копия шифруется (текст ляжет в базу открыто)
         "body_max_kb": 16,             # сколько текста письма индексировать, КБ (цитаты прошлых писем отбрасываются)
+    },
+    "replies": {
+        # Раздел «Ответы на письма» (1.16.0): связи «письмо — ответ» по заголовкам In-Reply-To и References.
+        "enabled": True,               # вести индекс ответов (фоновое задание читает заголовки новых писем)
+        "sla_hours": 24,               # срок ответа на входящее письмо, часов
+        "sla_business": False,         # срок считать в рабочих часах (по work_days / work_hours)
+        "work_days": "1-5",            # рабочие дни недели: 1 — понедельник … 7 — воскресенье
+        "work_hours": "09:00-18:00",   # рабочее время (по часовому поясу планировщика)
+        "internal_domains": [],        # свои домены сверх доменов ящиков архива (внутренняя переписка)
+        "exclude_senders": [],         # не ждать ответа на письма этих адресов: адрес, @домен, домен или маска *
     },
     "mailadmin": {
         # Вход в ящики учётной записью администратора почты — без паролей сотрудников.
@@ -316,6 +326,7 @@ VALUE_RANGES: Dict[str, tuple] = {
     "axigen.alert_quota_percent": (0, 100),
     # replica
     "search.body_max_kb": (1, 1024),
+    "replies.sla_hours": (1, 8760),
     "replica.db_snapshot_keep": (0, 365),
     "replica.max_delete_percent": (0, 100),
     "replica.parallel": (1, 32),
@@ -327,6 +338,56 @@ VALUE_RANGES: Dict[str, tuple] = {
     "notifications.smtp_port": (1, 65535),
     "database.busy_timeout_ms": (100, 600000),
 }
+
+
+def parse_work_days(text: str, strict: bool = False) -> frozenset:
+    """Рабочие дни недели из строки «1-5», «1,2,3,4,5» или «1-4,6» (1 — понедельник … 7 — воскресенье).
+
+    ``strict`` — неверная строка даёт ``ValueError`` (проверка при сохранении), иначе — понедельник–пятница.
+    """
+    days = set()
+    try:
+        for chunk in str(text or "").replace(" ", "").split(","):
+            if not chunk:
+                continue
+            lo, _, hi = chunk.partition("-")
+            a, b = int(lo), int(hi or lo)
+            if not (1 <= a <= 7 and 1 <= b <= 7 and a <= b):
+                raise ValueError(chunk)
+            days.update(range(a, b + 1))
+        if not days:
+            raise ValueError("пусто")
+    except ValueError:
+        if strict:
+            raise ValueError("Рабочие дни: номера дней недели от 1 (понедельник) до 7 (воскресенье) через запятую "
+                             "или диапазоном, например «1-5».") from None
+        return frozenset(range(1, 6))
+    return frozenset(days)
+
+
+def parse_work_hours(text: str, strict: bool = False) -> Tuple[int, int]:
+    """Рабочее время «09:00-18:00» → (минута начала, минута конца) от полуночи.
+
+    ``strict`` — неверная строка даёт ``ValueError``, иначе — 9:00–18:00.
+    """
+    try:
+        lo, _, hi = str(text or "").replace(" ", "").replace("–", "-").partition("-")
+
+        def minutes(value: str) -> int:
+            h, _, m = value.partition(":")
+            hh, mm = int(h), int(m or 0)
+            if not (0 <= hh <= 24 and 0 <= mm < 60) or (hh == 24 and mm):
+                raise ValueError(value)
+            return hh * 60 + mm
+        start, end = minutes(lo), minutes(hi)
+        if start >= end:
+            raise ValueError(text)
+    except ValueError:
+        if strict:
+            raise ValueError("Рабочее время: начало и конец через дефис, например «09:00-18:00»; конец позже "
+                             "начала.") from None
+        return 9 * 60, 18 * 60
+    return start, end
 
 
 def check_value_range(full_key: str, value):
@@ -462,6 +523,10 @@ def coerce_setting(full_key: str, value):
             ZoneInfo(out)
         except Exception:  # noqa: BLE001
             raise ValueError(f"Неизвестный часовой пояс «{out}». Пример: Europe/Moscow.") from None
+    if full_key == "replies.work_days":
+        parse_work_days(out, strict=True)
+    if full_key == "replies.work_hours":
+        parse_work_hours(out, strict=True)
     if full_key == "storage.encryption_key_file" and out and not os.path.isabs(out):
         raise ValueError("Путь к файлу ключа должен быть абсолютным (например /etc/mailarchiver/storage.key).")
     if full_key == "server.public_url" and out and not out.lower().startswith(("http://", "https://")):

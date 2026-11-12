@@ -35,11 +35,12 @@ class JobType:
     AXIGEN_ACTION = "axigen_action"      # изменения на сервере Axigen для выбранных ящиков
     SERVER_ACTION = "server_action"      # групповые действия с ящиками на почтовом сервере (Axigen и IMAP)
     SERVER_SYNC = "server_sync"          # сверка учётных записей подключённого почтового сервера
+    REPLY_INDEX = "reply_index"          # индекс ответов на письма (раздел «Ответы на письма»)
 
     ALL = [BACKUP, RESTORE, EXPORT, IMPORT_PST, TEST, RETENTION, VERIFY, ANALYZE, SYNC_EMPLOYEES,
            STORAGE_CONVERT, CHECK_LOGINS, REPLICATE, DB_SNAPSHOT, SEARCH_INDEX, DEDUP_REPORT, CLEANUP,
            BACKUP_ALL, QUARANTINE_CHECK, QUARANTINE_RESCUE, FOLDERS_CHECK, SEARCH_REINDEX, AXIGEN_SYNC,
-           AXIGEN_ACTION, SERVER_ACTION, SERVER_SYNC]
+           AXIGEN_ACTION, SERVER_ACTION, SERVER_SYNC, REPLY_INDEX]
     LABELS = {
         BACKUP: "Резервное копирование",
         RESTORE: "Восстановление",
@@ -66,6 +67,7 @@ class JobType:
         AXIGEN_ACTION: "Действия на сервере Axigen",
         SERVER_ACTION: "Действия с ящиками на сервере",
         SERVER_SYNC: "Сверка с почтовым сервером",
+        REPLY_INDEX: "Индекс ответов на письма",
     }
     #: Задания, которые после перезапуска службы не продолжаются сами: они меняют
     #: почтовый сервер по кнопке администратора, а за время простоя состояние могли

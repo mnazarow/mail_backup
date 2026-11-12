@@ -29,6 +29,7 @@ from .api import router as api_router
 from .bulk_api import router as bulk_router
 from .axigen_api import router as axigen_router
 from .mailservers_api import router as mailservers_router
+from .replies_api import router as replies_router
 from .server_api import router as server_router
 from .proxy import SECURITY_HEADERS, BodyLimitMiddleware, ProxyHeadersMiddleware, SecurityHeadersMiddleware
 from .ws import router as ws_router
@@ -188,6 +189,7 @@ def create_app() -> FastAPI:
     app.include_router(axigen_router)
     app.include_router(server_router)
     app.include_router(mailservers_router)
+    app.include_router(replies_router)
     app.include_router(api_router)
     app.include_router(ws_router)
 

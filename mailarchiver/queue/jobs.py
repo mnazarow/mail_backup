@@ -1669,6 +1669,26 @@ def handle_search_index(ctx: JobContext) -> Dict:
     return {"final_status": JobStatus.SUCCESS, "summary": summary, **res}
 
 
+#: Сколько секунд один проход индекса ответов разбирает письма; остальное — следующим проходом.
+REPLY_INDEX_SLICE_S = 600
+
+
+def handle_reply_index(ctx: JobContext) -> Dict:
+    """Индекс ответов на письма: разобрать заголовки новых писем и связать ответы с письмами."""
+    from ..replies import index_pending
+    res = index_pending(ctx.services, progress=ctx.progress, cancelled=ctx.is_cancelled, event=ctx.event,
+                        max_seconds=float(ctx.params.get("max_seconds") or REPLY_INDEX_SLICE_S))
+    summary = (f"Разобрано писем: {res['indexed']}"
+               + (f", осталось {res['pending']} (продолжится автоматически)" if res["pending"] else "")
+               + (f"; заголовки не прочитаны (в индексе без связей с ответами): {res['errors']}"
+                  if res["errors"] else "") + ".")
+    if res.get("stopped") == "reset":
+        summary += " Индекс пересобрали во время работы — разбор начнётся заново."
+    if ctx.is_cancelled():
+        raise JobCancelled(ctx.stop_reason() + ". " + summary)
+    return {"final_status": JobStatus.SUCCESS, "summary": summary, **res}
+
+
 def handle_search_reindex(ctx: JobContext) -> Dict:
     """Переиндексировать поиск по выбранным ящикам (групповое действие).
 
@@ -2599,6 +2619,7 @@ HANDLERS: Dict[str, Callable[[JobContext], Dict]] = {
     JobType.REPLICATE: handle_replicate,
     JobType.DB_SNAPSHOT: handle_db_snapshot,
     JobType.SEARCH_INDEX: handle_search_index,
+    JobType.REPLY_INDEX: handle_reply_index,
     JobType.DEDUP_REPORT: handle_dedup_report,
     JobType.BACKUP_ALL: handle_backup_all,
     JobType.CLEANUP: handle_cleanup,

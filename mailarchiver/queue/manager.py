@@ -45,10 +45,11 @@ LOCAL_JOB_TYPES = (JobType.BACKUP, JobType.RETENTION, JobType.STORAGE_CONVERT, J
 SINGLETON_JOB_TYPES = (JobType.SYNC_EMPLOYEES, JobType.CHECK_LOGINS, JobType.REPLICATE,
                        JobType.DB_SNAPSHOT, JobType.SEARCH_INDEX, JobType.DEDUP_REPORT,
                        JobType.BACKUP_ALL, JobType.SEARCH_REINDEX, JobType.FOLDERS_CHECK,
-                       JobType.AXIGEN_SYNC, JobType.AXIGEN_ACTION, JobType.SERVER_ACTION, JobType.SERVER_SYNC)
+                       JobType.AXIGEN_SYNC, JobType.AXIGEN_ACTION, JobType.SERVER_ACTION, JobType.SERVER_SYNC,
+                       JobType.REPLY_INDEX)
 #: О каких заданиях не слать уведомления (служебные, по кнопке).
 _QUIET_TYPES = (JobType.TEST, JobType.CHECK_LOGINS, JobType.SEARCH_INDEX, JobType.DEDUP_REPORT,
-                JobType.QUARANTINE_CHECK, JobType.FOLDERS_CHECK, JobType.SEARCH_REINDEX)
+                JobType.QUARANTINE_CHECK, JobType.FOLDERS_CHECK, JobType.SEARCH_REINDEX, JobType.REPLY_INDEX)
 
 
 class QueueManager:

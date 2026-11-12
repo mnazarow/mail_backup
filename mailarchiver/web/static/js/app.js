@@ -345,6 +345,7 @@ const NAV = [
   {id:'dashboard', icon:'📊', title:'Дашборд', roles:'aom'},
   {id:'analytics', icon:'📈', title:'Аналитика', roles:'ao'},
   {id:'mailanalytics', icon:'🔎', title:'Аналитика писем', roles:'a'},
+  {id:'replies', icon:'↩️', title:'Ответы на письма', roles:'am'},
   {id:'mail', icon:'📧', title:'Почта', roles:'am'},
   {id:'accounts', icon:'📬', title:'Почтовые ящики', roles:'ao'},
   {id:'employees', icon:'🧑‍💼', title:'Сотрудники', roles:'a'},
@@ -548,7 +549,7 @@ function route(){
   const c=h('<div class="view-host"><div class="empty"><div class="spinner"></div></div></div>');
   content.appendChild(c);
   State.routeSeq=(State.routeSeq||0)+1;
-  const map={dashboard:viewDashboard,analytics:viewAnalytics,mailanalytics:viewMailAnalytics,mail:viewMail,accounts:viewAccounts,employees:viewEmployees,jobs:viewJobs,exports:viewExports,schedules:viewSchedules,axigen:viewAxigen,mailservers:viewMailservers,server:viewServer,logs:viewLogs,settings:viewSettings,users:viewUsers,security:viewSecurity,audit:viewAudit,docs:viewDocs};
+  const map={dashboard:viewDashboard,analytics:viewAnalytics,mailanalytics:viewMailAnalytics,replies:viewReplies,mail:viewMail,accounts:viewAccounts,employees:viewEmployees,jobs:viewJobs,exports:viewExports,schedules:viewSchedules,axigen:viewAxigen,mailservers:viewMailservers,server:viewServer,logs:viewLogs,settings:viewSettings,users:viewUsers,security:viewSecurity,audit:viewAudit,docs:viewDocs};
   (map[view]||viewDashboard)(c).catch(toastErr);
 }
 
@@ -3716,7 +3717,7 @@ function userModal(){
 //  Документация — встроенная справка внутри интерфейса
 // ===================================================================
 //: Глава справки для каждого раздела: «📖 Справка» в шапке открывает её.
-const DOC_ANCHORS={dashboard:'dashboard', analytics:'analytics', mailanalytics:'mailanalytics', mail:'mailview',
+const DOC_ANCHORS={dashboard:'dashboard', analytics:'analytics', mailanalytics:'mailanalytics', replies:'replies', mail:'mailview',
   accounts:'mailboxes', employees:'employees', jobs:'jobs', exports:'export', schedules:'schedules', axigen:'axigen',
   mailservers:'mailservers', server:'serverbulk', logs:'jobs', settings:'settings', users:'roles',
   security:'secjournal', audit:'audit'};
@@ -4353,7 +4354,7 @@ const STATUS_LBL = {queued:'в очереди',running:'выполняется',
 // Задания, которые меняли почтовый сервер: «Повторить» у них нет — повтор вслепую изменил бы ещё раз и
 // уже изменённые ящики. Их запускают заново из раздела, с проверкой.
 const NO_RETRY_JOBS = new Set(['axigen_action','server_action']);
-const JOBLBL = {backup:'Резервное копирование',restore:'Восстановление',export:'Экспорт',import_pst:'Импорт PST',test:'Проверка подключения',retention:'Очистка (ретеншн)',verify:'Проверка целостности',analyze:'Глубокий анализ писем',sync_employees:'Синхронизация сотрудников',storage_convert:'Шифрование копии',check_logins:'Проверка паролей',replicate:'Копия вне сервера',db_snapshot:'Снимок базы',search_index:'Индексация поиска',dedup_report:'Отчёт об одинаковых вложениях',cleanup:'Удаление архивов и прежних копий',backup_all:'Копирование всех ящиков по очереди',quarantine_check:'Сравнение прежней копии с новой',quarantine_rescue:'Возврат писем из прежней копии',folders_check:'Проверка папок на сервере',search_reindex:'Переиндексация поиска',axigen_sync:'Сверка с сервером Axigen',axigen_action:'Действия на сервере Axigen',server_action:'Действия с ящиками на сервере',server_sync:'Сверка с почтовым сервером'};
+const JOBLBL = {backup:'Резервное копирование',restore:'Восстановление',export:'Экспорт',import_pst:'Импорт PST',test:'Проверка подключения',retention:'Очистка (ретеншн)',verify:'Проверка целостности',analyze:'Глубокий анализ писем',sync_employees:'Синхронизация сотрудников',storage_convert:'Шифрование копии',check_logins:'Проверка паролей',replicate:'Копия вне сервера',db_snapshot:'Снимок базы',search_index:'Индексация поиска',dedup_report:'Отчёт об одинаковых вложениях',cleanup:'Удаление архивов и прежних копий',backup_all:'Копирование всех ящиков по очереди',quarantine_check:'Сравнение прежней копии с новой',quarantine_rescue:'Возврат писем из прежней копии',folders_check:'Проверка папок на сервере',search_reindex:'Переиндексация поиска',axigen_sync:'Сверка с сервером Axigen',axigen_action:'Действия на сервере Axigen',server_action:'Действия с ящиками на сервере',server_sync:'Сверка с почтовым сервером',reply_index:'Индекс ответов на письма'};
 function cvar(n,f){ const v=getComputedStyle(document.documentElement).getPropertyValue(n).trim(); return v||f; }
 function fmtNum(n){ return Number(n||0).toLocaleString('ru-RU'); }
 function trunc(s,n){ s=String(s==null?'':s); return s.length>n? s.slice(0,n-1)+'…':s; }
@@ -4445,7 +4446,7 @@ function donutLegend(slices){ const tot=slices.reduce((s,d)=>s+(d.value||0),0)||
 function chartHeat(container, matrix, rowLabels, opts={}){
   const rows=matrix.length, cols=(matrix[0]||[]).length, H=opts.height||(rows*22+30);
   drawInto(container,H,(ctx,W)=>{
-    const dim=cvar('--text-dim','#888'), base=cvar('--primary','#2f6fed');
+    const dim=cvar('--text-dim','#888'), base=opts.color||cvar('--primary','#2f6fed');
     if(!rows||!cols){ cEmpty(ctx,W,H); return; }
     const padL=34,padT=6,padB=16, gw=(W-padL-6)/cols, gh=(H-padT-padB)/rows;
     let max=opts.max||1; matrix.forEach(r=>r.forEach(v=>{ if(v>max)max=v; }));
@@ -4668,6 +4669,445 @@ function renderDedup(body, r, st, redraws){
     add(()=>chartHBars($('#ddBoxes',box), r.by_account, {colorByIndex:true, labelChars:22, valW:70, fmt:x=>x.value_h, height:Math.max(80,r.by_account.length*27+14)}));
     registerCharts(redraws);
   }
+}
+
+// ===================================================================
+//  Раздел «Ответы на письма» (1.16.0): кто, как быстро и на что отвечает
+// ===================================================================
+// Фильтры раздела живут, пока открыта вкладка: возврат в раздел показывает тот же отбор.
+const RP = {period:'30', from:'', to:'', acc:'', dep:'', scope:'all', kinds:'0', addressed:'all', incoming:'all',
+  sla:'', slaBiz:'', heat:'count', accSort:'count', accDir:-1, accText:'', peerTab:'senders', domTab:'domains',
+  list:'overdue', order:'old', text:'', meta:null};
+const RP_PERIODS=[['7','7 дней'],['30','30 дней'],['90','90 дней'],['180','полгода'],['365','год'],['0','всё время'],['custom','свой период…']];
+const RP_KINDS=[['0','Только личные'],['0,4','Личные и исключённые'],['0,2','Личные и рассылки'],['0,1,2,3,4','Все письма']];
+
+/** Длительность по-человечески: «2 ч 15 мин», «3 д 4 ч». */
+function fmtDur(s){
+  if(s==null || isNaN(s)) return '—';
+  s=Math.max(0,Math.round(s));
+  if(s<60) return s+' с';
+  if(s<3600) return Math.round(s/60)+' мин';
+  if(s<86400){ const hh=Math.floor(s/3600), mm=Math.round((s%3600)/60); return hh+' ч'+(mm?' '+mm+' мин':''); }
+  const d=Math.floor(s/86400), hh=Math.round((s%86400)/3600); return d+' д'+(hh?' '+hh+' ч':'');
+}
+function fmtPct(v){ return v==null?'—':(Number(v).toLocaleString('ru-RU',{maximumFractionDigits:1})+'%'); }
+/** Изменение к прошлому периоду: стрелка и цвет — «хорошо» или «плохо» (better: 'up' | 'down'). */
+function rpDelta(cur, prev, better, kind){
+  if(cur==null || prev==null) return '';
+  const diff=cur-prev; if(Math.abs(diff)<1e-9) return '<span class="rp-delta same">= как в прошлом периоде</span>';
+  const good = better==='up' ? diff>0 : diff<0;
+  const cls = better==='none' ? 'same' : (good?'good':'bad');
+  let txt;
+  if(kind==='pct') txt=(diff>0?'+':'−')+Math.abs(diff).toLocaleString('ru-RU',{maximumFractionDigits:1})+' п.п.';
+  else if(kind==='dur') txt=(diff>0?'+':'−')+fmtDur(Math.abs(diff));
+  else { const rel=prev? Math.round(100*diff/prev):null; txt=(diff>0?'+':'−')+fmtNum(Math.abs(diff))+(rel!=null&&isFinite(rel)?` (${diff>0?'+':'−'}${Math.abs(rel)}%)`:''); }
+  return `<span class="rp-delta ${cls}" title="К прошлому такому же периоду">${diff>0?'▲':'▼'} ${txt}</span>`;
+}
+function rpParams(extra){
+  const p=new URLSearchParams();
+  if(RP.period==='custom'){ if(RP.from) p.set('date_from',RP.from); if(RP.to) p.set('date_to',RP.to); }
+  else p.set('days', RP.period);
+  if(RP.acc) p.set('account_id', RP.acc);
+  if(RP.dep && !RP.acc) p.set('department', RP.dep);
+  p.set('kinds', RP.kinds); p.set('scope', RP.scope); p.set('addressed', RP.addressed); p.set('incoming', RP.incoming);
+  if(RP.sla) p.set('sla', RP.sla);
+  if(RP.slaBiz!=='') p.set('sla_business', RP.slaBiz);
+  Object.entries(extra||{}).forEach(([k,v])=>p.set(k,v));
+  return p.toString();
+}
+
+// ---- графики раздела: составные столбцы, несколько линий, подсказки при наведении ----
+function chartTipAttach(container, find){
+  const cv=container.querySelector('canvas'); if(!cv) return;
+  let tip=container.querySelector('.chart-tip');
+  if(!tip){ tip=document.createElement('div'); tip.className='chart-tip'; tip.hidden=true; container.appendChild(tip); }
+  cv.onmousemove=(e)=>{
+    const r=cv.getBoundingClientRect(); const html=find(e.clientX-r.left, e.clientY-r.top);
+    if(!html){ tip.hidden=true; return; }
+    tip.innerHTML=html; tip.hidden=false;
+    const w=tip.offsetWidth, x=e.clientX-r.left;
+    tip.style.left=Math.max(0,Math.min(r.width-w, x+12))+'px'; tip.style.top=Math.max(0,e.clientY-r.top-tip.offsetHeight-10)+'px';
+  };
+  cv.onmouseleave=()=>{ tip.hidden=true; };
+}
+/** Составные столбцы: items — [{label, values:[…]}], series — [{name, color}]. */
+function chartStack(container, items, series, opts={}){
+  const H=opts.height||240;
+  let geo=null;
+  drawInto(container,H,(ctx,W)=>{
+    const grid=cvar('--border','#ddd'), dim=cvar('--text-dim','#888');
+    const n=items.length; if(!n){ cEmpty(ctx,W,H); return; }
+    const padL=44,padR=10,padT=12,padB=28, plotW=W-padL-padR, plotH=H-padT-padB;
+    const max=niceMax(Math.max(1,...items.map(d=>d.values.reduce((a,b)=>a+(b||0),0))));
+    ctx.font='11px sans-serif'; ctx.lineWidth=1;
+    for(let i=0;i<=4;i++){ const y=padT+plotH*i/4; ctx.strokeStyle=grid; ctx.globalAlpha=.55; ctx.beginPath(); ctx.moveTo(padL,y); ctx.lineTo(W-padR,y); ctx.stroke(); ctx.globalAlpha=1; ctx.fillStyle=dim; ctx.textAlign='right'; ctx.fillText(fmtNum(Math.round(max*(4-i)/4)),padL-5,y+3); }
+    const bw=plotW/n;
+    items.forEach((d,i)=>{
+      let y=padT+plotH; const x=padL+i*bw+bw*0.14, w=Math.max(1,bw*0.72);
+      d.values.forEach((v,j)=>{ if(!v) return; const bh=plotH*(v/max); y-=bh; ctx.fillStyle=series[j].color; ctx.fillRect(x,y,w,bh); });
+      ctx.fillStyle=dim; ctx.textAlign='center'; ctx.font='10px sans-serif';
+      const step=Math.max(1,Math.ceil(n/(W>620?16:7))); if(i%step===0||n<=10) ctx.fillText(d.label,x+w/2,H-padB+14);
+    });
+    geo={padL,bw,n};
+  });
+  chartTipAttach(container,(x)=>{ if(!geo) return ''; const i=Math.floor((x-geo.padL)/geo.bw); if(i<0||i>=geo.n) return '';
+    const d=items[i]; const tot=d.values.reduce((a,b)=>a+(b||0),0);
+    return `<b>${esc(d.title||d.label)}</b> · ${fmtNum(tot)}<br>`+series.map((s,j)=>`<span class="dot" style="background:${s.color}"></span>${esc(s.name)}: <b>${fmtNum(d.values[j]||0)}</b>`).join('<br>')+(d.extra?'<br>'+d.extra:''); });
+}
+/** Несколько линий: labels — подписи оси X, series — [{name, color, values:[…], dash}]. */
+function chartMulti(container, labels, series, opts={}){
+  const H=opts.height||230, yfmt=opts.yfmt||(v=>fmtNum(Math.round(v)));
+  let geo=null;
+  drawInto(container,H,(ctx,W)=>{
+    const grid=cvar('--border','#ddd'), dim=cvar('--text-dim','#888');
+    const n=labels.length; const all=series.flatMap(s=>s.values.filter(v=>v!=null));
+    if(!n || !all.length){ cEmpty(ctx,W,H); return; }
+    const padL=54,padR=12,padT=12,padB=28, plotW=W-padL-padR, plotH=H-padT-padB;
+    const max=opts.max || (Math.max(...all)*1.08 || 1);
+    ctx.font='11px sans-serif'; ctx.lineWidth=1;
+    for(let i=0;i<=4;i++){ const y=padT+plotH*i/4; ctx.strokeStyle=grid; ctx.globalAlpha=.55; ctx.beginPath(); ctx.moveTo(padL,y); ctx.lineTo(W-padR,y); ctx.stroke(); ctx.globalAlpha=1; ctx.fillStyle=dim; ctx.textAlign='right'; ctx.fillText(yfmt(max*(4-i)/4),padL-5,y+3); }
+    const xat=i=> n<=1?padL+plotW/2:padL+plotW*i/(n-1), yat=v=>padT+plotH*(1-Math.min(v,max)/max);
+    series.forEach(s=>{
+      ctx.beginPath(); let started=false;
+      s.values.forEach((v,i)=>{ if(v==null){ started=false; return; } const x=xat(i),y=yat(v); if(started) ctx.lineTo(x,y); else { ctx.moveTo(x,y); started=true; } });
+      ctx.strokeStyle=s.color; ctx.lineWidth=s.width||2; ctx.setLineDash(s.dash?[5,4]:[]); ctx.stroke(); ctx.setLineDash([]);
+      if(n<=45) s.values.forEach((v,i)=>{ if(v==null) return; ctx.beginPath(); ctx.arc(xat(i),yat(v),2.3,0,7); ctx.fillStyle=s.color; ctx.fill(); });
+    });
+    ctx.fillStyle=dim; ctx.font='10px sans-serif'; const step=Math.max(1,Math.ceil(n/(W>620?12:6)));
+    labels.forEach((l,i)=>{ if(i%step===0||i===n-1){ ctx.textAlign = i===0?'left':(i===n-1?'right':'center'); ctx.fillText(l,xat(i),H-padB+15); } });
+    geo={padL,plotW,n};
+  });
+  chartTipAttach(container,(x)=>{ if(!geo) return ''; const i=geo.n<=1?0:Math.round((x-geo.padL)/(geo.plotW/(geo.n-1))); if(i<0||i>=geo.n) return '';
+    return `<b>${esc(labels[i])}</b><br>`+series.map(s=>`<span class="dot" style="background:${s.color}"></span>${esc(s.name)}: <b>${s.values[i]==null?'—':yfmt(s.values[i],true)}</b>`).join('<br>'); });
+}
+function rpLegend(series){ return `<div class="an-legend">${series.map(s=>`<span class="lg"><span class="dot" style="background:${s.color}${s.dash?';opacity:.55':''}"></span>${esc(s.name)}</span>`).join('')}</div>`; }
+/** Тепловая карта со своей палитрой и подсказкой. */
+function chartHeatRp(container, matrix, rowLabels, opts={}){
+  chartHeat(container, matrix, rowLabels, opts);
+  const rows=matrix.length, cols=(matrix[0]||[]).length; if(!rows||!cols) return;
+  chartTipAttach(container,(x,y)=>{
+    const cv=container.querySelector('canvas'); const W=cv.clientWidth, H=cv.clientHeight;
+    const padL=34,padT=6,padB=16, gw=(W-padL-6)/cols, gh=(H-padT-padB)/rows;
+    const c=Math.floor((x-padL)/gw), r=Math.floor((y-padT)/gh); if(c<0||c>=cols||r<0||r>=rows) return '';
+    return `<b>${esc(rowLabels[r])}, ${String(c).padStart(2,'0')}:00–${String(c+1).padStart(2,'0')}:00</b><br>${opts.fmt?opts.fmt(matrix[r][c],r,c):fmtNum(matrix[r][c])}`;
+  });
+}
+function rpBar(v, max, color){ const w=max? Math.max(2, Math.round(100*(v||0)/max)) : 0; return `<span class="rp-bar"><span style="width:${w}%;background:${color||'var(--primary)'}"></span></span>`; }
+
+async function viewReplies(c){
+  c.innerHTML='';
+  if(!RP.meta){ try{ RP.meta=await api('/replies/meta'); }catch(e){ toastErr(e); c.innerHTML='<div class="card"><div class="empty">Не удалось открыть раздел</div></div>'; return; } }
+  const meta=RP.meta;
+  if(RP.acc && !meta.accounts.find(a=>String(a.id)===String(RP.acc))) RP.acc='';
+  const opt=(list,cur)=>list.map(([v,l])=>`<option value="${esc(v)}" ${String(v)===String(cur)?'selected':''}>${esc(l)}</option>`).join('');
+  const bar=h(`<div class="card rp-filters">
+    <div class="rp-frow">
+      <label>Период <select id="rpPeriod">${opt(RP_PERIODS,RP.period)}</select></label>
+      <span id="rpDates" ${RP.period==='custom'?'':'hidden'}><input type="date" id="rpFrom" value="${esc(RP.from)}" aria-label="С"> — <input type="date" id="rpTo" value="${esc(RP.to)}" aria-label="По"></span>
+      <label>Ящик <select id="rpAcc"><option value="">${meta.is_admin?'Все ящики':'Все мои ящики'}</option>${meta.accounts.map(a=>`<option value="${a.id}" ${String(a.id)===String(RP.acc)?'selected':''}>${esc(a.name)}</option>`).join('')}</select></label>
+      ${meta.is_admin&&meta.departments.length?`<label>Отдел <select id="rpDep"><option value="">Все отделы</option>${meta.departments.map(d=>`<option ${d===RP.dep?'selected':''}>${esc(d)}</option>`).join('')}</select></label>`:''}
+      <span class="spacer" style="flex:1"></span>
+      <a class="btn ghost sm" href="${docsHref('replies')}">📖 Как считается</a>
+      <button class="btn ghost sm" id="rpRefresh">↻ Обновить</button>
+    </div>
+    <div class="rp-frow">
+      <label>Собеседники <select id="rpScope">${opt([['all','Все'],['external','Внешние'],['internal','Свои (внутренние)']],RP.scope)}</select></label>
+      <label>Письма <select id="rpKinds">${opt(RP_KINDS,RP.kinds)}</select></label>
+      <label>Ящик среди адресатов <select id="rpAddr">${opt([['all','Не важно'],['to_cc','В «Кому» или «Копии»'],['to','Только в «Кому»']],RP.addressed)}</select></label>
+      <label>Входящие <select id="rpInc">${opt([['all','Все'],['new','Только новые обращения']],RP.incoming)}</select></label>
+      <label>Срок ответа, ч <input type="number" id="rpSla" min="0.25" max="8760" step="0.25" style="width:80px" value="${esc(RP.sla||meta.settings.sla_hours)}"></label>
+      <label class="rp-check"><input type="checkbox" id="rpBiz" ${(RP.slaBiz!==''?RP.slaBiz==='true':meta.settings.sla_business)?'checked':''}> в рабочих часах</label>
+    </div></div>`);
+  c.appendChild(bar);
+  const reload=()=>viewReplies(c);
+  $('#rpPeriod',bar).onchange=e=>{ RP.period=e.target.value; if(RP.period==='custom'){ $('#rpDates',bar).hidden=false; return; } reload(); };
+  [['#rpFrom','from'],['#rpTo','to']].forEach(([s,k])=>{ $(s,bar).onchange=e=>{ RP[k]=e.target.value; if(RP.from||RP.to) reload(); }; });
+  $('#rpAcc',bar).onchange=e=>{ RP.acc=e.target.value; reload(); };
+  if($('#rpDep',bar)) $('#rpDep',bar).onchange=e=>{ RP.dep=e.target.value; RP.acc=''; reload(); };
+  $('#rpScope',bar).onchange=e=>{ RP.scope=e.target.value; reload(); };
+  $('#rpKinds',bar).onchange=e=>{ RP.kinds=e.target.value; reload(); };
+  $('#rpAddr',bar).onchange=e=>{ RP.addressed=e.target.value; reload(); };
+  $('#rpInc',bar).onchange=e=>{ RP.incoming=e.target.value; reload(); };
+  $('#rpSla',bar).onchange=e=>{ const v=parseFloat(String(e.target.value).replace(',','.')); if(!(v>=0.25&&v<=8760)){ toast('Срок ответа','От 0,25 до 8760 часов','warn'); return; } RP.sla=String(v); reload(); };
+  $('#rpBiz',bar).onchange=e=>{ RP.slaBiz=e.target.checked?'true':'false'; reload(); };
+  $('#rpRefresh',bar).onclick=()=>{ RP.meta=null; reload(); };
+  if(RP.period==='custom' && !RP.from && !RP.to){ c.appendChild(h('<div class="card"><div class="empty">Выберите даты периода.</div></div>')); return; }
+
+  const statusBox=h('<div></div>'); c.appendChild(statusBox);
+  const body=h('<div><div class="card"><div class="empty"><span class="spinner"></span> Считаем ответы… На большом архиве за долгий период — до минуты.</div></div></div>');
+  c.appendChild(body);
+  const seq=State.routeSeq;
+  let d;
+  try{ d=await api('/replies/summary?'+rpParams()); }
+  catch(e){ if(seq!==State.routeSeq) return; toastErr(e); body.innerHTML='<div class="card"><div class="empty">Не удалось посчитать ответы</div></div>'; return; }
+  if(seq!==State.routeSeq || !body.isConnected) return;
+  rpStatus(statusBox, d.index, meta, c);
+  body.innerHTML='';
+  rpRender(body, d, meta);
+}
+
+function rpStatus(box, st, meta, c){
+  box.innerHTML='';
+  if(!st) return;
+  const running=!!st.job_status;
+  const part=st.total? Math.round(100*st.indexed/st.total):100;
+  if(!st.enabled && !st.indexed){ box.appendChild(h(`<div class="deep-banner"><div>⏸️ <strong>Индекс ответов выключен</strong><div class="muted small">Включите «Настройки → Ответы на письма → Вести индекс ответов».</div></div></div>`)); return; }
+  if(st.pending<=0 && !running) return;
+  const b=h(`<div class="deep-banner">
+    <div style="min-width:240px;flex:1"><strong>${running?'<span class="spinner"></span> ':''}Индекс ответов: разобрано ${fmtNum(st.indexed)} из ${fmtNum(st.total)} писем (${part}%)</strong>
+      <div class="rp-progress"><span style="width:${part}%"></span></div>
+      <div class="muted small">${st.pending>0?'Остальные письма разбираются в фоне (раз в 10 минут, порциями) — цифры раздела пока неполные.':'Идёт разбор новых писем.'}</div></div>
+    ${meta.is_admin&&!running?'<button class="btn sm" id="rpIdxRun">▶ Разобрать сейчас</button>':''}</div>`);
+  box.appendChild(b);
+  const run=$('#rpIdxRun',b);
+  if(run) run.onclick=async()=>{ try{ await api('/replies/update',{method:'POST'}); toast('Разбор писем запущен','Ход — в «Очереди и заданиях»'); viewReplies(c); }catch(e){ toastErr(e); } };
+}
+
+function rpRender(body, d, meta){
+  const s=d.summary, p=d.prev, prm=d.params;
+  const redraws=[]; const reg=fn=>{ fn(); redraws.push(fn); };
+  const C={ontime:cvar('--success','#1f9d55'), late:cvar('--warn','#d98a00'), flag:'#7c5cff', waiting:cvar('--info','#2b8ca6'), overdue:cvar('--danger','#d64545'), primary:cvar('--primary','#2f6fed'), dim:cvar('--text-dim','#888')};
+  const slaTxt=`${String(prm.sla_hours).replace('.',',')} ч${prm.sla_business?' рабочих':''}`;
+  const span=`${new Date(d.period.since*1000).toLocaleDateString('ru-RU')} — ${new Date((d.period.until-1)*1000).toLocaleDateString('ru-RU')}`;
+  if(!s.in_total && !s.out_total){
+    body.appendChild(h(`<div class="card"><div class="empty"><div class="big">↩️</div>За ${esc(span)} писем по этому отбору нет.<br><span class="muted small">Попробуйте период длиннее или другие фильтры. Если архив только что обновлён — дождитесь разбора писем (полоса выше).</span></div></div>`));
+    registerCharts(redraws); return;
+  }
+  const kpi=(l,v,sub,delta,ac,cls)=>`<div class="kpi ${ac?'accent':''} ${cls||''}"><div class="k-label">${l}</div><div class="k-value">${v}</div><div class="k-sub">${sub||''}</div>${delta?`<div class="k-sub">${delta}</div>`:''}</div>`;
+  const pv=k=>p?p[k]:null;
+  body.appendChild(h(`<div><div class="rp-period muted small">Период: <b>${esc(span)}</b>${p?` · сравнение с ${esc(new Date(p.since*1000).toLocaleDateString('ru-RU'))} — ${esc(new Date((p.until-1)*1000).toLocaleDateString('ru-RU'))}`:''} · срок ответа ${esc(slaTxt)} · рабочее время ${esc(prm.work_hours)}, ${esc(prm.timezone)}</div>
+  <div class="an-kpis">
+    ${kpi('📥 Входящих',fmtNum(s.in_total),'ждут ответа сейчас: '+fmtNum(s.waiting),rpDelta(s.in_total,pv('in_total'),'none'),true)}
+    ${kpi('✅ Отвечено',fmtPct(s.answered_pct),fmtNum(s.answered)+' из '+fmtNum(s.in_total),rpDelta(s.answered_pct,pv('answered_pct'),'up','pct'))}
+    ${kpi('⏱️ Медиана ответа',fmtDur(s.median_s),'среднее '+fmtDur(s.mean_s),rpDelta(s.median_s,pv('median_s'),'down','dur'))}
+    ${kpi('📈 90% ответов быстрее',fmtDur(s.p90_s),'75% — быстрее '+fmtDur(s.p75_s),rpDelta(s.p90_s,pv('p90_s'),'down','dur'))}
+    ${kpi('🎯 В срок',fmtPct(s.sla_pct),'срок '+esc(slaTxt)+' · позже срока: '+fmtNum(s.late),rpDelta(s.sla_pct,pv('sla_pct'),'up','pct'))}
+    ${kpi('🚨 Без ответа, срок вышел',fmtNum(s.overdue),'всего без ответа: '+fmtNum(s.unanswered)+' ('+fmtPct(s.unanswered_pct)+')'+(s.in_followups_unanswered&&prm.incoming!=='new'?`; из них ответы на наши письма: ${fmtNum(s.in_followups_unanswered)} — <a href="#" id="rpOnlyNew">не считать</a>`:''),rpDelta(s.overdue,pv('overdue'),'down'),false,s.overdue?'kpi-bad':'')}
+    ${kpi('🕘 В рабочих часах',fmtDur(s.median_business_s),'медиана без ночей и выходных · 90%: '+fmtDur(s.p90_business_s),rpDelta(s.median_business_s,pv('median_business_s'),'down','dur'))}
+    ${kpi('🤝 Ответили коллеги',fmtNum(s.colleague),'отмечено «отвечено» без ответа в архиве: '+fmtNum(s.flag))}
+    ${kpi('📤 Исходящих',fmtNum(s.out_total),'из них ответов: '+fmtNum(s.out_answers)+' · новых: '+fmtNum(s.out_new),rpDelta(s.out_total,pv('out_total'),'none'))}
+    ${kpi('💬 Нам ответили',fmtPct(s.out_replied_pct),fmtNum(s.out_replied)+' из '+fmtNum(s.out_total)+' исходящих',rpDelta(s.out_replied_pct,pv('out_replied_pct'),'up','pct'))}
+    ${kpi('⌛ Ждём ответа (медиана)',fmtDur(s.out_median_wait_s),'90% — быстрее '+fmtDur(s.out_p90_wait_s),rpDelta(s.out_median_wait_s,pv('out_median_wait_s'),'down','dur'))}
+    ${kpi('🔇 Исходящие без ответа',fmtNum(s.out_noreply),'на них не ответили (автоответы не в счёт)',rpDelta(s.out_noreply,pv('out_noreply'),'down'))}
+  </div></div>`));
+
+  const onlyNew=$('#rpOnlyNew',body); if(onlyNew) onlyNew.onclick=e=>{ e.preventDefault(); RP.incoming='new'; route(); };
+  // ---- Динамика ----
+  const series=[{name:'Ответ в срок',color:C.ontime},{name:'Ответ позже срока',color:C.late},{name:'Отмечено «отвечено»',color:C.flag},{name:'Ждёт ответа',color:C.waiting},{name:'Без ответа, срок вышел',color:C.overdue}];
+  const tItems=d.trend.map(t=>({label:t.label, values:[t.ontime,t.late,t.flag,t.waiting,t.overdue], extra:`Отвечено: <b>${fmtPct(t.answered_pct)}</b> · медиана ${fmtDur(t.median_s)}`}));
+  const bucketName={day:'по дням',week:'по неделям',month:'по месяцам'}[d.period.bucket]||'';
+  const trCard=h(`<div class="card an-card"><h3>📊 Входящие и ответы ${bucketName} <span class="h-sub">— наведите на столбец</span></h3><div class="an-chart" id="rpTrend"></div>${rpLegend(series)}</div>`);
+  body.appendChild(trCard);
+  reg(()=>chartStack($('#rpTrend',trCard), tItems, series, {height:250}));
+  const labels=d.trend.map(t=>t.label);
+  const prevAligned=(key)=>{ const tp=d.trend_prev||[]; const off=tp.length-labels.length; return labels.map((_,i)=>{ const x=tp[i+off]; return x? x[key]:null; }); };
+  const hr=v=>v==null?null:Math.round(v/360)/10;
+  const mlCard=h(`<div class="grid cols-2 an-card">
+    <div class="card"><h3>⏱️ Время ответа ${bucketName}</h3><div class="an-chart" id="rpMed"></div><div id="rpMedLeg"></div></div>
+    <div class="card"><h3>✅ Доля отвеченных ${bucketName}</h3><div class="an-chart" id="rpRate"></div><div id="rpRateLeg"></div></div></div>`);
+  body.appendChild(mlCard);
+  const medS=[{name:'Медиана',color:C.primary,values:d.trend.map(t=>hr(t.median_s))},{name:'90% быстрее',color:C.late,values:d.trend.map(t=>hr(t.p90_s)),width:1.5}];
+  if(p) medS.push({name:'Медиана, прошлый период',color:C.dim,values:prevAligned('median_s').map(hr),dash:true,width:1.5});
+  const rateS=[{name:'Отвечено входящих',color:C.ontime,values:d.trend.map(t=>t.answered_pct)},{name:'Ответили на исходящие',color:C.primary,values:d.trend.map(t=>t.out_replied_pct)}];
+  if(p) rateS.push({name:'Отвечено, прошлый период',color:C.dim,values:prevAligned('answered_pct'),dash:true,width:1.5});
+  reg(()=>{ chartMulti($('#rpMed',mlCard), labels, medS, {height:220, yfmt:(v,t)=>t?fmtDur(v*3600):(Math.round(v*10)/10)+' ч'}); $('#rpMedLeg',mlCard).innerHTML=rpLegend(medS); });
+  reg(()=>{ chartMulti($('#rpRate',mlCard), labels, rateS, {height:220, max:100, yfmt:v=>Math.round(v)+'%'}); $('#rpRateLeg',mlCard).innerHTML=rpLegend(rateS); });
+
+  // ---- Распределения ----
+  const how=d.how_answered.map(x=>({...x, color:{own:C.ontime,colleague:'#2bb0a6',flag:C.flag,waiting:C.waiting,overdue:C.overdue}[x.key]}));
+  const kinds=s.kinds.map((x,i)=>({...x, color:[C.primary,'#e0567f',C.late,C.dim,'#8e6bd8'][i]}));
+  const dCard=h(`<div class="grid cols-2 an-card">
+    <div class="card"><h3>⏳ Через сколько отвечают</h3><div class="an-chart" id="rpHist"></div></div>
+    <div class="card"><h3>🧭 Как ответили на входящие</h3><div class="an-chart" id="rpHow"></div><div id="rpHowLeg"></div></div></div>`);
+  body.appendChild(dCard);
+  reg(()=>chartVBars($('#rpHist',dCard), d.delay_hist, {height:230, color:C.primary}));
+  reg(()=>{ chartDonut($('#rpHow',dCard), how, {height:190, centerLabel:'входящих'}); $('#rpHowLeg',dCard).innerHTML=donutLegend(how); });
+  const aCard=h(`<div class="grid cols-2 an-card">
+    <div class="card"><h3>📭 Сколько ждут письма без ответа</h3><div class="an-chart" id="rpAge"></div></div>
+    <div class="card"><h3>📨 Что приходит <span class="h-sub">— все входящие периода</span></h3><div class="an-chart" id="rpKindsC"></div><div id="rpKindsLeg"></div></div></div>`);
+  body.appendChild(aCard);
+  reg(()=>chartHBars($('#rpAge',aCard), d.age_hist, {height:Math.max(120,d.age_hist.length*30), labelChars:18, color:C.overdue}));
+  reg(()=>{ chartDonut($('#rpKindsC',aCard), kinds, {height:190, centerLabel:'писем'}); $('#rpKindsLeg',aCard).innerHTML=donutLegend(kinds); });
+
+  // ---- Тепловая карта ----
+  const heatModes={count:['Сколько писем приходит','писем',C.primary,v=>fmtNum(v)+' '+plural(v,'письмо','письма','писем')],
+    unanswered_pct:['Доля писем без ответа','%',C.overdue,v=>fmtPct(v)+' без ответа'],
+    median_h:['Медиана времени ответа','ч',C.late,v=>'медиана '+fmtDur(v*3600)]};
+  const hCard=h(`<div class="card an-card"><h3>🔥 День недели × час получения <span class="h-sub">— чем ярче, тем больше</span>
+    <span class="spacer" style="flex:1"></span><select id="rpHeatSel" style="width:auto">${Object.entries(heatModes).map(([k,v])=>`<option value="${k}" ${RP.heat===k?'selected':''}>${v[0]}</option>`).join('')}</select></h3><div class="an-chart" id="rpHeat"></div></div>`);
+  body.appendChild(hCard);
+  const drawHeat=()=>{ const m=heatModes[RP.heat]||heatModes.count; chartHeatRp($('#rpHeat',hCard), d.heat[RP.heat]||d.heat.count, d.heat.rows, {height:7*24+30, color:m[2], fmt:m[3]}); };
+  reg(drawHeat);
+  $('#rpHeatSel',hCard).onchange=e=>{ RP.heat=e.target.value; drawHeat(); };
+  const hwCard=h(`<div class="grid cols-2 an-card">
+    <div class="card"><h3>🕐 Медиана ответа по часу получения</h3><div class="an-chart" id="rpByHour"></div></div>
+    <div class="card"><h3>📆 Отвечено по дню недели</h3><div class="an-chart" id="rpByWd"></div></div></div>`);
+  body.appendChild(hwCard);
+  reg(()=>chartVBars($('#rpByHour',hwCard), d.by_hour.map(x=>({label:x.label, value:Math.round((x.median_s||0)/60)})), {height:210, color:C.late}));
+  reg(()=>chartVBars($('#rpByWd',hwCard), d.by_weekday.map(x=>({label:x.label, value:Math.round(x.answered_pct||0)})), {height:210, color:C.ontime}));
+  chartTipAttach($('#rpByHour',hwCard),(x)=>{ const cv=$('#rpByHour canvas',hwCard); const i=Math.floor((x-40)/((cv.clientWidth-50)/24)); const r=d.by_hour[i]; return r?`<b>${r.label}:00–${String(i+1).padStart(2,'0')}:00</b><br>писем: ${fmtNum(r.count)}<br>медиана ответа: <b>${fmtDur(r.median_s)}</b><br>отвечено: ${fmtPct(r.answered_pct)}`:''; });
+  chartTipAttach($('#rpByWd',hwCard),(x)=>{ const cv=$('#rpByWd canvas',hwCard); const i=Math.floor((x-40)/((cv.clientWidth-50)/7)); const r=d.by_weekday[i]; return r?`<b>${r.label}</b><br>писем: ${fmtNum(r.count)}<br>отвечено: <b>${fmtPct(r.answered_pct)}</b><br>медиана ответа: ${fmtDur(r.median_s)}`:''; });
+
+  // ---- Сравнения ----
+  const cmpRows=[['🕘 Когда пришло',d.work_split],['🏢 От кого',d.internal_split],['🎯 Ящик среди адресатов',d.addressed_split]];
+  const cmpCard=h(`<div class="card an-card"><h3>⚖️ Сравнения</h3><div class="table-wrap"><table class="tbl rp-cmp"><thead><tr><th></th><th>Писем</th><th>Отвечено</th><th>В срок</th><th>Медиана ответа</th><th>В рабочих часах</th><th>90% быстрее</th><th>Без ответа</th></tr></thead><tbody>
+    ${cmpRows.map(([title,rows])=>`<tr class="rp-group"><td colspan="8">${title}</td></tr>`+rows.map(r=>`<tr><td>${esc(r.label)}</td><td>${fmtNum(r.count)}</td><td>${fmtPct(r.answered_pct)}</td><td>${fmtPct(r.sla_pct)}</td><td>${fmtDur(r.median_s)}</td><td>${r.median_business_s!=null?fmtDur(r.median_business_s):'—'}</td><td>${fmtDur(r.p90_s)}</td><td>${fmtNum(r.unanswered)}${r.overdue?` <span class="rp-red">(срок вышел: ${fmtNum(r.overdue)})</span>`:''}</td></tr>`).join('')).join('')}
+  </tbody></table></div></div>`);
+  body.appendChild(cmpCard);
+
+  // ---- Ящики ----
+  rpAccounts(body, d, meta, reg, C);
+  if(d.departments.length>1) rpDepartments(body, d, reg, C);
+  rpPeers(body, d, reg, C);
+  rpOutgoing(body, d, reg, C);
+  rpThreads(body, d, reg, C);
+  const lists=h('<div></div>'); body.appendChild(lists);
+  rpLists(lists, meta);
+  if(meta.is_admin) rpIndexFooter(body, d.index);
+  registerCharts(redraws);
+}
+
+/** Внизу раздела (администратору): состояние индекса ответов, «Разобрать новые» и «Пересобрать». */
+function rpIndexFooter(body, st){
+  if(!st) return;
+  const f=h(`<div class="deep-banner"><div><strong>🗂️ Индекс ответов на письма</strong><div class="muted small">разобрано ${fmtNum(st.indexed)} из ${fmtNum(st.total)} писем${st.pending>0?` · ждут разбора: ${fmtNum(st.pending)}`:''}${st.enabled?' · новые письма разбираются сами раз в 10 минут':' · ведение индекса выключено в настройках'}. Пересобрать нужно, только если поменялись адреса ящиков или сотрудников.</div></div>
+    <span class="spacer"></span>
+    <button class="btn sm" id="rpUpd" ${st.job_status?'disabled':''}>▶ Разобрать новые</button>
+    <button class="btn ghost sm" id="rpRebuild" ${st.job_status?'disabled':''}>↺ Пересобрать индекс</button></div>`);
+  body.appendChild(f);
+  $('#rpUpd',f).onclick=async()=>{ try{ await api('/replies/update',{method:'POST'}); toast('Разбор писем запущен','Ход — в «Очереди и заданиях»'); $('#rpUpd',f).disabled=true; }catch(e){ toastErr(e); } };
+  $('#rpRebuild',f).onclick=async()=>{
+    if(!await confirmDlg('Пересобрать индекс ответов?', 'Индекс будет очищен, и все письма архива разберутся заново (в фоне, порциями). Пока разбор не закончится, цифры раздела будут неполными.', {okText:'Пересобрать', okClass:'primary'})) return;
+    try{ await api('/replies/rebuild',{method:'POST'}); toast('Индекс пересобирается','Ход — в «Очереди и заданиях»'); route(); }catch(e){ toastErr(e); }
+  };
+}
+
+const RP_ACC_COLS=[['name','Ящик'],['count','Входящих'],['answered_pct','Отвечено'],['sla_pct','В срок'],['median_s','Медиана'],['p90_s','90% быстрее'],['median_business_s','В рабочих ч'],['unanswered','Без ответа'],['overdue','Срок вышел'],['colleague','Ответили коллеги'],['out','Исходящих'],['out_replied_pct','Нам ответили'],['out_median_wait_s','Ждём ответа']];
+function rpAccounts(body, d, meta, reg, C){
+  const card=h(`<div class="card an-card"><h3>📬 Сравнение ящиков <span class="h-sub">— щелчок по строке оставляет только этот ящик</span><span class="spacer" style="flex:1"></span>
+    <input type="text" id="rpAccQ" placeholder="Найти ящик, сотрудника, отдел…" value="${esc(RP.accText)}" style="width:240px"></h3>
+    <div class="grid cols-2"><div><div class="muted small">Медиана ответа, ч — самые медленные</div><div class="an-chart" id="rpAccSlow"></div></div><div><div class="muted small">Без ответа, срок вышел — больше всего</div><div class="an-chart" id="rpAccOver"></div></div></div>
+    <div class="table-wrap" style="margin-top:12px"><table class="tbl rp-sort" id="rpAccT"></table></div></div>`);
+  body.appendChild(card);
+  const slow=d.accounts.filter(a=>a.median_s!=null).sort((a,b)=>b.median_s-a.median_s).slice(0,12);
+  const over=d.accounts.filter(a=>a.overdue).sort((a,b)=>b.overdue-a.overdue).slice(0,12);
+  reg(()=>chartHBars($('#rpAccSlow',card), slow.map(a=>({label:a.name, value:Math.round(a.median_s/360)/10})), {labelChars:26, color:C.late, fmt:x=>String(x.value).replace('.',',')+' ч'}));
+  reg(()=>chartHBars($('#rpAccOver',card), over.map(a=>({label:a.name, value:a.overdue})), {labelChars:26, color:C.overdue}));
+  const maxIn=Math.max(1,...d.accounts.map(a=>a.count));
+  const draw=()=>{
+    const q=RP.accText.trim().toLowerCase();
+    let rows=d.accounts.filter(a=>!q || [a.name,a.username,a.employee,a.department].join(' ').toLowerCase().includes(q));
+    const k=RP.accSort; rows=rows.slice().sort((a,b)=>{ const x=a[k], y=b[k]; if(k==='name') return RP.accDir*String(x||'').localeCompare(String(y||''),'ru'); return RP.accDir*(((x==null)?-1:x)-((y==null)?-1:y)); });
+    const fmt={count:v=>fmtNum(v), answered_pct:fmtPct, sla_pct:fmtPct, median_s:fmtDur, p90_s:fmtDur, median_business_s:fmtDur, unanswered:fmtNum, overdue:fmtNum, colleague:fmtNum, out:fmtNum, out_replied_pct:fmtPct, out_median_wait_s:fmtDur};
+    $('#rpAccT',card).innerHTML=`<thead><tr>${RP_ACC_COLS.map(([k,l])=>`<th data-k="${k}" class="${RP.accSort===k?'sorted':''}">${l}${RP.accSort===k?(RP.accDir<0?' ▼':' ▲'):''}</th>`).join('')}</tr></thead><tbody>${rows.slice(0,500).map(a=>`<tr data-id="${a.id}" class="rp-click"><td><b>${esc(a.name)}</b><div class="muted small">${esc([a.employee&&a.employee!==a.name?a.employee:'',a.department].filter(Boolean).join(' · ')||a.username||'')}</div></td>${RP_ACC_COLS.slice(1).map(([k])=>`<td class="${k==='overdue'&&a.overdue?'rp-red':''}">${k==='count'?rpBar(a.count,maxIn)+' ':''}${fmt[k](a[k])}</td>`).join('')}</tr>`).join('')||`<tr><td colspan="${RP_ACC_COLS.length}" class="muted">Нет ящиков</td></tr>`}</tbody>`;
+    $$('#rpAccT th',card).forEach(th=>th.onclick=()=>{ const k=th.dataset.k; if(RP.accSort===k) RP.accDir=-RP.accDir; else { RP.accSort=k; RP.accDir=k==='name'?1:-1; } draw(); });
+    $$('#rpAccT tr[data-id]',card).forEach(tr=>tr.onclick=()=>{ RP.acc=tr.dataset.id; RP.dep=''; route(); });
+  };
+  draw();
+  $('#rpAccQ',card).oninput=e=>{ RP.accText=e.target.value; draw(); };
+}
+function rpDepartments(body, d, reg, C){
+  const card=h(`<div class="card an-card"><h3>🏢 Сравнение отделов</h3>
+    <div class="grid cols-2"><div><div class="muted small">Отвечено, %</div><div class="an-chart" id="rpDepRate"></div></div><div><div class="muted small">Медиана ответа, ч</div><div class="an-chart" id="rpDepMed"></div></div></div>
+    <div class="table-wrap" style="margin-top:12px"><table class="tbl"><thead><tr><th>Отдел</th><th>Ящиков</th><th>Входящих</th><th>Отвечено</th><th>В срок</th><th>Медиана</th><th>90% быстрее</th><th>Без ответа</th><th>Срок вышел</th><th>Исходящих</th><th>Нам ответили</th></tr></thead><tbody>
+    ${d.departments.map(x=>`<tr class="rp-click" data-dep="${esc(x.name)}"><td><b>${esc(x.name)}</b></td><td>${fmtNum(x.accounts)}</td><td>${fmtNum(x.count)}</td><td>${fmtPct(x.answered_pct)}</td><td>${fmtPct(x.sla_pct)}</td><td>${fmtDur(x.median_s)}</td><td>${fmtDur(x.p90_s)}</td><td>${fmtNum(x.unanswered)}</td><td class="${x.overdue?'rp-red':''}">${fmtNum(x.overdue)}</td><td>${fmtNum(x.out)}</td><td>${fmtPct(x.out_replied_pct)}</td></tr>`).join('')}
+    </tbody></table></div></div>`);
+  body.appendChild(card);
+  const deps=d.departments.slice(0,15);
+  reg(()=>chartHBars($('#rpDepRate',card), deps.map(x=>({label:x.name, value:Math.round(x.answered_pct||0)})), {colorByIndex:true, fmt:x=>x.value+'%'}));
+  reg(()=>chartHBars($('#rpDepMed',card), deps.map(x=>({label:x.name, value:Math.round((x.median_s||0)/360)/10})), {color:C.late, fmt:x=>String(x.value).replace('.',',')+' ч'}));
+  $$('tr[data-dep]',card).forEach(tr=>tr.onclick=()=>{ if(!RP.meta||!RP.meta.is_admin) return; RP.dep=tr.dataset.dep; RP.acc=''; route(); });
+}
+/** Строки таблицы: первые 10, остальные — по «Показать все». */
+function rpRows(rows, render, cols){
+  if(!rows.length) return `<tr><td colspan="${cols}" class="muted">Нет данных</td></tr>`;
+  return rows.map((r,i)=>render(r).replace('<tr', `<tr${i>=10?' class="rp-more" hidden':''}`)).join('')
+    + (rows.length>10?`<tr class="rp-more-row"><td colspan="${cols}"><a href="#" class="rp-more-link">Показать все (${rows.length})</a></td></tr>`:'');
+}
+function rpMoreLinks(root){ $$('.rp-more-link',root).forEach(a=>a.onclick=e=>{ e.preventDefault(); const tb=a.closest('tbody'); $$('tr.rp-more',tb).forEach(tr=>tr.hidden=false); a.closest('tr').remove(); }); }
+function rpPeerTable(rows, key, label){
+  return `<div class="table-wrap"><table class="tbl"><thead><tr><th>${label}</th><th>Писем</th><th>Отвечено</th><th>Медиана ответа</th><th>Без ответа</th><th>Срок вышел</th></tr></thead><tbody>${rpRows(rows, r=>`<tr><td>${esc(trunc(r[key],42))}</td><td>${fmtNum(r.count)}</td><td>${fmtPct(r.answered_pct)}</td><td>${fmtDur(r.median_s)}</td><td>${fmtNum(r.unanswered)}</td><td class="${r.overdue?'rp-red':''}">${fmtNum(r.overdue)}</td></tr>`, 6)}</tbody></table></div>`;
+}
+function rpPeers(body, d, reg, C){
+  const sTabs={senders:['Пишут чаще всего',d.senders],senders_ignored:['Больше всего без ответа',d.senders_ignored]};
+  const dTabs={domains:['Пишут чаще всего',d.domains],domains_slow:['Отвечаем медленнее всего',d.domains_slow],domains_fast:['Отвечаем быстрее всего',d.domains_fast]};
+  const card=h(`<div class="grid cols-2 an-card">
+    <div class="card"><h3>👤 Отправители <span class="h-sub">— всего ${fmtNum(d.senders_total)}</span></h3><div class="tabs" id="rpSTabs">${Object.entries(sTabs).map(([k,v])=>`<a href="#" data-t="${k}" class="${RP.peerTab===k?'active':''}">${v[0]}</a>`).join('')}</div><div id="rpSBody"></div></div>
+    <div class="card"><h3>🌐 Домены отправителей <span class="h-sub">— всего ${fmtNum(d.domains_total)}</span></h3><div class="tabs" id="rpDTabs">${Object.entries(dTabs).map(([k,v])=>`<a href="#" data-t="${k}" class="${RP.domTab===k?'active':''}">${v[0]}</a>`).join('')}</div><div id="rpDBody"></div></div></div>`);
+  body.appendChild(card);
+  const drawS=()=>{ if(!sTabs[RP.peerTab]) RP.peerTab='senders'; $('#rpSBody',card).innerHTML=rpPeerTable(sTabs[RP.peerTab][1],'peer','Отправитель'); rpMoreLinks($('#rpSBody',card)); $$('#rpSTabs a',card).forEach(a=>a.classList.toggle('active',a.dataset.t===RP.peerTab)); };
+  const drawD=()=>{ if(!dTabs[RP.domTab]) RP.domTab='domains'; $('#rpDBody',card).innerHTML=rpPeerTable(dTabs[RP.domTab][1],'domain','Домен'); rpMoreLinks($('#rpDBody',card)); $$('#rpDTabs a',card).forEach(a=>a.classList.toggle('active',a.dataset.t===RP.domTab)); };
+  $$('#rpSTabs a',card).forEach(a=>a.onclick=e=>{ e.preventDefault(); RP.peerTab=a.dataset.t; drawS(); });
+  $$('#rpDTabs a',card).forEach(a=>a.onclick=e=>{ e.preventDefault(); RP.domTab=a.dataset.t; drawD(); });
+  drawS(); drawD();
+}
+function rpOutgoing(body, d, reg, C){
+  const t=d.trend;
+  const card=h(`<div class="card an-card"><h3>📤 Исходящие: отвечают ли нам</h3>
+    <div class="grid cols-2"><div><div class="muted small">Отправлено и получен ответ</div><div class="an-chart" id="rpOutTr"></div><div id="rpOutLeg"></div></div>
+    <div><div class="muted small">Через сколько нам отвечают</div><div class="an-chart" id="rpWait"></div></div></div>
+    <div class="grid cols-2" style="margin-top:12px">
+      <div><h4>Кому пишем чаще всего</h4>${rpOutTable(d.out_domains)}</div>
+      <div><h4>Отвечают реже всего <span class="h-sub">(от 3 писем)</span></h4>${rpOutTable(d.out_domains_silent)}</div></div></div>`);
+  body.appendChild(card);
+  rpMoreLinks(card);
+  const outS=[{name:'Отправлено',color:C.primary},{name:'Без ответа',color:C.dim}];
+  reg(()=>{ chartStack($('#rpOutTr',card), t.map(x=>({label:x.label, values:[x.out_replied, x.out-x.out_replied], extra:`Ответили: <b>${fmtPct(x.out_replied_pct)}</b> · медиана ожидания ${fmtDur(x.out_median_wait_s)}`})), [{name:'Получен ответ',color:C.ontime},{name:'Без ответа',color:C.dim}], {height:210}); $('#rpOutLeg',card).innerHTML=rpLegend([{name:'Получен ответ',color:C.ontime},outS[1]]); });
+  reg(()=>chartVBars($('#rpWait',card), d.wait_hist, {height:210, color:C.primary}));
+}
+function rpOutTable(rows){
+  return `<div class="table-wrap"><table class="tbl"><thead><tr><th>Домен получателя</th><th>Писем</th><th>Ответили</th><th>Медиана ожидания</th><th>Без ответа</th></tr></thead><tbody>${rpRows(rows, r=>`<tr><td>${esc(trunc(r.domain,40))}</td><td>${fmtNum(r.count)}</td><td>${fmtPct(r.replied_pct)}</td><td>${fmtDur(r.median_wait_s)}</td><td>${fmtNum(r.noreply)}</td></tr>`, 5)}</tbody></table></div>`;
+}
+function rpThreads(body, d, reg, C){
+  const th=d.threads;
+  const card=h(`<div class="card an-card"><h3>🧵 Цепочки переписки <span class="h-sub">— письма одной переписки по заголовку References</span></h3>
+    <div class="an-kpis" style="margin-bottom:8px">
+      <div class="kpi"><div class="k-label">Цепочек</div><div class="k-value">${fmtNum(th.total)}</div><div class="k-sub">с ответами: ${fmtNum(th.with_replies)}</div></div>
+      <div class="kpi"><div class="k-label">Писем в цепочке</div><div class="k-value">${th.avg_len==null?'—':String(th.avg_len).replace('.',',')}</div><div class="k-sub">в среднем; в цепочках с ответами — ${th.avg_len_multi==null?'—':String(th.avg_len_multi).replace('.',',')}</div></div>
+      <div class="kpi"><div class="k-label">Самая длинная</div><div class="k-value">${fmtNum(th.max_len)}</div><div class="k-sub">писем</div></div></div>
+    <div class="grid cols-2"><div><div class="muted small">Сколько писем в цепочке</div><div class="an-chart" id="rpThH"></div></div>
+    <div><div class="muted small">Самые длинные (щелчок — открыть последнее письмо)</div><div class="table-wrap"><table class="tbl"><thead><tr><th>Тема</th><th>Писем</th><th>Длилась</th><th>Последнее</th></tr></thead><tbody>
+      ${th.longest.map((x,i)=>`<tr class="rp-click" data-i="${i}"><td>${esc(trunc(x.subject||'(без темы)',60))}<div class="muted small">входящих ${fmtNum(x.incoming)} · исходящих ${fmtNum(x.outgoing)} · ящиков ${fmtNum(x.mailboxes)}</div></td><td>${fmtNum(x.messages)}</td><td>${fmtDur(x.duration_s)}</td><td class="small muted">${fmtDate(new Date(x.last_ts*1000).toISOString())}</td></tr>`).join('')||'<tr><td colspan="4" class="muted">Нет цепочек</td></tr>'}
+    </tbody></table></div></div></div></div>`);
+  body.appendChild(card);
+  reg(()=>chartVBars($('#rpThH',card), th.hist, {height:220, color:'#7c5cff'}));
+  $$('tr[data-i]',card).forEach(tr=>tr.onclick=()=>{ const x=th.longest[parseInt(tr.dataset.i)]; if(x&&x.account_id) openMailMessage(x.account_id, x.message_id, x.folder); });
+}
+
+// ---- Списки писем: без ответа, просроченные, отвеченные с опозданием, исходящие без ответа ----
+function rpLists(wrap, meta){
+  const card=h(`<div class="card an-card" id="rpListCard"><h3>📋 Письма</h3>
+    <div class="tabs" id="rpLTabs">${meta.lists.map(l=>`<a href="#" data-m="${l.id}" class="${RP.list===l.id?'active':''}">${esc(l.label)}</a>`).join('')}</div>
+    <div class="an-toolbar">
+      <input type="text" id="rpLQ" placeholder="Отправитель, получатель или тема…" value="${esc(RP.text)}" style="flex:1;min-width:200px">
+      <select id="rpLOrder"><option value="old" ${RP.order==='old'?'selected':''}>Сначала давние</option><option value="new" ${RP.order==='new'?'selected':''}>Сначала новые</option></select>
+      <a class="btn sm" id="rpCsv" href="#" download>⬇ CSV</a>
+      <span class="muted small" id="rpLTotal"></span></div>
+    <div class="table-wrap"><table class="tbl"><thead><tr><th>Дата</th><th>Ящик</th><th>Собеседник</th><th>Тема</th><th id="rpLAgeH">Ждёт</th></tr></thead><tbody id="rpLBody"></tbody></table></div>
+    <div style="text-align:center;margin-top:10px"><button class="btn ghost sm" id="rpLMore" hidden>Показать ещё</button></div></div>`);
+  wrap.appendChild(card);
+  let offset=0, total=0, items=[];
+  const csvHref=()=>'/api/replies/list.csv?'+rpParams({mode:RP.list, order:RP.order, text:RP.text});
+  const load=async(append)=>{
+    const seq=State.routeSeq;
+    let r; try{ r=await api('/replies/list?'+rpParams({mode:RP.list, order:RP.order, text:RP.text, offset:String(offset), limit:'100'})); }catch(e){ toastErr(e); return; }
+    if(seq!==State.routeSeq || !card.isConnected) return;
+    total=r.total; items=append?items.concat(r.items):r.items; offset=items.length;
+    const answered=['late','answered','out_replied'].includes(RP.list);
+    $('#rpLAgeH',card).textContent=answered?'Ответ через':'Ждёт';
+    $('#rpLTotal',card).textContent=`${fmtNum(total)} ${plural(total,'письмо','письма','писем')}`;
+    $('#rpLBody',card).innerHTML=items.map((x,i)=>`<tr class="rp-click" data-i="${i}"><td class="small">${fmtDate(x.date)}</td><td>${esc(trunc(x.account_name,28))}<div class="muted small">${esc(trunc(x.folder,28))}</div></td><td>${esc(trunc(x.peer||x.from,40))}${x.kind?`<div class="muted small">${esc(x.kind_label)}</div>`:''}</td><td>${esc(trunc(x.subject||'(без темы)',70))}${x.is_reply?' <span class="muted small" title="Это ответ на другое письмо">↩</span>':''}</td><td class="${answered?'':'rp-red'}">${fmtDur(answered?x.delay_s:x.age_s)}</td></tr>`).join('')||'<tr><td colspan="5" class="muted">Писем нет — отлично.</td></tr>';
+    $('#rpLMore',card).hidden=items.length>=total;
+    $$('#rpLBody tr[data-i]',card).forEach(tr=>tr.onclick=()=>{ const x=items[parseInt(tr.dataset.i)]; if(x) openMailMessage(x.account_id, x.id, x.folder); });
+    $('#rpCsv',card).href=csvHref();
+  };
+  $$('#rpLTabs a',card).forEach(a=>a.onclick=e=>{ e.preventDefault(); RP.list=a.dataset.m; $$('#rpLTabs a',card).forEach(x=>x.classList.toggle('active',x===a)); offset=0; load(false); });
+  let qT=null;
+  $('#rpLQ',card).oninput=e=>{ RP.text=e.target.value; clearTimeout(qT); qT=setTimeout(()=>{ offset=0; load(false); }, 350); };
+  $('#rpLOrder',card).onchange=e=>{ RP.order=e.target.value; offset=0; load(false); };
+  $('#rpLMore',card).onclick=()=>load(true);
+  $('#rpCsv',card).href=csvHref();
+  load(false);
 }
 
 /** Открыть ящик в разделе «Почта» с первой папки и первой страницы (раньше — с папки и страницы,
