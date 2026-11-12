@@ -39,6 +39,8 @@ SELF_ROUTES = {
     ("GET", "/api/needs-setup"), ("POST", "/api/setup"), ("POST", "/api/login"), ("POST", "/api/login/otp"),
     ("POST", "/api/logout"), ("GET", "/api/me"), ("GET", "/api/me/2fa"), ("POST", "/api/me/2fa/setup"),
     ("POST", "/api/me/2fa/enable"), ("POST", "/api/me/2fa/disable"), ("POST", "/api/me/2fa/recovery"),
+    # единый вход (1.22.0): начало и возврат от поставщика — до входа, роли ещё нет
+    ("GET", "/api/auth/oidc/start"), ("GET", "/api/auth/oidc/callback"),
 }
 
 
@@ -120,7 +122,7 @@ def test_operator_starts_backups_and_checks(setup, monkeypatch):
     assert op.post("/api/accounts/check-logins", json={}).status_code == 200
     r = op.post("/api/accounts/backup-all", json={"sequential": True})
     assert r.status_code == 200 and r.json()["job_id"]
-    import mailarchiver.web.api as api_mod
+    import mailarchiver.web.api_accounts as api_mod          # маршруты ящиков (с 1.22.0 — отдельный модуль)
     monkeypatch.setattr(api_mod, "probe_account", lambda acc, opts: {"ok": True, "folders": []})
     monkeypatch.setattr(api_mod, "diagnose_folders", lambda *a, **k: {"ok": True, "folders": [], "broken_folders": []})
     assert op.post(f"/api/accounts/{aid}/test").json()["ok"] is True

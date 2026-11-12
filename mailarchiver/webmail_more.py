@@ -106,6 +106,11 @@ class _Watcher:
         except (MailArchiverError, ValidationError) as exc:
             log.info("Новая почта ящика «%s» не скачана: %s", acc.name, exc.message)
         bump(self.account_id)
+        try:                                        # уведомления на устройства сотрудника (1.22.0)
+            from .webpush import notify_account
+            notify_account(self.svc, self.account_id)
+        except Exception:  # noqa: BLE001
+            log.exception("Ошибка рассылки уведомлений о новой почте")
 
     def _run(self) -> None:
         from .imap.client import ImapConnection

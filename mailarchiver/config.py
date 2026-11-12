@@ -190,6 +190,13 @@ DEFAULTS: Dict[str, Any] = {
         "warn_recipients": 20,         # предупреждать, если в «Кому» и «Копии» больше адресатов (0 — нет)
         "smime_ca_file": "",           # доверенные центры организации для подписей S/MIME (PEM), кроме системных
         "send_limit_hour": 300,        # адресатов в час с одного ящика (0 — без предела), 1.21.0
+        # уведомления о новой почте на компьютер и телефон сотрудника (Web Push), 1.22.0
+        "web_push": False,             # разрешить сотрудникам включать уведомления на своих устройствах
+        "web_push_preview": True,      # показывать в уведомлении отправителя и тему (иначе — «Новое письмо»)
+        "web_push_poll_min": 5,        # ящик без IMAP IDLE: проверять «Входящие» раз в столько минут
+        "web_push_hosts": ["fcm.googleapis.com", "push.services.mozilla.com", "push.apple.com",
+                           "notify.windows.com"],   # службы доставки браузеров, куда архиву можно слать
+        "web_push_contact": "",        # адрес для служб доставки (mailto: или https://; '' — адрес сервера)
     },
     "audit": {
         # Аудит (1.21.0): срок хранения и копия на сервер журналов (syslog / SIEM)
@@ -247,6 +254,23 @@ DEFAULTS: Dict[str, Any] = {
         "employee_base_dn": "",       # где искать сотрудников для справочника ('' — как base_dn), 1.21.0
         "employee_filter": "(&(objectCategory=person)(objectClass=user)(mail=*))",  # кто — сотрудник
         "timeout_s": 10,
+    },
+    "oidc": {
+        # Единый вход через OpenID Connect (1.22.0): Keycloak, Entra ID, ADFS, Google, Authentik, Okta…
+        "enabled": False,
+        "issuer": "",                 # https://sso.company.ru/realms/company (адрес издателя)
+        "client_id": "",
+        "client_secret": "",          # секрет клиента (хранится зашифрованным); '' — публичный клиент с PKCE
+        "scopes": "openid email profile",
+        "username_claim": "preferred_username",   # логин в архиве (иначе — email, sub)
+        "role_claim": "groups",       # утверждение с группами/ролями; путь через точку: realm_access.roles
+        "admin_values": [],           # группы/роли администраторов архива
+        "operator_values": [],        # группы/роли операторов
+        "employee_login": False,      # остальные — сотрудники: архив своих ящиков по адресу email
+        "use_userinfo": False,        # дополнять данные из userinfo (если групп нет в id_token)
+        "button_text": "Войти через единый вход",
+        "redirect_uri": "",           # '' — <server.public_url или адрес запроса>/api/auth/oidc/callback
+        "verify_ssl": True,
     },
     "mailadmin": {
         # Вход в ящики учётной записью администратора почты — без паролей сотрудников.
@@ -432,6 +456,7 @@ VALUE_RANGES: Dict[str, tuple] = {
     "journal.port": (1, 65535),
     "journal.max_size_mb": (1, 500),
     "webmail.send_limit_hour": (0, 100000),
+    "webmail.web_push_poll_min": (1, 60),
     "audit.keep_days": (0, 36500),
     "audit.syslog_port": (1, 65535),
     "cases.export_keep_days": (0, 36500),

@@ -183,8 +183,8 @@ def test_cases_admin_only(client):
 
 
 def test_ui_has_cases_section():
-    js = open(os.path.join(os.path.dirname(__file__), "..", "mailarchiver", "web", "static", "js", "app.js"),
-              encoding="utf-8").read()
+    from mailarchiver.web.assets import bundle_text
+    js = bundle_text()
     for needle in ("{id:'cases'", "async function viewCases", "accountPickerDlg", "/exports/${x.id}/download",
                    "cases:viewCases", "🔒 по делу"):
         assert needle in js, needle

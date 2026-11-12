@@ -289,8 +289,8 @@ def test_api_archived_smime_and_decrypt(api, smtp):
 
 
 def test_ui_needles():
-    js = open(os.path.join(os.path.dirname(__file__), "..", "mailarchiver", "web", "static", "js", "app.js"),
-              encoding="utf-8").read()
+    from mailarchiver.web.assets import bundle_text
+    js = bundle_text()
     for needle in ('data-opt="smime_sign"', 'data-opt="smime_encrypt"', "mailPresendConfirm", "archivePickerDlg",
                    "mailSmimeSection", "mailShowDecrypted", "registerProtocolHandler", "mailComposeFromMailto"):
         assert needle in js, needle

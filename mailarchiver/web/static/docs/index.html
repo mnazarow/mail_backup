@@ -458,9 +458,30 @@ systemd, требующие пространств имён. Служба по-�
 </ul>
 <img class="shot" src="img/71_mailclient_rules.png" alt="Правило сортировки">
 <div class="cap">Правило: письма с «тендер» в теме — в папку «Проекты» с меткой «Важно»</div>
+<h3 id="mailshared">Общие ящики, «Все входящие», уведомления на телефон</h3>
+<ul>
+<li><b>Общие и делегированные ящики.</b> Администратор открывает сотруднику чужой ящик («Почтовые ящики → ⋯ →
+👥 Доступ других сотрудников»): секретарю — ящик руководителя, отделу — <code>info@</code>. Права — <b>только
+чтение</b> (письма, вложения, поиск) или <b>полный доступ</b> (как свой ящик: письма от имени ящика, правила,
+выгрузка); можно задать дату «до». Ящик появляется в переключателе ящиков сотрудника; снятие доступа и
+увольнение закрывают его сразу.</li>
+</ul>
+<img class="shot" src="img/80_mailbox_delegates.png" alt="Доступ к общему ящику">
+<div class="cap">Общий ящик info@: только чтение одному сотруднику, полный доступ до конца года — другому</div>
+<ul>
+<li><b>«📥 Все входящие»</b> — у сотрудника с несколькими ящиками: «Входящие» всех ящиков одним списком, у
+каждого письма — название ящика.</li>
+<li><b>Уведомления на компьютер и телефон</b> (Web Push): «⚙️ → 🔔 Уведомления → Уведомлять о новых письмах
+на этом устройстве» — браузер сообщит о новом письме во «Входящих», даже когда «Почта» закрыта; щелчок
+открывает письмо. Нужны адрес <code>https://</code>, разрешение администратора («Настройки → Почтовый
+клиент → Уведомления на компьютер и телефон») и выход сервера к службам доставки браузеров. На iPhone —
+сначала «Поделиться → На экран «Домой»». Содержимое уведомления зашифровано ключом браузера.</li>
+</ul>
+<img class="shot" src="img/79_mailclient_notify.png" alt="Уведомления на устройство">
+<div class="cap">«⚙️ → 🔔 Уведомления»: уведомления на этом устройстве, выбор ящиков, список устройств</div>
 <div class="note"><b>Кто может писать и менять ящик</b>
 Сотрудник, вошедший паролем своего ящика, — в своих ящиках (выключенный администратором ящик — только
-читать). Администратор — в любом ящике, если включено «Настройки → Почтовый клиент → Администратор может
+читать) и в открытых ему с полным доступом. Администратор — в любом ящике, если включено «Настройки → Почтовый клиент → Администратор может
 писать и менять ящики»; каждое такое действие — в аудите. Открытое администратором письмо сотрудника не
 становится прочитанным. Оператор писем не видит. Список писем берётся из локальной копии, поэтому сначала
 выполните резервное копирование ящика.</div>
@@ -678,6 +699,8 @@ OpenDocument, RTF (сканы не распознаются). Первое ин�
 записать неверный пароль (колонки перепутаны, Excel превратил пароль в дату или TRUE), пропускаются с
 причиной.</li>
 <li>Меню ящика «⋯» → <b>«Завершить сеансы сотрудника»</b> — разлогинить сотрудника, вошедшего по паролю ящика.</li>
+<li>Меню ящика «⋯» → <b>«👥 Доступ других сотрудников»</b> — открыть ящик другим сотрудникам: только чтение или
+полный доступ, по желанию до даты (<a href="#mailshared">общие ящики</a>).</li>
 </ul>
 <img class="shot" src="img/17_check_logins.png" alt="Проверка паролей">
 <div class="cap">Проверка паролей: все ящики, только включённые или показанные в отборе</div>
@@ -2437,6 +2460,36 @@ cron-выражение подставится само. Для особых с�
     <p class="prec">💡 300; для ящиков рассылок поднимите или отправляйте рассылки другим способом.</p>
     <p class="pmeta">Пример: <code>300</code> · По умолчанию: <code>300</code></p>
   </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Уведомления на компьютер и телефон (Web Push)</span><code>webmail.web_push</code></div>
+  <div class="pdesc"><p>Сотрудник включает в «Почта → ⚙ → 🔔 Уведомления» уведомления о новых письмах своих ящиков: браузер покажет их, даже когда «Почта» закрыта (Chrome, Edge, Firefox, Safari; на iPhone — сайт, добавленный на экран «Домой»). Архив отправляет зашифрованное ключом браузера сообщение через службу доставки браузера (Google, Mozilla, Apple, Microsoft) — ей нужен выход в интернет, а интерфейсу — адрес https://. Служба доставки содержимого не видит.</p>
+    <p class="prec">💡 Включите, если сервер может обращаться к службам доставки браузеров и «Почта» открыта по https.</p>
+    <p class="pmeta">Пример: <code>true</code> · По умолчанию: <code>false</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Отправитель и тема в уведомлении</span><code>webmail.web_push_preview</code></div>
+  <div class="pdesc"><p>Включено — уведомление показывает отправителя и тему письма; выключено — только «Новое письмо» и название ящика (тему не увидят на заблокированном экране телефона).</p>
+    <p class="prec">💡 Включено; выключите, если темы писем бывают конфиденциальными.</p>
+    <p class="pmeta">Пример: <code>true</code> · По умолчанию: <code>true</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Проверять «Входящие» для уведомлений, минут</span><code>webmail.web_push_poll_min</code></div>
+  <div class="pdesc"><p>Пока у ящика есть устройства с уведомлениями, служба держит с ним соединение IMAP IDLE (если включено «Новая почта сразу» и сервер это умеет) — письмо объявляется за секунды. Без IDLE «Входящие» проверяются раз в столько минут.</p>
+    <p class="prec">💡 5.</p>
+    <p class="pmeta">Пример: <code>5</code> · По умолчанию: <code>5</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Службы уведомлений браузеров</span><code>webmail.web_push_hosts</code></div>
+  <div class="pdesc"><p>Имена служб доставки, на адреса которых архив отправляет уведомления (вместе с поддоменами). Браузер сам выбирает свою службу; адрес подписки другой службы архив не примет — так браузер не заставит сервер обращаться куда угодно.</p>
+    <p class="prec">💡 Оставьте по умолчанию; уберите службы, к которым серверу нельзя обращаться.</p>
+    <p class="pmeta">Пример: <code>fcm.googleapis.com, push.services.mozilla.com, push.apple.com, notify.windows.com</code> · По умолчанию: <code>fcm.googleapis.com, push.services.mozilla.com, push.apple.com, notify.windows.com</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Контакт для служб уведомлений</span><code>webmail.web_push_contact</code></div>
+  <div class="pdesc"><p>Адрес, по которому служба доставки свяжется с владельцем сервера при проблемах (передаётся в подписи запросов VAPID): mailto:адрес или https://сайт. Пусто — адрес сервера из «Адрес интерфейса», если он https. Службе Apple нужен настоящий адрес.</p>
+    <p class="prec">💡 mailto: адрес администратора.</p>
+    <p class="pmeta">Пример: <code>mailto:it@example.ru</code></p>
+  </div></div>
 </div>
 <h3 class="pg">📨 Приём журналирования (SMTP)</h3>
 <div class="ptable">
@@ -2703,6 +2756,93 @@ cron-выражение подставится само. Для особых с�
   <div class="pdesc"><p>Сколько ждать сервер каталога при входе.</p>
     <p class="prec">💡 10.</p>
     <p class="pmeta">Пример: <code>10</code> · По умолчанию: <code>10</code></p>
+  </div></div>
+</div>
+<h3 class="pg">🔑 Единый вход (OpenID Connect)</h3>
+<div class="ptable">
+<div class="prow">
+  <div class="pname"><span class="ptitle">Единый вход (OpenID Connect)</span><code>oidc.enabled</code></div>
+  <div class="pdesc"><p>На странице входа появляется кнопка входа через поставщика удостоверений организации: Keycloak, Microsoft Entra ID (Azure AD), ADFS, Google Workspace, Authentik, Okta. Пароль вводится у поставщика (с его вторым фактором), архив получает подписанный id_token. Учётная запись архива заводится сама, роль — по группам.</p>
+    <p class="prec">💡 Включите, если в организации есть единый вход; локальный администратор остаётся на случай сбоя.</p>
+    <p class="pmeta">Пример: <code>true</code> · По умолчанию: <code>false</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Издатель (issuer)</span><code>oidc.issuer</code></div>
+  <div class="pdesc"><p>Адрес поставщика: его описание берётся по &lt;issuer&gt;/.well-known/openid-configuration. Keycloak — https://sso.company.ru/realms/&lt;realm&gt;; Entra ID — https://login.microsoftonline.com/&lt;tenant&gt;/v2.0; ADFS — https://adfs.company.ru/adfs; Google — https://accounts.google.com. Только https.</p>
+    <p class="prec">💡 Скопируйте из настроек поставщика.</p>
+    <p class="pmeta">Пример: <code>https://sso.company.ru/realms/company</code> · По умолчанию: <code>(пусто)</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Идентификатор клиента</span><code>oidc.client_id</code></div>
+  <div class="pdesc"><p>Регистрация приложения у поставщика: тип «конфиденциальный клиент», поток Authorization Code, адрес возврата — &lt;адрес архива&gt;/api/auth/oidc/callback (карточка ниже показывает точный).</p>
+    <p class="prec">💡 mailarchiver.</p>
+    <p class="pmeta">Пример: <code>mailarchiver</code> · По умолчанию: <code>(пусто)</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Секрет клиента</span><code>oidc.client_secret</code></div>
+  <div class="pdesc"><p>Хранится в базе зашифрованным; при смене издателя вводится заново. Пусто — публичный клиент (только PKCE).</p>
+    <p class="prec">💡 Конфиденциальный клиент с секретом.</p>
+    <p class="pmeta">Пример: <code>(секрет)</code> · По умолчанию: <code>(пусто)</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Области (scope)</span><code>oidc.scopes</code></div>
+  <div class="pdesc"><p>Что запрашивать у поставщика; openid добавляется всегда. Группы в Keycloak — областью groups или ролями.</p>
+    <p class="prec">💡 openid email profile (Keycloak с группами — openid email profile groups).</p>
+    <p class="pmeta">Пример: <code>openid email profile</code> · По умолчанию: <code>openid email profile</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Логин в архиве — из утверждения</span><code>oidc.username_claim</code></div>
+  <div class="pdesc"><p>preferred_username (Keycloak, Entra ID), upn (ADFS), email. Нет такого — email, иначе sub.</p>
+    <p class="prec">💡 preferred_username.</p>
+    <p class="pmeta">Пример: <code>preferred_username</code> · По умолчанию: <code>preferred_username</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Утверждение с группами или ролями</span><code>oidc.role_claim</code></div>
+  <div class="pdesc"><p>Где в id_token группы пользователя: groups (Keycloak с картой групп, Entra ID — идентификаторы групп), roles (роли приложения Entra ID), realm_access.roles (роли Keycloak) — путь через точку.</p>
+    <p class="prec">💡 groups или roles.</p>
+    <p class="pmeta">Пример: <code>groups</code> · По умолчанию: <code>groups</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Группы или роли администраторов</span><code>oidc.admin_values</code></div>
+  <div class="pdesc"><p>Значения утверждения, дающие роль администратора (через запятую). Регистр не важен.</p>
+    <p class="prec">💡 Отдельная группа, например /mailarchiver-admins.</p>
+    <p class="pmeta">Пример: <code>/mailarchiver-admins</code> · По умолчанию: <code>(пусто)</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Группы или роли операторов</span><code>oidc.operator_values</code></div>
+  <div class="pdesc"><p>Значения утверждения, дающие роль оператора (через запятую).</p>
+    <p class="prec">💡 Отдельная группа.</p>
+    <p class="pmeta">Пример: <code>/mailarchiver-operators</code> · По умолчанию: <code>(пусто)</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Сотрудники входят единым входом</span><code>oidc.employee_login</code></div>
+  <div class="pdesc"><p>Пользователь без групп архива входит в архив своих ящиков: ящик находится по подтверждённому адресу email (логин ящика или адрес сотрудника в справочнике).</p>
+    <p class="prec">💡 Включите, если сотрудникам нужен архив своей почты.</p>
+    <p class="pmeta">Пример: <code>false</code> · По умолчанию: <code>false</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Дополнять данные из userinfo</span><code>oidc.use_userinfo</code></div>
+  <div class="pdesc"><p>Если групп или почты нет в id_token, архив спросит их у userinfo поставщика.</p>
+    <p class="prec">💡 Выключено; включите, если роль не определяется.</p>
+    <p class="pmeta">Пример: <code>false</code> · По умолчанию: <code>false</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Надпись на кнопке входа</span><code>oidc.button_text</code></div>
+  <div class="pdesc"><p>Как кнопка называется на странице входа.</p>
+    <p class="prec">💡 Например «Войти через Keycloak» или «Войти учётной записью компании».</p>
+    <p class="pmeta">Пример: <code>Войти через Keycloak</code> · По умолчанию: <code>Войти через единый вход</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Адрес возврата (redirect URI)</span><code>oidc.redirect_uri</code></div>
+  <div class="pdesc"><p>Пусто — &lt;server.public_url или адрес, по которому открыт архив&gt;/api/auth/oidc/callback. Задайте явно, если архив за прокси и адрес определяется неверно; он должен точно совпадать с зарегистрированным.</p>
+    <p class="prec">💡 Пусто, если задан server.public_url.</p>
+    <p class="pmeta">Пример: <code>https://archive.company.ru/api/auth/oidc/callback</code> · По умолчанию: <code>(пусто)</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Проверять сертификат поставщика</span><code>oidc.verify_ssl</code></div>
+  <div class="pdesc"><p>Выключать только для проверки на стенде.</p>
+    <p class="prec">💡 Включено.</p>
+    <p class="pmeta">Пример: <code>true</code> · По умолчанию: <code>true</code></p>
   </div></div>
 </div>
 <h3 class="pg">🗝️ Вход в ящики через администратора почты</h3>
@@ -3011,6 +3151,16 @@ cron-выражение подставится само. Для особых с�
 входе и отключается, когда человека убирают из групп. По желанию сотрудники входят доменным паролем в архив
 своих ящиков (по адресу почты). Пароль уходит только по <code>ldaps://</code> или StartTLS; кнопка «Проверить»
 показывает, кого найдёт каталог и какую роль получит.</p>
+<h3 id="oidc">Единый вход (OpenID Connect)</h3>
+<p>«Настройки → 🔑 Единый вход» — вход через Keycloak, Microsoft Entra ID, ADFS, Authentik, Okta, Google и другие
+поставщики OpenID Connect: на странице входа появляется кнопка «Войти через единый вход». У поставщика заводится
+клиент с обратным адресом <code>https://&lt;адрес архива&gt;/api/auth/oidc/callback</code>; роль — по группам
+или ролям из <code>id_token</code> («Группы администраторов», «Группы операторов»), остальные по желанию входят
+сотрудниками в архив своих ящиков. Вход — по коду с PKCE, подпись <code>id_token</code>, издатель, получатель,
+срок и <code>nonce</code> проверяются. Учётная запись архива заводится сама и отключается, когда у поставщика
+пропадают группы архива; второй фактор проверяет поставщик.</p>
+<img class="shot" src="img/78_login_sso.png" alt="Вход через единый вход">
+<div class="cap">Страница входа с кнопкой единого входа</div>
 <h3 id="apitokens">API-токены</h3>
 <p>Для скриптов и интеграций администратор выпускает токен в разделе «Пользователи → 🔑 API-токены»: имя,
 владелец, роль (администратор или оператор — не выше роли владельца) и срок. Токен показывается один раз; запрос

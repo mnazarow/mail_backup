@@ -1638,6 +1638,11 @@ def tick(svc) -> Dict:
         log.exception("Ошибка запланированной отправки")
     if not bool(svc.rt("webmail", "enabled")):
         return out
+    try:                                            # уведомления на устройства сотрудников (1.22.0)
+        from .webpush import tick as push_tick
+        out["pushed"] = push_tick(svc)["messages"]
+    except Exception:  # noqa: BLE001
+        log.exception("Ошибка уведомлений о новой почте")
     now_iso = datetime.now(timezone.utc).isoformat()
     for r in svc.db.query("SELECT DISTINCT account_id FROM webmail_snooze WHERE until<=?", (now_iso,)):
         acc = svc.db.get_account(int(r["account_id"]))

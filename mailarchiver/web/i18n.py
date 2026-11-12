@@ -800,6 +800,46 @@ PARAM_HELP: Dict[str, dict] = {
         "recommend": "300; для ящиков рассылок поднимите или отправляйте рассылки другим способом.",
         "example": "300", "default": "300",
     },
+    "webmail.web_push": {
+        "title": "Уведомления на компьютер и телефон (Web Push)",
+        "help": ("Сотрудник включает в «Почта → ⚙ → 🔔 Уведомления» уведомления о новых письмах своих ящиков: "
+                 "браузер покажет их, даже когда «Почта» закрыта (Chrome, Edge, Firefox, Safari; на iPhone — "
+                 "сайт, добавленный на экран «Домой»). Архив отправляет зашифрованное ключом браузера сообщение "
+                 "через службу доставки браузера (Google, Mozilla, Apple, Microsoft) — ей нужен выход в интернет, "
+                 "а интерфейсу — адрес https://. Служба доставки содержимого не видит."),
+        "recommend": "Включите, если сервер может обращаться к службам доставки браузеров и «Почта» открыта по https.",
+        "example": "true", "default": "false",
+    },
+    "webmail.web_push_preview": {
+        "title": "Отправитель и тема в уведомлении",
+        "help": ("Включено — уведомление показывает отправителя и тему письма; выключено — только «Новое письмо» и "
+                 "название ящика (тему не увидят на заблокированном экране телефона)."),
+        "recommend": "Включено; выключите, если темы писем бывают конфиденциальными.",
+        "example": "true", "default": "true",
+    },
+    "webmail.web_push_poll_min": {
+        "title": "Проверять «Входящие» для уведомлений, минут",
+        "help": ("Пока у ящика есть устройства с уведомлениями, служба держит с ним соединение IMAP IDLE (если "
+                 "включено «Новая почта сразу» и сервер это умеет) — письмо объявляется за секунды. Без IDLE "
+                 "«Входящие» проверяются раз в столько минут."),
+        "recommend": "5.", "example": "5", "default": "5",
+    },
+    "webmail.web_push_hosts": {
+        "title": "Службы уведомлений браузеров",
+        "help": ("Имена служб доставки, на адреса которых архив отправляет уведомления (вместе с поддоменами). "
+                 "Браузер сам выбирает свою службу; адрес подписки другой службы архив не примет — так браузер не "
+                 "заставит сервер обращаться куда угодно."),
+        "recommend": "Оставьте по умолчанию; уберите службы, к которым серверу нельзя обращаться.",
+        "example": "fcm.googleapis.com, push.services.mozilla.com, push.apple.com, notify.windows.com",
+        "default": "fcm.googleapis.com, push.services.mozilla.com, push.apple.com, notify.windows.com",
+    },
+    "webmail.web_push_contact": {
+        "title": "Контакт для служб уведомлений",
+        "help": ("Адрес, по которому служба доставки свяжется с владельцем сервера при проблемах (передаётся в "
+                 "подписи запросов VAPID): mailto:адрес или https://сайт. Пусто — адрес сервера из «Адрес "
+                 "интерфейса», если он https. Службе Apple нужен настоящий адрес."),
+        "recommend": "mailto: адрес администратора.", "example": "mailto:it@example.ru", "default": "",
+    },
 
     # ---- journal ----
     "journal.enabled": {
@@ -1747,6 +1787,93 @@ PARAM_HELP: Dict[str, dict] = {
         "recommend": "50; для небольшого архива можно больше.",
         "example": "50", "default": "50",
     },
+
+    # ---- oidc (1.22.0) ----
+    "oidc.enabled": {
+        "title": "Единый вход (OpenID Connect)",
+        "help": ("На странице входа появляется кнопка входа через поставщика удостоверений организации: Keycloak, "
+                 "Microsoft Entra ID (Azure AD), ADFS, Google Workspace, Authentik, Okta. Пароль вводится у "
+                 "поставщика (с его вторым фактором), архив получает подписанный id_token. Учётная запись архива "
+                 "заводится сама, роль — по группам."),
+        "recommend": "Включите, если в организации есть единый вход; локальный администратор остаётся на случай сбоя.",
+        "example": "true", "default": "false",
+    },
+    "oidc.issuer": {
+        "title": "Издатель (issuer)",
+        "help": ("Адрес поставщика: его описание берётся по <issuer>/.well-known/openid-configuration. Keycloak — "
+                 "https://sso.company.ru/realms/<realm>; Entra ID — https://login.microsoftonline.com/<tenant>/v2.0; "
+                 "ADFS — https://adfs.company.ru/adfs; Google — https://accounts.google.com. Только https."),
+        "recommend": "Скопируйте из настроек поставщика.",
+        "example": "https://sso.company.ru/realms/company", "default": "(пусто)",
+    },
+    "oidc.client_id": {
+        "title": "Идентификатор клиента",
+        "help": ("Регистрация приложения у поставщика: тип «конфиденциальный клиент», поток Authorization Code, адрес "
+                 "возврата — <адрес архива>/api/auth/oidc/callback (карточка ниже показывает точный)."),
+        "recommend": "mailarchiver.", "example": "mailarchiver", "default": "(пусто)",
+    },
+    "oidc.client_secret": {
+        "title": "Секрет клиента",
+        "help": "Хранится в базе зашифрованным; при смене издателя вводится заново. Пусто — публичный клиент (только PKCE).",
+        "recommend": "Конфиденциальный клиент с секретом.", "example": "(секрет)", "default": "(пусто)",
+    },
+    "oidc.scopes": {
+        "title": "Области (scope)",
+        "help": "Что запрашивать у поставщика; openid добавляется всегда. Группы в Keycloak — областью groups или ролями.",
+        "recommend": "openid email profile (Keycloak с группами — openid email profile groups).",
+        "example": "openid email profile", "default": "openid email profile",
+    },
+    "oidc.username_claim": {
+        "title": "Логин в архиве — из утверждения",
+        "help": "preferred_username (Keycloak, Entra ID), upn (ADFS), email. Нет такого — email, иначе sub.",
+        "recommend": "preferred_username.", "example": "preferred_username", "default": "preferred_username",
+    },
+    "oidc.role_claim": {
+        "title": "Утверждение с группами или ролями",
+        "help": ("Где в id_token группы пользователя: groups (Keycloak с картой групп, Entra ID — идентификаторы групп), "
+                 "roles (роли приложения Entra ID), realm_access.roles (роли Keycloak) — путь через точку."),
+        "recommend": "groups или roles.", "example": "groups", "default": "groups",
+    },
+    "oidc.admin_values": {
+        "title": "Группы или роли администраторов",
+        "help": "Значения утверждения, дающие роль администратора (через запятую). Регистр не важен.",
+        "recommend": "Отдельная группа, например /mailarchiver-admins.",
+        "example": "/mailarchiver-admins", "default": "(пусто)",
+    },
+    "oidc.operator_values": {
+        "title": "Группы или роли операторов",
+        "help": "Значения утверждения, дающие роль оператора (через запятую).",
+        "recommend": "Отдельная группа.", "example": "/mailarchiver-operators", "default": "(пусто)",
+    },
+    "oidc.employee_login": {
+        "title": "Сотрудники входят единым входом",
+        "help": ("Пользователь без групп архива входит в архив своих ящиков: ящик находится по подтверждённому "
+                 "адресу email (логин ящика или адрес сотрудника в справочнике)."),
+        "recommend": "Включите, если сотрудникам нужен архив своей почты.", "example": "false", "default": "false",
+    },
+    "oidc.use_userinfo": {
+        "title": "Дополнять данные из userinfo",
+        "help": "Если групп или почты нет в id_token, архив спросит их у userinfo поставщика.",
+        "recommend": "Выключено; включите, если роль не определяется.", "example": "false", "default": "false",
+    },
+    "oidc.button_text": {
+        "title": "Надпись на кнопке входа",
+        "help": "Как кнопка называется на странице входа.",
+        "recommend": "Например «Войти через Keycloak» или «Войти учётной записью компании».",
+        "example": "Войти через Keycloak", "default": "Войти через единый вход",
+    },
+    "oidc.redirect_uri": {
+        "title": "Адрес возврата (redirect URI)",
+        "help": ("Пусто — <server.public_url или адрес, по которому открыт архив>/api/auth/oidc/callback. Задайте явно, "
+                 "если архив за прокси и адрес определяется неверно; он должен точно совпадать с зарегистрированным."),
+        "recommend": "Пусто, если задан server.public_url.", "example": "https://archive.company.ru/api/auth/oidc/callback",
+        "default": "(пусто)",
+    },
+    "oidc.verify_ssl": {
+        "title": "Проверять сертификат поставщика",
+        "help": "Выключать только для проверки на стенде.",
+        "recommend": "Включено.", "example": "true", "default": "true",
+    },
 }
 
 # Порядок и группировка секций для страницы настроек
@@ -1808,7 +1935,8 @@ SETTINGS_SECTIONS: List[dict] = [
      "keys": ["enabled", "admin_actions", "mark_read", "auto_refresh_s", "max_attachments_mb", "save_sent",
               "drafts_keep_days", "undo_send_s", "rules_interval_min", "push", "drafts_on_server",
               "phishing_report_to", "dlp_mode", "warn_external", "warn_recipients", "smime_ca_file",
-              "send_limit_hour"]},
+              "send_limit_hour", "web_push", "web_push_preview", "web_push_poll_min", "web_push_hosts",
+              "web_push_contact"]},
     {"section": "journal", "title": "Приём журналирования (SMTP)", "icon": "📨",
      "keys": ["enabled", "listen", "port", "allowed_ips", "address", "folder", "unwrap_exchange", "tls_cert",
               "tls_key", "require_tls", "auth_user", "auth_password", "client_ca", "max_size_mb"]},
@@ -1823,6 +1951,10 @@ SETTINGS_SECTIONS: List[dict] = [
      "keys": ["enabled", "url", "starttls", "verify_ssl", "bind_dn", "bind_password", "base_dn", "user_filter",
               "admin_group", "operator_group", "nested_groups", "employee_login", "sync_users", "employee_base_dn",
               "employee_filter", "timeout_s"]},
+    {"section": "oidc", "title": "Единый вход (OpenID Connect)", "icon": "🔑",
+     "keys": ["enabled", "issuer", "client_id", "client_secret", "scopes", "username_claim", "role_claim",
+              "admin_values", "operator_values", "employee_login", "use_userinfo", "button_text", "redirect_uri",
+              "verify_ssl"]},
     {"section": "mailadmin", "title": "Вход в ящики через администратора почты", "icon": "🗝️",
      "keys": ["enabled", "host", "user", "password", "mode", "separator"]},
     {"section": "axigen", "title": "Сервер Axigen", "icon": "📮",

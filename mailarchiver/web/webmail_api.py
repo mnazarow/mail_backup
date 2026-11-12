@@ -76,6 +76,9 @@ def _act_problem(svc, user: dict, acc) -> str:
     if user.get("role") == "admin" and not bool(svc.rt("webmail", "admin_actions")):
         return ("Администратору писать письма и менять ящики сотрудников запрещено настройкой «Администратор может "
                 "писать и менять ящики» («Настройки → Почтовый клиент»).")
+    if _is_mailbox(user) and auth_mod.mailbox_rights(user, int(acc.id)) == "read":
+        return (f"Ящик «{acc.name}» открыт вам только для чтения: писать от его имени и менять его на сервере "
+                f"нельзя (доступ даёт администратор).")
     return ""
 
 
@@ -135,6 +138,16 @@ def webmail_status(request: Request, account_id: int, user: dict = Depends(_user
         "phishing_report_to": bool(str(svc.rt("webmail", "phishing_report_to") or "").strip()),
         "sieve": wx.sieve_active(svc, int(acc.id)),
     }
+
+
+@router.get("/unified")
+def webmail_unified(request: Request, offset: int = 0, limit: int = 50, user: dict = Depends(_user)):
+    """«Все входящие»: «Входящие» всех ящиков сотрудника (свои и открытые ему) одним списком (1.22.0)."""
+    from .. import delegation
+    svc = _svc(request)
+    if not _is_mailbox(user):
+        raise HTTPException(403, "«Все входящие» — для сотрудника, вошедшего паролем ящика.")
+    return delegation.unified_inbox(svc, auth_mod.mailbox_ids(user), offset=max(0, offset), limit=limit)
 
 
 @router.get("/folders")

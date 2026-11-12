@@ -492,7 +492,8 @@ def test_settings_new_keys():
 def test_ui_has_client_tools():
     import pathlib
     root = pathlib.Path(__file__).parent.parent / "mailarchiver/web/static"
-    js = (root / "js/app.js").read_text("utf-8")
+    from mailarchiver.web.assets import bundle_text
+    js = bundle_text()
     for needle in ("function mailSettingsDialog", "function mailRuleEditor", "/webmail/snooze", "/webmail/zip",
                    "function mailUndoWait", "/schedule`", "/webmail/extras", "/webmail/invite", "/webmail/receipt",
                    "/webmail/book/import", "function composeMentionsAttachment", "function mailQuickReply",

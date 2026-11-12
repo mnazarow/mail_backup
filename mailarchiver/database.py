@@ -38,7 +38,7 @@ _ENCRYPTED_SETTINGS = {"notifications.smtp_password", "notifications.telegram_bo
                        "notifications.webhook_secret", "employees.source_url_password",
                        "replica.s3_secret_key", "monitoring.metrics_token", "mailadmin.password",
                        "axigen.admin_password", "axigen.ftp_password",
-                       "journal.auth_password"}
+                       "journal.auth_password", "oidc.client_secret"}
 
 
 #: Выборка сотрудника вместе с ОСНОВНЫМ ящиком и числом всех его ящиков.
@@ -291,6 +291,12 @@ class Database:
             # откуда пришли письма журнала (1.21.0)
             from .journal import ensure_schema as _ensure_journal
             _ensure_journal(conn)
+            # общие и делегированные ящики (1.22.0)
+            from .delegation import ensure_schema as _ensure_delegation
+            _ensure_delegation(conn)
+            # уведомления о новой почте на устройства сотрудников (Web Push, 1.22.0)
+            from .webpush import ensure_schema as _ensure_webpush
+            _ensure_webpush(conn)
         self._encrypt_plain_settings()
 
     def _encrypt_plain_settings(self) -> None:
@@ -1474,7 +1480,15 @@ class Database:
         ids = [int(account_id)] + [int(r["id"]) for r in rows if int(r["id"]) != int(account_id)]
         own = self.scalar("SELECT username FROM accounts WHERE id=?", (account_id,)) or ""
         logins = [own] + [r["username"] or "" for r in rows if int(r["id"]) != int(account_id)]
+        # ящики, открытые сотруднику администратором (общие, делегированные — 1.22.0): после своих
+        ids += [aid for aid in self.mailbox_delegated(account_id) if aid not in ids]
         return ids, [x for x in logins if x]
+
+    def mailbox_delegated(self, account_id: int) -> Dict[int, str]:
+        """{ящик: права} — чужие ящики, открытые сотруднику, вошедшему паролем ящика ``account_id``."""
+        from .delegation import delegated_for_employee
+        emp = self.scalar("SELECT employee_id FROM accounts WHERE id=?", (account_id,))
+        return delegated_for_employee(self, int(emp)) if emp else {}
 
     # ======================================================================
     #  Состояние папок и индекс сообщений

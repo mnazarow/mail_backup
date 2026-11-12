@@ -189,7 +189,8 @@ table.tbl tr:last-child td { border-bottom: none; }
 .form-row { margin-bottom: 15px; }
 .form-row label { display: block; font-weight: 600; margin-bottom: 5px; font-size: .9rem; display:flex; align-items:center; gap:7px; }
 .form-row input[type=text], .form-row input[type=password], .form-row input[type=number],
-.form-row input[type=date], .form-row select, .form-row textarea {
+.form-row input[type=date], .form-row input[type=search], .form-row input[type=email], .form-row input:not([type]),
+.form-row select, .form-row textarea {
   width: 100%; padding: 9px 11px; border: 1px solid var(--border); border-radius: var(--radius-sm);
   background: var(--bg); color: var(--text); font-size: .92rem; font-family: inherit;
 }
@@ -781,3 +782,10 @@ table.tbl select[data-role]:focus { outline: none; border-color: var(--primary);
 .cal-ev { display: block; width: 100%; text-align: left; border: 0; border-radius: 4px; margin: 1px 0; padding: 1px 4px; font-size: .74rem;
   background: var(--primary-soft); color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; }
 @media (max-width: 640px) { .cal-d { min-height: 56px; } .cal-ev { font-size: .66rem; } }
+
+/* Страница входа: «или» перед единым входом (1.22.0) */
+.auth-or { text-align: center; margin: 10px 0 8px; }
+
+/* уведомления на устройство (1.22.0) */
+.wp-accs label { display: flex; gap: 8px; align-items: center; margin: 3px 0; font-weight: normal; }
+.wp-accs input { width: auto; }

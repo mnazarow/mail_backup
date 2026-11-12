@@ -212,6 +212,12 @@ webmail:                     # почтовый клиент раздела «П
   warn_recipients: 20        # предупреждать о большом списке адресатов в «Кому» и «Копии» (0 — нет)
   smime_ca_file: ""          # доверенные центры организации для подписей S/MIME (PEM), кроме системных
   send_limit_hour: 300       # адресатов в час с одного ящика (0 — без предела)
+  # уведомления о новой почте на компьютер и телефон сотрудника (Web Push, 1.22.0); нужен https
+  web_push: false            # разрешить сотрудникам включать уведомления на своих устройствах
+  web_push_preview: true     # отправитель и тема в уведомлении (иначе — «Новое письмо»)
+  web_push_poll_min: 5       # ящик без IMAP IDLE: проверять «Входящие» раз в столько минут
+  web_push_hosts: [fcm.googleapis.com, push.services.mozilla.com, push.apple.com, notify.windows.com]
+  web_push_contact: ""       # mailto:адрес администратора для служб доставки ('' — адрес сервера)
 
 journal:                     # приём журналирования по SMTP (docs/ru/23-compliance.md)
   enabled: false
@@ -264,6 +270,22 @@ ldap:                        # вход через LDAP / Active Directory (docs
   employee_base_dn: ""       # источник справочника сотрудников (employees.source_type: ldap): где искать
   employee_filter: "(&(objectCategory=person)(objectClass=user)(mail=*))"
   timeout_s: 10
+
+oidc:                        # единый вход OpenID Connect (docs/ru/08-security.md), 1.22.0
+  enabled: false
+  issuer: ""                 # https://sso.company.ru/realms/company, https://login.microsoftonline.com/<tenant>/v2.0
+  client_id: ""
+  client_secret: ""          # лучше задать в интерфейсе: там хранится зашифрованным ('' — публичный клиент с PKCE)
+  scopes: "openid email profile"
+  username_claim: "preferred_username"
+  role_claim: "groups"       # для ролей Keycloak — realm_access.roles
+  admin_values: []           # группы/роли администраторов архива
+  operator_values: []        # группы/роли операторов
+  employee_login: false      # остальные — сотрудники: архив своих ящиков по адресу email
+  use_userinfo: false        # дополнять данными userinfo (если групп нет в id_token)
+  button_text: "Войти через единый вход"
+  redirect_uri: ""           # '' — <адрес интерфейса>/api/auth/oidc/callback
+  verify_ssl: true
 
 mailadmin:                   # вход в ящики через администратора почты (docs/ru/16-mailadmin.md)
   enabled: false

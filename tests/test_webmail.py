@@ -676,8 +676,8 @@ def test_api_folders_and_sync(api):
 
 
 def test_ui_has_mail_client():
-    import pathlib
-    js = (pathlib.Path(__file__).parent.parent / "mailarchiver/web/static/js/app.js").read_text("utf-8")
+    from mailarchiver.web.assets import bundle_text
+    js = bundle_text()
     for needle in ("/webmail/status", "/webmail/drafts", "function composeWindow", "/webmail/sync",
                    "/webmail/folders/rename", "function mailMovePicker", "function composeClean"):
         assert needle in js, needle

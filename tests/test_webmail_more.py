@@ -392,9 +392,8 @@ def test_unused_names_guard():
 
 
 def test_ui_119():
-    import pathlib
-    root = pathlib.Path(__file__).parent.parent / "mailarchiver/web/static"
-    js = (root / "js/app.js").read_text("utf-8")
+    from mailarchiver.web.assets import bundle_text
+    js = bundle_text()
     for needle in ("function mailPushLoop", "/webmail/wait?", "data-threads", "thread_ids", "/webmail/searches",
                    "function mailRenderTrust", "/webmail/phishing", "function mailSieveSection", "to_server",
                    "function mailShortcutsHelp", "/webmail/quota", "data-a=\"archive\""):

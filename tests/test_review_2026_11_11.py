@@ -195,7 +195,8 @@ def test_help_page_can_be_framed_only_by_the_app(client):
 def test_documentation_section_in_menu():
     """Пункт «Документация» в меню — всем ролям; у каждого раздела есть глава справки, и она есть в справке."""
     import re
-    js = open(os.path.join(ROOT, "mailarchiver", "web", "static", "js", "app.js"), encoding="utf-8").read()
+    from mailarchiver.web.assets import bundle_text
+    js = bundle_text()
     assert "{id:'docs', icon:'📖', title:'Документация', roles:'aom'}" in js and "docs:viewDocs" in js
     anchors = dict(re.findall(r"(\w+):'([a-z]+)'", js[js.index("const DOC_ANCHORS="):js.index("function docsHref")]))
     views = set(re.findall(r"\{id:'(\w+)'", js[js.index("const NAV = ["):js.index("const ROLE_LABELS")])) - {"docs"}

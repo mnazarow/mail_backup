@@ -14,6 +14,7 @@
 <body>
   <div id="root"><div class="auth-wrap"><div class="spinner"></div></div></div>
   <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
-  <script src="/static/js/app.js?v={{ asset }}"></script>
+  {% for name in js_files %}<script src="/static/js/{{ name }}?v={{ asset }}"></script>
+  {% endfor %}
 </body>
 </html>

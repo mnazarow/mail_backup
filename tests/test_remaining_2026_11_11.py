@@ -23,6 +23,11 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATIC = os.path.join(ROOT, "mailarchiver", "web", "static")
 
 
+
+def _js():
+    from mailarchiver.web.assets import bundle_text
+    return bundle_text()
+
 def _read(*parts):
     with open(os.path.join(*parts), encoding="utf-8") as fh:
         return fh.read()
@@ -54,7 +59,7 @@ def test_index_page_has_strict_csp(client):
 
 
 def test_app_js_has_no_javascript_urls():
-    js = _read(STATIC, "js", "app.js")
+    js = _js()
     assert not re.search(r"""href\s*=\s*\\?["']javascript:""", js)
     # обработчики событий не собираются строкой (on…="…" в разметке из шаблонов)
     assert not re.search(r"""\son(click|change|input|submit|load|error)\s*=\s*["']""", js)
@@ -151,7 +156,7 @@ def test_exports_are_paged(admin):
     # предел страницы — 1…1000
     assert len(admin.get("/api/exports", params={"limit": 0}).json()) == 1
     assert len(admin.get("/api/exports", params={"limit": 100000}).json()) == 7
-    assert "before_id" in _read(STATIC, "js", "app.js")
+    assert "before_id" in _js()
 
 
 # -- доступность ---------------------------------------------------------------------------------
@@ -185,6 +190,6 @@ def test_contrast_of_buttons_and_status_text():
 
 
 def test_labels_are_linked_to_fields():
-    js = _read(STATIC, "js", "app.js")
+    js = _js()
     assert "function linkFormLabels" in js and "MutationObserver" in js
     assert 'aria-live="polite"' in _read(ROOT, "mailarchiver", "web", "templates", "index.html")

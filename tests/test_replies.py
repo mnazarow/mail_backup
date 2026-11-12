@@ -460,9 +460,8 @@ def test_api_operator_forbidden(client):
 
 
 def test_ui_has_section():
-    import os
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    js = open(os.path.join(root, "mailarchiver", "web", "static", "js", "app.js"), encoding="utf-8").read()
+    from mailarchiver.web.assets import bundle_text
+    js = bundle_text()
     assert "{id:'replies'" in js and "replies:viewReplies" in js and "reply_index:" in js
 
 

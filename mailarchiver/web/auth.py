@@ -186,7 +186,8 @@ def user_from_token(services, token: str, touch: bool = True) -> Optional[dict]:
         services.db.delete_session(token)
         return None
     return {"id": user["id"], "username": user["username"], "role": user["role"],
-            "totp_enabled": bool(_row_get(user, "totp_enabled", 0))}
+            "totp_enabled": bool(_row_get(user, "totp_enabled", 0)),
+            "auth_source": _row_get(user, "auth_source", "local") or "local"}
 
 
 def mailbox_user(services, acc) -> dict:
@@ -198,8 +199,21 @@ def mailbox_user(services, acc) -> dict:
     ``logins`` — логины этих ящиков: «своё задание» — запущенное под любым из них.
     """
     ids, logins = services.db.mailbox_scope(acc.id)
+    delegated = {aid: r for aid, r in services.db.mailbox_delegated(acc.id).items() if aid in ids}
     return {"id": 0, "username": acc.username, "role": "mailbox", "account_id": acc.id,
-            "account_name": acc.name, "account_ids": ids, "logins": logins}
+            "account_name": acc.name, "account_ids": ids, "logins": logins, "delegated": delegated}
+
+
+def mailbox_full_ids(user: dict) -> List[int]:
+    """Ящики, с которыми сотрудник может делать всё (свои и открытые с полным доступом, 1.22.0)."""
+    read_only = {int(a) for a, r in (user.get("delegated") or {}).items() if r != "full"}
+    return [i for i in mailbox_ids(user) if i not in read_only]
+
+
+def mailbox_rights(user: dict, account_id: int) -> str:
+    """own | full | read — как сотруднику открыт ящик."""
+    r = (user.get("delegated") or {}).get(int(account_id))
+    return r or "own"
 
 
 def mailbox_ids(user: dict) -> List[int]:
@@ -229,6 +243,8 @@ def two_factor_required(services, user: dict) -> bool:
         return False
     if user.get("totp_enabled"):
         return False
+    if user.get("auth_source") == "oidc":
+        return False        # единый вход (1.22.0): второй фактор проверяет поставщик удостоверений
     try:
         return bool(services.rt("security", "require_2fa"))
     except Exception:  # noqa: BLE001

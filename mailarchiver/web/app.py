@@ -32,6 +32,7 @@ from .axigen_api import router as axigen_router
 from .mailservers_api import router as mailservers_router
 from .replies_api import router as replies_router
 from .webmail_api import router as webmail_router
+from .push_api import router as push_router
 from .server_api import router as server_router
 from .proxy import SECURITY_HEADERS, BodyLimitMiddleware, ProxyHeadersMiddleware, SecurityHeadersMiddleware
 from .ws import router as ws_router
@@ -43,7 +44,8 @@ def _asset_tag() -> str:
     """Отпечаток файлов интерфейса — для ?v=… в ссылках на них (сброс кеша)."""
     import hashlib
     digest = hashlib.sha256()
-    for rel in ("js/app.js", "css/app.css"):
+    from .assets import CSS_FILES, JS_FILES
+    for rel in [f"js/{n}" for n in JS_FILES] + [f"css/{n}" for n in CSS_FILES]:
         try:
             with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", rel), "rb") as fh:
                 digest.update(fh.read())
@@ -194,6 +196,7 @@ def create_app() -> FastAPI:
     app.include_router(replies_router)
     app.include_router(cases_router)
     app.include_router(webmail_router)
+    app.include_router(push_router)
     app.include_router(api_router)
     app.include_router(ws_router)
 
@@ -267,9 +270,19 @@ def create_app() -> FastAPI:
     async def index(request: Request):
         # Версию анониму не отдаём (как и /health): для сброса кеша браузера
         # хватает отпечатка самих файлов интерфейса.
-        response = render_template(request, "index.html", {"asset": asset_tag, "title": APP_TITLE})
+        from .assets import JS_FILES
+        response = render_template(request, "index.html", {"asset": asset_tag, "title": APP_TITLE,
+                                                           "js_files": JS_FILES})
         response.headers["Content-Security-Policy"] = PAGE_CSP
         return response
+
+    @app.get("/sw.js", include_in_schema=False)
+    async def service_worker():
+        """Фоновый обработчик браузера для уведомлений о новой почте (Web Push, 1.22.0). Отдаётся из корня,
+        чтобы управлять всеми страницами интерфейса (щелчок по уведомлению открывает письмо в той же вкладке)."""
+        from fastapi.responses import FileResponse
+        return FileResponse(os.path.join(STATIC_DIR, "sw.js"), media_type="text/javascript",
+                            headers={"Cache-Control": "no-cache"})
 
     @app.get("/health")
     def health(request: Request):
