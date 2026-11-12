@@ -19,6 +19,7 @@ from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from .. import webmail as wm
+from .. import webmail_more as wx
 from .. import webmail_tools as wt
 from ..errors import ValidationError
 from ..models import AuthType
@@ -128,6 +129,9 @@ def webmail_status(request: Request, account_id: int, user: dict = Depends(_user
         "identity": {"display_name": ident["display_name"], "address": ident["address"],
                      "signature": ident["signature"], "from_choices": ident["from_choices"]},
         "autoreply_active": wt.get_autoreply(svc, int(acc.id))["active"],
+        "push": bool(svc.rt("webmail", "push")),
+        "phishing_report_to": bool(str(svc.rt("webmail", "phishing_report_to") or "").strip()),
+        "sieve": wx.sieve_active(svc, int(acc.id)),
     }
 
 
@@ -176,35 +180,50 @@ def webmail_sync(request: Request, body: SyncBody, user: dict = Depends(_user)):
 # ---------------------------------------------------------------------------
 #  Список писем
 # ---------------------------------------------------------------------------
+def _fmt_row(svc, acc, r) -> dict:
+    from ..imap.backup import BackupEngine
+    subject, from_addr, has_attach = r["subject"], r["from_addr"], r["has_attach"]
+    if subject is None:      # копии, снятые до 1.0: тема и отправитель дозаполняются при первом показе
+        try:
+            raw = svc.store.read_message(int(acc.id), r["stored_path"])
+            subject, from_addr, has_attach = BackupEngine._extract_meta(raw)  # noqa: SLF001
+            svc.db.set_message_headers(r["id"], subject, from_addr, has_attach)
+        except Exception:  # noqa: BLE001
+            subject, from_addr, has_attach = "", "", 0
+    flags = [f for f in (r["flags"] or "").split(",") if f]
+    keywords = [f for f in flags if not f.startswith("\\") and f not in _SYSTEM_KEYWORDS]
+    return {
+        "id": r["id"], "folder": r["folder"], "subject": subject or "(без темы)", "from": from_addr or "",
+        "to": (r["peer"] or "") if r["dir"] == 2 else "", "date": r["internaldate"],
+        "size": int(r["size"] or 0), "size_h": human_size(r["size"] or 0),
+        "has_attach": bool(has_attach), "seen": "\\Seen" in flags, "flagged": "\\Flagged" in flags,
+        "answered": "\\Answered" in flags, "forwarded": "$Forwarded" in flags, "draft": "\\Draft" in flags,
+        "gone": bool(r["gone"]), "keywords": keywords,
+    }
+
+
 @router.get("/messages")
 def webmail_messages(request: Request, account_id: int, folder: str, offset: int = 0, limit: int = 50,
                      sort: str = "date_desc", filter: str = "all", show_gone: bool = False,  # noqa: A002
-                     user: dict = Depends(_user)):
+                     threads: bool = False, user: dict = Depends(_user)):
     svc = _svc(request)
     acc = _account(svc, user, account_id)
-    from ..imap.backup import BackupEngine
+    if threads:
+        # беседы: одна строка на переписку (последнее письмо), id всех писем беседы в папке
+        data = wx.list_threads(svc, int(acc.id), folder, offset=offset, limit=limit, filt=filter, show_gone=show_gone)
+        out = []
+        for t in data["threads"]:
+            item = _fmt_row(svc, acc, t["row"])
+            item.update(thread_ids=t["ids"], thread_count=t["count"], thread_unread=t["unread"],
+                        seen=t["unread"] == 0)
+            out.append(item)
+        gone_total = int(svc.db.scalar("SELECT COUNT(*) FROM messages WHERE account_id=? AND folder=? AND gone=1",
+                                       (int(acc.id), folder)) or 0)
+        return {"messages": out, "total": data["total"], "gone": gone_total, "offset": data["offset"],
+                "limit": data["limit"], "folder": folder, "threads": True}
     data = wm.list_messages(svc, int(acc.id), folder, offset=offset, limit=limit, sort=sort, filt=filter,
                             show_gone=show_gone)
-    out = []
-    for r in data["rows"]:
-        subject, from_addr, has_attach = r["subject"], r["from_addr"], r["has_attach"]
-        if subject is None:      # копии, снятые до 1.0: тема и отправитель дозаполняются при первом показе
-            try:
-                raw = svc.store.read_message(int(acc.id), r["stored_path"])
-                subject, from_addr, has_attach = BackupEngine._extract_meta(raw)  # noqa: SLF001
-                svc.db.set_message_headers(r["id"], subject, from_addr, has_attach)
-            except Exception:  # noqa: BLE001
-                subject, from_addr, has_attach = "", "", 0
-        flags = [f for f in (r["flags"] or "").split(",") if f]
-        keywords = [f for f in flags if not f.startswith("\\") and f not in _SYSTEM_KEYWORDS]
-        out.append({
-            "id": r["id"], "folder": r["folder"], "subject": subject or "(без темы)", "from": from_addr or "",
-            "to": (r["peer"] or "") if r["dir"] == 2 else "", "date": r["internaldate"],
-            "size": int(r["size"] or 0), "size_h": human_size(r["size"] or 0),
-            "has_attach": bool(has_attach), "seen": "\\Seen" in flags, "flagged": "\\Flagged" in flags,
-            "answered": "\\Answered" in flags, "forwarded": "$Forwarded" in flags, "draft": "\\Draft" in flags,
-            "gone": bool(r["gone"]), "keywords": keywords,
-        })
+    out = [_fmt_row(svc, acc, r) for r in data["rows"]]
     return {"messages": out, "total": data["total"], "gone": data["gone"], "offset": data["offset"],
             "limit": data["limit"], "folder": folder}
 
@@ -503,17 +522,27 @@ class DraftUpdateBody(BaseModel):
     from_addr: Optional[str] = Field(default=None, max_length=300)
     priority: Optional[bool] = None
     receipt: Optional[bool] = None
+    #: положить и в «Черновики» сервера (при «Сохранить» и закрытии окна, не при автосохранении)
+    to_server: bool = False
 
 
 @router.put("/drafts/{draft_id}")
 def webmail_draft_update(request: Request, draft_id: int, body: DraftUpdateBody, user: dict = Depends(_user)):
     svc = _svc(request)
     _row, _acc = _draft_account(svc, user, draft_id)
-    data = {k: v for k, v in body.model_dump().items() if v is not None}
+    data = {k: v for k, v in body.model_dump().items() if v is not None and k != "to_server"}
     if data.get("account_id"):
         new_acc = _account(svc, user, int(data["account_id"]))
         _require_act(svc, user, new_acc)
-    return wm.update_draft(svc, draft_id, _owner(svc, user), data)
+    res = wm.update_draft(svc, draft_id, _owner(svc, user), data)
+    if body.to_server:
+        acc = _account(svc, user, int(res["account_id"]))
+        if not _act_problem(svc, user, acc):
+            try:
+                res["server"] = wx.save_draft_to_server(svc, acc, draft_id, _owner(svc, user))
+            except (ValidationError, wm.MailArchiverError) as exc:
+                res["server"] = {"saved": False, "warning": f"В «Черновики» сервера не сохранено: {exc.message}"}
+    return res
 
 
 @router.delete("/drafts/{draft_id}")
@@ -756,7 +785,8 @@ def webmail_rule_create(request: Request, body: RuleBody, user: dict = Depends(_
     svc = _svc(request)
     acc = _account(svc, user, body.account_id)
     _require_act(svc, user, acc)
-    return wt.save_rule(svc, acc, body.model_dump(), actor=_actor(user))
+    res = wt.save_rule(svc, acc, body.model_dump(), actor=_actor(user))
+    return res | {"sieve_error": wx.sieve_resync_quiet(svc, acc)}
 
 
 @router.put("/rules/{rule_id}")
@@ -764,7 +794,8 @@ def webmail_rule_update(request: Request, rule_id: int, body: RuleBody, user: di
     svc = _svc(request)
     acc = _account(svc, user, body.account_id)
     _require_act(svc, user, acc)
-    return wt.save_rule(svc, acc, body.model_dump(), rule_id, actor=_actor(user))
+    res = wt.save_rule(svc, acc, body.model_dump(), rule_id, actor=_actor(user))
+    return res | {"sieve_error": wx.sieve_resync_quiet(svc, acc)}
 
 
 @router.delete("/rules/{rule_id}")
@@ -773,7 +804,7 @@ def webmail_rule_delete(request: Request, rule_id: int, account_id: int, user: d
     acc = _account(svc, user, account_id)
     _require_act(svc, user, acc)
     wt.delete_rule(svc, acc, rule_id, actor=_actor(user))
-    return {"ok": True}
+    return {"ok": True, "sieve_error": wx.sieve_resync_quiet(svc, acc)}
 
 
 class RuleOrderBody(BaseModel):
@@ -787,7 +818,7 @@ def webmail_rules_order(request: Request, body: RuleOrderBody, user: dict = Depe
     acc = _account(svc, user, body.account_id)
     _require_act(svc, user, acc)
     wt.reorder_rules(svc, int(acc.id), body.ids)
-    return {"ok": True}
+    return {"ok": True, "sieve_error": wx.sieve_resync_quiet(svc, acc)}
 
 
 class RuleApplyBody(BaseModel):
@@ -815,7 +846,8 @@ def webmail_block(request: Request, body: BlockBody, user: dict = Depends(_user)
     svc = _svc(request)
     acc = _account(svc, user, body.account_id)
     _require_act(svc, user, acc)
-    return wt.block_sender(svc, acc, body.address, ids=body.ids, actor=_actor(user))
+    res = wt.block_sender(svc, acc, body.address, ids=body.ids, actor=_actor(user))
+    return res | {"sieve_error": wx.sieve_resync_quiet(svc, acc)}
 
 
 @router.get("/autoreply")
@@ -844,7 +876,8 @@ def webmail_autoreply_save(request: Request, body: AutoreplyBody, user: dict = D
         problem = wm.send_problem(svc, acc)
         if problem:
             raise HTTPException(400, f"Автоответ не сможет отправлять письма: {problem}")
-    return wt.save_autoreply(svc, acc, body.model_dump(), actor=_actor(user))
+    res = wt.save_autoreply(svc, acc, body.model_dump(), actor=_actor(user))
+    return res | {"sieve_error": wx.sieve_resync_quiet(svc, acc)}
 
 
 # ---------------------------------------------------------------------------
@@ -927,7 +960,16 @@ def webmail_extras(request: Request, account_id: int, id: int, user: dict = Depe
     svc = _svc(request)
     acc = _account(svc, user, account_id)
     row = _message_row(svc, acc, id)
-    return wt.message_extras(svc, acc, row, can_act=not _act_problem(svc, user, acc))
+    out = wt.message_extras(svc, acc, row, can_act=not _act_problem(svc, user, acc))
+    try:
+        out["check"] = wx.sender_check(svc, acc, row, wt.headers_of(svc, acc, row))
+    except Exception as exc:  # noqa: BLE001
+        out["check"] = {"error": str(exc)[:200]}
+    try:
+        out["smime"] = wx.smime_status(svc, acc, row)
+    except Exception as exc:  # noqa: BLE001
+        out["smime"] = {"kind": "signed", "valid": None, "text": f"Подпись S/MIME не проверена: {exc}"}
+    return out
 
 
 class ReceiptBody(BaseModel):
@@ -967,3 +1009,111 @@ def webmail_invite_ics(request: Request, account_id: int, id: int, user: dict = 
     data = wt.invite_ics(svc, acc, _message_row(svc, acc, id))
     return Response(data, media_type="text/calendar; charset=utf-8",
                     headers={"Content-Disposition": 'attachment; filename="invite.ics"'})
+
+
+# ---------------------------------------------------------------------------
+#  1.19.0: новая почта сразу, сохранённые поиски, «Архивировать», фишинг, Sieve, квота
+# ---------------------------------------------------------------------------
+@router.get("/wait")
+async def webmail_wait(request: Request, account_id: int, since: int = -1, user: dict = Depends(_user)):
+    """Дождаться новой почты (до 25 с): пока клиент ждёт, ящик слушается соединением IMAP IDLE."""
+    import asyncio
+    svc = _svc(request)
+    acc = await asyncio.to_thread(_account, svc, user, account_id)
+    problem = await asyncio.to_thread(_client_problem, svc, user, acc)
+    if problem or acc.login_status == "auth_error":
+        return {"version": wx.version(acc.id), "push": "off", "changed": False}
+    st = await asyncio.to_thread(wx.want_push, svc, acc)
+    if since < 0 or st.get("push") in ("off", "unsupported", "limit", "error"):
+        return {"version": wx.version(acc.id), "changed": False} | st
+    for _ in range(25):
+        if wx.version(acc.id) != since:
+            return {"version": wx.version(acc.id), "changed": True} | wx.push_status(svc, acc.id)
+        if await request.is_disconnected():
+            break
+        await asyncio.sleep(1)
+    return {"version": wx.version(acc.id), "changed": False} | wx.push_status(svc, acc.id)
+
+
+@router.get("/searches")
+def webmail_searches(request: Request, user: dict = Depends(_user)):
+    svc = _svc(request)
+    return {"items": wx.list_searches(svc, _owner(svc, user))}
+
+
+class SearchBody(BaseModel):
+    name: str = Field(default="", max_length=80)
+    q: str = Field(min_length=1, max_length=500)
+    scope: str = Field(default="account", pattern="^(account|all)$")
+    attach: bool = False
+
+
+@router.post("/searches")
+def webmail_search_save(request: Request, body: SearchBody, user: dict = Depends(_user)):
+    svc = _svc(request)
+    return wx.save_search(svc, _owner(svc, user), body.model_dump())
+
+
+@router.delete("/searches/{search_id}")
+def webmail_search_delete(request: Request, search_id: int, user: dict = Depends(_user)):
+    svc = _svc(request)
+    wx.delete_search(svc, _owner(svc, user), search_id)
+    return {"ok": True}
+
+
+@router.post("/archive")
+def webmail_archive(request: Request, body: IdsBody, user: dict = Depends(_user)):
+    svc = _svc(request)
+    acc = _account(svc, user, body.account_id)
+    _require_act(svc, user, acc)
+    return wx.archive(svc, acc, body.ids, actor=_actor(user))
+
+
+class PhishBody(BaseModel):
+    account_id: int
+    ids: List[int] = Field(min_length=1, max_length=20)
+
+
+@router.post("/phishing")
+def webmail_phishing(request: Request, body: PhishBody, user: dict = Depends(_user)):
+    svc = _svc(request)
+    acc = _account(svc, user, body.account_id)
+    _require_act(svc, user, acc)
+    return wx.report_phishing(svc, acc, body.ids, actor=_actor(user))
+
+
+@router.get("/sieve")
+def webmail_sieve(request: Request, account_id: int, user: dict = Depends(_user)):
+    svc = _svc(request)
+    acc = _account(svc, user, account_id)
+    return wx.sieve_settings(svc, acc) | {"script": wx.sieve_script(svc, acc)}
+
+
+class SieveBody(BaseModel):
+    account_id: int
+    enabled: bool = False
+    host: str = Field(default="", max_length=255)
+    port: int = Field(default=4190, ge=1, le=65535)
+    security: str = Field(default="starttls", pattern="^(starttls|ssl|none)$")
+    force: bool = False
+
+
+@router.put("/sieve")
+def webmail_sieve_save(request: Request, body: SieveBody, user: dict = Depends(_user)):
+    svc = _svc(request)
+    acc = _account(svc, user, body.account_id)
+    _require_act(svc, user, acc)
+    return wx.sieve_save(svc, acc, body.model_dump(), actor=_actor(user), force=body.force)
+
+
+@router.get("/quota")
+def webmail_quota(request: Request, account_id: int, refresh: bool = False, user: dict = Depends(_user)):
+    svc = _svc(request)
+    acc = _account(svc, user, account_id)
+    if _client_problem(svc, user, acc) or acc.login_status == "auth_error":
+        try:
+            import json as _json
+            return _json.loads(wt._kv_get(svc, int(acc.id), "quota") or "{}")  # noqa: SLF001
+        except ValueError:
+            return {}
+    return wx.quota(svc, acc, refresh=refresh)

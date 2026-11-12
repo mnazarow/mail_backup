@@ -132,6 +132,7 @@ _LATE_COLUMNS = (
     ("webmail_drafts", "receipt", "INTEGER NOT NULL DEFAULT 0"),         # запросить уведомление о прочтении
     ("webmail_drafts", "send_at", "TEXT"),                               # отправить в это время (UTC, ISO)
     ("webmail_drafts", "actor", "TEXT NOT NULL DEFAULT ''"),             # кто отправляет (для аудита)
+    ("webmail_drafts", "server_copy", "TEXT NOT NULL DEFAULT ''"),       # копия в «Черновиках» сервера (1.19.0)
 )
 
 
@@ -144,6 +145,8 @@ def ensure_schema(conn) -> None:
     conn.commit()
     from .webmail_tools import ensure_schema as _tools_schema
     _tools_schema(conn)
+    from .webmail_more import ensure_schema as _more_schema
+    _more_schema(conn)
 
 
 def _now() -> float:
@@ -331,6 +334,11 @@ def pool(svc) -> ImapPool:
 
 def shutdown(svc) -> None:
     """Закрыть соединения клиента (остановка службы)."""
+    try:
+        from .webmail_more import stop_push
+        stop_push(svc)
+    except Exception:  # noqa: BLE001
+        pass
     with _POOLS_LOCK:
         p = _POOLS.pop(id(svc), None)
     if p is not None:
@@ -2020,7 +2028,12 @@ def update_draft(svc, draft_id: int, owner: str, fields: Dict) -> Dict:
 
 
 def delete_draft(svc, draft_id: int, owner: str) -> None:
-    get_draft_row(svc, draft_id, owner)
+    row = get_draft_row(svc, draft_id, owner)
+    if "server_copy" in row.keys() and row["server_copy"]:
+        acc = svc.db.get_account(int(row["account_id"]))
+        if acc is not None:
+            from .webmail_more import drop_server_copy
+            drop_server_copy(svc, acc, row)
     svc.db.execute("DELETE FROM webmail_drafts WHERE id=?", (int(draft_id),))
     shutil.rmtree(_draft_dir(svc, draft_id), ignore_errors=True)
 
@@ -2276,13 +2289,26 @@ def _short_date(value: str) -> str:
 _DATA_IMG_TAG = re.compile(r'(<img\b[^>]*?\bsrc=")(data:image/(png|jpe?g|gif|webp);base64,([A-Za-z0-9+/=\s]+))(")', re.I)
 
 
-def build_message(svc, account: Account, draft, ident: Dict) -> Tuple[EmailMessage, List[str], List[Dict]]:
-    """Письмо из черновика: заголовки, текст и HTML, вложения. → (письмо, все адресаты, вложения)."""
-    to = _addresses(draft["to_addrs"], what="Кому")
-    cc = _addresses(draft["cc_addrs"], what="Копия")
-    bcc = _addresses(draft["bcc_addrs"], what="Скрытая копия")
+def _draft_addrs(value: str, what: str, as_draft: bool) -> List[Tuple[str, str]]:
+    if not as_draft:
+        return _addresses(value, what=what)
+    try:
+        return _addresses(value, what=what)
+    except ValidationError:          # недописанный адрес в черновике — не повод не сохранить черновик
+        return [(n, a) for n, a in getaddresses([value or ""]) if a and "@" in a][:MAX_RECIPIENTS]
+
+
+def build_message(svc, account: Account, draft, ident: Dict, *, as_draft: bool = False
+                  ) -> Tuple[EmailMessage, List[str], List[Dict]]:
+    """Письмо из черновика: заголовки, текст и HTML, вложения. → (письмо, все адресаты, вложения).
+
+    ``as_draft`` — для папки «Черновики» сервера: получателей может не быть, «Скрытая копия» — в заголовке.
+    """
+    to = _draft_addrs(draft["to_addrs"], "Кому", as_draft)
+    cc = _draft_addrs(draft["cc_addrs"], "Копия", as_draft)
+    bcc = _draft_addrs(draft["bcc_addrs"], "Скрытая копия", as_draft)
     rcpts = [a for _n, a in to + cc + bcc]
-    if not rcpts:
+    if not rcpts and not as_draft:
         raise ValidationError("Укажите хотя бы одного получателя.")
     if len(rcpts) > MAX_RECIPIENTS:
         raise ValidationError(f"Получателей больше {MAX_RECIPIENTS}.")
@@ -2294,6 +2320,8 @@ def build_message(svc, account: Account, draft, ident: Dict) -> Tuple[EmailMessa
         msg["To"] = _fmt_addrs(to)
     if cc:
         msg["Cc"] = _fmt_addrs(cc)
+    if as_draft and bcc:
+        msg["Bcc"] = _fmt_addrs(bcc)
     if ident.get("reply_to"):
         msg["Reply-To"] = ident["reply_to"]
     msg["Subject"] = draft["subject"] or ""
@@ -2420,6 +2448,9 @@ def send(svc, account: Account, draft_id: int, owner: str, *, actor: str = "") -
         svc.db.add_audit(actor, "webmail_send",
                          f"ящик «{account.name}» ({draft_sender(ident, row)}): «{_one_line(row['subject'], 120)}» "
                          f"→ {shown}")
+    if "server_copy" in row.keys() and row["server_copy"]:
+        from .webmail_more import drop_server_copy
+        drop_server_copy(svc, account, row)
     svc.db.execute("DELETE FROM webmail_drafts WHERE id=?", (int(draft_id),))
     shutil.rmtree(_draft_dir(svc, draft_id), ignore_errors=True)
     return {"ok": True, "message_id": message_id, "recipients": len(rcpts), "saved_to": saved_to,

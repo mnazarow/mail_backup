@@ -973,6 +973,9 @@ def _inbox(svc, account: Account) -> str:
 
 
 def has_automation(svc, account_id: int) -> bool:
+    from .webmail_more import sieve_active
+    if sieve_active(svc, account_id):
+        return False            # правила и автоответ выполняет почтовый сервер (Sieve)
     if svc.db.query_one("SELECT 1 FROM webmail_rules WHERE account_id=? AND enabled=1 LIMIT 1",
                         (int(account_id),)) is not None:
         return True

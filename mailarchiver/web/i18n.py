@@ -638,6 +638,31 @@ PARAM_HELP: Dict[str, dict] = {
         "recommend": "5. Чаще — больше обращений к почтовому серверу.",
         "example": "5", "default": "5",
     },
+    "webmail.push": {
+        "title": "Новая почта сразу (IMAP IDLE)",
+        "help": ("Пока «Почта» открыта, служба держит с ящиком ещё одно соединение в режиме IDLE: почтовый сервер сам "
+                 "сообщает о новом письме, и оно появляется в списке за секунды, а не при следующей проверке. "
+                 "Соединение закрывается через три минуты после того, как клиент закрыли. Сервер без IDLE — "
+                 "проверка по «Проверять почту, секунд»."),
+        "recommend": "Включено. Выключите, если почтовый сервер жёстко ограничивает число соединений ящика.",
+        "example": "true", "default": "true",
+    },
+    "webmail.drafts_on_server": {
+        "title": "Черновики — и в папку «Черновики» сервера",
+        "help": ("Черновик, сохранённый или закрытый в клиенте, кладётся и в папку «Черновики» на почтовом сервере "
+                 "(прежняя копия заменяется): его видно и продолжить можно в почте на телефоне. После отправки "
+                 "или удаления черновика копия на сервере удаляется."),
+        "recommend": "Включено.",
+        "example": "true", "default": "true",
+    },
+    "webmail.phishing_report_to": {
+        "title": "Сообщать о фишинге на адрес",
+        "help": ("Адрес службы безопасности: кнопка «Сообщить о фишинге» пересылает на него подозрительное письмо "
+                 "целиком (со всеми заголовками) и переносит его в «Спам». Пусто — письмо только переносится в "
+                 "«Спам»."),
+        "recommend": "Адрес ИБ или администратора почты, например security@company.ru.",
+        "example": "security@company.ru", "default": "",
+    },
 
     # ---- mailadmin ----
     "mailadmin.enabled": {
@@ -1349,7 +1374,8 @@ SETTINGS_SECTIONS: List[dict] = [
               "exclude_senders", "match_subject"]},
     {"section": "webmail", "title": "Почтовый клиент", "icon": "✉️",
      "keys": ["enabled", "admin_actions", "mark_read", "auto_refresh_s", "max_attachments_mb", "save_sent",
-              "drafts_keep_days", "undo_send_s", "rules_interval_min"]},
+              "drafts_keep_days", "undo_send_s", "rules_interval_min", "push", "drafts_on_server",
+              "phishing_report_to"]},
     {"section": "mailadmin", "title": "Вход в ящики через администратора почты", "icon": "🗝️",
      "keys": ["enabled", "host", "user", "password", "mode", "separator"]},
     {"section": "axigen", "title": "Сервер Axigen", "icon": "📮",

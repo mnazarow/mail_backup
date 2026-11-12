@@ -555,6 +555,24 @@ table.rp-cmp tr.rp-group td { background:var(--bg-soft); font-weight:600; font-s
 .mail-preview img { max-width: 100%; max-height: 72vh; object-fit: contain; background: repeating-conic-gradient(var(--bg-soft) 0 25%, transparent 0 50%) 0 0 / 16px 16px; }
 .mail-preview-pdf { width: 100%; height: 72vh; border: 0; background: #fff; }
 .mail-preview-text { width: 100%; margin: 0; white-space: pre-wrap; word-break: break-word; font-family: var(--mono); font-size: .82rem; background: var(--bg-soft); padding: 12px; border-radius: var(--radius-sm); max-height: 72vh; overflow: auto; }
+.msg-cnt { font-size: .72rem; color: var(--text-dim); background: var(--bg-soft); border-radius: 8px; padding: 0 6px; line-height: 16px; flex: none; }
+.mail-threads-sw { display: inline-flex; align-items: center; gap: 4px; margin: 0; white-space: nowrap; }
+.rp-tag.ok { background: var(--success-soft); color: var(--success-text); }
+.rp-tag.ext { background: var(--warn-soft); color: var(--warn-text); }
+.mail-trust { border: 1px solid var(--warn); border-left-width: 4px; background: var(--warn-soft); border-radius: var(--radius-sm); padding: 10px 12px; margin-bottom: 12px; }
+.mail-trust.danger { border-color: var(--danger); background: var(--danger-soft); }
+.mail-trust-t { font-weight: 650; margin-bottom: 4px; }
+.mail-trust ul { margin: 4px 0 6px 18px; padding: 0; }
+.mail-smime { margin: -4px 0 10px; }
+.mail-quota { margin: 14px 6px 4px; }
+.mail-quota .bar { height: 6px; background: var(--bg-soft); border-radius: 3px; overflow: hidden; margin-bottom: 4px; }
+.mail-quota .bar span { display: block; height: 100%; background: var(--primary); }
+.mail-quota.warn .bar span { background: var(--warn); }
+.mail-quota.full .bar span { background: var(--danger); }
+.mail-keys td { padding: 5px 10px; }
+.mail-keys kbd { font-family: var(--mono); font-size: .8rem; background: var(--bg-soft); border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 4px; padding: 1px 6px; }
+.mail-sieve { margin-top: 22px; border-top: 1px solid var(--border); padding-top: 6px; }
+.mail-sieve .grid2 { display: grid; grid-template-columns: 2fr 1fr; gap: 0 12px; }
 @media (max-width: 700px){
   .compose, .compose.max { right: 0; left: 0; transform: none; width: 100vw; height: 100dvh; bottom: 0; border-radius: 0; }
   .compose.min { height: auto; width: 100vw; }

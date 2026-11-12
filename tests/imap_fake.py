@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import datetime as _dt
 import re
+import threading
+import time as _time
 import types
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
@@ -49,7 +51,10 @@ class ImapWorld:
     def __init__(self) -> None:
         self.boxes: Dict[str, Dict[str, Folder]] = {}
         self.passwords: Dict[str, str] = {}
-        self.capabilities: Set[str] = {"IMAP4REV1", "UIDPLUS", "MOVE", "QUOTA", "SPECIAL-USE"}
+        self.capabilities: Set[str] = {"IMAP4REV1", "UIDPLUS", "MOVE", "QUOTA", "SPECIAL-USE", "IDLE"}
+        #: новые письма (логин, папка) — их видит IDLE; cond будит ожидающих
+        self.events: List[tuple] = []
+        self.cond = threading.Condition()
         self.subscribed: Dict[str, Set[str]] = {}
         self.quota: Dict[str, tuple] = {}            # логин → (занято КБ, предел КБ)
         self.delimiter = "/"
@@ -80,7 +85,13 @@ class ImapWorld:
         f.uidnext += 1
         when = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=days_ago)
         f.messages[uid] = Msg(raw=raw, date=when, flags=set(flags))
+        self.notify(login, folder)
         return uid
+
+    def notify(self, login: str, folder: str) -> None:
+        with self.cond:
+            self.events.append((login, folder))
+            self.cond.notify_all()
 
     def uids(self, login: str, folder: str) -> List[int]:
         return sorted(self.boxes[login][folder].messages)
@@ -191,6 +202,27 @@ class FakeIMAPClient:
     @property
     def box(self) -> Dict[str, Folder]:
         return self.world.boxes[self.login_name]
+
+    # -- IDLE (RFC 2177) -------------------------------------------------------
+    def idle(self):
+        self._cmd("IDLE")
+        self._idle_from = len(self.world.events)
+
+    def idle_check(self, timeout=None):
+        deadline = _time.monotonic() + (timeout if timeout is not None else 30)
+        with self.world.cond:
+            while True:
+                new = [e for e in self.world.events[self._idle_from:] if e == (self.login_name, self.current)]
+                if new:
+                    self._idle_from = len(self.world.events)
+                    return [(len(self.box[self.current].messages), b"EXISTS")]
+                left = deadline - _time.monotonic()
+                if left <= 0:
+                    return []
+                self.world.cond.wait(min(left, 0.2))
+
+    def idle_done(self):
+        return (b"OK", [])
 
     def capabilities(self):
         return [c.encode() for c in sorted(self.world.capabilities)]

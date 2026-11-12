@@ -3936,13 +3936,14 @@ const Mail = { acc:null, folder:null, offset:0, total:0, limit:mailPrefs().limit
   // не перерисовывает то, что уже показано по новому
   seqFolders:0, seqList:0, seqMsg:0,
   st:null, folders:[], special:{}, sort:'date_desc', filter:'all', showGone:false, items:[], cur:null,
-  drafts:[], timer:null, view:'folder', goneCount:0, syncing:false, tags:[], extras:null, inboxUnseen:null, baseTitle:'' };
+  drafts:[], timer:null, view:'folder', goneCount:0, syncing:false, tags:[], extras:null, inboxUnseen:null, baseTitle:'',
+  searches:[], quota:null, pushSeq:0 };
 const MAIL_ICONS={inbox:'📥', drafts:'📝', sent:'📤', archive:'🗄️', junk:'🚫', trash:'🗑️', all:'🗂️'};
 const MAIL_NAMES={inbox:'Входящие', drafts:'Черновики', sent:'Отправленные', archive:'Архив', junk:'Спам', trash:'Корзина', all:'Вся почта'};
 /** Вид «Почты» в этом браузере: писем на странице, компактный список, уведомления о новой почте. */
 const MAIL_PREFS_KEY='ma.mail.prefs';
 function mailPrefs(){
-  const def={limit:50, compact:false, notify:false};
+  const def={limit:50, compact:false, notify:false, threads:false};
   try{ return Object.assign(def, JSON.parse(localStorage.getItem(MAIL_PREFS_KEY)||'{}')||{}); }catch(e){ return def; }
 }
 function mailSavePrefs(p){ try{ localStorage.setItem(MAIL_PREFS_KEY, JSON.stringify(p)); }catch(e){ /* приватное окно: до перезагрузки страницы */ } }
@@ -4039,18 +4040,20 @@ async function viewMail(c){
     <label class="small" style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="msAttach" ${Mail.search&&Mail.search.attach?'checked':''}> с вложениями</label>
     <button class="btn sm primary" id="msGo">🔎 Найти</button>
     <button class="btn sm ghost" id="msClear" ${Mail.search?'':'style="display:none"'}>✕ Сбросить</button>
+    <button class="btn sm ghost" id="msSave" ${Mail.search?'':'style="display:none"'} title="Сохранить этот поиск — он появится под папками">☆ Сохранить поиск</button>
     <span class="small muted" id="msInfo"></span></div>`);
   c.appendChild(sbar);
   const runSearch=()=>{
     const q=$('#msq',sbar).value.trim();
     if(!q){ Mail.search=null; $('#msClear',sbar).style.display='none'; loadMailMessages(accId); return; }
     Mail.search={q, scope:($('#msScope',sbar)||{}).value||'account', attach:$('#msAttach',sbar).checked, offset:0};
-    $('#msClear',sbar).style.display='';
+    $('#msClear',sbar).style.display=''; $('#msSave',sbar).style.display='';
     loadSearchResults(accId);
   };
   $('#msGo',sbar).onclick=runSearch;
   $('#msq',sbar).onkeydown=(e)=>{ if(e.key==='Enter'){ e.preventDefault(); runSearch(); } if(e.key==='Escape'){ e.target.blur(); } };
-  $('#msClear',sbar).onclick=()=>{ $('#msq',sbar).value=''; Mail.search=null; $('#msClear',sbar).style.display='none'; loadMailMessages(accId); };
+  $('#msClear',sbar).onclick=()=>{ $('#msq',sbar).value=''; Mail.search=null; $('#msClear',sbar).style.display='none'; $('#msSave',sbar).style.display='none'; loadMailMessages(accId); };
+  $('#msSave',sbar).onclick=()=>mailSaveSearch(accId);
   api('/search/status',{bg:true}).then(st=>{
     const info=$('#msInfo',sbar); if(!info) return;
     if(!st.available) info.textContent='Поиск только по теме и отправителю (SQLite без FTS5).';
@@ -4069,6 +4072,7 @@ async function viewMail(c){
   c.appendChild(layout);
   await loadMailFolders(accId);
   mailStartTimer();
+  mailPushLoop(accId);
 }
 
 /** Проверка почты по таймеру, пока раздел открыт и вкладка видна. */
@@ -4127,20 +4131,22 @@ function pickBox(acc, id, subject){
   if(!canRestoreMessages()) return '';
   return `<input type="checkbox" class="msg-pick" data-pick ${Mail.picked.has(acc+':'+id)?'checked':''} aria-label="Выбрать письмо «${esc(trunc(subject||'без темы',60))}»">`;
 }
-function wirePick(el, acc, id, subject){
+function wirePick(el, acc, id, subject, ids){
   const cb=el.querySelector('input[data-pick]'); if(!cb) return;
   // щелчок по флажку не открывает письмо
   cb.onclick=(e)=>e.stopPropagation();
   cb.onkeydown=(e)=>e.stopPropagation();
   cb.onchange=()=>{
     const k=acc+':'+id;
-    if(cb.checked) Mail.picked.set(k,{acc, id, subject}); else Mail.picked.delete(k);
+    if(cb.checked) Mail.picked.set(k, ids&&ids.length>1?{acc, id, subject, ids}:{acc, id, subject}); else Mail.picked.delete(k);
     el.classList.toggle('picked', cb.checked);
     renderPickBar();
     const list=el.parentElement; if(list) list.dispatchEvent(new Event('pickchange'));
   };
 }
-function mailPickedIds(){ return [...Mail.picked.values()].filter(p=>p.acc===Mail.acc).map(p=>p.id); }
+function mailPickedIds(){ return [...Mail.picked.values()].filter(p=>p.acc===Mail.acc).flatMap(p=>p.ids||[p.id]); }
+/** Выбранные письма для «Восстановить»: беседа раскрывается во все её письма. */
+function mailPickedItems(){ return [...Mail.picked.values()].flatMap(p=>(p.ids||[p.id]).map(id=>({acc:p.acc, id, subject:p.subject}))); }
 function mailClearPicked(){
   Mail.picked.clear(); renderPickBar();
   document.querySelectorAll('#mlist input[data-pick], #mlist input[data-pickall]').forEach(x=>{ x.checked=false; x.indeterminate=false; });
@@ -4149,7 +4155,7 @@ function mailClearPicked(){
 /** Полоса «Выбрано: N» с действиями над выбранными письмами. */
 function renderPickBar(){
   const bar=$('#mpick'); if(!bar) return;
-  const n=Mail.picked.size;
+  const n=mailPickedItems().length;
   bar.hidden=!n;
   if(!n){ bar.innerHTML=''; return; }
   const accs=new Set([...Mail.picked.values()].map(p=>p.acc));
@@ -4159,6 +4165,7 @@ function renderPickBar(){
       <button class="btn sm" data-a="unread" title="Отметить непрочитанными">📩 Не прочитано</button>
       <button class="btn sm" data-a="star" title="Пометить">⭐</button>
       <button class="btn sm" data-a="move" title="Переместить в папку">📁 Переместить</button>
+      <button class="btn sm" data-a="archive" title="В архив (e)">🗄 В архив</button>
       <button class="btn sm" data-a="tag" title="Поставить или снять метку">🏷 Метка</button>
       <button class="btn sm" data-a="snooze" title="Убрать из папки и вернуть непрочитанными в назначенное время">⏰ Напомнить</button>
       <button class="btn sm" data-a="junk" title="В спам">🚫 Спам</button>
@@ -4168,7 +4175,7 @@ function renderPickBar(){
     <button class="btn sm ${here?'ghost':'primary'}" data-go>♻️ Восстановить</button>
     <button class="btn sm ghost" data-clear>✕ Снять выбор</button>
     ${mailSelectAllLink()}`;
-  bar.querySelector('[data-go]').onclick=()=>messagesRestoreModal([...Mail.picked.values()], mailClearPicked);
+  bar.querySelector('[data-go]').onclick=()=>messagesRestoreModal(mailPickedItems(), mailClearPicked);
   bar.querySelector('[data-clear]').onclick=mailClearPicked;
   bar.querySelectorAll('[data-a]').forEach(b=>b.onclick=(e)=>{
     const ids=mailPickedIds(); const a=b.dataset.a;
@@ -4179,6 +4186,7 @@ function renderPickBar(){
     else if(a==='delete') mailDelete(ids);
     else if(a==='move') mailMovePicker(e.currentTarget, ids);
     else if(a==='tag') mailTagPicker(e.currentTarget, ids);
+    else if(a==='archive') mailAct('archive', ids);
     else if(a==='snooze') mailSnoozePicker(e.currentTarget, ids);
     else if(a==='fwdatt') mailCompose('forward_attach', null, {ref_ids:ids.slice(0,50)});
     else if(a==='zip') mailZip(ids);
@@ -4197,9 +4205,9 @@ async function mailAct(kind, ids, extra={}, {quiet=false}={}){
   if(r && r.missing && !quiet) toast('Часть писем уже удалена на сервере', `Писем: ${fmtNum(r.missing)} — в архиве они остались.`, 'warn');
   if(kind!=='flags') ids.forEach(id=>Mail.picked.delete(acc+':'+id));
   renderPickBar();
-  if(!quiet && r && (kind==='move' || kind==='junk' || (kind==='delete' && !extra.permanent))){
+  if(!quiet && r && (kind==='move' || kind==='junk' || kind==='archive' || (kind==='delete' && !extra.permanent))){
     const n=r.moved!=null?r.moved:r.trashed;
-    const title=kind==='delete'?'Перенесено в корзину':(kind==='junk'?(extra.spam===false?'Перенесено во «Входящие»':'Перенесено в спам'):`Перенесено в «${mailFolderLabel(mailFolderInfo(extra.folder))||extra.folder}»`);
+    const title=kind==='archive'?'Перенесено в архив':kind==='delete'?'Перенесено в корзину':(kind==='junk'?(extra.spam===false?'Перенесено во «Входящие»':'Перенесено в спам'):`Перенесено в «${mailFolderLabel(mailFolderInfo(extra.folder))||extra.folder}»`);
     if(n && r.undo && r.undo.length) toastAction(title, `Писем: ${fmtNum(n)}`, 'Отменить', ()=>mailUndo(acc, r.undo));
     else if(n) toast(title, `Писем: ${fmtNum(n)}`);
   }
@@ -4360,6 +4368,7 @@ async function loadMailFolders(accId, {refresh=false, quiet=false}={}){
   mailNotifyNew();
   if(data.error && !quiet && mailOnline()) toast('Список папок с сервера не получен', data.error.message+(data.error.hint?' '+data.error.hint:''), 'warn', 7000);
   try{ const d=await api(`/webmail/drafts?account_id=${accId}`, {bg:true}); Mail.drafts=d.items||[]; }catch(e){ Mail.drafts=[]; }
+  if(!quiet){ await mailLoadSearches(); if(!Mail.quota || Mail.quota._acc!==accId){ Mail.quota={_acc:accId}; mailLoadQuota(accId); } }
   if(seq!==Mail.seqFolders) return;
   if(!Mail.folders.length){ box.innerHTML='<div class="empty small" style="padding:16px">Нет папок.<br>Сделайте бэкап ящика.</div>'; return; }
   const first=Mail.folders.find(f=>f.special==='inbox') || Mail.folders.find(f=>f.selectable) || Mail.folders[0];
@@ -4424,6 +4433,8 @@ function renderMailFolders(accId){
     box.appendChild(el);
   });
   mailRenderTagList(accId, box);
+  mailRenderSaved(accId, box);
+  mailRenderQuota(box);
 }
 
 function mailFolderMenu(anchor, f){
@@ -4532,7 +4543,7 @@ async function loadMailMessages(accId, {keep=false}={}){
   const showGone=Mail.showGone || !mailOnline() || (fi && fi.on_server===false);
   let data;
   const qs=new URLSearchParams({account_id:String(accId), folder:Mail.folder||'', offset:String(Mail.offset), limit:String(Mail.limit),
-    sort:Mail.sort, filter:Mail.filter, show_gone:showGone?'true':'false'});
+    sort:Mail.sort, filter:Mail.filter, show_gone:showGone?'true':'false', threads:mailPrefs().threads?'true':'false'});
   try{ data=await api('/webmail/messages?'+qs.toString(), {bg:keep}); }
   catch(e){ if(seq===Mail.seqList) box.innerHTML=`<div class="empty small">${esc(e.message)}</div>`; return; }
   if(seq!==Mail.seqList || Mail.acc!==accId) return;
@@ -4551,12 +4562,13 @@ function renderMailList(accId){
   box.innerHTML='';
   const bar=h(`<div class="mail-list-bar">
     <div class="row1">${canRestoreMessages()&&items.length?'<input type="checkbox" class="msg-pick" data-pickall aria-label="Выбрать все письма на странице" title="Выбрать все на странице">':''}
-    <span class="muted">${fmtNum(Mail.total)} ${plural(Mail.total||0,'письмо','письма','писем')}</span><span class="spacer" style="flex:1"></span>
+    <span class="muted">${fmtNum(Mail.total)} ${mailPrefs().threads?plural(Mail.total||0,'беседа','беседы','бесед'):plural(Mail.total||0,'письмо','письма','писем')}</span>
+    <label class="small muted mail-threads-sw" title="Письма одной переписки — одной строкой"><input type="checkbox" data-threads ${mailPrefs().threads?'checked':''}> беседами</label><span class="spacer" style="flex:1"></span>
     <button class="btn ghost sm" ${Mail.offset<=0?'disabled':''} data-prev aria-label="Предыдущая страница">←</button>
     <span class="muted">${Math.floor(Mail.offset/Mail.limit)+1}/${Math.max(1,Math.ceil(Mail.total/Mail.limit))}</span>
     <button class="btn ghost sm" ${Mail.offset+Mail.limit>=Mail.total?'disabled':''} data-next aria-label="Следующая страница">→</button></div>
     <div class="row2">
-      <select data-sort aria-label="Порядок"><option value="date_desc">Сначала новые</option><option value="date_asc">Сначала старые</option><option value="from">По ${out?'получателю':'отправителю'}</option><option value="subject">По теме</option><option value="size">Крупные сначала</option></select>
+      <select data-sort aria-label="Порядок" ${mailPrefs().threads?'disabled title="В беседах — сначала новые"':''}><option value="date_desc">Сначала новые</option><option value="date_asc">Сначала старые</option><option value="from">По ${out?'получателю':'отправителю'}</option><option value="subject">По теме</option><option value="size">Крупные сначала</option></select>
       <select data-filter aria-label="Отбор"><option value="all">Все</option><option value="unread">Непрочитанные</option><option value="flagged">Помеченные</option><option value="attach">С вложениями</option><option value="answered">Отвеченные</option>${Mail.tags.length?`<optgroup label="С меткой">${Mail.tags.map(t=>`<option value="tag:${esc(t.keyword)}">🏷 ${esc(t.name)}</option>`).join('')}</optgroup>`:''}</select>
       ${mailOnline()&&!archiveOnly&&(Mail.goneCount||Mail.showGone)?`<label class="small muted" title="Письма, которых в этой папке на сервере больше нет (удалены, перенесены) — их копии в архиве"><input type="checkbox" data-gone ${Mail.showGone?'checked':''}> удалённые с сервера (${fmtNum(Mail.goneCount)})</label>`:''}
     </div></div>`);
@@ -4564,6 +4576,7 @@ function renderMailList(accId){
   bar.querySelector('[data-sort]').value=Mail.sort; bar.querySelector('[data-filter]').value=Mail.filter;
   if(bar.querySelector('[data-filter]').value!==Mail.filter){ Mail.filter='all'; bar.querySelector('[data-filter]').value='all'; }
   bar.querySelector('[data-sort]').onchange=(e)=>{ Mail.sort=e.target.value; Mail.offset=0; loadMailMessages(accId); };
+  bar.querySelector('[data-threads]').onchange=(e)=>{ const p=mailPrefs(); p.threads=e.target.checked; mailSavePrefs(p); Mail.offset=0; loadMailMessages(accId); };
   bar.querySelector('[data-filter]').onchange=(e)=>{ Mail.filter=e.target.value; Mail.offset=0; loadMailMessages(accId); };
   const gcb=bar.querySelector('[data-gone]'); if(gcb) gcb.onchange=()=>{ Mail.showGone=gcb.checked; Mail.offset=0; loadMailMessages(accId); };
   bar.querySelector('[data-prev]').onclick=()=>{ Mail.offset=Math.max(0,Mail.offset-Mail.limit); loadMailMessages(accId); };
@@ -4578,7 +4591,7 @@ function renderMailList(accId){
       all.checked=n===items.length; all.indeterminate=n>0&&n<items.length; };
     sync();
     all.onchange=()=>{
-      items.forEach(m=>{ const k=accId+':'+m.id; if(all.checked) Mail.picked.set(k,{acc:accId,id:m.id,subject:m.subject}); else Mail.picked.delete(k); });
+      items.forEach(m=>{ const k=accId+':'+m.id; if(all.checked) Mail.picked.set(k, m.thread_ids&&m.thread_ids.length>1?{acc:accId,id:m.id,subject:m.subject,ids:m.thread_ids}:{acc:accId,id:m.id,subject:m.subject}); else Mail.picked.delete(k); });
       box.querySelectorAll('input[data-pick]').forEach(x=>{ x.checked=all.checked; const it=x.closest('.msg-item'); if(it) it.classList.toggle('picked', all.checked); });
       renderPickBar();
     };
@@ -4592,11 +4605,11 @@ function renderMailList(accId){
     const el=h(`<div class="msg-item ${m.seen?'':'unread'} ${m.gone?'gone':''} ${m.id===Mail.cur?'active':''} ${picked?'picked':''}" data-id="${m.id}" tabindex="0" role="button" title="${esc(m.size_h)}" ${act&&!m.gone?'draggable="true"':''}>
       <div class="msg-top">${pickBox(accId, m.id, m.subject)}
         <button class="msg-star ${m.flagged?'on':''}" ${act&&!m.gone?'':'disabled'} title="${m.flagged?'Снять пометку':'Пометить'} (s)" aria-label="Пометка">${m.flagged?'★':'☆'}</button>
-        <span class="msg-from">${esc(who)}</span><span>${m.has_attach?'📎':''}</span><span class="msg-date" title="${esc(fmtDate(m.date))}">${esc(mailWhen(m.date))}</span></div>
+        <span class="msg-from">${esc(who)}</span>${m.thread_count>1?`<span class="msg-cnt" title="Писем в беседе: ${m.thread_count}${m.thread_unread?`, непрочитанных: ${m.thread_unread}`:''}">${m.thread_count}</span>`:''}<span>${m.has_attach?'📎':''}</span><span class="msg-date" title="${esc(fmtDate(m.date))}">${esc(mailWhen(m.date))}</span></div>
       <div class="msg-subj">${m.answered?'<span class="msg-ic" title="Отвечено">↩</span>':''}${m.forwarded?'<span class="msg-ic" title="Переслано">↪</span>':''}${esc(m.subject)}</div>
       ${mailTagChips(m.keywords)}
       ${m.gone?'<div class="msg-meta"><span class="rp-tag" title="Письма в этой папке на сервере больше нет — копия в архиве">нет на сервере</span></div>':''}</div>`);
-    wirePick(el, accId, m.id, m.subject);
+    wirePick(el, accId, m.id, m.subject, m.thread_ids);
     const star=el.querySelector('.msg-star');
     star.onclick=(e)=>{ e.stopPropagation(); if(star.disabled) return; mailAct('flags', [m.id], m.flagged?{remove:['\\Flagged']}:{add:['\\Flagged']}); };
     el.onclick=()=>{ box.querySelectorAll('.msg-item').forEach(x=>x.classList.remove('active')); el.classList.add('active'); loadMailMessage(accId, m.id); };
@@ -4607,7 +4620,7 @@ function renderMailList(accId){
       else if(e.key==='ArrowUp' && el.previousElementSibling && el.previousElementSibling.classList.contains('msg-item')){ e.preventDefault(); el.previousElementSibling.focus(); }
     };
     el.addEventListener('dragstart', (e)=>{
-      const ids=Mail.picked.has(accId+':'+m.id)?mailPickedIds():[m.id];
+      const ids=Mail.picked.has(accId+':'+m.id)?mailPickedIds():(m.thread_ids||[m.id]);
       e.dataTransfer.setData('text/x-mail-ids', JSON.stringify(ids)); e.dataTransfer.effectAllowed='move';
     });
     box.appendChild(el);
@@ -4715,16 +4728,16 @@ async function loadMailMessage(accId, pk){
       <button class="btn sm ghost" data-c="star" ${act?'':'disabled'} title="Пометить (s)">☆</button>
       <button class="btn sm ghost" data-c="unread" ${act?'':'disabled'} title="Отметить непрочитанным (u)">📩</button>
       <button class="btn sm ghost" data-c="move" ${act?'':'disabled'} title="Переместить в папку (v)">📁</button>
+      <button class="btn sm ghost" data-c="archive" ${act?'':'disabled'} title="В архив (e)">🗄</button>
       <button class="btn sm ghost" data-c="tag" ${act?'':'disabled'} title="Метка (l)">🏷</button>
       <button class="btn sm ghost" data-c="snooze" ${act?'':'disabled'} title="Напомнить позже (b)">⏰</button>
-      <button class="btn sm ghost" data-c="junk" ${act&&Mail.special.junk?'':'disabled'} title="${(mailFolderInfo(m.folder)||{}).special==='junk'?'Не спам — во «Входящие»':'В спам'}">🚫</button>
       <button class="btn sm ghost danger" data-c="delete" ${act?'':'disabled'} title="Удалить (Delete)">🗑</button>
       <button class="btn sm ghost mail-tb-more" data-c="more" title="Ещё: скачать, заголовки, печать, переслать вложением, правило, блокировка, восстановить" aria-label="Ещё">⋯</button>
     </div>
     <div class="rhead">
       <div class="rsubj">${esc(hd.subject||'(без темы)')}<span id="mprio"></span></div>
       <div id="mtags">${mailTagChips(item.keywords)}</div>
-      <div class="rmeta"><b>От:</b> ${esc(hd.from||'—')}</div>
+      <div class="rmeta"><b>От:</b> ${esc(hd.from||'—')} <span id="mfromtags"></span></div>
       <div class="rmeta"><b>Кому:</b> ${esc(hd.to||'—')}</div>
       ${hd.cc?`<div class="rmeta"><b>Копия:</b> ${esc(hd.cc)}</div>`:''}
       <div class="rmeta"><b>Дата:</b> <span title="${esc(hd.date||'')}">${esc(item.date?fmtDate(item.date):(hd.date||''))}</span> · <span class="muted">📁 ${esc(mailFolderLabel(mailFolderInfo(m.folder))||m.folder||'')}</span>${gone?' · <span class="rp-tag" title="Письма в этой папке на сервере больше нет — копия в архиве">нет на сервере</span>':''}</div>
@@ -4745,6 +4758,7 @@ async function loadMailMessage(accId, pk){
     if(c==='unread') return mailAct('flags', [pk], item.seen?{remove:['\\Seen']}:{add:['\\Seen']});
     if(c==='move') return mailMovePicker(e.currentTarget, [pk]);
     if(c==='tag') return mailTagPicker(e.currentTarget, [pk]);
+    if(c==='archive') return mailAct('archive', [pk]);
     if(c==='snooze') return mailSnoozePicker(e.currentTarget, [pk]);
     if(c==='junk') return mailAct('junk', [pk], {spam:(mailFolderInfo(m.folder)||{}).special!=='junk'});
     if(c==='delete') return mailDelete([pk]);
@@ -4822,6 +4836,8 @@ function mailMoreMenu(anchor, accId, pk, hd, gone){
     ${act&&X.sender&&!X.in_book?'<button class="mail-pop-item" data-a="book">👤 Добавить отправителя в адресную книгу</button>':''}
     ${act?'<button class="mail-pop-item" data-a="rule">⚙️ Создать правило по этому письму</button>':''}
     ${act&&X.sender&&!X.blocked?'<button class="mail-pop-item" data-a="block">⛔ Заблокировать отправителя</button>':''}
+    ${act&&Mail.special.junk?`<button class="mail-pop-item" data-a="junk">🚫 ${(mailFolderInfo(Mail.msg&&Mail.msg.folder)||{}).special==='junk'?'Не спам — во «Входящие»':'В спам'}</button>`:''}
+    ${act?'<button class="mail-pop-item danger" data-a="phish">🎣 Сообщить о фишинге</button>':''}
     ${canRestoreMessages()?'<button class="mail-pop-item" data-a="restore">♻️ Восстановить письмо</button>':''}
     ${mailCanAct()&&!gone&&accId===Mail.acc?'<button class="mail-pop-item danger" data-a="erase">🗑 Удалить с сервера насовсем</button>':''}</div></div>`);
   document.body.appendChild(pop);
@@ -4838,6 +4854,8 @@ function mailMoreMenu(anchor, accId, pk, hd, gone){
     else if(a==='book') mailAddToBook(accId, hd.from||X.sender);
     else if(a==='rule') mailRuleEditor(accId, null, {name:trunc(hd.subject||X.sender||'Правило',60), conditions:[{field:'from', op:'equals', value:X.sender||''}], actions:[{type:'move', folder:''}]});
     else if(a==='block') mailBlockSender(accId, X.sender, [pk]);
+    else if(a==='phish') mailReportPhish(accId, [pk]);
+    else if(a==='junk') mailAct('junk', [pk], {spam:(mailFolderInfo(Mail.msg&&Mail.msg.folder)||{}).special!=='junk'});
     else if(a==='erase') mailDelete([pk], {permanent:true});
     else if(a==='print') window.print();
     else if(a==='headers'){
@@ -4922,18 +4940,21 @@ async function composeWindow(draft){
   renderAtts();
   const fields=()=>{ const o={body:body.innerHTML}; w.querySelectorAll('[data-f]').forEach(x=>{ o[x.dataset.f]=x.dataset.f==='account_id'?parseInt(x.value):x.value; });
     w.querySelectorAll('[data-opt]').forEach(x=>{ o[x.dataset.opt]=x.checked; }); return o; };
-  const save=async(manual)=>{
+  let serverDirty=false;
+  const save=async(manual, toServer)=>{
     if(closed && !manual) return;
     if(saving) await saving;
-    if(!dirty && !manual) return;
+    if(!dirty && !manual && !(toServer && serverDirty)) return;
     dirty=false;
     state.textContent='Сохраняю…';
-    saving=api(`/webmail/drafts/${draft.id}`, {method:'PUT', body:fields(), bg:!manual})
-      .then(d=>{ Object.assign(draft, d); state.textContent='Сохранено '+new Date().toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'}); })
+    const body=fields(); if(toServer && serverDirty){ body.to_server=true; serverDirty=false; }
+    saving=api(`/webmail/drafts/${draft.id}`, {method:'PUT', body, bg:!manual})
+      .then(d=>{ const srv=d.server; delete d.server; Object.assign(draft, d); state.textContent='Сохранено '+new Date().toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'})+(srv&&srv.saved?' (и на сервере)':'');
+        if(srv && srv.warning && manual) toast('Черновик сохранён только здесь', srv.warning, 'warn', 7000); })
       .catch(e=>{ dirty=true; state.textContent='Не сохранено'; if(manual) toastErr(e); });
     await saving; saving=null;
   };
-  const touch=()=>{ dirty=true; state.textContent='Изменено'; clearTimeout(timer); timer=setTimeout(()=>save(false), 3000); };
+  const touch=()=>{ dirty=true; serverDirty=true; state.textContent='Изменено'; clearTimeout(timer); timer=setTimeout(()=>save(false), 3000); };
   w.querySelectorAll('[data-f],[data-opt]').forEach(x=>{ x.addEventListener('input', touch); x.addEventListener('change', touch); });
   g('[data-tpl]').onclick=(e)=>{ e.preventDefault(); composeTemplateMenu(e.currentTarget, w, body, touch); };
   body.addEventListener('input', touch);
@@ -4980,12 +5001,12 @@ async function composeWindow(draft){
   w.addEventListener('dragleave', (e)=>{ if(!w.contains(e.relatedTarget)) w.classList.remove('drop'); });
   w.addEventListener('drop', (e)=>{ if(!e.dataTransfer.files.length) return; e.preventDefault(); w.classList.remove('drop');
     const imgs=[...e.dataTransfer.files]; if(e.target.closest('.compose-body') && imgs.every(f=>/^image\//.test(f.type) && f.size<3*1024*1024)) imgs.forEach(composeInsertImage); else upload(imgs); });
-  const close=async()=>{ if(closed) return; clearTimeout(timer); await save(false); closed=true; w.remove(); if(Mail.view==='drafts' && Mail.acc) mailShowDrafts(Mail.acc); else if(Mail.acc) loadMailFolders(Mail.acc, {quiet:true}); };
+  const close=async()=>{ if(closed) return; clearTimeout(timer); await save(false, true); closed=true; w.remove(); if(Mail.view==='drafts' && Mail.acc) mailShowDrafts(Mail.acc); else if(Mail.acc) loadMailFolders(Mail.acc, {quiet:true}); };
   g('[data-close]').onclick=close;
   g('[data-min]').onclick=()=>w.classList.toggle('min');
   g('[data-max]').onclick=()=>w.classList.toggle('max');
   g('.compose-head').ondblclick=()=>w.classList.toggle('min');
-  g('[data-save]').onclick=()=>save(true);
+  g('[data-save]').onclick=()=>{ serverDirty=true; save(true, true); };
   g('[data-discard]').onclick=async()=>{
     if(!await confirmDlg('Удалить черновик?', 'Письмо и его вложения будут удалены.', {okText:'Удалить'})) return;
     clearTimeout(timer); closed=true;
@@ -5368,7 +5389,7 @@ function mailRenderExtras(el, accId, pk, x, {act, send}){
   const pr=el.querySelector('#mprio');
   if(pr && x.priority==='high') pr.innerHTML=' <span class="rp-tag hot" title="Отправитель отметил письмо как важное">❗ Важное</span>';
   else if(pr && x.priority==='low') pr.innerHTML=' <span class="rp-tag" title="Отправитель отметил письмо как неважное">↓ неважное</span>';
-  const box=el.querySelector('#mextras'); if(!box) return;
+  const box=el.querySelector('#mextras'); if(!box){ mailRenderTrust(el, accId, pk, x, act); return; }
   box.innerHTML='';
   if(x.receipt && act && send){
     const b=h(`<div class="hint mail-banner">📬 Отправитель просит уведомить его о прочтении письма (${esc(x.receipt.to)}).
@@ -5396,6 +5417,7 @@ function mailRenderExtras(el, accId, pk, x, {act, send}){
     u.querySelector('[data-u]').onclick=(e)=>{ e.preventDefault(); mailUnsubscribe(x.unsubscribe); };
     box.appendChild(u);
   }
+  mailRenderTrust(el, accId, pk, x, act);
 }
 function mailUnsubscribe(u){
   if(!u) return;
@@ -5580,17 +5602,18 @@ async function mailRulesPane(pane, accId){
   pane.querySelectorAll('.mail-rule').forEach(row=>{
     const id=parseInt(row.dataset.id), r=d.items.find(x=>x.id===id)||d.blocked.find(x=>x.id===id);
     const en=row.querySelector('[data-en]');
-    if(en) en.onchange=async()=>{ try{ await api(`/webmail/rules/${id}`, {method:'PUT', body:Object.assign({account_id:accId}, r, {enabled:en.checked})}); reload(); }catch(e){ en.checked=!en.checked; toastErr(e); } };
+    if(en) en.onchange=async()=>{ try{ mailSieveWarn(await api(`/webmail/rules/${id}`, {method:'PUT', body:Object.assign({account_id:accId}, r, {enabled:en.checked})})); reload(); }catch(e){ en.checked=!en.checked; toastErr(e); } };
     const ed=row.querySelector('[data-ed]'); if(ed) ed.onclick=()=>mailRuleEditor(accId, r, null, reload);
     const del=row.querySelector('[data-del]'); if(del) del.onclick=async()=>{
       if(r.kind!=='block' && !await confirmDlg('Удалить правило?', `«${r.name}»`, {okText:'Удалить'})) return;
-      try{ await api(`/webmail/rules/${id}?account_id=${accId}`, {method:'DELETE'}); reload(); }catch(e){ toastErr(e); } };
+      try{ mailSieveWarn(await api(`/webmail/rules/${id}?account_id=${accId}`, {method:'DELETE'})); reload(); }catch(e){ toastErr(e); } };
     const mv=async(delta)=>{ const ids=d.items.map(x=>x.id); const i=ids.indexOf(id); ids.splice(i,1); ids.splice(i+delta,0,id);
       try{ await api('/webmail/rules/order', {method:'POST', body:{account_id:accId, ids}}); reload(); }catch(e){ toastErr(e); } };
     const up=row.querySelector('[data-up]'); if(up) up.onclick=()=>mv(-1);
     const dn=row.querySelector('[data-down]'); if(dn) dn.onclick=()=>mv(1);
   });
   const nb=pane.querySelector('[data-new]'); if(nb) nb.onclick=()=>mailRuleEditor(accId, null, null, reload);
+  mailSieveSection(pane, accId);
   const ap=pane.querySelector('[data-apply]'); if(ap) ap.onclick=()=>mailFolderAction('rules', {name:Mail.special.inbox||'INBOX'});
 }
 function mailRuleEditor(accId, rule, preset, onSaved){
@@ -5645,7 +5668,7 @@ function mailRuleEditor(accId, rule, preset, onSaved){
     const body={account_id:accId, name:g('#re-name').value.trim()||'Правило', match:g('#re-match').value, conditions:r.conditions, actions:r.actions, stop:g('#re-stop').checked, enabled:r.enabled!==false};
     try{
       const saved=await api(rule?`/webmail/rules/${rule.id}`:'/webmail/rules', {method:rule?'PUT':'POST', body});
-      m.close(); toast('Правило сохранено', saved.name);
+      m.close(); toast('Правило сохранено', saved.name); mailSieveWarn(saved);
       if(g('#re-now') && g('#re-now').checked) mailFolderAction('rules', {name:Mail.special.inbox||'INBOX'});
       if(onSaved) onSaved();
     }catch(e){ toastErr(e); }
@@ -5658,7 +5681,7 @@ async function mailAutoreplyPane(pane, accId){
   const act=mailCanAct();
   pane.innerHTML=`${mailRoNote()}
     <p class="small muted" style="margin-top:0">Пока вас нет на месте, на новые письма уходит ответ. Одному отправителю — не чаще раза в несколько дней; рассылкам, роботам и автоматическим письмам — никогда.
-      ${d.interval_min?`Работает и без открытого клиента (проверка «Входящих» — раз в ${d.interval_min} мин.).`:'<b>Работает, только пока открыт клиент</b> — проверка без клиента выключена в настройках сервиса.'}</p>
+      ${Mail.st&&Mail.st.sieve?'Автоответ выполняет <b>почтовый сервер</b> (Sieve, вкладка «Правила»).':d.interval_min?`Работает и без открытого клиента (проверка «Входящих» — раз в ${d.interval_min} мин.).`:'<b>Работает, только пока открыт клиент</b> — проверка без клиента выключена в настройках сервиса.'}</p>
     <div class="form-row check"><span class="switch"><input type="checkbox" id="ar-on" ${d.enabled?'checked':''}><span class="track"></span></span><label for="ar-on">Автоответ включён${d.enabled&&!d.active?' <span class="muted small">(сейчас не действует — вне выбранных дат)</span>':''}</label></div>
     <div class="grid2"><div class="form-row"><label for="ar-from">С даты <span class="muted small">(необязательно)</span></label><input id="ar-from" type="date" value="${esc(d.date_from||'')}"></div>
       <div class="form-row"><label for="ar-to">По дату включительно</label><input id="ar-to" type="date" value="${esc(d.date_to||'')}"></div></div>
@@ -5671,7 +5694,7 @@ async function mailAutoreplyPane(pane, accId){
   if(!act) pane.querySelectorAll('input').forEach(x=>x.disabled=true);
   const ok=g('[data-ok]'); if(ok) ok.onclick=async()=>{
     const body={account_id:accId, enabled:g('#ar-on').checked, date_from:g('#ar-from').value, date_to:g('#ar-to').value, subject:g('#ar-subj').value, body:g('#ar-body').innerHTML, days:parseInt(g('#ar-days').value||'4')||4};
-    try{ const r=await api('/webmail/autoreply', {method:'PUT', body}); toast(r.enabled?'Автоответ включён':'Автоответ выключен', r.enabled&&!r.active?'Начнёт действовать с выбранной даты.':'');
+    try{ const r=await api('/webmail/autoreply', {method:'PUT', body}); toast(r.enabled?'Автоответ включён':'Автоответ выключен', r.enabled&&!r.active?'Начнёт действовать с выбранной даты.':''); mailSieveWarn(r);
       if(Mail.st && Mail.acc===accId){ Mail.st.autoreply_active=r.active; mailArButton(accId); }
       mailAutoreplyPane(pane, accId);
     }catch(e){ toastErr(e); }
@@ -5803,6 +5826,144 @@ async function mailViewPane(pane, accId){
   };
 }
 
+// ---------- Почтовый клиент 1.19.0: новая почта сразу, поиски, квота, подлинность, фишинг, Sieve ----------
+/** Ждать новую почту: сервер держит IMAP IDLE и отвечает, как только письмо пришло (или через 25 с). */
+async function mailPushLoop(accId){
+  if(!Mail.st || !Mail.st.push || !mailOnline()) return;
+  const token=++Mail.pushSeq, seq=State.routeSeq;
+  let since=-1, fails=0;
+  while(token===Mail.pushSeq && seq===State.routeSeq && State.view==='mail' && Mail.acc===accId){
+    let r;
+    try{ r=await api(`/webmail/wait?account_id=${accId}&since=${since}`, {bg:true}); fails=0; }
+    catch(e){ if(++fails>5 || e.status===401 || e.status===403) return; await new Promise(res=>setTimeout(res, 10000)); continue; }
+    if(token!==Mail.pushSeq || Mail.acc!==accId) return;
+    if(['off','unsupported','limit'].includes(r.push)) return;      // остаётся проверка по таймеру
+    if(r.push==='error'){ await new Promise(res=>setTimeout(res, 30000)); }
+    if(r.changed && since>=0){
+      await loadMailFolders(accId, {quiet:true});
+      const inbox=Mail.special.inbox;
+      if(Mail.folder===inbox && !Mail.search && Mail.view==='folder') loadMailMessages(accId, {keep:true});
+    }
+    since=r.version;
+  }
+}
+
+// сохранённые поиски
+async function mailSaveSearch(accId){
+  if(!Mail.search) return;
+  const name=window.prompt('Название поиска', Mail.search.q.slice(0,60)); if(name===null) return;
+  try{ await api('/webmail/searches', {method:'POST', body:{name:name.trim(), q:Mail.search.q, scope:Mail.search.scope||'account', attach:!!Mail.search.attach}});
+    toast('Поиск сохранён', 'Он — под папками, в «Поисках».'); await mailLoadSearches(); renderMailFolders(accId); }
+  catch(e){ toastErr(e); }
+}
+async function mailLoadSearches(){ try{ Mail.searches=(await api('/webmail/searches', {bg:true})).items||[]; }catch(e){ Mail.searches=[]; } }
+function mailRenderSaved(accId, box){
+  if(!Mail.searches.length) return;
+  box.appendChild(h('<div class="mail-folders-sep">🔎 Поиски</div>'));
+  Mail.searches.forEach(s=>{
+    const active=!!(Mail.search && Mail.search.q===s.q);
+    const el=h(`<div class="mail-folder ${active?'active':''}" tabindex="0" role="button" title="${esc(s.q)}${s.scope==='all'?' — во всех ящиках':''}${s.attach?' — с вложениями':''}"><span>🔎</span><span class="fname">${esc(s.name)}</span><button class="fmenu" data-del title="Удалить поиск" aria-label="Удалить поиск">×</button></div>`);
+    el.onclick=(e)=>{ if(e.target.closest('[data-del]')) return;
+      const q=$('#msq'); if(!q) return; q.value=s.q;
+      const sc=$('#msScope'); if(sc) sc.value=s.scope; const at=$('#msAttach'); if(at) at.checked=!!s.attach;
+      $('#msGo').click(); renderMailFolders(accId); };
+    el.onkeydown=(e)=>{ if(e.key==='Enter'){ e.preventDefault(); el.click(); } };
+    el.querySelector('[data-del]').onclick=async(e)=>{ e.stopPropagation();
+      try{ await api(`/webmail/searches/${s.id}`, {method:'DELETE'}); await mailLoadSearches(); renderMailFolders(accId); }catch(err){ toastErr(err); } };
+    box.appendChild(el);
+  });
+}
+// квота
+async function mailLoadQuota(accId){
+  if(!mailOnline()) return;
+  try{ const q=await api(`/webmail/quota?account_id=${accId}`, {bg:true}); if(Mail.acc===accId){ Mail.quota=Object.assign(q||{}, {_acc:accId}); renderMailFolders(accId); } }catch(e){ /* квота — необязательна */ }
+}
+function mailRenderQuota(box){
+  const q=Mail.quota; if(!q || !q.limit) return;
+  const pct=Math.min(100, q.percent||0);
+  box.appendChild(h(`<div class="mail-quota ${pct>=90?'full':pct>=75?'warn':''}" title="Квота ящика на почтовом сервере"><div class="bar"><span style="width:${pct}%"></span></div>
+    <div class="small muted">Занято ${esc(fmtBytes(q.used))} из ${esc(fmtBytes(q.limit))} (${fmtNum(Math.round(pct))}%)</div></div>`));
+}
+
+// подлинность отправителя, S/MIME
+function mailRenderTrust(el, accId, pk, x, act){
+  const tags=el.querySelector('#mfromtags'), box=el.querySelector('#mextras');
+  const c=x.check||{}, a=c.auth||{}, sm=x.smime;
+  const parts=[];
+  if(a.verdict==='pass') parts.push(`<span class="rp-tag ok" title="Почтовый сервер подтвердил отправителя: SPF ${esc(a.spf||'—')}, DKIM ${esc(a.dkim||'—')}, DMARC ${esc(a.dmarc||'—')}">✔ подтверждён</span>`);
+  else if(a.verdict==='fail') parts.push(`<span class="rp-tag hot" title="SPF ${esc(a.spf||'—')}, DKIM ${esc(a.dkim||'—')}, DMARC ${esc(a.dmarc||'—')}">⚠ не подтверждён</span>`);
+  if(c.external) parts.push('<span class="rp-tag ext" title="Письмо пришло не с адресов вашей организации">внешний</span>');
+  if(c.first_time) parts.push('<span class="rp-tag" title="Раньше писем с этого адреса в ящике не было">впервые пишет</span>');
+  if(sm && sm.kind==='signed') parts.push(`<span class="rp-tag ${sm.valid&&sm.trusted?'ok':sm.valid?'':'hot'}" title="${esc(sm.text||'')}">${sm.valid?'🔏 подпись верна':sm.valid===false?'🔏 подпись неверна':'🔏 подписано'}</span>`);
+  if(sm && sm.kind==='encrypted') parts.push(`<span class="rp-tag" title="${esc(sm.text||'')}">🔒 зашифровано</span>`);
+  if(tags) tags.innerHTML=parts.join(' ');
+  if(!box) return;
+  const warns=c.warnings||[];
+  if(warns.length){
+    const danger=warns.some(w=>w.level==='danger');
+    const b=h(`<div class="mail-trust ${danger?'danger':''}"><div class="mail-trust-t">${danger?'⚠️ Письмо может быть поддельным':'⚠️ Осторожно'}</div>
+      <ul>${warns.map(w=>`<li>${esc(w.text)}</li>`).join('')}</ul>
+      <div class="small muted">Не переходите по ссылкам, не открывайте вложения и не отвечайте, пока не убедитесь, что письмо настоящее (например, позвонив отправителю).</div>
+      ${act?`<div class="btn-row" style="margin-top:8px"><button class="btn sm danger" data-phish>🎣 Сообщить о фишинге</button></div>`:''}</div>`);
+    const ph=b.querySelector('[data-phish]'); if(ph) ph.onclick=()=>mailReportPhish(accId, [pk]);
+    box.prepend(b);
+  }
+  if(sm && sm.kind==='signed' && sm.signer && sm.signer.name){
+    box.appendChild(h(`<div class="small muted mail-smime">🔏 ${esc(sm.text||'')} Подписал: ${esc(sm.signer.name)}${(sm.signer.emails||[]).length?` &lt;${esc(sm.signer.emails.join(', '))}&gt;`:''}${sm.signer.issuer?`, выдан: ${esc(sm.signer.issuer)}`:''}${sm.signer.expired?' — сертификат истёк':''}.</div>`));
+  }else if(sm && sm.text && sm.kind!=='signed'){
+    box.appendChild(h(`<div class="small muted mail-smime">🔒 ${esc(sm.text)}</div>`));
+  }
+}
+async function mailReportPhish(accId, ids){
+  const to=Mail.st && Mail.st.phishing_report_to;
+  if(!await confirmDlg('Сообщить о фишинге?', `${to?'Письмо целиком будет отправлено в службу безопасности и ':'Письмо '}перенесено в «Спам».`, {okText:'Сообщить', okClass:'danger'})) return;
+  let r; try{ r=await api('/webmail/phishing', {method:'POST', body:{account_id:accId, ids}}); }catch(e){ return toastErr(e); }
+  toast('Спасибо', `${r.reported?`Письмо отправлено на ${r.to}. `:''}${r.moved?'Перенесено в «Спам».':''}`);
+  if(Mail.cur && ids.includes(Mail.cur)){ Mail.cur=null; const rd=$('#mreader'); if(rd) rd.innerHTML='<div class="empty" style="padding:40px 20px"><div class="big">✉️</div>Выберите письмо для просмотра</div>'; }
+  await loadMailFolders(accId, {quiet:true}); if(!Mail.search) loadMailMessages(accId, {keep:true});
+}
+
+// справка по клавишам
+function mailShortcutsHelp(){
+  const rows=[['j / k','следующее / предыдущее письмо'],['Enter','открыть письмо'],['пробел','выбрать письмо в списке'],['/','поиск'],
+    ['c','новое письмо'],['r / a / f','ответить / всем / переслать'],['s','пометить звёздочкой'],['u','прочитано / не прочитано'],
+    ['e','в архив'],['v','переместить в папку'],['l','метка'],['b','напомнить позже'],['Delete, #','удалить'],
+    ['Ctrl+Enter','отправить (в окне письма)'],['Ctrl+S','сохранить черновик'],['?','эта справка']];
+  modal('Горячие клавиши почты', `<table class="t mail-keys">${rows.map(([k,t])=>`<tr><td>${k.split(' / ').map(x=>`<kbd>${esc(x)}</kbd>`).join(' / ')}</td><td>${esc(t)}</td></tr>`).join('')}</table>
+    <div class="hint">Клавиши работают и в русской раскладке (например, «у» — в архив).</div>`);
+}
+
+// правила на сервере (Sieve)
+async function mailSieveSection(pane, accId){
+  let d; try{ d=await api(`/webmail/sieve?account_id=${accId}`); }catch(e){ return; }
+  const act=mailCanAct();
+  const sec=h(`<div class="mail-sieve"><h3 class="mset-h">🖥 Правила на почтовом сервере (Sieve)</h3>
+    <p class="small muted" style="margin-top:0">Правила и автоответ можно отдать самому почтовому серверу (Dovecot, Cyrus, Stalwart и другие с ManageSieve): письма будут раскладываться сразу при получении — и в почте на телефоне, даже если служба архива остановлена. Exchange, Gmail и Яндекс Sieve не поддерживают.</p>
+    ${d.supported?'':'<div class="hint">Доступно ящикам с паролем: ящику с OAuth или входом через администратора почты сервер Sieve не откроет.</div>'}
+    ${d.error?`<div class="hint" style="border-color:var(--warn)">⚠️ ${esc(d.error)}</div>`:''}
+    ${d.enabled&&d.synced_at?`<div class="hint">✔ Правила выполняет почтовый сервер (загружены ${esc(fmtDate(d.synced_at))}); служба архива их сама не выполняет. Изменили правило — сценарий на сервере обновится сам.</div>`:''}
+    <div class="form-row check"><span class="switch"><input type="checkbox" id="sv-on" ${d.enabled?'checked':''} ${act&&d.supported?'':'disabled'}><span class="track"></span></span><label for="sv-on">Выполнять правила и автоответ на почтовом сервере</label></div>
+    <div class="grid2"><div class="form-row"><label for="sv-host">Сервер ManageSieve</label><input id="sv-host" type="text" value="${esc(d.host||'')}" ${act?'':'disabled'}></div>
+      <div class="form-row"><label for="sv-port">Порт</label><input id="sv-port" type="number" min="1" max="65535" value="${d.port||4190}" ${act?'':'disabled'}></div></div>
+    <div class="form-row"><label for="sv-sec">Защита</label><select id="sv-sec" ${act?'':'disabled'}><option value="starttls">STARTTLS</option><option value="ssl">SSL</option><option value="none">без шифрования (только localhost)</option></select></div>
+    <details><summary class="small">Сценарий Sieve, который будет загружен</summary><pre class="mail-headers">${esc(d.script||'')}</pre></details>
+    ${act&&d.supported?'<div class="btn-row mset-foot"><button class="btn primary" data-sv>Сохранить</button></div>':''}</div>`);
+  sec.querySelector('#sv-sec').value=d.security||'starttls';
+  const btn=sec.querySelector('[data-sv]');
+  const send=async(force)=>{
+    const body={account_id:accId, enabled:sec.querySelector('#sv-on').checked, host:sec.querySelector('#sv-host').value.trim(),
+      port:parseInt(sec.querySelector('#sv-port').value||'4190')||4190, security:sec.querySelector('#sv-sec').value, force:!!force};
+    try{ const r=await api('/webmail/sieve', {method:'PUT', body}); toast(r.enabled?'Правила загружены на сервер':'Правила на сервере выключены', r.enabled?`${r.host}:${r.port}`:'');
+      if(Mail.st) Mail.st.sieve=!!(r.enabled&&r.synced_at); mailRulesPane(pane, accId); }
+    catch(e){
+      if(e.data && e.data.code==='sieve_conflict' && await confirmDlg('Заменить сценарий на сервере?', e.message+' Сценарий клиента станет активным, прежний останется на сервере неактивным.', {okText:'Заменить', okClass:'primary'})) return send(true);
+      toastErr(e);
+    }
+  };
+  if(btn) btn.onclick=()=>send(false);
+  pane.appendChild(sec);
+}
+function mailSieveWarn(r){ if(r && r.sieve_error) toast('Правила на сервере не обновлены', r.sieve_error, 'warn', 8000); }
 // ---------- Горячие клавиши «Почты» ----------
 document.addEventListener('keydown', (e)=>{ if(e.key==='Escape') document.querySelectorAll('.mail-pop').forEach(x=>x.remove()); });
 document.addEventListener('keydown', (e)=>{
@@ -5813,6 +5974,7 @@ document.addEventListener('keydown', (e)=>{
   const k=e.key;
   const list=$('#mlist');
   if(k==='/'){ const q=$('#msq'); if(q){ e.preventDefault(); q.focus(); } return; }
+  if(k==='?' || k===','){ e.preventDefault(); mailShortcutsHelp(); return; }
   if(k==='c' || k==='с'){ if(mailCanSend()){ e.preventDefault(); mailCompose('new'); } return; }
   if((k==='j'||k==='о'||k==='k'||k==='л') && list){
     const items=[...list.querySelectorAll('.msg-item')]; if(!items.length) return;
@@ -5821,7 +5983,7 @@ document.addEventListener('keydown', (e)=>{
     e.preventDefault(); items[next].focus(); items[next].click(); return;
   }
   if(!Mail.cur || !Mail.readerGo) return;
-  const map={r:'reply', 'к':'reply', a:'reply_all', 'ф':'reply_all', f:'forward', 'а':'forward', s:'star', 'ы':'star', u:'unread', 'г':'unread', '#':'delete', Delete:'delete', v:'move', 'м':'move', l:'tag', 'д':'tag', b:'snooze', 'и':'snooze'};
+  const map={r:'reply', 'к':'reply', a:'reply_all', 'ф':'reply_all', f:'forward', 'а':'forward', s:'star', 'ы':'star', u:'unread', 'г':'unread', '#':'delete', Delete:'delete', v:'move', 'м':'move', l:'tag', 'д':'tag', b:'snooze', 'и':'snooze', e:'archive', 'у':'archive'};
   const c=map[k]; if(!c) return;
   const rd=$('#mreader'); const btn=rd && rd.querySelector(`[data-c="${c}"]`);
   if(!btn || btn.disabled) return;
