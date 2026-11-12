@@ -36,7 +36,7 @@ import ssl
 import threading
 import time
 from datetime import datetime, timezone
-from email import policy
+from email import message_from_bytes, policy
 from email.message import EmailMessage
 from email.parser import BytesHeaderParser
 from email.utils import format_datetime, getaddresses, make_msgid
@@ -124,9 +124,26 @@ MAX_SUBJECT = 998
 MAX_ACTION_IDS = 5000
 
 
+#: Колонки, добавленные после 1.17.0: (таблица, колонка, объявление).
+_LATE_COLUMNS = (
+    ("webmail_identities", "aliases", "TEXT NOT NULL DEFAULT ''"),       # другие адреса отправителя
+    ("webmail_drafts", "from_addr", "TEXT NOT NULL DEFAULT ''"),         # от какого адреса (псевдонима)
+    ("webmail_drafts", "priority", "INTEGER NOT NULL DEFAULT 0"),        # 1 — важное
+    ("webmail_drafts", "receipt", "INTEGER NOT NULL DEFAULT 0"),         # запросить уведомление о прочтении
+    ("webmail_drafts", "send_at", "TEXT"),                               # отправить в это время (UTC, ISO)
+    ("webmail_drafts", "actor", "TEXT NOT NULL DEFAULT ''"),             # кто отправляет (для аудита)
+)
+
+
 def ensure_schema(conn) -> None:
     conn.executescript(SCHEMA_SQL)
+    for table, col, decl in _LATE_COLUMNS:
+        have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if col not in have:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
     conn.commit()
+    from .webmail_tools import ensure_schema as _tools_schema
+    _tools_schema(conn)
 
 
 def _now() -> float:
@@ -685,13 +702,13 @@ def _move_group(conn: ImapConnection, uids: List[int], dest: str) -> Tuple[Dict[
 
 
 def _copy_into_archive(svc, account: Account, rows, dest: str, dest_uidv: int, mapping: Dict[int, int],
-                       *, extra_flags: Sequence[str] = ()) -> int:
+                       *, extra_flags: Sequence[str] = ()) -> List[int]:
     """Письма, перенесённые на сервере, — в архив под новой папкой и номером (файл копируется из архива).
 
     Копирование сделало бы то же самое, только скачав письма с сервера заново.
     """
     if not dest_uidv or not mapping:
-        return 0
+        return []
     from .imap.backup import BackupEngine
     delim = _delimiter_of(svc, int(account.id), dest)
     batch = []
@@ -719,10 +736,15 @@ def _copy_into_archive(svc, account: Account, rows, dest: str, dest_uidv: int, m
         batch.append((int(account.id), dest, int(dest_uidv), int(new_uid), r["message_id"] or "", size,
                       r["internaldate"] or "", ",".join(flags), rel, digest, subject, from_addr,
                       1 if has_attach else 0))
-    if batch:
-        svc.db.add_message_index_batch(batch)
-        _ensure_folder_state(svc, int(account.id), dest)
-    return len(batch)
+    if not batch:
+        return []
+    svc.db.add_message_index_batch(batch)
+    _ensure_folder_state(svc, int(account.id), dest)
+    uids = [b[3] for b in batch]
+    marks = ",".join("?" * len(uids))
+    return [int(r["id"]) for r in svc.db.query(
+        f"SELECT id FROM messages WHERE account_id=? AND folder=? AND uidvalidity=? AND uid IN ({marks})",
+        (int(account.id), dest, int(dest_uidv), *uids))]
 
 
 def move(svc, account: Account, ids: Iterable[int], dest: str, *, actor: str = "",
@@ -732,6 +754,8 @@ def move(svc, account: Account, ids: Iterable[int], dest: str, *, actor: str = "
     rows = _rows(svc, int(account.id), ids)
     moved = missing = archived = 0
     touched = {dest}
+    #: чтобы отменить перенос: письма в новой папке (id архива) → папка, откуда они пришли
+    undo: List[Dict] = []
     with pool(svc).session(account) as conn:
         for (folder, uidv), group in _groups(rows).items():
             if folder == dest:
@@ -767,11 +791,14 @@ def move(svc, account: Account, ids: Iterable[int], dest: str, *, actor: str = "
                         item = dict(r)
                         item["uid"] = old_uid
                         copies.append(item)
-                archived += _copy_into_archive(svc, account, copies, dest, new_uidv, uidmap)
+                new_ids = _copy_into_archive(svc, account, copies, dest, new_uidv, uidmap)
+                archived += len(new_ids)
+                if new_ids:
+                    undo.append({"folder": folder, "ids": new_ids})
     _touch_counts(svc, account, touched)
     if actor and moved:
         svc.db.add_audit(actor, audit_action, f"ящик «{account.name}»: писем {moved} → «{dest}»")
-    return {"moved": moved, "missing": missing, "archived": archived, "folder": dest}
+    return {"moved": moved, "missing": missing, "archived": archived, "folder": dest, "undo": undo}
 
 
 def delete(svc, account: Account, ids: Iterable[int], *, permanent: bool = False, actor: str = "") -> Dict:
@@ -781,11 +808,12 @@ def delete(svc, account: Account, ids: Iterable[int], *, permanent: bool = False
     trash = special.get("trash")
     to_trash = [r for r in rows if not permanent and trash and r["folder"] != trash]
     to_erase = [r for r in rows if r not in to_trash]
-    result = {"trashed": 0, "deleted": 0, "missing": 0}
+    result = {"trashed": 0, "deleted": 0, "missing": 0, "undo": []}
     if to_trash:
         res = move(svc, account, [r["id"] for r in to_trash], trash)
         result["trashed"] = res["moved"]
         result["missing"] += res["missing"]
+        result["undo"] = res["undo"]
     if to_erase:
         with pool(svc).session(account) as conn:
             for (folder, uidv), group in _groups(to_erase).items():
@@ -843,6 +871,52 @@ def _touch_counts(svc, account: Account, names: Iterable[str]) -> None:
         log.debug("Счётчики папок не обновлены: %s", exc)
 
 
+def mark_all_read(svc, account: Account, folder: str) -> Dict:
+    """«Отметить все прочитанными» — все непрочитанные письма папки на сервере и в архиве."""
+    acc_id = int(account.id)
+    with pool(svc).session(account) as conn:
+        info = conn.select(folder, readonly=False)
+        uids = conn.search(["UNSEEN"])
+        if uids:
+            conn.add_flags(uids, ["\\Seen"])
+        uidv = int(info.get("uidvalidity") or 0)
+    changed = []
+    if uids:
+        for start in range(0, len(uids), 500):
+            part = uids[start:start + 500]
+            for r in svc.db.query(f"SELECT id, flags FROM messages WHERE account_id=? AND folder=? AND uidvalidity=? "
+                                  f"AND uid IN ({','.join('?' * len(part))})", (acc_id, folder, uidv, *part)):
+                flags = _flags_of(r)
+                if "\\Seen" not in flags:
+                    changed.append((int(r["id"]), flags + ["\\Seen"]))
+    _set_local_flags(svc, changed)
+    _touch_counts(svc, account, [folder])
+    return {"marked": len(uids)}
+
+
+def empty_folder(svc, account: Account, folder: str, *, actor: str = "") -> Dict:
+    """Очистить «Корзину» или «Спам»: удалить с сервера все письма папки. Копии остаются в архиве."""
+    special = special_folders(svc, account)
+    kind = next((k for k, v in special.items() if v == folder), "")
+    if kind not in ("trash", "junk"):
+        raise ValidationError("Очистить целиком можно только «Корзину» и «Спам».",
+                              hint="Письма другой папки выберите и удалите.")
+    with pool(svc).session(account) as conn:
+        conn.select(folder, readonly=False)
+        uids = conn.search(["ALL"])
+        if uids:
+            conn.add_flags(uids, ["\\Deleted"])
+            if conn.has_capability("UIDPLUS"):
+                conn.expunge_uids(uids)
+            else:
+                conn.expunge_all()
+    svc.db.execute("UPDATE messages SET gone=1 WHERE account_id=? AND folder=? AND gone=0", (int(account.id), folder))
+    _touch_counts(svc, account, [folder])
+    if actor and uids:
+        svc.db.add_audit(actor, "webmail_empty", f"ящик «{account.name}»: папка «{folder}», писем {len(uids)}")
+    return {"deleted": len(uids)}
+
+
 # ===========================================================================
 #  Папки: создать, переименовать, удалить
 # ===========================================================================
@@ -890,7 +964,9 @@ def _protected(row) -> bool:
     return row["name"].upper() == "INBOX" or bool(row["special"])
 
 
-def rename_folder(svc, account: Account, folder: str, new_leaf: str, *, actor: str = "") -> Dict:
+def rename_folder(svc, account: Account, folder: str, new_leaf: str, *, actor: str = "",
+                  new_parent: Optional[str] = None) -> Dict:
+    """Переименовать папку и (с ``new_parent``) перенести её в другую ('' — в корень ящика)."""
     rows = {r["name"]: r for r in _folder_rows(svc, int(account.id))}
     row = rows.get(folder)
     if row is None:
@@ -900,6 +976,12 @@ def rename_folder(svc, account: Account, folder: str, new_leaf: str, *, actor: s
     delim = row["delimiter"] or ""
     leaf = _check_folder_leaf(new_leaf, delim)
     parent = folder.rsplit(delim, 1)[0] if delim and delim in folder else ""
+    if new_parent is not None:
+        if new_parent and new_parent not in rows:
+            raise ValidationError(f"Папки «{new_parent}» на сервере нет.")
+        if new_parent and (new_parent == folder or (delim and new_parent.startswith(folder + delim))):
+            raise ValidationError("Папку нельзя перенести в неё саму или во вложенную в неё.")
+        parent = new_parent
     new = f"{parent}{delim}{leaf}" if parent else leaf
     if new == folder:
         return {"folder": folder}
@@ -1131,26 +1213,49 @@ LIST_FILTERS = {
 }
 
 
+def _list_cond(filt: str, show_gone: bool) -> Tuple[str, Tuple]:
+    """Условие отбора писем списка: вид отбора («непрочитанные», «с меткой …») и письма, которых нет на сервере."""
+    filt = str(filt or "all")
+    args: Tuple = ()
+    if filt.startswith("tag:"):
+        cond = " AND instr(',' || COALESCE(m.flags, '') || ',', ?) > 0"
+        args = (f",{_norm_flag(filt[4:])},",)
+    else:
+        cond = LIST_FILTERS.get(filt, "")
+    if not show_gone:
+        cond += " AND m.gone = 0"
+    return cond, args
+
+
 def list_messages(svc, account_id: int, folder: str, *, offset: int = 0, limit: int = 50, sort: str = "date_desc",
                   filt: str = "all", show_gone: bool = True) -> Dict:
     order = LIST_SORTS.get(sort, LIST_SORTS["date_desc"])
-    cond = LIST_FILTERS.get(filt, "")
-    if not show_gone:
-        cond += " AND m.gone = 0"
+    cond, args = _list_cond(filt, show_gone)
     limit = max(1, min(200, int(limit)))
     offset = max(0, int(offset))
     where = f"m.account_id=? AND m.folder=?{cond}"
     rows = svc.db.query(
         f"SELECT m.id, m.folder, m.subject, m.from_addr, m.internaldate, m.size, m.has_attach, m.flags, m.gone, "
         f"m.stored_path, r.peer AS peer, r.dir AS dir FROM messages m LEFT JOIN reply_msgs r ON r.id = m.id "
-        f"WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?", (account_id, folder, limit, offset))
+        f"WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?", (account_id, folder, *args, limit, offset))
     if not cond:
         total = svc.db.count_folder_messages(account_id, folder)
     else:
-        total = int(svc.db.scalar(f"SELECT COUNT(*) FROM messages m WHERE {where}", (account_id, folder)) or 0)
+        total = int(svc.db.scalar(f"SELECT COUNT(*) FROM messages m WHERE {where}", (account_id, folder, *args)) or 0)
     gone_total = int(svc.db.scalar("SELECT COUNT(*) FROM messages WHERE account_id=? AND folder=? AND gone=1",
                                    (account_id, folder)) or 0)
     return {"rows": rows, "total": total, "gone": gone_total, "offset": offset, "limit": limit}
+
+
+def list_ids(svc, account_id: int, folder: str, *, filt: str = "all", show_gone: bool = False,
+             limit: int = MAX_ACTION_IDS) -> Dict:
+    """Все письма папки (с тем же отбором) — для «Выбрать все письма папки»."""
+    cond, args = _list_cond(filt, show_gone)
+    where = f"m.account_id=? AND m.folder=?{cond}"
+    ids = [int(r["id"]) for r in svc.db.query(
+        f"SELECT m.id FROM messages m WHERE {where} ORDER BY m.internaldate DESC, m.id DESC LIMIT ?",
+        (account_id, folder, *args, int(limit) + 1))]
+    return {"ids": ids[:limit], "more": len(ids) > limit}
 
 
 # ===========================================================================
@@ -1424,8 +1529,12 @@ def get_identity(svc, account: Account) -> Dict:
     security = get("smtp_security") or (defaults["security"] if not get("smtp_host") else "starttls")
     auth = get("smtp_auth", "account") or "account"
     save_sent = get("save_sent") or str(svc.rt("webmail", "save_sent") or "auto")
+    aliases = [a for a in re.split(r"[\s,;]+", get("aliases") or "") if a]
     return {
         "account_id": int(account.id),
+        "aliases": aliases,
+        #: адреса, от которых можно отправлять: основной и псевдонимы
+        "from_choices": [address] + [a for a in aliases if a.lower() != (address or "").lower()] if address else aliases,
         "display_name": get("display_name") or _employee_name(svc, account) or account.name,
         "address": address,
         "signature": get("signature"),
@@ -1442,15 +1551,16 @@ def get_identity(svc, account: Account) -> Dict:
 
 _IDENTITY_USER_FIELDS = ("display_name", "signature", "reply_to")
 _IDENTITY_ADMIN_FIELDS = ("address", "smtp_host", "smtp_port", "smtp_security", "smtp_auth", "smtp_username",
-                          "save_sent")
+                          "save_sent", "aliases")
 
 
 def save_identity(svc, account: Account, data: Dict, *, admin: bool) -> Dict:
     """Сохранить отправителя (имя, подпись, «Ответ на») и — администратору — сервер отправки."""
     row = _identity_row(svc, int(account.id))
     cur = dict(row) if row is not None else {}
-    vals = {k: cur.get(k, "") for k in ("display_name", "address", "signature", "reply_to", "smtp_host",
-                                       "smtp_security", "smtp_auth", "smtp_username", "smtp_password", "save_sent")}
+    vals = {k: cur.get(k, "") or "" for k in ("display_name", "address", "signature", "reply_to", "smtp_host",
+                                             "smtp_security", "smtp_auth", "smtp_username", "smtp_password",
+                                             "save_sent", "aliases")}
     vals["smtp_port"] = int(cur.get("smtp_port") or 0)
     if not vals["smtp_auth"]:
         vals["smtp_auth"] = "account"
@@ -1490,6 +1600,16 @@ def save_identity(svc, account: Account, data: Dict, *, admin: bool) -> Dict:
     if vals["save_sent"] not in ("", "auto", "always", "never"):
         raise ValidationError("Копия в «Отправленные»: auto, always или never.")
     vals["smtp_username"] = _one_line(str(vals["smtp_username"] or ""), 300)
+    aliases = vals["aliases"]
+    if isinstance(aliases, (list, tuple)):
+        aliases = ",".join(str(a) for a in aliases)
+    aliases = [a.strip() for a in re.split(r"[\s,;]+", str(aliases or "")) if a.strip()]
+    for a in aliases:
+        if not _EMAIL_RE.fullmatch(a):
+            raise ValidationError(f"Псевдоним «{a}» — не адрес электронной почты.")
+    if len(aliases) > 20:
+        raise ValidationError("Псевдонимов — не больше 20.")
+    vals["aliases"] = ", ".join(dict.fromkeys(aliases))
     svc.db.execute(
         "INSERT INTO webmail_identities(account_id, display_name, address, signature, reply_to, smtp_host, smtp_port, "
         "smtp_security, smtp_auth, smtp_username, smtp_password, save_sent, updated_at) "
@@ -1501,6 +1621,7 @@ def save_identity(svc, account: Account, data: Dict, *, admin: bool) -> Dict:
         (int(account.id), vals["display_name"], vals["address"], vals["signature"], vals["reply_to"],
          vals["smtp_host"], vals["smtp_port"], vals["smtp_security"], vals["smtp_auth"], vals["smtp_username"],
          vals["smtp_password"], vals["save_sent"], utcnow_iso()))
+    svc.db.execute("UPDATE webmail_identities SET aliases=? WHERE account_id=?", (vals["aliases"], int(account.id)))
     return get_identity(svc, account)
 
 
@@ -1718,6 +1839,7 @@ def own_addresses(svc, account: Account) -> set:
     ident = get_identity(svc, account)
     if ident["address"]:
         own.add(ident["address"].lower())
+    own.update(a.lower() for a in ident.get("aliases") or [])
     if account.employee_id:
         row = svc.db.query_one("SELECT email, known_logins FROM employees WHERE id=?", (int(account.employee_id),))
         if row is not None:
@@ -1733,8 +1855,10 @@ def own_addresses(svc, account: Account) -> set:
 def contacts(svc, account: Account, q: str, limit: int = 10) -> List[Dict]:
     """Подсказка адресов: сотрудники, отправители писем ящика, адресаты его писем."""
     q = (q or "").strip().lower()
+    from .webmail_tools import book_suggest
+    book = book_suggest(svc, int(account.id), q, limit)
     if len(q) < 2:
-        return []
+        return book
     out: Dict[str, Dict] = {}
     for r in svc.db.query("SELECT full_name, email FROM employees WHERE email IS NOT NULL AND email<>'' "
                           "AND status<>'dismissed' LIMIT 20000"):
@@ -1755,11 +1879,12 @@ def contacts(svc, account: Account, q: str, limit: int = 10) -> List[Dict]:
         if "@" in a:
             item = out.setdefault(a.lower(), {"name": "", "email": a, "count": 0})
             item["count"] += int(r["n"])
-    items = sorted(out.values(), key=lambda x: (-x["count"], x["email"]))[:limit]
+    known = {b["email"].lower() for b in book if b.get("email")}
+    items = [x for x in sorted(out.values(), key=lambda x: (-x["count"], x["email"])) if x["email"].lower() not in known]
     for it in items:
         it["label"] = display_addr(it["name"], it["email"])
         it.pop("count", None)
-    return items
+    return (book + items)[:limit]
 
 
 # ===========================================================================
@@ -1798,7 +1923,7 @@ def thread(svc, account_id: int, pk: int, limit: int = 60) -> List[Dict]:
 # ===========================================================================
 #  Черновики
 # ===========================================================================
-DRAFT_FIELDS = ("to_addrs", "cc_addrs", "bcc_addrs", "subject", "body")
+DRAFT_FIELDS = ("to_addrs", "cc_addrs", "bcc_addrs", "subject", "body", "from_addr", "priority", "receipt")
 
 
 def _drafts_root(svc) -> str:
@@ -1864,16 +1989,26 @@ def create_draft(svc, account: Account, owner: str, fields: Optional[Dict] = Non
     return _draft_dict(get_draft_row(svc, int(cur.lastrowid), owner))
 
 
-def update_draft(svc, draft_id: int, owner: str, fields: Dict) -> Dict:
-    row = get_draft_row(svc, draft_id, owner)
+def _not_editable(row) -> None:
+    if row["status"] == "scheduled":
+        raise ValidationError("Письмо запланировано к отправке — сначала отмените отправку.")
     if row["status"] != "draft":
         raise ValidationError("Письмо уже отправляется — изменить его нельзя.")
+
+
+def update_draft(svc, draft_id: int, owner: str, fields: Dict) -> Dict:
+    row = get_draft_row(svc, draft_id, owner)
+    _not_editable(row)
     vals = {}
     for key in DRAFT_FIELDS:
         if key in fields:
             v = fields[key]
-            vals[key] = _clean_body(v) if key == "body" else \
-                _one_line(v, MAX_SUBJECT if key == "subject" else 5000)
+            if key == "body":
+                vals[key] = _clean_body(v)
+            elif key in ("priority", "receipt"):
+                vals[key] = 1 if v else 0
+            else:
+                vals[key] = _one_line(v, MAX_SUBJECT if key == "subject" else 300 if key == "from_addr" else 5000)
     if fields.get("account_id") and int(fields["account_id"]) != int(row["account_id"]):
         vals["account_id"] = int(fields["account_id"])
     if not vals:
@@ -1931,8 +2066,7 @@ def _safe_filename(name: str) -> str:
 
 def add_attachment(svc, draft_id: int, owner: str, filename: str, ctype: str, fileobj) -> Dict:
     row = get_draft_row(svc, draft_id, owner)
-    if row["status"] != "draft":
-        raise ValidationError("Письмо уже отправляется — изменить его нельзя.")
+    _not_editable(row)
     limit = int(svc.rt("webmail", "max_attachments_mb") or 25) * 1024 * 1024
     items = _attachments_of(row)
     used = sum(int(a.get("size") or 0) for a in items)
@@ -1963,6 +2097,7 @@ def add_attachment(svc, draft_id: int, owner: str, filename: str, ctype: str, fi
 
 def remove_attachment(svc, draft_id: int, owner: str, n: int) -> None:
     row = get_draft_row(svc, draft_id, owner)
+    _not_editable(row)
     items = _attachments_of(row)
     keep = [a for a in items if int(a.get("n") or 0) != int(n)]
     for a in items:
@@ -1975,6 +2110,12 @@ def remove_attachment(svc, draft_id: int, owner: str, n: int) -> None:
 
 
 def _attachment_bytes(svc, account: Account, draft_id: int, item: Dict) -> bytes:
+    if item.get("eml"):
+        # письмо из архива целиком — «Переслать как вложение»
+        row = svc.db.get_message(int((item.get("eml") or {}).get("id") or 0))
+        if row is None or int(row["account_id"]) != int(account.id):
+            raise ValidationError(f"Письмо «{item.get('name')}» больше не найдено в архиве.")
+        return svc.store.read_message(int(account.id), row["stored_path"])
     if item.get("file"):
         with open(os.path.join(_draft_dir(svc, draft_id), item["file"]), "rb") as fh:
             blob = fh.read()
@@ -2036,8 +2177,36 @@ def _plain_of(parsed: Dict) -> str:
     return text.strip()
 
 
-def compose_fields(svc, account: Account, mode: str, ref_id: Optional[int]) -> Dict:
+def _eml_name(subject: str, n: int) -> str:
+    base = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', " ", subject or "").strip()[:80] or f"Письмо {n}"
+    return f"{base}.eml"
+
+
+def forward_attached_fields(svc, account: Account, ref_ids: Sequence[int]) -> Dict:
+    """«Переслать как вложение»: исходные письма целиком — файлами .eml."""
+    ids = list(dict.fromkeys(int(i) for i in ref_ids))[:50]
+    rows = [r for r in svc.db.messages_by_ids(int(account.id), ids)] if ids else []
+    if not rows:
+        raise ValidationError("Письма не найдены в архиве.", code="not_found")
+    by_id = {int(r["id"]): r for r in rows}
+    atts, names = [], []
+    for i, pk in enumerate(ids):
+        r = by_id.get(pk)
+        if r is None:
+            continue
+        names.append(r["subject"] or "")
+        atts.append({"n": len(atts) + 1, "name": _eml_name(r["subject"], i + 1), "ctype": "message/rfc822",
+                     "size": int(r["size"] or 0), "eml": {"id": pk}})
+    subject = _prefixed(names[0], "Fwd") if len(names) == 1 else f"Fwd: писем {len(names)}"
+    return {"mode": "forward", "ref_id": ids[0] if len(ids) == 1 else None, "to_addrs": "", "subject": subject,
+            "body": "", "in_reply_to": "", "refs": "", "attachments": atts}
+
+
+def compose_fields(svc, account: Account, mode: str, ref_id: Optional[int],
+                   ref_ids: Optional[Sequence[int]] = None) -> Dict:
     """Поля нового письма: ответ, ответ всем, пересылка или продолжение черновика с сервера."""
+    if mode == "forward_attach":
+        return forward_attached_fields(svc, account, list(ref_ids or []) or ([int(ref_id)] if ref_id else []))
     if mode == "new" or not ref_id:
         return {"mode": "new"}
     row = svc.db.get_message(int(ref_id))
@@ -2117,7 +2286,7 @@ def build_message(svc, account: Account, draft, ident: Dict) -> Tuple[EmailMessa
         raise ValidationError("Укажите хотя бы одного получателя.")
     if len(rcpts) > MAX_RECIPIENTS:
         raise ValidationError(f"Получателей больше {MAX_RECIPIENTS}.")
-    sender = ident["address"]
+    sender = draft_sender(ident, draft)
     domain = sender.split("@", 1)[1] if "@" in sender else None
     msg = EmailMessage(policy=policy.SMTP)
     msg["From"] = display_addr(ident["display_name"], sender)
@@ -2134,6 +2303,12 @@ def build_message(svc, account: Account, draft, ident: Dict) -> Tuple[EmailMessa
         msg["In-Reply-To"] = draft["in_reply_to"]
     if draft["refs"]:
         msg["References"] = draft["refs"]
+    keys = draft.keys() if hasattr(draft, "keys") else ()
+    if "priority" in keys and draft["priority"]:
+        msg["X-Priority"] = "1 (Highest)"
+        msg["Importance"] = "High"
+    if "receipt" in keys and draft["receipt"]:
+        msg["Disposition-Notification-To"] = sender
     from .version import __version__
     msg["User-Agent"] = f"MailArchiver/{__version__}"
     body = sanitize_html(draft["body"] or "")
@@ -2164,10 +2339,23 @@ def build_message(svc, account: Account, draft, ident: Dict) -> Tuple[EmailMessa
         total += len(data)
         if total > limit:
             raise ValidationError(f"Вложения письма больше {limit // (1024 * 1024)} МБ.")
+        if item.get("eml"):
+            msg.add_attachment(message_from_bytes(data, policy=policy.default), filename=item.get("name") or "message.eml")
+            continue
         maintype, _sep, subtype = (item.get("ctype") or "application/octet-stream").partition("/")
         msg.add_attachment(data, maintype=maintype or "application", subtype=subtype or "octet-stream",
                            filename=item.get("name") or "file")
     return msg, rcpts, atts
+
+
+def draft_sender(ident: Dict, draft) -> str:
+    """Адрес отправителя письма: выбранный псевдоним (если он из разрешённых) или основной адрес."""
+    keys = draft.keys() if hasattr(draft, "keys") else ()
+    chosen = (draft["from_addr"] if "from_addr" in keys else "") or ""
+    for a in ident.get("from_choices") or []:
+        if chosen and a.lower() == chosen.strip().lower():
+            return a
+    return ident["address"]
 
 
 def _save_policy(ident: Dict) -> bool:
@@ -2185,7 +2373,7 @@ def send(svc, account: Account, draft_id: int, owner: str, *, actor: str = "") -
     if int(row["account_id"]) != int(account.id):
         raise ValidationError("Черновик относится к другому ящику.")
     cur = svc.db.execute("UPDATE webmail_drafts SET status='sending', error='', updated_at=? "
-                         "WHERE id=? AND status='draft'", (utcnow_iso(), int(draft_id)))
+                         "WHERE id=? AND status IN ('draft', 'scheduled')", (utcnow_iso(), int(draft_id)))
     if not int(cur.rowcount or 0):
         raise ValidationError("Это письмо уже отправляется или отправлено.")
     try:
@@ -2195,10 +2383,10 @@ def send(svc, account: Account, draft_id: int, owner: str, *, actor: str = "") -
             raise ValidationError(problem)
         msg, rcpts, _atts = build_message(svc, account, row, ident)
         data = msg.as_bytes()
-        refused = _smtp_send(svc, account, ident, ident["address"], rcpts, data)
+        refused = _smtp_send(svc, account, ident, draft_sender(ident, row), rcpts, data)
     except BaseException as exc:
         text = exc.message if isinstance(exc, MailArchiverError) else f"{type(exc).__name__}: {exc}"
-        svc.db.execute("UPDATE webmail_drafts SET status='draft', error=?, updated_at=? WHERE id=?",
+        svc.db.execute("UPDATE webmail_drafts SET status='draft', send_at=NULL, error=?, updated_at=? WHERE id=?",
                        (text[:1000], utcnow_iso(), int(draft_id)))
         raise
     message_id = str(msg["Message-ID"])
@@ -2230,7 +2418,8 @@ def send(svc, account: Account, draft_id: int, owner: str, *, actor: str = "") -
     if actor:
         shown = ", ".join(rcpts[:5]) + (f" и ещё {len(rcpts) - 5}" if len(rcpts) > 5 else "")
         svc.db.add_audit(actor, "webmail_send",
-                         f"ящик «{account.name}» ({ident['address']}): «{_one_line(row['subject'], 120)}» → {shown}")
+                         f"ящик «{account.name}» ({draft_sender(ident, row)}): «{_one_line(row['subject'], 120)}» "
+                         f"→ {shown}")
     svc.db.execute("DELETE FROM webmail_drafts WHERE id=?", (int(draft_id),))
     shutil.rmtree(_draft_dir(svc, draft_id), ignore_errors=True)
     return {"ok": True, "message_id": message_id, "recipients": len(rcpts), "saved_to": saved_to,

@@ -82,6 +82,10 @@ class SchedulerService:
             self._sched.add_job(self._reply_index_tick, IntervalTrigger(minutes=10), id="reply_index",
                                 replace_existing=True, coalesce=True, misfire_grace_time=600,
                                 next_run_time=datetime.now(timezone.utc) + timedelta(minutes=4))
+            # почтовый клиент: запланированная отправка, «напомнить позже», правила и автоответ — раз в минуту
+            self._sched.add_job(self._webmail_tick, IntervalTrigger(minutes=1), id="webmail",
+                                replace_existing=True, coalesce=True, max_instances=1, misfire_grace_time=120,
+                                next_run_time=datetime.now(timezone.utc) + timedelta(seconds=30))
             # состояние сервера Axigen — каждые 15 минут (сама проверка смотрит, включена ли она)
             self._sched.add_job(self._axigen_monitor_tick, IntervalTrigger(minutes=15), id="axigen_monitor",
                                 replace_existing=True, coalesce=True, max_instances=1, misfire_grace_time=600,
@@ -135,7 +139,7 @@ class SchedulerService:
             log.info("Планировщик запущен.")
 
     #: Служебные задания, которые работают всегда (не зависят от scheduler.enabled).
-    ALWAYS_JOBS = ("maintenance", "search_index", "axigen_monitor", "mailservers_monitor")
+    ALWAYS_JOBS = ("maintenance", "search_index", "reply_index", "webmail", "axigen_monitor", "mailservers_monitor")
 
     # -- синхронизация сотрудников ------------------------------------------
     EMPLOYEES_JOB_ID = "employees_sync"
@@ -548,6 +552,14 @@ class SchedulerService:
         except Exception:  # noqa: BLE001
             log.exception("Ошибка при постановке индекса ответов")
             return None
+
+    def _webmail_tick(self) -> None:
+        """Почтовый клиент: письма, запланированные к отправке, отложенные письма, правила сортировки."""
+        try:
+            from ..webmail_tools import tick
+            tick(self.services)
+        except Exception:  # noqa: BLE001
+            log.exception("Ошибка почтового клиента (планировщик)")
 
     # -- обслуживание --------------------------------------------------------
     def _maintenance(self) -> None:

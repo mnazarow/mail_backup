@@ -622,6 +622,22 @@ PARAM_HELP: Dict[str, dict] = {
         "recommend": "30.",
         "example": "30", "default": "30",
     },
+    "webmail.undo_send_s": {
+        "title": "Отменить отправку, секунд",
+        "help": ("После «Отправить» письмо столько секунд ждёт, и его можно вернуть в редактор кнопкой «Отменить» — "
+                 "если заметили опечатку или не того адресата. 0 — письмо уходит сразу."),
+        "recommend": "5–10.",
+        "example": "5", "default": "5",
+    },
+    "webmail.rules_interval_min": {
+        "title": "Правила и автоответ без открытого клиента, минут",
+        "help": ("Ящики, у которых есть правила сортировки или включён автоответ, раз в столько минут проверяются "
+                 "сами, даже если «Почту» никто не открыл: новые письма «Входящих» раскладываются по правилам, на них "
+                 "уходит автоответ. 0 — правила и автоответ работают, только пока клиент открыт (при проверке почты). "
+                 "Запланированные письма и «напомнить позже» работают всегда."),
+        "recommend": "5. Чаще — больше обращений к почтовому серверу.",
+        "example": "5", "default": "5",
+    },
 
     # ---- mailadmin ----
     "mailadmin.enabled": {
@@ -1333,7 +1349,7 @@ SETTINGS_SECTIONS: List[dict] = [
               "exclude_senders", "match_subject"]},
     {"section": "webmail", "title": "Почтовый клиент", "icon": "✉️",
      "keys": ["enabled", "admin_actions", "mark_read", "auto_refresh_s", "max_attachments_mb", "save_sent",
-              "drafts_keep_days"]},
+              "drafts_keep_days", "undo_send_s", "rules_interval_min"]},
     {"section": "mailadmin", "title": "Вход в ящики через администратора почты", "icon": "🗝️",
      "keys": ["enabled", "host", "user", "password", "mode", "separator"]},
     {"section": "axigen", "title": "Сервер Axigen", "icon": "📮",

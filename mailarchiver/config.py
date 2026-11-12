@@ -164,6 +164,8 @@ DEFAULTS: Dict[str, Any] = {
         "max_attachments_mb": 25,      # вложения одного письма — не больше, МБ
         "save_sent": "auto",           # копия отправленного в «Отправленные»: auto | always | never
         "drafts_keep_days": 30,        # черновик, которого не касались столько дней, удаляется
+        "undo_send_s": 5,              # «Отменить отправку»: столько секунд письмо ждёт перед отправкой (0 — сразу)
+        "rules_interval_min": 5,       # правила и автоответ без открытого клиента: проверять «Входящие», минут (0 — нет)
     },
     "mailadmin": {
         # Вход в ящики учётной записью администратора почты — без паролей сотрудников.
@@ -341,6 +343,8 @@ VALUE_RANGES: Dict[str, tuple] = {
     "webmail.auto_refresh_s": (0, 3600),
     "webmail.max_attachments_mb": (1, 30),
     "webmail.drafts_keep_days": (1, 365),
+    "webmail.undo_send_s": (0, 30),
+    "webmail.rules_interval_min": (0, 1440),
     "replica.db_snapshot_keep": (0, 365),
     "replica.max_delete_percent": (0, 100),
     "replica.parallel": (1, 32),
