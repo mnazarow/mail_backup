@@ -69,7 +69,14 @@ from .util import decode_mime_header
 log = get_logger("replies")
 
 TABLE = "reply_msgs"
-_META_WATERMARK = "replies_last_id"
+#: Разобрано всё, что между «нижней» и «верхней» отметкой: новые письма (выше верхней) — сразу, давние (ниже
+#: нижней) — от новых к старым, чтобы последние месяцы были готовы первыми.
+_META_HIGH = "replies_last_id"
+_META_LOW = "replies_low_id"
+#: Отпечатки адресов каждого ящика (с адресами его сотрудника): от них зависит направление писем.
+_META_OWN = "replies_own_fp"
+#: Ящики, письма которых разбираются заново (адреса поменялись): {id ящика: последний разобранный id письма}.
+_META_REDO = "replies_redo"
 #: «Поколение» индекса: «Пересобрать» его меняет, и проход, начатый до этого, не запишет свою порцию.
 _META_GEN = "replies_gen"
 #: Писем за одну транзакцию.
@@ -107,7 +114,9 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
     flag_ans    INTEGER NOT NULL DEFAULT 0,    -- флаг \\Answered
     reply_id    INTEGER,                       -- первый ответ (см. описание модуля)
     reply_ts    INTEGER,
-    other_ts    INTEGER                        -- входящее: первый ответ из другого ящика архива
+    other_ts    INTEGER,                       -- входящее: первый ответ из другого ящика архива
+    subj        INTEGER,                       -- отпечаток темы без «Re:», «Fwd:»… (для связи по теме)
+    reply_how   INTEGER                        -- как найден ответ: 1 по заголовкам, 2 по теме и собеседнику
 );
 CREATE INDEX IF NOT EXISTS idx_reply_acc_ts ON {TABLE}(account_id, ts);
 CREATE INDEX IF NOT EXISTS idx_reply_ts ON {TABLE}(ts);
@@ -119,8 +128,22 @@ END;
 """
 
 
+#: Колонки, которых не было в первых сборках 1.16.0: при их добавлении индекс разбирается заново.
+_LATE_COLUMNS = (("subj", "INTEGER"), ("reply_how", "INTEGER"))
+
+
 def ensure_schema(conn) -> None:
     conn.executescript(SCHEMA_SQL)
+    have = {r[1] for r in conn.execute(f"PRAGMA table_info({TABLE})").fetchall()}
+    added = False
+    for name, decl in _LATE_COLUMNS:
+        if name not in have:
+            conn.execute(f"ALTER TABLE {TABLE} ADD COLUMN {name} {decl}")
+            added = True
+    if added:
+        conn.execute("DELETE FROM meta WHERE key IN (?, ?, ?)", (_META_HIGH, _META_LOW, _META_OWN))
+    conn.execute(f"CREATE INDEX IF NOT EXISTS idx_reply_subj ON {TABLE}(account_id, subj, ts) WHERE subj IS NOT NULL")
+    conn.commit()
 
 
 # ===========================================================================
@@ -316,6 +339,37 @@ class Context:
         self.org_domains: Set[str] = {d for d in auto if d} | {
             str(d).strip().lower().lstrip("@") for d in (svc.rt("replies", "internal_domains") or []) if str(d).strip()}
 
+    def fingerprints(self) -> Dict[str, str]:
+        """Отпечаток адресов каждого ящика: изменился — письма ящика надо разобрать заново."""
+        return {str(aid): hashlib.blake2b("\n".join(sorted(addrs)).encode("utf-8"), digest_size=8).hexdigest()
+                for aid, addrs in self.own.items()}
+
+
+# ===========================================================================
+#  Тема письма — для связи ответа, написанного без «Ответить»
+# ===========================================================================
+_SUBJ_PREFIX = re.compile(r"^\s*(?:\[[^\]]{1,40}\]\s*)?(?:re|fwd?|fw|aw|sv|tr|wg|rv|отв|ответ|пересл|переслать)"
+                          r"\s*(?:\[\d+\]|\(\d+\))?\s*[:：]\s*", re.IGNORECASE)
+_SUBJ_TAG = re.compile(r"^\s*\[[^\]]{1,40}\]\s*")
+_SUBJ_SPACE = re.compile(r"\s+")
+#: Ответ по теме ищется не дальше, чем через столько секунд после письма.
+SUBJECT_WINDOW_S = 14 * 86400
+
+
+def subject_key(subject: str) -> Optional[int]:
+    """Отпечаток темы без «Re:», «Fwd:», «Отв:», «[EXT]»… ``None`` — темы нет или она слишком короткая."""
+    text = (subject or "").strip()
+    for _ in range(10):
+        new = _SUBJ_PREFIX.sub("", text, count=1)
+        new = _SUBJ_TAG.sub("", new, count=1) if new == text else new
+        if new == text:
+            break
+        text = new
+    text = _SUBJ_SPACE.sub(" ", text).strip().lower()
+    if len(text) < 4:
+        return None
+    return fingerprint("s:" + text)
+
 
 # ===========================================================================
 #  Индексация
@@ -383,14 +437,18 @@ def build_record(svc, ctx: Context, row) -> Tuple[tuple, str]:
     kind = classify(msg, sender) if msg is not None else PERSONAL
     ts = message_ts(msg.get("Date") if msg is not None else None, row["internaldate"])
     flag_ans = 1 if "\\answered" in str(row["flags"] or "").lower() else 0
+    subject = decode_mime_header(msg.get("Subject") or "") if msg is not None else (row["subject"] or "")
     rec = (int(row["id"]), aid, mid, parent, root, direction, kind, addressed, peer[:320], domains,
-           len(rcpts), int(ts), flag_ans)
+           len(rcpts), int(ts), flag_ans, subject_key(subject))
     return rec, err
 
 
 _INSERT = (f"INSERT OR REPLACE INTO {TABLE}(id, account_id, mid, parent, root, dir, kind, addressed, peer, domains, "
-           f"rcpt, ts, flag_ans) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)")
+           f"rcpt, ts, flag_ans, subj) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+_MSG_COLS = "id, account_id, folder, message_id, internaldate, flags, stored_path, from_addr, subject"
 
+# Ответы по заголовкам (In-Reply-To): у входящего — первое личное исходящее этого ящика, у исходящего — первое
+# личное входящее этого ящика; «ответил коллега» — личное исходящее другого ящика.
 _LINK_SQL = f"""
 UPDATE {TABLE} SET
     reply_id = CASE dir
@@ -405,41 +463,139 @@ UPDATE {TABLE} SET
     END
 WHERE mid IN (SELECT mid FROM temp._reply_aff) AND dir IN (1, 2)
 """
-_LINK_TS_SQL = (f"UPDATE {TABLE} SET reply_ts = (SELECT r.ts FROM {TABLE} r WHERE r.id = {TABLE}.reply_id) "
-                f"WHERE mid IN (SELECT mid FROM temp._reply_aff) AND dir IN (1, 2)")
+_LINK_HOW_SQL = (f"UPDATE {TABLE} SET reply_how = CASE WHEN reply_id IS NULL THEN NULL ELSE 1 END "
+                 f"WHERE mid IN (SELECT mid FROM temp._reply_aff) AND dir IN (1, 2)")
+# Ответ, написанный новым письмом (без In-Reply-To): та же тема без «Re:», тот же собеседник, в этом же ящике,
+# в течение двух недель. Ищется только у писем без ответа по заголовкам. Пересчитываются лишь письма, на которые
+# новое письмо может быть таким ответом (та же тема в двух неделях до него), — не все письма с частой темой.
+_AFF_SUBJ_SQL = f"""
+INSERT OR IGNORE INTO temp._reply_aff_ids(id)
+SELECT r.id FROM temp._reply_aff_subj a JOIN {TABLE} r INDEXED BY idx_reply_subj
+    ON r.account_id = a.account_id AND r.subj = a.subj AND r.ts >= a.ts - {SUBJECT_WINDOW_S} AND r.ts <= a.ts
+WHERE r.dir IN (1, 2) AND r.kind = 0 AND r.peer <> ''
+"""
+_LINK_SUBJ_SQL = f"""
+UPDATE {TABLE} SET
+    reply_id = (SELECT r.id FROM {TABLE} r INDEXED BY idx_reply_subj WHERE r.account_id = {TABLE}.account_id
+                AND r.subj = {TABLE}.subj AND r.ts > {TABLE}.ts AND r.ts <= {TABLE}.ts + {SUBJECT_WINDOW_S}
+                AND r.dir = 3 - {TABLE}.dir AND r.kind = 0 AND r.parent IS NULL AND r.peer = {TABLE}.peer
+                ORDER BY r.ts, r.id LIMIT 1),
+    reply_how = 2
+WHERE id IN (SELECT id FROM temp._reply_aff_ids) AND (reply_id IS NULL OR reply_how = 2)
+"""
+_LINK_TS_SQL = (f"UPDATE {TABLE} SET reply_ts = (SELECT r.ts FROM {TABLE} r WHERE r.id = {TABLE}.reply_id), "
+                f"reply_how = CASE WHEN reply_id IS NULL THEN NULL ELSE reply_how END "
+                f"WHERE (mid IN (SELECT mid FROM temp._reply_aff) OR id IN (SELECT id FROM temp._reply_aff_ids)) "
+                f"AND dir IN (1, 2)")
 
 
-def _link(conn, mids: Iterable[int]) -> None:
-    """Пересчитать ответы для писем с отпечатками ``mids`` (новые письма и те, на которые пришли ответы)."""
+def _link(conn, mids: Iterable[int], subjects: Iterable[Tuple[int, int, int]] = ()) -> None:
+    """Пересчитать ответы: для писем с отпечатками ``mids`` (новые письма и те, на которые пришли ответы) — по
+    заголовкам; по теме — для писем, на которые может отвечать письмо ``subjects`` (ящик, отпечаток темы, время)."""
     conn.execute("CREATE TEMP TABLE IF NOT EXISTS _reply_aff(mid INTEGER PRIMARY KEY)")
-    conn.execute("DELETE FROM temp._reply_aff")
+    conn.execute("CREATE TEMP TABLE IF NOT EXISTS _reply_aff_subj(account_id INTEGER, subj INTEGER, ts INTEGER)")
+    conn.execute("CREATE TEMP TABLE IF NOT EXISTS _reply_aff_ids(id INTEGER PRIMARY KEY)")
+    for t in ("_reply_aff", "_reply_aff_subj", "_reply_aff_ids"):
+        conn.execute(f"DELETE FROM temp.{t}")
     conn.executemany("INSERT OR IGNORE INTO temp._reply_aff(mid) VALUES(?)", [(int(m),) for m in mids if m])
     conn.execute(_LINK_SQL)
+    conn.execute(_LINK_HOW_SQL)
+    conn.executemany("INSERT INTO temp._reply_aff_subj(account_id, subj, ts) VALUES(?, ?, ?)",
+                     [(int(a), int(t), int(ts)) for a, t, ts in subjects if t is not None])
+    # письма, у которых по заголовкам ответа не нашлось, — тоже кандидаты на связь по теме
+    conn.execute(f"INSERT INTO temp._reply_aff_subj(account_id, subj, ts) SELECT account_id, subj, ts FROM {TABLE} "
+                 f"WHERE mid IN (SELECT mid FROM temp._reply_aff) AND subj IS NOT NULL AND reply_id IS NULL "
+                 f"AND dir IN (1, 2)")
+    conn.execute(_AFF_SUBJ_SQL)
+    conn.execute(_LINK_SUBJ_SQL)
     conn.execute(_LINK_TS_SQL)
-    conn.execute("DELETE FROM temp._reply_aff")
+    for t in ("_reply_aff", "_reply_aff_subj", "_reply_aff_ids"):
+        conn.execute(f"DELETE FROM temp.{t}")
+
+
+def _marks(db) -> Tuple[Optional[int], Optional[int], Dict[str, int]]:
+    """(верхняя отметка, нижняя отметка, ящики к переразбору). Верхней нет — индекс ещё не начинали."""
+    high = db.get_meta(_META_HIGH)
+    low = db.get_meta(_META_LOW)
+    try:
+        redo = {str(k): int(v) for k, v in json.loads(db.get_meta(_META_REDO) or "{}").items()}
+    except (TypeError, ValueError, AttributeError):
+        redo = {}
+    return (int(high) if high not in (None, "") else None), (int(low) if low not in (None, "") else None), redo
 
 
 def pending_count(db, account_ids: Optional[Sequence[int]] = None) -> int:
-    last = int(db.get_meta(_META_WATERMARK) or 0)
-    if account_ids is None:
-        return int(db.scalar("SELECT COUNT(*) FROM messages WHERE id > ?", (last,)) or 0)
-    ids = [int(i) for i in account_ids]
-    if not ids:
+    """Сколько писем ещё не разобрано (новые, давние и письма ящиков, разбираемых заново)."""
+    high, low, redo = _marks(db)
+    ids = None if account_ids is None else [int(i) for i in account_ids]
+    if ids is not None and not ids:
         return 0
-    marks = ",".join("?" * len(ids))
-    return int(db.scalar(f"SELECT COUNT(*) FROM messages WHERE id > ? AND account_id IN ({marks})",
-                         (last, *ids)) or 0)
+    acc = "" if ids is None else f" AND account_id IN ({','.join('?' * len(ids))})"
+    args = () if ids is None else tuple(ids)
+    if high is None:
+        return int(db.scalar(f"SELECT COUNT(*) FROM messages WHERE 1=1{acc}", args) or 0)
+    low = high + 1 if low is None else low
+    n = int(db.scalar(f"SELECT COUNT(*) FROM messages WHERE (id > ? OR id < ?){acc}", (high, low, *args)) or 0)
+    for aid, cursor in redo.items():
+        if ids is not None and int(aid) not in ids:
+            continue
+        n += int(db.scalar("SELECT COUNT(*) FROM messages WHERE account_id = ? AND id > ? AND id >= ? AND id <= ?",
+                           (int(aid), cursor, low, high)) or 0)
+    return n
+
+
+def needs_pass(svc) -> bool:
+    """Есть ли работа индексу: новые или давние письма, ящики к переразбору, поменявшиеся адреса ящиков."""
+    db = svc.db
+    if pending_count(db) > 0:
+        return True
+    try:
+        stored = json.loads(db.get_meta(_META_OWN) or "{}")
+    except (TypeError, ValueError):
+        stored = {}
+    current = Context(svc).fingerprints()
+    return any(stored.get(k) not in (None, v) for k, v in current.items())
+
+
+def _set_meta(conn, key: str, value: str) -> None:
+    conn.execute("INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                 (key, value))
 
 
 def index_pending(svc, *, progress=None, cancelled=None, event=None, max_seconds: Optional[float] = None) -> Dict:
-    """Проиндексировать письма, появившиеся после прошлого прохода (по возрастанию id)."""
+    """Разобрать письма: сначала новые (по возрастанию id), потом ящики, у которых поменялись адреса, потом
+    давние — от новых к старым, чтобы раздел быстрее показывал последние месяцы."""
     db = svc.db
     ctx = Context(svc)
+    gen = db.get_meta(_META_GEN) or "0"
+    high, low, redo = _marks(db)
+    if high is None:                                   # первый проход (или после «Пересобрать»)
+        top = int(db.scalar("SELECT COALESCE(MAX(id), 0) FROM messages") or 0)
+        high, low = top, top + 1
+        with db.transaction() as conn:
+            _set_meta(conn, _META_HIGH, str(high))
+            _set_meta(conn, _META_LOW, str(low))
+    elif low is None:
+        low = 1
+    # адреса ящика (или его сотрудника) поменялись — его уже разобранные письма разбираются заново
+    fps = ctx.fingerprints()
+    try:
+        stored = json.loads(db.get_meta(_META_OWN) or "{}")
+    except (TypeError, ValueError):
+        stored = {}
+    changed = [k for k, v in fps.items() if stored.get(k) not in (None, v)]
+    for k in changed:
+        redo[k] = 0
+    if changed and event is not None:
+        names = ", ".join(ctx.names.get(int(k), "#" + k) for k in changed[:10])
+        event("INFO", f"Поменялись адреса ящиков ({names}{'…' if len(changed) > 10 else ''}) — их письма "
+                      "разбираются заново.")
+    with db.transaction() as conn:
+        _set_meta(conn, _META_OWN, json.dumps(fps, sort_keys=True))
+        _set_meta(conn, _META_REDO, json.dumps(redo, sort_keys=True))
     total_pending = pending_count(db)
     done = errors = 0
     started = time.time()
-    gen = db.get_meta(_META_GEN) or "0"
-    last = int(db.get_meta(_META_WATERMARK) or 0)
     stopped = ""
     while True:
         if cancelled is not None and cancelled():
@@ -448,8 +604,26 @@ def index_pending(svc, *, progress=None, cancelled=None, event=None, max_seconds
         if max_seconds is not None and time.time() - started > max_seconds:
             stopped = "slice"
             break
-        rows = db.query("SELECT id, account_id, folder, message_id, internaldate, flags, stored_path, from_addr "
-                        "FROM messages WHERE id > ? ORDER BY id LIMIT ?", (last, BATCH))
+        phase, redo_acc = "new", None
+        rows = db.query(f"SELECT {_MSG_COLS} FROM messages WHERE id > ? ORDER BY id LIMIT ?", (high, BATCH))
+        if not rows and redo:
+            redo_acc = next(iter(sorted(redo)))
+            phase = "redo"
+            rows = db.query(f"SELECT {_MSG_COLS} FROM messages WHERE account_id = ? AND id > ? AND id >= ? "
+                            f"AND id <= ? ORDER BY id LIMIT ?", (int(redo_acc), redo[redo_acc], low, high, BATCH))
+            if not rows:
+                redo.pop(redo_acc)
+                with db.transaction() as conn:
+                    _set_meta(conn, _META_REDO, json.dumps(redo, sort_keys=True))
+                continue
+        if not rows and low > 1:
+            phase = "old"
+            rows = db.query(f"SELECT {_MSG_COLS} FROM messages WHERE id < ? ORDER BY id DESC LIMIT ?", (low, BATCH))
+            if not rows:
+                low = 1
+                with db.transaction() as conn:
+                    _set_meta(conn, _META_LOW, "1")
+                continue
         if not rows:
             break
         batch: List[list] = []
@@ -461,43 +635,74 @@ def index_pending(svc, *, progress=None, cancelled=None, event=None, max_seconds
                     event("WARNING", f"Письмо #{row['id']}: заголовки не прочитаны ({err}) — в индексе без связей "
                                      "с ответами.")
             batch.append(list(rec))
-            last = int(row["id"])
+        ids = [int(r["id"]) for r in rows]
         with db.transaction() as conn:
             now_gen = conn.execute("SELECT value FROM meta WHERE key=?", (_META_GEN,)).fetchone()
             if (now_gen[0] if now_gen else "0") != gen:
                 stopped = "reset"
                 break                          # индекс пересобрали во время прохода — порция устарела
-            seen: Set[Tuple[int, int]] = set()
+            # То же письмо в другой папке ящика считается один раз — копия с меньшим id (сохранённая раньше),
+            # в каком бы порядке ни шёл разбор (давние письма разбираются от новых к старым).
+            seen: Dict[Tuple[int, int], list] = {}
+            demote: List[int] = []
             for rec in batch:
                 if rec[5] == SKIP or rec[2] < 0:
                     continue
                 key = (rec[1], rec[2])
-                dup = key in seen or conn.execute(
-                    f"SELECT 1 FROM {TABLE} WHERE mid=? AND account_id=? AND dir<>0 AND id<>? LIMIT 1",
-                    (rec[2], rec[1], rec[0])).fetchone() is not None
-                if dup:
-                    rec[5] = SKIP              # то же письмо в другой папке ящика — считаем один раз
-                seen.add(key)
+                other = seen.get(key)
+                if other is not None:
+                    keep, drop = (rec, other) if rec[0] < other[0] else (other, rec)
+                    drop[5] = SKIP
+                    seen[key] = keep
+                    continue
+                row = conn.execute(f"SELECT id FROM {TABLE} WHERE mid=? AND account_id=? AND dir<>0 AND id<>? "
+                                   f"ORDER BY id LIMIT 1", (rec[2], rec[1], rec[0])).fetchone()
+                if row is not None and int(row[0]) < rec[0]:
+                    rec[5] = SKIP
+                    continue
+                if row is not None:
+                    demote.append(int(row[0]))
+                seen[key] = rec
+            if demote:
+                conn.executemany(f"UPDATE {TABLE} SET dir = 0 WHERE id = ?", [(i,) for i in demote])
             conn.executemany(_INSERT, [tuple(r) for r in batch])
-            _link(conn, {r[2] for r in batch if r[5] != SKIP and r[2] > 0} | {r[3] for r in batch if r[3]})
-            conn.execute("INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET "
-                         "value=excluded.value", (_META_WATERMARK, str(last)))
+            _link(conn, {r[2] for r in batch if r[5] != SKIP and r[2] > 0} | {r[3] for r in batch if r[3]},
+                  {(r[1], r[13], r[11]) for r in batch if r[13] is not None and r[5] != SKIP})
+            if phase == "new":
+                high = max(ids)
+                _set_meta(conn, _META_HIGH, str(high))
+            elif phase == "redo":
+                redo[redo_acc] = max(ids)
+                _set_meta(conn, _META_REDO, json.dumps(redo, sort_keys=True))
+            else:
+                low = min(ids)
+                _set_meta(conn, _META_LOW, str(low))
         done += len(batch)
         if progress is not None:
             progress(done, max(total_pending, done), f"Разобрано писем: {done} из {total_pending}")
     _cache_clear()
-    return {"indexed": done, "errors": errors, "pending": pending_count(db), "stopped": stopped}
+    return {"indexed": done, "errors": errors, "pending": pending_count(db), "stopped": stopped,
+            "readdressed": len(changed)}
 
 
 def reset_index(db) -> None:
-    """Очистить индекс ответов — следующий проход разберёт архив заново."""
+    """Очистить индекс ответов — следующий проход разберёт архив заново (от новых писем к старым)."""
     with db.transaction() as conn:
         conn.execute(f"DELETE FROM {TABLE}")
-        conn.execute("INSERT INTO meta(key, value) VALUES(?, '0') ON CONFLICT(key) DO UPDATE SET value='0'",
-                     (_META_WATERMARK,))
+        conn.execute("DELETE FROM meta WHERE key IN (?, ?, ?)", (_META_HIGH, _META_LOW, _META_REDO))
         conn.execute("INSERT INTO meta(key, value) VALUES(?, '1') ON CONFLICT(key) DO UPDATE SET "
                      "value=CAST(COALESCE(value, '0') AS INTEGER) + 1", (_META_GEN,))
     _cache_clear()
+
+
+def indexed_since(db) -> Optional[str]:
+    """С какой даты письма уже разобраны (пока давние письма ещё разбираются) — ISO или None."""
+    high, low, _redo = _marks(db)
+    if high is None or low is None or low <= 1:
+        return None
+    if db.scalar("SELECT 1 FROM messages WHERE id < ? LIMIT 1", (low,)) is None:
+        return None
+    return db.scalar("SELECT MIN(internaldate) FROM messages WHERE id >= ? AND id <= ?", (low, high))
 
 
 def status(svc, account_ids: Optional[Sequence[int]] = None) -> Dict:
@@ -508,11 +713,19 @@ def status(svc, account_ids: Optional[Sequence[int]] = None) -> Dict:
     else:
         ids = [int(i) for i in account_ids]
         total = sum(int(db.count_messages(i) or 0) for i in ids)
-    pending = pending_count(db, account_ids)
+    pending = min(total, pending_count(db, account_ids))
+    redo = _marks(db)[2]
+    mine = None if account_ids is None else {int(i) for i in account_ids}
+    readdress: List[str] = []
+    for aid in sorted(int(a) for a in redo):
+        acc = db.get_account(aid) if (mine is None or aid in mine) and pending else None
+        if acc is not None:
+            readdress.append(acc.name)
     from .models import JobType
     job = next((j for j in db.active_jobs() if j["type"] == JobType.REPLY_INDEX), None)
     return {"enabled": bool(svc.rt("replies", "enabled")), "total": total, "pending": pending,
             "indexed": max(0, total - pending), "ready": total > 0 and pending < total,
+            "since": indexed_since(db) if pending else None, "readdress": readdress,
             "job_id": int(job["id"]) if job else None, "job_status": job["status"] if job else None}
 
 
@@ -581,6 +794,7 @@ def calc_settings(svc) -> Dict:
         sla_h = 24.0
     start, end = parse_work_hours(svc.rt("replies", "work_hours") or "")
     return {"sla_hours": max(0.25, sla_h), "sla_business": bool(svc.rt("replies", "sla_business")),
+            "match_subject": bool(svc.rt("replies", "match_subject")),
             "work_days": parse_work_days(svc.rt("replies", "work_days") or ""),
             "work_start": start, "work_end": end,
             "exclude": [str(p).strip().lower() for p in (svc.rt("replies", "exclude_senders") or []) if str(p).strip()]}
@@ -767,8 +981,17 @@ def _cache_clear() -> None:
 
 
 #: Колонки строки индекса в расчёте (кортежи — в разы быстрее sqlite3.Row на сотнях тысяч писем).
-_COLS = "id, account_id, mid, parent, root, dir, kind, addressed, peer, domains, ts, flag_ans, reply_ts, other_ts"
-R_ID, R_ACC, R_MID, R_PARENT, R_ROOT, R_DIR, R_KIND, R_ADDR, R_PEER, R_DOMS, R_TS, R_FLAG, R_REPLY, R_OTHER = range(14)
+_COLS = ("id, account_id, mid, parent, root, dir, kind, addressed, peer, domains, ts, flag_ans, reply_ts, other_ts, "
+         "reply_how")
+(R_ID, R_ACC, R_MID, R_PARENT, R_ROOT, R_DIR, R_KIND, R_ADDR, R_PEER, R_DOMS, R_TS, R_FLAG, R_REPLY, R_OTHER,
+ R_HOW) = range(15)
+
+
+def _reply_of(row, match_subject: bool) -> Optional[int]:
+    """Время первого ответа строки; связь «по теме» не в счёт, если она выключена настройкой."""
+    if row[R_REPLY] is None or (row[R_HOW] == 2 and not match_subject):
+        return None
+    return row[R_REPLY]
 
 
 def _tuples(db, sql: str, params: tuple) -> List[tuple]:
@@ -862,7 +1085,8 @@ def analyze(svc, *, account_ids: Optional[Sequence[int]] = None, since: Optional
     since, until = int(since), int(until)
     key = (tuple(sorted(account_ids)) if account_ids is not None else None, since, until, tuple(sorted(kinds)),
            scope, addressed, incoming, opts["sla_hours"], opts["sla_business"], now if not use_cache else None,
-           db.get_meta(_META_WATERMARK), db.get_meta(_META_GEN), json.dumps(sorted(opts["exclude"])),
+           db.get_meta(_META_HIGH), db.get_meta(_META_LOW), db.get_meta(_META_REDO), db.get_meta(_META_GEN),
+           json.dumps(sorted(opts["exclude"])), opts["match_subject"],
            opts["work_days"], opts["work_start"], opts["work_end"],
            str(svc.rt("replies", "internal_domains")), str(svc.rt("scheduler", "timezone")))
     if use_cache:
@@ -921,6 +1145,8 @@ class _Pass:
         self.full = full
         self.sla = int(opts["sla_hours"] * 3600)
         self.sla_business = bool(opts["sla_business"])
+        self.match_subject = bool(opts["match_subject"])
+        self.by_subject = [0, 0]                # ответов найдено по теме: на входящие, на исходящие
         self.bucket = bucket
         self.since, self.until = since, until
         self.inc = _Group()
@@ -934,6 +1160,7 @@ class _Pass:
             self.work = {True: _Group(), False: _Group()}
             self.inner = {True: _Group(), False: _Group()}
             self.addr = {ADDR_TO: _Group(), ADDR_CC: _Group(), ADDR_OTHER: _Group()}
+            self.thread_kind = {False: _Group(), True: _Group()}     # новое обращение / ответ в переписке
             self.accounts: Dict[int, _Group] = defaultdict(_Group)
             self.acc_out: Dict[int, _OutGroup] = defaultdict(_OutGroup)
             self.senders: Dict[str, _Group] = defaultdict(_Group)
@@ -1003,7 +1230,9 @@ class _Pass:
                 th[5 if d == IN else 6].add(row[R_MID])
 
     def _incoming(self, row, ts: int, local: int, full: bool) -> None:
-        reply_ts, other_ts = row[R_REPLY], row[R_OTHER]
+        reply_ts, other_ts = _reply_of(row, self.match_subject), row[R_OTHER]
+        if reply_ts is not None and row[R_HOW] == 2:
+            self.by_subject[0] += 1
         if reply_ts is not None:
             status, first = 1, reply_ts
         elif other_ts is not None:
@@ -1036,8 +1265,9 @@ class _Pass:
             work = self.work[self.sched.in_hours(ts)]
             inner = self.inner[self.flt.internal(row)]
             addr = self.addr[row[R_ADDR]]
-            groups += [self.heat[wd][hr], work, inner, addr, acc]
-            bgroups += [work, inner, addr, acc]
+            tk = self.thread_kind[row[R_PARENT] is not None]
+            groups += [self.heat[wd][hr], work, inner, addr, tk, acc]
+            bgroups += [work, inner, addr, tk, acc]
             if row[R_PEER]:
                 groups.append(self.senders[row[R_PEER]])
             if row[R_DOMS]:
@@ -1078,7 +1308,9 @@ class _Pass:
                 self.age_hist[_bucket_index(self.now - ts, AGE_BUCKETS)] += 1
 
     def _outgoing(self, row, ts: int, local: int, full: bool) -> None:
-        reply_ts = row[R_REPLY]
+        reply_ts = _reply_of(row, self.match_subject)
+        if reply_ts is not None and row[R_HOW] == 2:
+            self.by_subject[1] += 1
         wait = (reply_ts - ts if reply_ts > ts else 0) if reply_ts is not None else None
         groups: List[_OutGroup] = [self.out]
         if full:
@@ -1119,6 +1351,7 @@ class _Pass:
             "unanswered_pct": _rate(g.none, g.n), "overdue": g.overdue, "waiting": g.none - g.overdue,
             "ontime": g.ontime, "late": g.late, "sla_pct": _rate(g.ontime, g.ontime + g.late + g.overdue),
             "in_followups": self.followups[0], "in_followups_unanswered": self.followups[1],
+            "by_subject_in": self.by_subject[0], "by_subject_out": self.by_subject[1],
             "median_s": st["median_s"], "mean_s": st["mean_s"], "p75_s": st["p75_s"], "p90_s": st["p90_s"],
             "min_s": st["min_s"], "max_s": st["max_s"], "median_business_s": pct(b, 0.5),
             "p90_business_s": pct(b, 0.9),
@@ -1178,6 +1411,9 @@ class _Pass:
                              {"key": "off", "label": "Пришли в нерабочее время", **self.work[False].as_dict()}]
         res["internal_split"] = [{"key": "internal", "label": "От своих (внутренние)", **self.inner[True].as_dict()},
                                  {"key": "external", "label": "От внешних", **self.inner[False].as_dict()}]
+        res["thread_split"] = [
+            {"key": "new", "label": "Новое обращение", **self.thread_kind[False].as_dict()},
+            {"key": "followup", "label": "Ответ в переписке (в т. ч. на наше письмо)", **self.thread_kind[True].as_dict()}]
         res["addressed_split"] = [
             {"key": "to", "label": "Ящик в «Кому»", **self.addr[ADDR_TO].as_dict()},
             {"key": "cc", "label": "Ящик в «Копии»", **self.addr[ADDR_CC].as_dict()},
@@ -1332,12 +1568,14 @@ def list_messages(svc, *, mode: str, account_ids: Optional[Sequence[int]] = None
             return {"items": [], "total": 0, "offset": offset, "mode": mode, "title": LIST_MODES[mode]}
         where.append(f"r.account_id IN ({','.join('?' * len(ids))})")
         params += ids
+    # связь по теме может быть выключена — тогда её ответ не в счёт: такие строки отбираются в Python
+    loose = "" if opts["match_subject"] else " OR r.reply_how = 2"
     if mode in ("unanswered", "overdue"):
-        where.append("r.reply_ts IS NULL AND r.other_ts IS NULL AND r.flag_ans = 0")
+        where.append(f"(r.reply_ts IS NULL{loose}) AND r.other_ts IS NULL AND r.flag_ans = 0")
     elif mode in ("late", "answered"):
         where.append("(r.reply_ts IS NOT NULL OR r.other_ts IS NOT NULL)")
     elif mode == "out_noreply":
-        where.append("r.reply_ts IS NULL")
+        where.append(f"(r.reply_ts IS NULL{loose})")
     else:
         where.append("r.reply_ts IS NOT NULL")
     text = (q or "").strip().lower()
@@ -1353,7 +1591,12 @@ def list_messages(svc, *, mode: str, account_ids: Optional[Sequence[int]] = None
         if not flt.keep(r, flt.kind_of(r)):
             continue
         ts = int(r[R_TS])
-        first = r[R_REPLY] if r[R_REPLY] is not None else r[R_OTHER]
+        own_reply = _reply_of(r, opts["match_subject"])
+        first = own_reply if own_reply is not None else r[R_OTHER]
+        if mode in ("late", "answered", "out_replied") and first is None:
+            continue                           # ответ был найден только по теме, а связь по теме выключена
+        if mode in ("unanswered", "overdue", "out_noreply") and own_reply is not None:
+            continue
         if mode in ("overdue", "late"):
             end = now if mode == "overdue" else max(ts, int(first))
             span = sched.business_seconds(ts, end) if opts["sla_business"] else end - ts
@@ -1368,7 +1611,7 @@ def list_messages(svc, *, mode: str, account_ids: Optional[Sequence[int]] = None
     if page:
         marks = ",".join("?" * len(page))
         for r in db.query(f"SELECT m.id, m.folder, m.subject, m.from_addr, m.size, a.name AS account_name, "
-                          f"r.peer, r.domains, r.kind, r.addressed, r.reply_id, r.parent, r.rcpt "
+                          f"r.peer, r.domains, r.kind, r.addressed, r.reply_id, r.parent, r.rcpt, r.reply_how "
                           f"FROM messages m JOIN {TABLE} r ON r.id = m.id LEFT JOIN accounts a ON a.id = m.account_id "
                           f"WHERE m.id IN ({marks})", tuple(p[1] for p in page)):
             details[int(r["id"])] = dict(r)
@@ -1384,7 +1627,8 @@ def list_messages(svc, *, mode: str, account_ids: Optional[Sequence[int]] = None
                       "addressed": d.get("addressed"), "rcpt": d.get("rcpt"), "ts": ts,
                       "date": datetime.fromtimestamp(ts, timezone.utc).isoformat(),
                       "age_s": now - ts, "delay_s": max(0, delay) if delay is not None else None,
-                      "reply_id": d.get("reply_id"), "is_reply": d.get("parent") is not None})
+                      "reply_id": d.get("reply_id"), "is_reply": d.get("parent") is not None,
+                      "by_subject": d.get("reply_how") == 2 and delay is not None})
     return {"items": items, "total": total, "offset": offset, "mode": mode, "title": LIST_MODES[mode],
             "sla_hours": opts["sla_hours"], "sla_business": opts["sla_business"]}
 
@@ -1405,12 +1649,13 @@ def list_csv(svc, tz, listing: Dict) -> str:
     buf = io.StringIO()
     buf.write("﻿")
     w = csv.writer(buf, delimiter=";", lineterminator="\r\n")
-    w.writerow(["Дата", "Ящик", "Папка", "Собеседник", "Тема", "Тип", "Ждёт / ответ через", "Секунд"])
+    w.writerow(["Дата", "Ящик", "Папка", "Собеседник", "Тема", "Тип", "Ждёт / ответ через", "Секунд", "Ответ найден"])
     for it in listing["items"]:
         when = datetime.fromtimestamp(it["ts"], tz).strftime("%d.%m.%Y %H:%M")
         span = it["delay_s"] if it["delay_s"] is not None else it["age_s"]
+        how = "" if it["delay_s"] is None else ("по теме" if it.get("by_subject") else "по заголовкам")
         w.writerow([when, it["account_name"], it["folder"], it["peer"], _csv_safe(it["subject"]), it["kind_label"],
-                    _human_delay(span), int(span or 0)])
+                    _human_delay(span), int(span or 0), how])
     return buf.getvalue()
 
 

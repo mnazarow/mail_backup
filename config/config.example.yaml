@@ -178,6 +178,7 @@ replies:                     # раздел «Ответы на письма» (
   work_hours: "09:00-18:00"  # рабочее время (часовой пояс планировщика)
   internal_domains: []       # свои домены сверх доменов ящиков архива, напр. ["spb.company.ru"]
   exclude_senders: []        # не ждать ответа от: адрес, @домен, домен или маска *, напр. ["jira@company.ru"]
+  match_subject: true        # ответ без In-Reply-To связывать по теме и собеседнику (14 дней)
 
 mailadmin:                   # вход в ящики через администратора почты (docs/ru/16-mailadmin.md)
   enabled: false

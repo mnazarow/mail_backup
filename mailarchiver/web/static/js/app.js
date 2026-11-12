@@ -4856,7 +4856,10 @@ function rpStatus(box, st, meta, c){
   const b=h(`<div class="deep-banner">
     <div style="min-width:240px;flex:1"><strong>${running?'<span class="spinner"></span> ':''}Индекс ответов: разобрано ${fmtNum(st.indexed)} из ${fmtNum(st.total)} писем (${part}%)</strong>
       <div class="rp-progress"><span style="width:${part}%"></span></div>
-      <div class="muted small">${st.pending>0?'Остальные письма разбираются в фоне (раз в 10 минут, порциями) — цифры раздела пока неполные.':'Идёт разбор новых писем.'}</div></div>
+      <div class="muted small">${st.pending<=0?'Идёт разбор новых писем.':[
+        st.since?`Разобраны письма с ${esc(new Date(st.since).toLocaleDateString('ru-RU'))} по сегодня — за этот срок цифры полные; более давние разбираются в фоне (раз в 10 минут, порциями, от новых к старым).`:'',
+        (st.readdress||[]).length?(st.readdress.length===1?`У ящика «${esc(st.readdress[0])}» поменялись адреса — его письма разбираются заново, цифры по нему пока неполные.`:`У ящиков ${st.readdress.slice(0,3).map(n=>'«'+esc(n)+'»').join(', ')}${st.readdress.length>3?' и ещё '+fmtNum(st.readdress.length-3):''} поменялись адреса — их письма разбираются заново, цифры по ним пока неполные.`):'',
+        !st.since&&!(st.readdress||[]).length?'Остальные письма разбираются в фоне (раз в 10 минут, порциями) — цифры раздела пока неполные.':''].filter(Boolean).join(' ')}</div></div>
     ${meta.is_admin&&!running?'<button class="btn sm" id="rpIdxRun">▶ Разобрать сейчас</button>':''}</div>`);
   box.appendChild(b);
   const run=$('#rpIdxRun',b);
@@ -4878,7 +4881,7 @@ function rpRender(body, d, meta){
   body.appendChild(h(`<div><div class="rp-period muted small">Период: <b>${esc(span)}</b>${p?` · сравнение с ${esc(new Date(p.since*1000).toLocaleDateString('ru-RU'))} — ${esc(new Date((p.until-1)*1000).toLocaleDateString('ru-RU'))}`:''} · срок ответа ${esc(slaTxt)} · рабочее время ${esc(prm.work_hours)}, ${esc(prm.timezone)}</div>
   <div class="an-kpis">
     ${kpi('📥 Входящих',fmtNum(s.in_total),'ждут ответа сейчас: '+fmtNum(s.waiting),rpDelta(s.in_total,pv('in_total'),'none'),true)}
-    ${kpi('✅ Отвечено',fmtPct(s.answered_pct),fmtNum(s.answered)+' из '+fmtNum(s.in_total),rpDelta(s.answered_pct,pv('answered_pct'),'up','pct'))}
+    ${kpi('✅ Отвечено',fmtPct(s.answered_pct),fmtNum(s.answered)+' из '+fmtNum(s.in_total)+(s.by_subject_in?` · <span title="Ответ написан новым письмом — найден по теме и собеседнику">по теме: ${fmtNum(s.by_subject_in)}</span>`:''),rpDelta(s.answered_pct,pv('answered_pct'),'up','pct'))}
     ${kpi('⏱️ Медиана ответа',fmtDur(s.median_s),'среднее '+fmtDur(s.mean_s),rpDelta(s.median_s,pv('median_s'),'down','dur'))}
     ${kpi('📈 90% ответов быстрее',fmtDur(s.p90_s),'75% — быстрее '+fmtDur(s.p75_s),rpDelta(s.p90_s,pv('p90_s'),'down','dur'))}
     ${kpi('🎯 В срок',fmtPct(s.sla_pct),'срок '+esc(slaTxt)+' · позже срока: '+fmtNum(s.late),rpDelta(s.sla_pct,pv('sla_pct'),'up','pct'))}
@@ -4886,7 +4889,7 @@ function rpRender(body, d, meta){
     ${kpi('🕘 В рабочих часах',fmtDur(s.median_business_s),'медиана без ночей и выходных · 90%: '+fmtDur(s.p90_business_s),rpDelta(s.median_business_s,pv('median_business_s'),'down','dur'))}
     ${kpi('🤝 Ответили коллеги',fmtNum(s.colleague),'отмечено «отвечено» без ответа в архиве: '+fmtNum(s.flag))}
     ${kpi('📤 Исходящих',fmtNum(s.out_total),'из них ответов: '+fmtNum(s.out_answers)+' · новых: '+fmtNum(s.out_new),rpDelta(s.out_total,pv('out_total'),'none'))}
-    ${kpi('💬 Нам ответили',fmtPct(s.out_replied_pct),fmtNum(s.out_replied)+' из '+fmtNum(s.out_total)+' исходящих',rpDelta(s.out_replied_pct,pv('out_replied_pct'),'up','pct'))}
+    ${kpi('💬 Нам ответили',fmtPct(s.out_replied_pct),fmtNum(s.out_replied)+' из '+fmtNum(s.out_total)+' исходящих'+(s.by_subject_out?` · <span title="Ответ написан новым письмом — найден по теме и собеседнику">по теме: ${fmtNum(s.by_subject_out)}</span>`:''),rpDelta(s.out_replied_pct,pv('out_replied_pct'),'up','pct'))}
     ${kpi('⌛ Ждём ответа (медиана)',fmtDur(s.out_median_wait_s),'90% — быстрее '+fmtDur(s.out_p90_wait_s),rpDelta(s.out_median_wait_s,pv('out_median_wait_s'),'down','dur'))}
     ${kpi('🔇 Исходящие без ответа',fmtNum(s.out_noreply),'на них не ответили (автоответы не в счёт)',rpDelta(s.out_noreply,pv('out_noreply'),'down'))}
   </div></div>`));
@@ -4949,7 +4952,7 @@ function rpRender(body, d, meta){
   chartTipAttach($('#rpByWd',hwCard),(x)=>{ const cv=$('#rpByWd canvas',hwCard); const i=Math.floor((x-40)/((cv.clientWidth-50)/7)); const r=d.by_weekday[i]; return r?`<b>${r.label}</b><br>писем: ${fmtNum(r.count)}<br>отвечено: <b>${fmtPct(r.answered_pct)}</b><br>медиана ответа: ${fmtDur(r.median_s)}`:''; });
 
   // ---- Сравнения ----
-  const cmpRows=[['🕘 Когда пришло',d.work_split],['🏢 От кого',d.internal_split],['🎯 Ящик среди адресатов',d.addressed_split]];
+  const cmpRows=[['🕘 Когда пришло',d.work_split],['🏢 От кого',d.internal_split],['🎯 Ящик среди адресатов',d.addressed_split],['🧵 Что за письмо',d.thread_split||[]]].filter(r=>r[1].length);
   const cmpCard=h(`<div class="card an-card"><h3>⚖️ Сравнения</h3><div class="table-wrap"><table class="tbl rp-cmp"><thead><tr><th></th><th>Писем</th><th>Отвечено</th><th>В срок</th><th>Медиана ответа</th><th>В рабочих часах</th><th>90% быстрее</th><th>Без ответа</th></tr></thead><tbody>
     ${cmpRows.map(([title,rows])=>`<tr class="rp-group"><td colspan="8">${title}</td></tr>`+rows.map(r=>`<tr><td>${esc(r.label)}</td><td>${fmtNum(r.count)}</td><td>${fmtPct(r.answered_pct)}</td><td>${fmtPct(r.sla_pct)}</td><td>${fmtDur(r.median_s)}</td><td>${r.median_business_s!=null?fmtDur(r.median_business_s):'—'}</td><td>${fmtDur(r.p90_s)}</td><td>${fmtNum(r.unanswered)}${r.overdue?` <span class="rp-red">(срок вышел: ${fmtNum(r.overdue)})</span>`:''}</td></tr>`).join('')).join('')}
   </tbody></table></div></div>`);
@@ -4970,7 +4973,7 @@ function rpRender(body, d, meta){
 /** Внизу раздела (администратору): состояние индекса ответов, «Разобрать новые» и «Пересобрать». */
 function rpIndexFooter(body, st){
   if(!st) return;
-  const f=h(`<div class="deep-banner"><div><strong>🗂️ Индекс ответов на письма</strong><div class="muted small">разобрано ${fmtNum(st.indexed)} из ${fmtNum(st.total)} писем${st.pending>0?` · ждут разбора: ${fmtNum(st.pending)}`:''}${st.enabled?' · новые письма разбираются сами раз в 10 минут':' · ведение индекса выключено в настройках'}. Пересобрать нужно, только если поменялись адреса ящиков или сотрудников.</div></div>
+  const f=h(`<div class="deep-banner"><div><strong>🗂️ Индекс ответов на письма</strong><div class="muted small">разобрано ${fmtNum(st.indexed)} из ${fmtNum(st.total)} писем${st.pending>0?` · ждут разбора: ${fmtNum(st.pending)}`:''}${st.enabled?' · новые письма разбираются сами раз в 10 минут':' · ведение индекса выключено в настройках'}. Если поменялись адреса ящика или его сотрудника, письма этого ящика переразберутся сами; пересобрать индекс целиком нужно, только если цифры вызывают сомнения.</div></div>
     <span class="spacer"></span>
     <button class="btn sm" id="rpUpd" ${st.job_status?'disabled':''}>▶ Разобрать новые</button>
     <button class="btn ghost sm" id="rpRebuild" ${st.job_status?'disabled':''}>↺ Пересобрать индекс</button></div>`);
@@ -5096,7 +5099,7 @@ function rpLists(wrap, meta){
     const answered=['late','answered','out_replied'].includes(RP.list);
     $('#rpLAgeH',card).textContent=answered?'Ответ через':'Ждёт';
     $('#rpLTotal',card).textContent=`${fmtNum(total)} ${plural(total,'письмо','письма','писем')}`;
-    $('#rpLBody',card).innerHTML=items.map((x,i)=>`<tr class="rp-click" data-i="${i}"><td class="small">${fmtDate(x.date)}</td><td>${esc(trunc(x.account_name,28))}<div class="muted small">${esc(trunc(x.folder,28))}</div></td><td>${esc(trunc(x.peer||x.from,40))}${x.kind?`<div class="muted small">${esc(x.kind_label)}</div>`:''}</td><td>${esc(trunc(x.subject||'(без темы)',70))}${x.is_reply?' <span class="muted small" title="Это ответ на другое письмо">↩</span>':''}</td><td class="${answered?'':'rp-red'}">${fmtDur(answered?x.delay_s:x.age_s)}</td></tr>`).join('')||'<tr><td colspan="5" class="muted">Писем нет — отлично.</td></tr>';
+    $('#rpLBody',card).innerHTML=items.map((x,i)=>`<tr class="rp-click" data-i="${i}"><td class="small">${fmtDate(x.date)}</td><td>${esc(trunc(x.account_name,28))}<div class="muted small">${esc(trunc(x.folder,28))}</div></td><td>${esc(trunc(x.peer||x.from,40))}${x.kind?`<div class="muted small">${esc(x.kind_label)}</div>`:''}</td><td>${esc(trunc(x.subject||'(без темы)',70))}${x.is_reply?' <span class="muted small" title="Это ответ на другое письмо">↩</span>':''}</td><td class="${answered?'':'rp-red'}">${fmtDur(answered?x.delay_s:x.age_s)}${x.by_subject?' <span class="rp-tag" title="Ответ написан новым письмом — найден по теме и собеседнику">по теме</span>':''}</td></tr>`).join('')||'<tr><td colspan="5" class="muted">Писем нет — отлично.</td></tr>';
     $('#rpLMore',card).hidden=items.length>=total;
     $$('#rpLBody tr[data-i]',card).forEach(tr=>tr.onclick=()=>{ const x=items[parseInt(tr.dataset.i)]; if(x) openMailMessage(x.account_id, x.id, x.folder); });
     $('#rpCsv',card).href=csvHref();

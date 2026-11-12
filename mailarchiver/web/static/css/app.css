@@ -316,6 +316,7 @@ canvas { max-width: 100%; }
 .rp-delta.same { color:var(--text-dim); font-weight:400; }
 .kpi.kpi-bad .k-value { color:var(--danger-text); }
 .rp-red { color:var(--danger-text); }
+.rp-tag { display:inline-block; padding:0 6px; border-radius:8px; font-size:11px; line-height:16px; background:rgba(127,127,127,.16); color:var(--text-dim); white-space:nowrap; vertical-align:1px; }
 .rp-progress { height:6px; border-radius:3px; background:var(--border); margin:7px 0 4px; overflow:hidden; max-width:520px; }
 .rp-progress span { display:block; height:100%; background:var(--primary); }
 .rp-bar { display:inline-block; width:48px; height:6px; border-radius:3px; background:var(--bg-soft); vertical-align:middle; margin-right:4px; overflow:hidden; }

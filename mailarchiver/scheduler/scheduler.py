@@ -539,8 +539,8 @@ class SchedulerService:
         try:
             if not bool(svc.rt("replies", "enabled")):
                 return None
-            from ..replies import pending_count
-            if pending_count(svc.db) <= 0:
+            from ..replies import needs_pass
+            if not needs_pass(svc):
                 return None
             if any(job["type"] == JobType.REPLY_INDEX for job in svc.db.active_jobs()):
                 return None

@@ -464,3 +464,137 @@ def test_ui_has_section():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     js = open(os.path.join(root, "mailarchiver", "web", "static", "js", "app.js"), encoding="utf-8").read()
     assert "{id:'replies'" in js and "replies:viewReplies" in js and "reply_index:" in js
+
+
+# ---------------------------------------------------------------------------
+#  Доделки 1.16.0: связь по теме, порядок разбора, переразбор при смене адресов
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("subject", ["Re: Договор поставки", "RE: RE: Fwd: договор  поставки", "Отв: Договор поставки",
+                                     "[EXT] Re[2]: Договор поставки", "AW: Договор поставки"])
+def test_subject_key_strips_prefixes(subject):
+    assert replies.subject_key(subject) == replies.subject_key("Договор поставки")
+    assert replies.subject_key("Re: Re:") is None and replies.subject_key("") is None
+
+
+def test_reply_without_in_reply_to_is_linked_by_subject(services):
+    svc, db = services, services.db
+    a = db.create_account(models.Account(name="A", host="h", username="a@c.ru", password="p"))
+    box = Box(svc)
+    t = NOW - 20 * D
+    x = box.add(a, _raw(frm="client@e.ru", to="a@c.ru", mid="x@e", subject="Счёт за ноябрь", ts=t), ts=t,
+                subject="Счёт за ноябрь")
+    box.add(a, _raw(frm="a@c.ru", to="client@e.ru", mid="r@c", subject="Re: Счёт за ноябрь", ts=t + 3 * H),
+            folder="Sent", ts=t + 3 * H, subject="Re: Счёт за ноябрь")              # ответили новым письмом
+    o = box.add(a, _raw(frm="a@c.ru", to="partner@p.ru", mid="o@c", subject="Акт сверки", ts=t), folder="Sent",
+                ts=t, subject="Акт сверки")
+    box.add(a, _raw(frm="partner@p.ru", to="a@c.ru", mid="or@p", subject="RE: Акт сверки", ts=t + D), ts=t + D,
+            subject="RE: Акт сверки")
+    # не ответы: другой собеседник; позже двух недель; ответ на другое письмо (с In-Reply-To)
+    y = box.add(a, _raw(frm="other@e.ru", to="a@c.ru", mid="y@e", subject="Счёт за ноябрь", ts=t), ts=t)
+    z = box.add(a, _raw(frm="late@e.ru", to="a@c.ru", mid="z@e", subject="Претензия", ts=t - 30 * D), ts=t - 30 * D)
+    box.add(a, _raw(frm="a@c.ru", to="late@e.ru", mid="zr@c", subject="Re: Претензия", ts=t - 10 * D),
+            folder="Sent", ts=t - 10 * D)
+    replies.index_pending(svc)
+    rx, ro = _row(db, x), _row(db, o)
+    assert rx["reply_how"] == 2 and rx["reply_ts"] - rx["ts"] == 3 * H
+    assert ro["reply_how"] == 2 and ro["reply_ts"] - ro["ts"] == D
+    assert _row(db, y)["reply_id"] is None and _row(db, z)["reply_id"] is None
+    common = dict(since=t - 40 * D, until=NOW + 1, sla_hours=24)
+    s = replies.analyze(svc, use_cache=False, **common)["summary"]
+    assert s["by_subject_in"] == 1 and s["by_subject_out"] == 1 and s["own"] == 1
+    lst = replies.list_messages(svc, mode="answered", **common)
+    assert [i["by_subject"] for i in lst["items"] if i["id"] == x] == [True]
+    db.set_setting("replies.match_subject", False)                   # выключено — такие ответы не в счёт
+    s = replies.analyze(svc, use_cache=False, **common)["summary"]
+    assert s["own"] == 0 and s["out_replied"] == 0
+    assert x in {i["id"] for i in replies.list_messages(svc, mode="unanswered", **common)["items"]}
+    assert o in {i["id"] for i in replies.list_messages(svc, mode="out_noreply", **common)["items"]}
+
+
+def test_header_reply_wins_over_subject(services):
+    svc, db = services, services.db
+    a = db.create_account(models.Account(name="A", host="h", username="a@c.ru", password="p"))
+    box = Box(svc)
+    t = NOW - 5 * D
+    x = box.add(a, _raw(frm="c@e.ru", to="a@c.ru", mid="x@e", subject="Вопрос по заказу", ts=t), ts=t)
+    box.add(a, _raw(frm="a@c.ru", to="c@e.ru", mid="s@c", subject="Re: Вопрос по заказу", ts=t + H), folder="Sent",
+            ts=t + H)
+    replies.index_pending(svc)
+    assert _row(db, x)["reply_how"] == 2
+    hdr = box.add(a, _raw(frm="a@c.ru", to="c@e.ru", mid="h@c", irt="x@e", subject="Re: Вопрос по заказу",
+                          ts=t + 2 * H), folder="Sent", ts=t + 2 * H)
+    replies.index_pending(svc)
+    row = _row(db, x)
+    assert row["reply_how"] == 1 and row["reply_id"] == hdr
+
+
+def test_backlog_goes_newest_first_and_new_mail_first(services):
+    svc, db = services, services.db
+    a = db.create_account(models.Account(name="A", host="h", username="a@c.ru", password="p"))
+    box = Box(svc)
+    ids = [box.add(a, _raw(frm=f"c{i}@e.ru", to="a@c.ru", mid=f"m{i}@e", ts=NOW - (40 - i) * D), ts=NOW - (40 - i) * D)
+           for i in range(12)]
+    calls = []
+    replies.BATCH, old = 4, replies.BATCH
+    try:
+        replies.index_pending(svc, cancelled=lambda: len(calls) >= 1, progress=lambda d, t, m: calls.append(d))
+        done = [int(r[0]) for r in db.query("SELECT id FROM reply_msgs ORDER BY id")]
+        assert done == ids[-4:]                                       # сначала самые новые давние письма
+        st = replies.status(svc)
+        assert st["pending"] == 8 and st["since"][:10] == datetime.fromtimestamp(NOW - 32 * D, timezone.utc).strftime("%Y-%m-%d")
+        assert st["readdress"] == []
+        fresh = box.add(a, _raw(frm="n@e.ru", to="a@c.ru", mid="new@e", ts=NOW), ts=NOW)
+        calls.clear()
+        replies.index_pending(svc, cancelled=lambda: len(calls) >= 1, progress=lambda d, t, m: calls.append(d))
+        assert _row(db, fresh) is not None                           # новое письмо — раньше давних
+        replies.index_pending(svc)
+    finally:
+        replies.BATCH = old
+    assert db.scalar("SELECT COUNT(*) FROM reply_msgs") == 13 and replies.status(svc)["pending"] == 0
+    assert replies.status(svc)["since"] is None
+
+
+def test_changed_addresses_reindex_the_mailbox(services):
+    svc, db = services, services.db
+    a = db.create_account(models.Account(name="Общий ящик", host="h", username="info@c.ru", password="p"))
+    box = Box(svc)
+    m = box.add(a, _raw(frm="boss@c.ru", to="client@e.ru", mid="b@c", ts=NOW - D), ts=NOW - D)   # отправлено из INBOX
+    replies.index_pending(svc)
+    assert _row(db, m)["dir"] == replies.IN and not replies.needs_pass(svc)
+    e = db.create_employee(full_name="Начальник", email="boss@c.ru")
+    db.link_employee_account(e, a)                                   # теперь это адрес самого ящика
+    assert replies.needs_pass(svc)
+    assert replies.status(svc)["readdress"] == []                    # ещё не замечено — заметит проход
+    res = replies.index_pending(svc, cancelled=lambda: True)         # заметил и сразу прерван
+    assert res["readdressed"] == 1 and _row(db, m)["dir"] == replies.IN
+    st = replies.status(svc)
+    assert st["readdress"] == ["Общий ящик"] and st["pending"] == 1 and st["since"] is None
+    replies.index_pending(svc)
+    assert _row(db, m)["dir"] == replies.OUT and _row(db, m)["peer"] == "client@e.ru"
+    assert not replies.needs_pass(svc) and replies.status(svc)["readdress"] == []
+
+
+def test_thread_split_in_comparisons(world):
+    svc = world["svc"]
+    replies.index_pending(svc)
+    d = replies.analyze(svc, since=NOW - 30 * D, until=NOW + 1, use_cache=False)
+    split = {x["key"]: x["count"] for x in d["thread_split"]}
+    assert split == {"new": 8, "followup": 1}
+
+
+def test_schema_upgrade_from_first_build(tmp_path):
+    import sqlite3
+    conn = sqlite3.connect(str(tmp_path / "x.db"))
+    conn.execute("CREATE TABLE messages(id INTEGER PRIMARY KEY)")
+    conn.execute("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT)")
+    conn.execute("CREATE TABLE reply_msgs(id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL, mid INTEGER NOT NULL, "
+                 "parent INTEGER, root INTEGER, dir INTEGER NOT NULL, kind INTEGER NOT NULL DEFAULT 0, "
+                 "addressed INTEGER NOT NULL DEFAULT 0, peer TEXT NOT NULL DEFAULT '', domains TEXT NOT NULL DEFAULT '', "
+                 "rcpt INTEGER NOT NULL DEFAULT 0, ts INTEGER NOT NULL, flag_ans INTEGER NOT NULL DEFAULT 0, "
+                 "reply_id INTEGER, reply_ts INTEGER, other_ts INTEGER)")
+    conn.execute("INSERT INTO meta VALUES('replies_last_id', '100')")
+    conn.commit()
+    replies.ensure_schema(conn)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(reply_msgs)")}
+    assert {"subj", "reply_how"} <= cols
+    assert conn.execute("SELECT COUNT(*) FROM meta WHERE key='replies_last_id'").fetchone()[0] == 0   # разбор заново
