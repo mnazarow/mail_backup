@@ -100,6 +100,12 @@ notifications:
   on_success: false
   summary_enabled: true  # еженедельная сводка администраторам (если уведомления включены)
   summary_cron: "0 8 * * 1"
+  telegram_bot_token: ""   # Telegram: токен бота (лучше задать в интерфейсе — там хранится зашифрованным)
+  telegram_chat_id: ""     # Telegram: чат, группа или канал
+  telegram_api_url: "https://api.telegram.org"
+  webhook_url: ""          # вебхук: POST с JSON на этот адрес
+  webhook_format: "json"   # json | slack (Slack, Mattermost, Rocket.Chat)
+  webhook_secret: ""       # подпись HMAC-SHA256 в заголовке X-MailArchiver-Signature
 
 employees:
   sync_enabled: false        # синхронизировать справочник сотрудников по расписанию
@@ -169,6 +175,9 @@ search:                      # поиск по письмам (docs/ru/15-search
   index_bodies: true         # искать и по тексту писем
   index_bodies_encrypted: false   # индексировать текст при шифровании копии (не рекомендуется)
   body_max_kb: 16
+  index_attachments: true    # искать и по тексту вложений (PDF, Word, Excel, PowerPoint, OpenDocument, RTF)
+  attachment_max_kb: 10240   # вложения крупнее не разбираются
+  attachment_text_kb: 64     # текста вложений одного письма в индексе, КБ
 
 replies:                     # раздел «Ответы на письма» (docs/ru/06-analytics.md)
   enabled: true              # вести индекс ответов (фоновое задание читает заголовки новых писем)
@@ -193,6 +202,37 @@ webmail:                     # почтовый клиент раздела «П
   push: true                 # новая почта сразу (IMAP IDLE), пока клиент открыт
   drafts_on_server: true     # черновики клиента — и в папку «Черновики» сервера (видны на телефоне)
   phishing_report_to: ""     # «Сообщить о фишинге»: адрес службы безопасности ('' — только в «Спам»)
+  dlp_mode: "warn"           # конфиденциальные данные в письме: off | warn | block_external
+  warn_external: true        # предупреждать, что письмо уходит за пределы организации
+  warn_recipients: 20        # предупреждать о большом списке адресатов в «Кому» и «Копии» (0 — нет)
+
+journal:                     # приём журналирования по SMTP (docs/ru/13-replica.md → «Журналирование»)
+  enabled: false
+  listen: "127.0.0.1"        # 0.0.0.0 — принимать на всех адресах
+  port: 2525
+  allowed_ips: ["127.0.0.1", "::1"]   # почтовые серверы, которым можно отправлять журнал
+  address: ""                # адрес журнала в конверте (сам он ящиком не считается)
+  folder: "Журнал"
+  unwrap_exchange: true      # разворачивать журнальные отчёты Exchange
+  tls_cert: ""               # сертификат и ключ для STARTTLS (PEM)
+  tls_key: ""
+  require_tls: false
+  max_size_mb: 50
+
+ldap:                        # вход через LDAP / Active Directory (docs/ru/08-security.md)
+  enabled: false
+  url: ""                    # ldaps://dc01.company.local или ldap://… со StartTLS
+  starttls: true
+  verify_ssl: true
+  bind_dn: ""                # служебная учётная запись для поиска пользователей
+  bind_password: ""          # лучше задать в интерфейсе — там хранится зашифрованным
+  base_dn: ""                # DC=company,DC=local
+  user_filter: "(&(objectClass=user)(sAMAccountName={login}))"
+  admin_group: ""            # DN группы администраторов архива
+  operator_group: ""         # DN группы операторов
+  nested_groups: true
+  employee_login: false      # сотрудники входят доменным паролем в архив своих ящиков
+  timeout_s: 10
 
 mailadmin:                   # вход в ящики через администратора почты (docs/ru/16-mailadmin.md)
   enabled: false

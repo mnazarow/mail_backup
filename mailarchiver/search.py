@@ -187,7 +187,7 @@ def status(svc) -> Dict:
     pending = pending_count(db) if available else 0
     return {"enabled": bool(svc.rt("search", "enabled")), "available": available,
             "indexed": max(0, total - pending), "total": total, "pending": pending, "last_id": last,
-            "bodies": bodies_enabled(svc),
+            "bodies": bodies_enabled(svc), "attachments": attachments_enabled(svc),
             "bodies_blocked_by_encryption": bool(svc.rt("search", "index_bodies")) and svc.store.encrypt
             and not bool(svc.rt("search", "index_bodies_encrypted"))}
 
@@ -210,7 +210,70 @@ def _body_cap(svc) -> int:
     return max(1, cap_kb) * 1024
 
 
-def _row_fields(svc, row, with_body: bool, body_cap: int) -> Tuple[Dict[str, str], str]:
+#: Письма крупнее этого не разбираются ради текста вложений (письмо читается в память целиком).
+ATTACH_MESSAGE_MAX = 60 * 1024 * 1024
+
+
+def attachments_enabled(svc) -> bool:
+    """Индексировать ли текст вложений: как текст писем (не при шифровании) и если не выключено."""
+    return bodies_enabled(svc) and bool(svc.rt("search", "index_attachments"))
+
+
+def _attach_cap(svc) -> int:
+    """Сколько текста вложений одного письма индексировать (0 — не индексировать)."""
+    if not attachments_enabled(svc):
+        return 0
+    try:
+        return max(1, int(svc.rt("search", "attachment_text_kb") or 64)) * 1024
+    except (TypeError, ValueError):
+        return 64 * 1024
+
+
+def attachments_text(svc, open_fn, cap_chars: int) -> str:
+    """Текст поддерживаемых вложений письма (PDF, Word, Excel…), не больше ``cap_chars``."""
+    from email import message_from_binary_file
+    from email.policy import compat32
+    from . import attachtext
+    from .mailview import _decoded_payload, _is_attachment, _iter_parts
+    try:
+        max_one = max(1, int(svc.rt("search", "attachment_max_kb") or 10240)) * 1024
+    except (TypeError, ValueError):
+        max_one = 10240 * 1024
+    with open_fn() as fh:
+        msg = message_from_binary_file(fh, policy=compat32)
+    out: List[str] = []
+    left = cap_chars
+    for part in _iter_parts(msg):
+        if left <= 0:
+            break
+        ctype = (part.get_content_type() or "").lower()
+        try:
+            filename = decode_mime_header(part.get_filename() or "")
+        except Exception:  # noqa: BLE001
+            filename = ""
+        disp = part.get_content_disposition()
+        if not _is_attachment(ctype, disp, filename) or not attachtext.kind_of(filename, ctype):
+            continue
+        if ctype == "message/rfc822":
+            payload = part.as_bytes() if not part.is_multipart() else b""
+            inner = part.get_payload()
+            if isinstance(inner, list) and inner:
+                try:
+                    payload = inner[0].as_bytes()
+                except Exception:  # noqa: BLE001
+                    payload = b""
+        else:
+            payload = _decoded_payload(part) or b""
+        if not payload or len(payload) > max_one:
+            continue
+        text = attachtext.extract(filename, ctype, payload, left)
+        if text:
+            out.append(text)
+            left -= len(text)
+    return "\n".join(out)[:cap_chars]
+
+
+def _row_fields(svc, row, with_body: bool, body_cap: int, attach_cap: int = 0) -> Tuple[Dict[str, str], str]:
     """Поля индекса для письма ``row`` и текст ошибки ('' — файл прочитан).
 
     Файл не читается (его нет, нет ключа, письмо битое) — письмо попадает в
@@ -227,7 +290,23 @@ def _row_fields(svc, row, with_body: bool, body_cap: int) -> Tuple[Dict[str, str
         return fields, str(getattr(exc, "message", None) or exc)
     if not full["subject"]:
         full["subject"] = fields["subject"]
+    if attach_cap and _row_has(row, "has_attach") and int(_row_has(row, "size") or 0) <= ATTACH_MESSAGE_MAX:
+        try:
+            text = attachments_text(svc, lambda r=row: svc.store.open_message(r["account_id"], r["stored_path"]),
+                                    attach_cap)
+        except Exception as exc:  # noqa: BLE001 - вложения не прочитались — письмо остаётся в индексе
+            log.debug("Текст вложений письма #%s не извлечён: %s", row["id"], exc)
+            text = ""
+        if text:
+            full["attach"] = (full["attach"] + "\n" + normalize(text)).strip()
     return full, ""
+
+
+def _row_has(row, key: str):
+    try:
+        return row[key]
+    except (IndexError, KeyError):
+        return None
 
 
 def index_pending(svc, *, progress=None, cancelled=None, event=None, max_seconds: Optional[float] = None) -> Dict:
@@ -237,6 +316,7 @@ def index_pending(svc, *, progress=None, cancelled=None, event=None, max_seconds
         return {"indexed": 0, "errors": 0, "pending": 0, "available": False}
     with_body = bodies_enabled(svc)
     body_cap = _body_cap(svc)
+    attach_cap = _attach_cap(svc)
     total_pending = pending_count(db)
     done = errors = 0
     started = time.time()
@@ -247,13 +327,13 @@ def index_pending(svc, *, progress=None, cancelled=None, event=None, max_seconds
             break
         if max_seconds is not None and time.time() - started > max_seconds:
             break
-        rows = db.query("SELECT id, account_id, stored_path, subject, from_addr FROM messages WHERE id > ? "
+        rows = db.query("SELECT id, account_id, stored_path, subject, from_addr, size, has_attach FROM messages WHERE id > ? "
                         "ORDER BY id LIMIT ?", (last, BATCH))
         if not rows:
             break
         batch: List[Tuple] = []
         for row in rows:
-            fields, error = _row_fields(svc, row, with_body, body_cap)
+            fields, error = _row_fields(svc, row, with_body, body_cap, attach_cap)
             if error:
                 errors += 1
                 if errors <= 20 and event is not None:
@@ -296,6 +376,7 @@ def reindex_accounts(svc, account_ids: Iterable[int], *, progress=None, cancelle
         return {"available": False, "indexed": 0, "errors": 0, "total": 0, "accounts": {}, "stopped": ""}
     with_body = bodies_enabled(svc)
     body_cap = _body_cap(svc)
+    attach_cap = _attach_cap(svc)
     gen = db.get_meta(_META_GEN) or "0"
     watermark = int(db.get_meta(_META_WATERMARK) or 0)
     total = 0
@@ -314,7 +395,7 @@ def reindex_accounts(svc, account_ids: Iterable[int], *, progress=None, cancelle
             if cancelled is not None and cancelled():
                 stopped = "cancelled"
                 break
-            rows = db.query("SELECT id, account_id, stored_path, subject, from_addr FROM messages "
+            rows = db.query("SELECT id, account_id, stored_path, subject, from_addr, size, has_attach FROM messages "
                             "WHERE account_id=? AND id > ? AND id <= ? ORDER BY id LIMIT ?",
                             (account_id, last, watermark, BATCH))
             if not rows:
@@ -322,7 +403,7 @@ def reindex_accounts(svc, account_ids: Iterable[int], *, progress=None, cancelle
             batch: List[Tuple] = []
             failed_ids: List[int] = []
             for row in rows:
-                fields, error = _row_fields(svc, row, with_body, body_cap)
+                fields, error = _row_fields(svc, row, with_body, body_cap, attach_cap)
                 if error:
                     stat["errors"] += 1
                     errors += 1

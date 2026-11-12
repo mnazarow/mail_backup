@@ -154,8 +154,17 @@ edits = []          # (начало, конец, новый XML) — приме�
 
 
 def replace_range(i, j, xml):
-    """Заменить элементы [i, j) на xml (i == j — вставка перед элементом i)."""
-    edits.append((els[i][1], els[j][1] if j < len(els) else els[-1][2], xml))
+    """Заменить элементы [i, j) на xml (i == j — вставка перед элементом i).
+
+    Несколько вставок подряд перед одним и тем же элементом (два новых раздела приложения перед одним
+    прежним) склеиваются в одну — в порядке вызова.
+    """
+    start = els[i][1]
+    end = els[j][1] if j < len(els) else els[-1][2]
+    if i == j and edits and edits[-1][0] == edits[-1][1] == start == end:
+        edits[-1] = (start, end, edits[-1][2] + xml)
+        return
+    edits.append((start, end, xml))
 
 
 def replace_text(i, old, new):

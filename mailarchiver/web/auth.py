@@ -125,9 +125,15 @@ TOUCH_EVERY_S = 60
 
 
 def current_user(request: Request) -> Optional[dict]:
-    """Вернуть словарь пользователя по cookie сессии или None."""
+    """Вернуть словарь пользователя по cookie сессии или API-токену (1.20.0), или None."""
+    services = request.app.state.services
+    authz = request.headers.get("authorization", "")
+    if authz[:7].lower() == "bearer " and authz[7:].strip().startswith("ma_") and \
+            bool(services.rt("security", "auth_enabled")):
+        from ..apitokens import user_for
+        return user_for(services, authz[7:].strip(), client_ip(request))
     touch = request.headers.get(BACKGROUND_HEADER, "") != "1"
-    return user_from_cookies(request.app.state.services, request.cookies, touch=touch)
+    return user_from_cookies(services, request.cookies, touch=touch)
 
 
 def user_from_cookies(services, cookies, touch: bool = True) -> Optional[dict]:
@@ -234,6 +240,8 @@ def _authenticated(request: Request) -> dict:
     user = current_user(request)
     if user is None:
         raise HTTPException(status_code=401, detail="Требуется вход")
+    if user.get("via_token") and _token_forbidden(request.url.path):
+        raise HTTPException(status_code=403, detail="С API-токеном это недоступно: войдите в интерфейс паролем")
     if two_factor_required(request.app.state.services, user):
         path = request.url.path
         if not (path in _ENROLL_PATHS or path.startswith("/api/me/2fa")):
@@ -242,6 +250,14 @@ def _authenticated(request: Request) -> dict:
                 "message": "Для работы необходимо включить двухфакторный вход.",
                 "hint": "Так требует настройка «Обязательный двухфакторный вход» (раздел «Безопасность»)."})
     return user
+
+
+#: Чего нельзя делать с API-токеном: свой пароль и двухфакторный вход, выпуск и отзыв токенов, пользователи.
+TOKEN_FORBIDDEN_PREFIXES = ("/api/me", "/api/tokens", "/api/users", "/api/logout")
+
+
+def _token_forbidden(path: str) -> bool:
+    return any(path == p or path.startswith(p + "/") for p in TOKEN_FORBIDDEN_PREFIXES)
 
 
 def _route_key(request: Request) -> Tuple[str, str]:
@@ -398,6 +414,11 @@ def do_login(services, request: Request, response: Response, username: str, pass
         create_session(services, response, user["id"], request, role=user["role"])
         return {"id": user["id"], "username": user["username"], "role": user["role"],
                 "totp_enabled": False}
+    # 1а) вход доменной учётной записью (LDAP / Active Directory, 1.20.0)
+    if user is None or _row_get(user, "auth_source", "local") == "ldap":
+        res = _try_ldap(services, request, response, username, password, ip)
+        if res is not None:
+            return res
     # 2) вход по учётным данным почтового ящика (проверка через IMAP).
     #    Факт попытки фиксируем ДО обращения к IMAP: проверка занимает до 30/120 с,
     #    и если писать неудачу только после неё, сотня одновременных запросов
@@ -716,6 +737,59 @@ def do_login_otp(services, request: Request, response: Response, challenge: str,
         left = len((services.db.totp_state(user_id) or {}).get("recovery") or [])
     return {"id": user_id, "username": username, "role": user["role"], "totp_enabled": True,
             "recovery_left": left}
+
+
+def _try_ldap(services, request: Request, response: Response, username: str, password: str, ip: str):
+    """Вход через каталог: None — каталог не отвечает за этого пользователя (дальше — вход по ящику)."""
+    from .. import ldapauth
+    if not ldapauth.enabled(services) or not password:
+        return None
+    try:
+        info = ldapauth.lookup(services, username, password)
+    except (ldapauth.LdapError, OSError, ValueError) as exc:
+        log.warning("Вход через LDAP не проверен: %s", exc)
+        services.db.add_audit(username, "login_ldap_error", f"{ip}: {exc}"[:300])
+        return None
+    except Exception as exc:  # noqa: BLE001 - ошибка в настройках (фильтр) не должна давать 500
+        log.warning("Вход через LDAP не проверен: %s", exc)
+        return None
+    existing = services.db.get_user_by_name(username)
+    if not info.get("ok"):
+        return None
+    role = info.get("role") or ""
+    if role in (ROLE_ADMIN, ROLE_OPERATOR):
+        if existing is None:
+            uid = services.db.create_user(username, hash_password(new_token(24)), role)
+            services.db.execute("UPDATE users SET auth_source='ldap' WHERE id=?", (uid,))
+            services.db.add_audit("system", "user_create", f"{username}: из каталога LDAP, роль {role}")
+            existing = services.db.get_user_by_id(uid)
+        elif existing["role"] != role or existing["disabled"]:
+            services.db.execute("UPDATE users SET role=?, disabled=0 WHERE id=?", (role, existing["id"]))
+            services.db.add_audit("system", "user_role", f"{username}: роль из каталога LDAP — {role}")
+            existing = services.db.get_user_by_id(existing["id"])
+        if _row_get(existing, "totp_enabled", 0):
+            services.db.add_audit(username, "login_password_ok", f"{ip} (LDAP)")
+            return {"otp_required": True, "challenge": _make_challenge(services, existing, ip),
+                    "username": existing["username"]}
+        services.db.record_login_attempt(username, True, ip)
+        services.db.clear_login_failures(username, ip=ip)
+        services.db.set_last_login(existing["id"])
+        services.db.add_audit(username, "login", f"{ip} (LDAP)")
+        create_session(services, response, existing["id"], request, role=role)
+        return {"id": existing["id"], "username": existing["username"], "role": role, "totp_enabled": False}
+    # в группах архива не состоит: учётную запись из каталога отключаем
+    if existing is not None and _row_get(existing, "auth_source", "local") == "ldap" and not existing["disabled"]:
+        services.db.execute("UPDATE users SET disabled=1 WHERE id=?", (existing["id"],))
+        services.db.add_audit("system", "user_disable", f"{username}: больше не в группах архива (LDAP)")
+    if role == "mailbox":
+        acc = ldapauth.mailbox_for(services, info.get("mail", ""))
+        if acc is not None:
+            services.db.record_login_attempt(username, True, ip)
+            services.db.clear_login_failures(username, ip=ip)
+            services.db.add_audit(username, "login_mailbox", f"{ip} account={acc.id} (LDAP)")
+            create_session(services, response, 0, request, role="mailbox", account_id=acc.id)
+            return mailbox_user(services, acc)
+    return None
 
 
 def _mailbox_candidate(services, username: str, password: str):

@@ -27,6 +27,7 @@ from ..version import __version__, APP_TITLE
 from . import auth as auth_mod
 from .api import router as api_router
 from .bulk_api import router as bulk_router
+from .cases_api import router as cases_router
 from .axigen_api import router as axigen_router
 from .mailservers_api import router as mailservers_router
 from .replies_api import router as replies_router
@@ -191,6 +192,7 @@ def create_app() -> FastAPI:
     app.include_router(server_router)
     app.include_router(mailservers_router)
     app.include_router(replies_router)
+    app.include_router(cases_router)
     app.include_router(webmail_router)
     app.include_router(api_router)
     app.include_router(ws_router)

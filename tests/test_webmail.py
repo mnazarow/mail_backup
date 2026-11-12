@@ -638,7 +638,11 @@ def test_api_compose_attach_send(api, smtp):
                  files={"file": ("платёжка.pdf", b"%PDF-1.4 test", "application/pdf")})
     assert up.status_code == 200 and up.json()["name"] == "платёжка.pdf"
     assert [x["id"] for x in mb.get("/api/webmail/drafts").json()["items"]] == [d["id"]]
-    res = mb.post(f"/api/webmail/drafts/{d['id']}/send").json()
+    # адресат вне организации — сначала предупреждение (1.20.0), письмо уходит после подтверждения
+    r = mb.post(f"/api/webmail/drafts/{d['id']}/send")
+    assert r.status_code == 409 and r.json()["code"] == "presend_warn"
+    assert [i["code"] for i in r.json()["items"]] == ["external"] and not smtp.sent
+    res = mb.post(f"/api/webmail/drafts/{d['id']}/send", json={"confirm": True}).json()
     assert res["ok"] and res["saved_to"] == "Sent"
     msg = email.message_from_bytes(smtp.sent[0]["data"], policy=policy.default)
     assert [p.get_filename() for p in msg.iter_attachments()] == ["платёжка.pdf"]

@@ -426,6 +426,27 @@ systemd, требующие пространств имён. Служба по-�
 в почте на телефоне.</p>
 <img class="shot" src="img/73_mailclient_trust.png" alt="Предупреждение о подозрительном письме">
 <div class="cap">Письмо с внешнего адреса под именем сотрудника: предупреждение и «Сообщить о фишинге»</div>
+<h3 id="mailsecure">Подпись и шифрование, проверки перед отправкой, календарь</h3>
+<ul>
+<li><b>S/MIME.</b> В «⚙️ → Подпись и шифрование» загружается сертификат ящика с ключом (.p12 / .pfx); в окне
+письма появляются «🔏 Подписать» и «🔒 Зашифровать». Сертификаты получателей собираются сами из писем с верной
+подписью (или загружаются файлом .cer). Зашифрованное входящее письмо открывается кнопкой «🔓 Расшифровать» —
+на сервере расшифрованный текст не сохраняется.</li>
+<li><b>Проверки перед отправкой</b>: адресаты вне организации, номера банковских карт, СНИЛС, паспортные
+данные и ИНН в теме, тексте и вложениях, длинный список адресов в «Кому». Письмо уходит после подтверждения
+(запись в аудите); настройка «Конфиденциальные данные в письме = block_external» запрещает отправлять такие
+данные за пределы организации.</li>
+<li><b>«🗄 Из архива»</b> в окне письма прикладывает найденные письма архива файлами .eml.</li>
+</ul>
+<img class="shot" src="img/75_mailclient_presend.png" alt="Проверка перед отправкой">
+<div class="cap">Перед отправкой: внешний адресат, номер карты и СНИЛС в тексте письма</div>
+<ul>
+<li><b>Календарь и контакты сервера</b> (CalDAV, CardDAV): администратор указывает адрес сервера в «⚙️ →
+Календарь и контакты»; контакты загружаются в адресную книгу, «📅» показывает ближайшие события и создаёт новые,
+принятое приглашение ложится в календарь.</li>
+<li>Клиент устанавливается <b>как приложение</b> (меню браузера → «Установить приложение») и может открывать
+ссылки <code>mailto:</code>.</li>
+</ul>
 <img class="shot" src="img/71_mailclient_rules.png" alt="Правило сортировки">
 <div class="cap">Правило: письма с «тендер» в теме — в папку «Проекты» с меткой «Важно»</div>
 <div class="note"><b>Кто может писать и менять ящик</b>
@@ -450,7 +471,8 @@ systemd, требующие пространств имён. Служба по-�
 <tr><td><code>вложение:прайс</code>, <code>текст:реквизиты</code></td><td>в имени вложения, только в тексте письма</td></tr>
 </table>
 <p>Письма заранее разбираются в <b>индекс</b> (SQLite FTS5) — поэтому поиск мгновенный. Новые письма
-индексируются в фоне каждые 10 минут; первое индексирование большого архива идёт часы, но искать можно сразу —
+индексируются в фоне каждые 10 минут; ищется и <b>текст вложений</b> — PDF, Word, Excel, PowerPoint,
+OpenDocument, RTF (сканы не распознаются). Первое индексирование большого архива идёт часы, но искать можно сразу —
 по уже проиндексированной части. При включённом шифровании копии <b>текст</b> писем по умолчанию не
 индексируется (индекс в базе открыт): ищутся тема, адреса и имена вложений. <b>Каждый поиск администратора
 записывается в аудит</b> — это доступ к чужой переписке.</p>
@@ -1301,6 +1323,26 @@ sudo chown mailarchiver: /var/lib/mailarchiver/import/Архив.pst</pre>
 Ретеншн удаляет именно локальные копии старше срока. Если нужен полный «вечный» архив — оставьте
 «Хранить всё». Хранение за 3 дня/неделю удобно, когда важны только свежие письма и экономия места.</div>
 
+<h2 id="cases">Дела: удержание и выгрузка для проверок</h2>
+<p>Раздел <b>«⚖️ Дела»</b> (только администратору) собирает переписку для проверки, спора или запроса: ящики
+сотрудников, период и поисковый запрос (как в поиске писем). Пока дело открыто, <b>архив его ящиков
+удерживается</b>: письма не удаляются ни по сроку хранения, ни вручную, ящик нельзя удалить, а снять удержание
+можно только закрыв дело или убрав из него ящик. Закрытое дело возвращает ящику прежнее удержание (например,
+архива уволенного сотрудника).</p>
+<p>«📦 Выгрузить» собирает найденные письма в ZIP: письма <code>.eml</code> без изменений, опись
+<code>manifest.csv</code> с SHA-256 каждого файла, отчёт <code>report.txt</code> (кто, когда, по какому запросу) и
+контрольная сумма описи. SHA-256 всего архива показывается рядом с выгрузкой — по ней получатель проверяет, что
+файл не меняли. Создание, изменения, просмотр писем и скачивание выгрузки — в истории дела и в аудите.</p>
+<img class="shot" src="img/74_cases.png" alt="Дело">
+<div class="cap">Дело: удержание архива двух ящиков, выгрузка с SHA-256 и письма по запросу «проект»</div>
+<h3 id="journal">Журналирование по SMTP</h3>
+<p>Копирование по IMAP видит только то, что лежит в ящике в момент копии. Чтобы в архив попадало каждое письмо
+(даже удалённое через минуту), почтовый сервер может отправлять копии на приёмник журналирования MailArchiver
+(«Настройки → Приём журналирования»): Exchange — правилом журналирования (отчёт разворачивается, скрытые адресаты
+берутся из него), Postfix — <code>always_bcc</code>. Письмо кладётся в папку «Журнал» ящиков отправителя и
+получателей; повтор того же письма не сохраняется; приём — только с адресов почтовых серверов, по желанию — с
+STARTTLS.</p>
+
 <h2 id="schedules">14. Расписания</h2>
 <p>Раздел <b>«Расписания»</b> позволяет запускать бэкап (или очистку/проверку) автоматически — для одного ящика
 или для <b>всех ящиков по очереди</b>.</p>
@@ -1834,8 +1876,8 @@ cron-выражение подставится само. Для особых с�
 <h3 class="pg">✉️ Уведомления</h3>
 <div class="ptable">
 <div class="prow">
-  <div class="pname"><span class="ptitle">Уведомления по e-mail</span><code>notifications.enabled</code></div>
-  <div class="pdesc"><p>Отправлять письма о результатах заданий (по SMTP).</p>
+  <div class="pname"><span class="ptitle">Уведомления</span><code>notifications.enabled</code></div>
+  <div class="pdesc"><p>Сообщать о результатах заданий, сводку и предупреждения мониторинга: по e-mail (SMTP), в Telegram и на вебхук — во все настроенные каналы.</p>
     <p class="prec">💡 Включите, чтобы узнавать об ошибках бэкапа вовремя.</p>
     <p class="pmeta">Пример: <code>false</code> · По умолчанию: <code>false</code></p>
   </div></div>
@@ -1904,6 +1946,42 @@ cron-выражение подставится само. Для особых с�
   <div class="pdesc"><p>Расписание сводки (cron: минуты часы день месяц день_недели; 1 — понедельник).</p>
     <p class="prec">💡 В начале рабочей недели: 0 8 * * 1.</p>
     <p class="pmeta">Пример: <code>0 8 * * 1</code> · По умолчанию: <code>0 8 * * 1</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Telegram: токен бота</span><code>notifications.telegram_bot_token</code></div>
+  <div class="pdesc"><p>Те же уведомления — в Telegram. Создайте бота у @BotFather и вставьте его токен; добавьте бота в группу или канал (в канал — администратором). Хранится в базе зашифрованным.</p>
+    <p class="prec">💡 Отдельный бот только для уведомлений архива.</p>
+    <p class="pmeta">Пример: <code>123456789:AA…</code> · По умолчанию: <code>(пусто)</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Telegram: чат</span><code>notifications.telegram_chat_id</code></div>
+  <div class="pdesc"><p>Куда писать: номер чата или группы (например -1001234567890) или @имя публичного канала. Номер группы покажет любой бот вида @getidsbot, если добавить его в группу.</p>
+    <p class="prec">💡 Группа дежурных администраторов.</p>
+    <p class="pmeta">Пример: <code>-1001234567890</code> · По умолчанию: <code>(пусто)</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Telegram: адрес Bot API</span><code>notifications.telegram_api_url</code></div>
+  <div class="pdesc"><p>Обычно не меняется. Свой сервер Bot API (telegram-bot-api) или шлюз — если сервер архива не ходит в api.telegram.org напрямую. Только https://; при смене адреса токен вводится заново.</p>
+    <p class="prec">💡 https://api.telegram.org.</p>
+    <p class="pmeta">Пример: <code>https://api.telegram.org</code> · По умолчанию: <code>https://api.telegram.org</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Вебхук: адрес</span><code>notifications.webhook_url</code></div>
+  <div class="pdesc"><p>Каждое уведомление — POST с JSON на этот адрес: для своего сервиса, системы заявок, Slack, Mattermost, Rocket.Chat. Формат «json»: поля event, subject, text, host, version, ts.</p>
+    <p class="prec">💡 https:// — без шифрования текст уведомлений (имена ящиков, ошибки) уходит открыто.</p>
+    <p class="pmeta">Пример: <code>https://hooks.example.ru/mailarchiver</code> · По умолчанию: <code>(пусто)</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Вебхук: формат</span><code>notifications.webhook_format</code></div>
+  <div class="pdesc"><p>json — свой сервис (полный набор полей); slack — {"text": …} для Slack, Mattermost, Rocket.Chat.</p>
+    <p class="prec">💡 json для своего сервиса, slack для мессенджеров.</p>
+    <p class="pmeta">Пример: <code>json</code> · По умолчанию: <code>json</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Вебхук: секрет подписи</span><code>notifications.webhook_secret</code></div>
+  <div class="pdesc"><p>Если задан, каждый запрос подписывается: заголовок X-MailArchiver-Signature: sha256=&lt;HMAC-SHA256 тела запроса с этим секретом&gt;. Получатель проверяет, что запрос пришёл от архива.</p>
+    <p class="prec">💡 Задайте, если вебхук доступен из интернета.</p>
+    <p class="pmeta">Пример: <code>(секрет)</code> · По умолчанию: <code>(пусто)</code></p>
   </div></div>
 </div>
 <h3 class="pg">📈 Мониторинг (Prometheus, Zabbix)</h3>
@@ -2136,6 +2214,24 @@ cron-выражение подставится само. Для особых с�
     <p class="prec">💡 16 — обычное письмо целиком.</p>
     <p class="pmeta">Пример: <code>16</code> · По умолчанию: <code>16</code></p>
   </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Искать по тексту вложений</span><code>search.index_attachments</code></div>
+  <div class="pdesc"><p>Индексировать текст вложений: PDF (текстовый слой), Word, Excel, PowerPoint, OpenDocument, RTF, текстовые файлы, HTML и вложенные письма — без внешних программ. Сканы (картинки) не распознаются. Действует вместе с «Искать по тексту писем» и, как он, выключается при шифровании копии. Уже проиндексированные письма получат текст вложений после «Перестроить индекс».</p>
+    <p class="prec">💡 Включено.</p>
+    <p class="pmeta">Пример: <code>true</code> · По умолчанию: <code>true</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Крупнейшее вложение для индекса, КБ</span><code>search.attachment_max_kb</code></div>
+  <div class="pdesc"><p>Вложения крупнее не разбираются (разбор держит файл в памяти).</p>
+    <p class="prec">💡 10240 (10 МБ).</p>
+    <p class="pmeta">Пример: <code>10240</code> · По умолчанию: <code>10240</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Текста вложений в индексе, КБ</span><code>search.attachment_text_kb</code></div>
+  <div class="pdesc"><p>Сколько текста всех вложений одного письма индексировать. Длинные документы обрезаются.</p>
+    <p class="prec">💡 64.</p>
+    <p class="pmeta">Пример: <code>64</code> · По умолчанию: <code>64</code></p>
+  </div></div>
 </div>
 <h3 class="pg">↩️ Ответы на письма</h3>
 <div class="ptable">
@@ -2261,6 +2357,174 @@ cron-выражение подставится само. Для особых с�
   <div class="pdesc"><p>Адрес службы безопасности: кнопка «Сообщить о фишинге» пересылает на него подозрительное письмо целиком (со всеми заголовками) и переносит его в «Спам». Пусто — письмо только переносится в «Спам».</p>
     <p class="prec">💡 Адрес ИБ или администратора почты, например security@company.ru.</p>
     <p class="pmeta">Пример: <code>security@company.ru</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Конфиденциальные данные в письме</span><code>webmail.dlp_mode</code></div>
+  <div class="pdesc"><p>Перед отправкой клиент ищет в теме, тексте и вложениях номера банковских карт (с проверкой по алгоритму Луна), СНИЛС (с контрольным числом), паспортные данные и ИНН. warn — предупредить: отправить можно, подтвердив (подтверждение — в аудите, webmail_dlp_override); block_external — за пределы организации такие письма не отправляются, внутри — предупреждение; off — не проверять.</p>
+    <p class="prec">💡 warn; block_external — если так требует политика безопасности.</p>
+    <p class="pmeta">Пример: <code>warn</code> · По умолчанию: <code>warn</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Предупреждать о внешних адресатах</span><code>webmail.warn_external</code></div>
+  <div class="pdesc"><p>Перед отправкой показать, что письмо уйдёт за пределы организации (адресаты не из доменов ящиков, сотрудников и «Ответы на письма → свои домены»).</p>
+    <p class="prec">💡 Включено.</p>
+    <p class="pmeta">Пример: <code>true</code> · По умолчанию: <code>true</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Предупреждать о большом списке адресатов</span><code>webmail.warn_recipients</code></div>
+  <div class="pdesc"><p>Если в «Кому» и «Копии» больше адресатов, чем указано, клиент предупредит, что все увидят адреса друг друга, и предложит «Скрытую копию». 0 — не предупреждать.</p>
+    <p class="prec">💡 20.</p>
+    <p class="pmeta">Пример: <code>20</code> · По умолчанию: <code>20</code></p>
+  </div></div>
+</div>
+<h3 class="pg">📨 Приём журналирования (SMTP)</h3>
+<div class="ptable">
+<div class="prow">
+  <div class="pname"><span class="ptitle">Принимать журналирование по SMTP</span><code>journal.enabled</code></div>
+  <div class="pdesc"><p>Почтовый сервер отправляет копию каждого письма на этот приёмник, и она сразу попадает в архив ящиков отправителя и получателей (папка «Журнал») — даже если письмо удалят до очередного копирования. Exchange: правило журналирования на адрес-контакт, ведущий сюда; Postfix: always_bcc и транспорт smtp:[сервер-архива]:порт. Ящик находится по логину или адресу сотрудника.</p>
+    <p class="prec">💡 Включите, если нужен полный архив, включая удалённые письма.</p>
+    <p class="pmeta">Пример: <code>false</code> · По умолчанию: <code>false</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Адрес приёма</span><code>journal.listen</code></div>
+  <div class="pdesc"><p>На каком адресе слушать SMTP: 127.0.0.1 — только эта машина, 0.0.0.0 — все адреса.</p>
+    <p class="prec">💡 Адрес во внутренней сети, доступный почтовому серверу.</p>
+    <p class="pmeta">Пример: <code>0.0.0.0</code> · По умолчанию: <code>127.0.0.1</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Порт приёма</span><code>journal.port</code></div>
+  <div class="pdesc"><p>TCP-порт SMTP-приёмника (порты ниже 1024 служба без прав root открыть не сможет).</p>
+    <p class="prec">💡 2525.</p>
+    <p class="pmeta">Пример: <code>2525</code> · По умолчанию: <code>2525</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Кому можно отправлять журнал</span><code>journal.allowed_ips</code></div>
+  <div class="pdesc"><p>Адреса или сети (через запятую) почтовых серверов; с остальных подключение отклоняется.</p>
+    <p class="prec">💡 Только адреса своих почтовых серверов.</p>
+    <p class="pmeta">Пример: <code>10.0.0.10, 10.0.1.0/24</code> · По умолчанию: <code>127.0.0.1, ::1</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Адрес журнала</span><code>journal.address</code></div>
+  <div class="pdesc"><p>Служебный адрес, на который сервер отправляет копии (в конверте письма). Ящиком он не считается.</p>
+    <p class="prec">💡 Например journal@company.ru.</p>
+    <p class="pmeta">Пример: <code>journal@company.ru</code> · По умолчанию: <code>(пусто)</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Папка для журнала</span><code>journal.folder</code></div>
+  <div class="pdesc"><p>В какую папку архива ящика класть письма из журнала.</p>
+    <p class="prec">💡 Журнал.</p>
+    <p class="pmeta">Пример: <code>Журнал</code> · По умолчанию: <code>Журнал</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Разворачивать отчёты Exchange</span><code>journal.unwrap_exchange</code></div>
+  <div class="pdesc"><p>Exchange присылает «журнальный отчёт»: исходное письмо — вложением, а все адресаты (и скрытые) — в тексте отчёта. Включено — в архив кладётся исходное письмо, адресаты берутся из отчёта.</p>
+    <p class="prec">💡 Включено.</p>
+    <p class="pmeta">Пример: <code>true</code> · По умолчанию: <code>true</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Сертификат для STARTTLS</span><code>journal.tls_cert</code></div>
+  <div class="pdesc"><p>Путь к сертификату (PEM) — включает шифрование STARTTLS при приёме. Пусто — без шифрования.</p>
+    <p class="prec">💡 Сертификат сервера архива, если журнал идёт по сети.</p>
+    <p class="pmeta">Пример: <code>/etc/ssl/archive.pem</code> · По умолчанию: <code>(пусто)</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Ключ для STARTTLS</span><code>journal.tls_key</code></div>
+  <div class="pdesc"><p>Путь к закрытому ключу (PEM) к сертификату выше; пусто — ключ в том же файле.</p>
+    <p class="prec">💡 Права на файл — только для службы.</p>
+    <p class="pmeta">Пример: <code>/etc/ssl/archive.key</code> · По умолчанию: <code>(пусто)</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Только с шифрованием</span><code>journal.require_tls</code></div>
+  <div class="pdesc"><p>Не принимать письма, пока отправитель не включит STARTTLS.</p>
+    <p class="prec">💡 Включите, если журнал идёт не по локальной сети.</p>
+    <p class="pmeta">Пример: <code>false</code> · По умолчанию: <code>false</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Крупнейшее письмо, МБ</span><code>journal.max_size_mb</code></div>
+  <div class="pdesc"><p>Письма крупнее отклоняются с ошибкой 552 (сервер-отправитель сообщит об этом).</p>
+    <p class="prec">💡 50.</p>
+    <p class="pmeta">Пример: <code>50</code> · По умолчанию: <code>50</code></p>
+  </div></div>
+</div>
+<h3 class="pg">🏢 Вход через LDAP / Active Directory</h3>
+<div class="ptable">
+<div class="prow">
+  <div class="pname"><span class="ptitle">Вход через LDAP / Active Directory</span><code>ldap.enabled</code></div>
+  <div class="pdesc"><p>Администраторы и операторы входят доменным логином и паролем; роль — по группе каталога. Учётные записи архива для них заводятся сами при первом входе; убрали из группы — вход запрещается, открытые сеансы завершаются. Локальные пользователи архива продолжают входить как раньше.</p>
+    <p class="prec">💡 Включите, если есть Active Directory, FreeIPA или OpenLDAP.</p>
+    <p class="pmeta">Пример: <code>false</code> · По умолчанию: <code>false</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Сервер LDAP</span><code>ldap.url</code></div>
+  <div class="pdesc"><p>ldaps://сервер (порт 636) или ldap://сервер (389) со StartTLS. Без шифрования пароль не отправляется.</p>
+    <p class="prec">💡 ldaps://dc01.company.local.</p>
+    <p class="pmeta">Пример: <code>ldaps://dc01.company.local</code> · По умолчанию: <code>(пусто)</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">StartTLS для ldap://</span><code>ldap.starttls</code></div>
+  <div class="pdesc"><p>Для адреса ldap:// — включить шифрование командой StartTLS. Для ldaps:// не нужен.</p>
+    <p class="prec">💡 Включено.</p>
+    <p class="pmeta">Пример: <code>true</code> · По умолчанию: <code>true</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Проверять сертификат сервера LDAP</span><code>ldap.verify_ssl</code></div>
+  <div class="pdesc"><p>Выключайте, только если сертификат контроллера выдан внутренним центром, которого нет в системе (лучше добавить корневой сертификат в систему).</p>
+    <p class="prec">💡 Включено.</p>
+    <p class="pmeta">Пример: <code>true</code> · По умолчанию: <code>true</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Служебная учётная запись</span><code>ldap.bind_dn</code></div>
+  <div class="pdesc"><p>Кем искать пользователей в каталоге: DN (CN=svc-archive,OU=Service,DC=company,DC=local) или svc-archive@company.local. Достаточно права чтения. Пусто — анонимный поиск.</p>
+    <p class="prec">💡 Отдельная учётная запись только для чтения.</p>
+    <p class="pmeta">Пример: <code>svc-archive@company.local</code> · По умолчанию: <code>(пусто)</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Пароль служебной учётной записи</span><code>ldap.bind_password</code></div>
+  <div class="pdesc"><p>Хранится в базе зашифрованным; при смене адреса сервера вводится заново.</p>
+    <p class="prec">💡 Длинный случайный пароль.</p>
+    <p class="pmeta">Пример: <code>(секрет)</code> · По умолчанию: <code>(пусто)</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Где искать пользователей (base DN)</span><code>ldap.base_dn</code></div>
+  <div class="pdesc"><p>Узел каталога, внутри которого ищутся пользователи.</p>
+    <p class="prec">💡 Корень домена или OU с сотрудниками.</p>
+    <p class="pmeta">Пример: <code>DC=company,DC=local</code> · По умолчанию: <code>(пусто)</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Фильтр пользователя</span><code>ldap.user_filter</code></div>
+  <div class="pdesc"><p>Как найти пользователя по введённому логину; {login} заменяется логином (часть до «\» отбрасывается). Active Directory: (&amp;(objectClass=user)(sAMAccountName={login})); FreeIPA/OpenLDAP: (uid={login}); вход по адресу: (|(sAMAccountName={login})(userPrincipalName={login})(mail={login})).</p>
+    <p class="prec">💡 Как в примере для вашего каталога.</p>
+    <p class="pmeta">Пример: <code>(&amp;(objectClass=user)(sAMAccountName={login}))</code> · По умолчанию: <code>(&amp;(objectClass=user)(sAMAccountName={login}))</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Группа администраторов</span><code>ldap.admin_group</code></div>
+  <div class="pdesc"><p>DN группы, члены которой входят администраторами архива.</p>
+    <p class="prec">💡 Отдельная группа, например CN=MailArchiver-Admins,OU=Groups,DC=company,DC=local.</p>
+    <p class="pmeta">Пример: <code>CN=MailArchiver-Admins,OU=Groups,DC=company,DC=local</code> · По умолчанию: <code>(пусто)</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Группа операторов</span><code>ldap.operator_group</code></div>
+  <div class="pdesc"><p>DN группы, члены которой входят операторами (следят за копированием, писем не читают).</p>
+    <p class="prec">💡 Группа дежурной смены.</p>
+    <p class="pmeta">Пример: <code>CN=MailArchiver-Operators,OU=Groups,DC=company,DC=local</code> · По умолчанию: <code>(пусто)</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Учитывать вложенные группы</span><code>ldap.nested_groups</code></div>
+  <div class="pdesc"><p>Член группы, которая входит в группу администраторов, — тоже администратор (Active Directory).</p>
+    <p class="prec">💡 Включено для Active Directory.</p>
+    <p class="pmeta">Пример: <code>true</code> · По умолчанию: <code>true</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Сотрудники входят доменным паролем</span><code>ldap.employee_login</code></div>
+  <div class="pdesc"><p>Сотрудник, не входящий в группы выше, может войти доменным логином и паролем в архив своих ящиков: ящик находится по адресу mail из каталога (логин ящика или адрес в справочнике сотрудников).</p>
+    <p class="prec">💡 Включите, если сотрудникам удобнее доменный пароль, чем пароль почты.</p>
+    <p class="pmeta">Пример: <code>false</code> · По умолчанию: <code>false</code></p>
+  </div></div>
+<div class="prow">
+  <div class="pname"><span class="ptitle">Ожидание ответа LDAP, с</span><code>ldap.timeout_s</code></div>
+  <div class="pdesc"><p>Сколько ждать сервер каталога при входе.</p>
+    <p class="prec">💡 10.</p>
+    <p class="pmeta">Пример: <code>10</code> · По умолчанию: <code>10</code></p>
   </div></div>
 </div>
 <h3 class="pg">🗝️ Вход в ящики через администратора почты</h3>
@@ -2541,7 +2805,9 @@ cron-выражение подставится само. Для особых с�
 <p id="audit">Раздел <b>«Аудит»</b> (только администратору) — кто, когда и что делал: входы, изменения ящиков и
 настроек, поиск по письмам, восстановление, перенос ящиков между сотрудниками. Поиск над таблицей ищет
 по пользователю, действию и подробностям (например, адрес ящика); «Показать ещё» листает к более старым
-записям.</p>
+записям. Каждая запись <b>подписана</b> (цепочка HMAC-SHA256 с ключом из файла <code>secret.key</code>, которого нет
+в базе): «🔏 Проверить целостность» показывает изменённые, удалённые и вставленные задним числом записи;
+«⬇ CSV» выгружает аудит с подписями.</p>
 <img class="shot" src="img/11_logs.png" alt="Логи">
 <div class="cap">Просмотр логов сервиса</div>
 
@@ -2560,6 +2826,19 @@ cron-выражение подставится само. Для особых с�
 безопасности: внешние картинки, стили и шрифты (трекинг-пиксели) не загружаются, пока вы не нажмёте
 «Показать картинки».</li>
 </ul>
+
+<h3 id="ldap">Вход через LDAP / Active Directory</h3>
+<p>«Настройки → Вход через LDAP» — администраторы и операторы входят доменным логином и паролем, роль — по
+группе каталога (вложенные группы Active Directory учитываются); учётная запись архива заводится сама при первом
+входе и отключается, когда человека убирают из групп. По желанию сотрудники входят доменным паролем в архив
+своих ящиков (по адресу почты). Пароль уходит только по <code>ldaps://</code> или StartTLS; кнопка «Проверить»
+показывает, кого найдёт каталог и какую роль получит.</p>
+<h3 id="apitokens">API-токены</h3>
+<p>Для скриптов и интеграций администратор выпускает токен в разделе «Пользователи → 🔑 API-токены»: имя,
+владелец, роль (администратор или оператор — не выше роли владельца) и срок. Токен показывается один раз; запрос
+с заголовком <code>Authorization: Bearer ma_…</code> выполняется от имени владельца, в аудите — с пометкой
+токена. С токеном недоступны свой пароль, двухфакторный вход, пользователи и сами токены; отзыв действует сразу.</p>
+<pre class="cmd">curl -H "Authorization: Bearer ma_…" https://mail-archive.company.ru/api/state</pre>
 
 <h3 id="roles">Роли: администратор и оператор</h3>
 <p>Пользователей интерфейса заводит администратор в разделе <b>«Пользователи»</b> и выбирает роль (её можно
@@ -2686,6 +2965,10 @@ sudo chown root:mailarchiver /etc/mailarchiver/storage.key && sudo chmod 640 /et
 хватит, <b>прежние копии</b> после «с нуля» (сколько их, сколько места занимают, есть ли письма, которых нет в
 архиве, и самая старая), состояние копии вне сервера, неудачные входы. В карточке «Уведомления» —
 «Посмотреть сводку» и «Отправить сейчас».</p>
+<p><b>Уведомления</b> об ошибках заданий, сводка и предупреждения мониторинга уходят во все настроенные каналы:
+почту, <b>Telegram</b> (бот и чат или канал) и <b>вебхук</b> — POST с JSON для своего сервиса или в формате Slack,
+Mattermost, Rocket.Chat; запрос можно подписать секретом (заголовок <code>X-MailArchiver-Signature</code>).
+«Отправить проверочное уведомление» показывает итог по каждому каналу.</p>
 <p><b>Метрики</b> <code>/metrics</code> в формате Prometheus включаются в «Настройки → Мониторинг»: ящики по
 состояниям, давность последней копии каждого ящика, очередь, диск, прежние копии
 (<code>mailarchiver_quarantines{state="total|unchecked|with_unique"}</code>,
@@ -2924,7 +3207,15 @@ MailArchiver делает три вещи:</p>
 <tr><td>POST</td><td>/api/users</td><td>новый пользователь <code>{"username", "password", "role": "operator" | "admin"}</code> (без роли — оператор)</td></tr>
 <tr><td>POST</td><td>/api/users/{id}/role</td><td>сменить роль пользователя <code>{"role": "admin" | "operator"}</code> (сеансы пользователя завершаются)</td></tr>
 <tr><td>GET</td><td>/metrics</td><td>метрики Prometheus (если включены; с разрешённых адресов или по токену)</td></tr>
+<tr><td>GET, POST, DELETE</td><td>/api/tokens, /api/tokens/{id}</td><td>API-токены: список, выпуск <code>{"name", "role", "days"}</code>, отзыв</td></tr>
+<tr><td>GET, POST</td><td>/api/cases, /api/cases/{id}</td><td>дела: список, создание <code>{"name", "query", "date_from", "date_to", "hold", "account_ids"}</code>, сведения</td></tr>
+<tr><td>POST</td><td>/api/cases/{id}/custodians, …/export, …/close</td><td>ящики дела, выгрузка ZIP заданием, закрытие (снимает удержание)</td></tr>
+<tr><td>GET</td><td>/api/audit/verify, /api/audit/export.csv</td><td>проверка цепочки подписей аудита, аудит в CSV</td></tr>
+<tr><td>GET</td><td>/api/journal/status</td><td>приём журналирования по SMTP: работает ли, сколько принято</td></tr>
+<tr><td>POST</td><td>/api/notifications/test, /api/ldap/test</td><td>проверочное уведомление во все каналы; проверка каталога LDAP</td></tr>
 </table>
+<p>Скрипты обращаются к API с <b>API-токеном</b> в заголовке <code>Authorization: Bearer ma_…</code> (раздел
+«Пользователи»): ни cookie, ни заголовок <code>X-Requested-With</code> для них не нужны.</p>
 
 <hr style="margin:40px 0;border:none;border-top:1px solid var(--bd)">
 <p class="cap">MailArchiver · документация сгенерирована из исходного кода, поэтому справочник параметров

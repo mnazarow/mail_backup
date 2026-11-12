@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import threading
@@ -33,7 +34,8 @@ log = get_logger("db")
 #: Настройки, значения которых хранятся в БД в зашифрованном виде
 #: (шифруются в :meth:`Database.set_setting`, расшифровываются в
 #: :meth:`Database.get_setting`).
-_ENCRYPTED_SETTINGS = {"notifications.smtp_password", "employees.source_url_password",
+_ENCRYPTED_SETTINGS = {"notifications.smtp_password", "notifications.telegram_bot_token", "ldap.bind_password",
+                       "notifications.webhook_secret", "employees.source_url_password",
                        "replica.s3_secret_key", "monitoring.metrics_token", "mailadmin.password",
                        "axigen.admin_password", "axigen.ftp_password"}
 
@@ -116,6 +118,17 @@ def _row_int(row, key: str) -> int:
         return int(value or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def audit_sign(key: bytes, prev: str, ts: str, user: str, action: str, detail: str) -> str:
+    import hmac
+    msg = "\x1f".join((prev or "", ts or "", user or "", action or "", detail or "")).encode("utf-8")
+    return hmac.new(key, msg, hashlib.sha256).hexdigest()
+
+
+def audit_kid(key: bytes) -> str:
+    """Отпечаток ключа подписи аудита: по нему видно, что файл секретного ключа заменили."""
+    return hashlib.sha256(b"kid:" + key).hexdigest()[:12]
 
 
 def _ma_lower(value):
@@ -260,6 +273,12 @@ class Database:
             # почтовый клиент раздела «Почта»: папки сервера, отправители, черновики (1.17.0)
             from .webmail import ensure_schema as _ensure_webmail
             _ensure_webmail(conn)
+            # «Дела»: юридическое удержание и выгрузка писем (1.20.0)
+            from .cases import ensure_schema as _ensure_cases
+            _ensure_cases(conn)
+            # API-токены для скриптов и интеграций (1.20.0)
+            from .apitokens import ensure_schema as _ensure_tokens
+            _ensure_tokens(conn)
         self._encrypt_plain_settings()
 
     def _encrypt_plain_settings(self) -> None:
@@ -340,6 +359,12 @@ class Database:
             # логины ящиков, которые у сотрудника уже были: удалённый или отвязанный ящик синхронизация
             # не заводит снова (1.15.0; раньше — один флаг had_account на весь справочник сотрудника)
             ("employees", "known_logins", "TEXT DEFAULT ''"),
+            # цепочка подписей аудита (1.20.0): подпись записи и подпись предыдущей
+            ("audit", "prev_hash", "TEXT NOT NULL DEFAULT ''"),
+            ("audit", "hash", "TEXT NOT NULL DEFAULT ''"),
+            ("audit", "kid", "TEXT NOT NULL DEFAULT ''"),
+            # откуда учётная запись: local | ldap (1.20.0)
+            ("users", "auth_source", "TEXT NOT NULL DEFAULT 'local'"),
             # письма, которых в папке на сервере больше нет (удалены, перенесены) — почтовый клиент их
             # не показывает, архив хранит (1.17.0)
             ("messages", "gone", "INTEGER NOT NULL DEFAULT 0"),
@@ -635,11 +660,9 @@ class Database:
             conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
                          (self._LEGACY_RETENTION_MARK, str(removed)))
             if removed:
-                conn.execute(
-                    "INSERT INTO audit(ts, user, action, detail) VALUES(?,?,?,?)",
-                    (utcnow_iso(), "system", "schedules_cleanup",
-                     f"удалено устаревших расписаний очистки ящиков: {removed} — очистку по сроку "
-                     f"хранения теперь ставит ежедневный обход (retention.cron)"))
+                self._audit_insert(conn, "system", "schedules_cleanup",
+                                   f"удалено устаревших расписаний очистки ящиков: {removed} — очистку по сроку "
+                                   f"хранения теперь ставит ежедневный обход (retention.cron)")
             conn.commit()
             if removed:
                 log.info("Удалено устаревших расписаний очистки ящиков: %d — их работу выполняет "
@@ -687,7 +710,7 @@ class Database:
         return self.query_one("SELECT * FROM users WHERE id=?", (user_id,))
 
     def list_users(self) -> List[sqlite3.Row]:
-        return self.query("SELECT id, username, role, created_at, last_login, disabled, totp_enabled "
+        return self.query("SELECT id, username, role, created_at, last_login, disabled, totp_enabled, auth_source "
                           "FROM users ORDER BY id")
 
     def set_user_password(self, user_id: int, password_hash: str) -> None:
@@ -1038,7 +1061,21 @@ class Database:
         )
 
     def set_account_hold(self, account_id: int, hold_until: str, reason: str = "manual") -> None:
-        """Удержание архива ящика: до даты (ГГГГ-ММ-ДД) очистка по сроку его не трогает."""
+        """Удержание архива ящика: до даты (ГГГГ-ММ-ДД) очистка по сроку его не трогает.
+
+        Ящик удерживается делом (1.20.0, ``case_holds``) — его удержание не меняется: новое значение
+        запоминается и вернётся, когда ящик перестанет удерживать последнее дело. Так ни увольнение,
+        ни групповые действия не снимут удержание, поставленное для проверки или спора.
+        """
+        if reason != "case":
+            try:
+                held = self.query_one("SELECT 1 FROM case_holds WHERE account_id=?", (account_id,))
+            except sqlite3.OperationalError:
+                held = None
+            if held is not None:
+                self.execute("UPDATE case_holds SET prev_until=?, prev_reason=? WHERE account_id=?",
+                             (hold_until or "", reason if hold_until else "", account_id))
+                return
         self.execute("UPDATE accounts SET hold_until=?, hold_reason=?, updated_at=? WHERE id=?",
                      (hold_until or "", reason if hold_until else "", utcnow_iso(), account_id))
 
@@ -2236,6 +2273,17 @@ class Database:
     def purge_older(self, table: str, column: str, before: str) -> int:
         if table not in ("audit", "stats_daily", "restores", "login_attempts"):
             raise ValueError(table)
+        if table == "audit":
+            # Старые записи аудита удаляются по сроку — отмечаем, до какой записи: проверка цепочки
+            # отличит это от удаления записей вручную.
+            with self.transaction() as conn:
+                upto = conn.execute("SELECT MAX(id) FROM audit WHERE ts < ?", (before,)).fetchone()[0]
+                if not upto:
+                    return 0
+                cur = conn.execute("DELETE FROM audit WHERE id <= ?", (int(upto),))
+                conn.execute("INSERT INTO meta(key, value) VALUES('audit_purged_upto', ?) ON CONFLICT(key) "
+                             "DO UPDATE SET value=excluded.value", (str(int(upto)),))
+                return int(cur.rowcount or 0)
         cur = self.execute(f"DELETE FROM {table} WHERE {column} < ?", (before,))
         return int(cur.rowcount or 0)
 
@@ -2615,11 +2663,86 @@ class Database:
         return out
 
     def add_audit(self, user: str, action: str, detail: str = "") -> None:
+        with self.transaction() as conn:
+            self._audit_insert(conn, user, action, detail)
+
+    def _audit_key(self) -> bytes:
+        key = getattr(self.secret, "audit_key", None)
+        return key if isinstance(key, bytes) and key else b"mailarchiver-audit-chain-no-key"
+
+    def _audit_insert(self, conn, user: str, action: str, detail: str = "") -> None:
+        """Запись аудита с подписью цепочки (1.20.0).
+
+        Подпись — HMAC-SHA256 (ключ из файла секретного ключа, его в базе нет) от подписи
+        предыдущей записи и полей этой. Изменённая, удалённая или вставленная задним числом
+        запись разрывает цепочку — это видно в «Аудит → Проверить целостность».
+        """
         # Имя пользователя тоже обрезаем: при входе оно приходит от анонима.
-        self.execute(
-            "INSERT INTO audit(ts, user, action, detail) VALUES(?,?,?,?)",
-            (utcnow_iso(), str(user or "")[:320], str(action or "")[:64], str(detail or "")[:1000]),
-        )
+        ts, user, action, detail = (utcnow_iso(), str(user or "")[:320], str(action or "")[:64],
+                                    str(detail or "")[:1000])
+        last = conn.execute("SELECT hash FROM audit ORDER BY id DESC LIMIT 1").fetchone()
+        prev = (last[0] if last is not None else "") or ""
+        key = self._audit_key()
+        conn.execute("INSERT INTO audit(ts, user, action, detail, prev_hash, hash, kid) VALUES(?,?,?,?,?,?,?)",
+                     (ts, user, action, detail, prev, audit_sign(key, prev, ts, user, action, detail),
+                      audit_kid(key)))
+
+    def verify_audit(self, batch: int = 5000) -> Dict[str, Any]:
+        """Проверить цепочку подписей аудита от первой записи до последней."""
+        key = self._audit_key()
+        kid = audit_kid(key)
+        res: Dict[str, Any] = {"total": 0, "verified": 0, "legacy": 0, "other_key": 0, "broken": [],
+                               "head_id": 0, "head_hash": "", "kid": kid}
+        prev_hash = None
+        started = False
+        last_id = 0
+        while True:
+            rows = self.query("SELECT id, ts, user, action, detail, prev_hash, hash, kid FROM audit WHERE id > ? "
+                              "ORDER BY id LIMIT ?", (last_id, batch))
+            if not rows:
+                break
+            for r in rows:
+                last_id = int(r["id"])
+                res["total"] += 1
+                if not r["hash"]:
+                    if started:
+                        res["broken"].append({"id": last_id, "ts": r["ts"], "reason": "запись без подписи"})
+                    else:
+                        res["legacy"] += 1
+                    prev_hash = ""
+                    continue
+                if started and (r["prev_hash"] or "") != (prev_hash or ""):
+                    res["broken"].append({"id": last_id, "ts": r["ts"],
+                                          "reason": "предыдущая запись удалена или изменена"})
+                started = True
+                if (r["kid"] or "") != kid:
+                    res["other_key"] += 1
+                elif audit_sign(key, r["prev_hash"] or "", r["ts"] or "", r["user"] or "", r["action"] or "",
+                                r["detail"] or "") != r["hash"]:
+                    res["broken"].append({"id": last_id, "ts": r["ts"], "reason": "запись изменена"})
+                else:
+                    res["verified"] += 1
+                prev_hash = r["hash"]
+                res["head_id"], res["head_hash"] = last_id, r["hash"]
+                if len(res["broken"]) >= 200:
+                    break
+            if len(res["broken"]) >= 200:
+                break
+        purged = int(self.get_meta("audit_purged_upto") or 0)
+        res["purged_upto"] = purged
+        first = self.scalar("SELECT MIN(id) FROM audit")
+        if first is not None and int(first) > purged + 1:
+            res["broken"].insert(0, {"id": int(first), "ts": "", "reason": f"удалены записи #{purged + 1}–#{int(first) - 1} "
+                                                                           f"(не по сроку хранения аудита)"})
+        try:
+            seq = self.scalar("SELECT seq FROM sqlite_sequence WHERE name='audit'")
+        except sqlite3.Error:
+            seq = None
+        last = int(self.scalar("SELECT MAX(id) FROM audit") or 0)
+        if seq is not None and int(seq) > last and (last or int(seq) > purged):
+            res["broken"].append({"id": int(seq), "ts": "", "reason": f"удалены последние записи #{last + 1}–#{int(seq)}"})
+        res["ok"] = not res["broken"]
+        return res
 
     # ======================================================================
     #  Групповые действия
@@ -2957,7 +3080,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     last_backup_at            TEXT,              -- последняя удачная резервная копия
     last_backup_status        TEXT DEFAULT '',
     hold_until                TEXT DEFAULT '',   -- удержание архива до даты (ГГГГ-ММ-ДД)
-    hold_reason               TEXT DEFAULT '',   -- dismissed | manual
+    hold_reason               TEXT DEFAULT '',   -- dismissed | manual | case
     dismissed_at              TEXT,              -- когда сотрудник уволен
     auto_disabled             INTEGER NOT NULL DEFAULT 0, -- копирование выключено увольнением
     server_id                 INTEGER,                     -- подключение к почтовому серверу (auth_type=server)
@@ -3194,11 +3317,14 @@ CREATE TABLE IF NOT EXISTS replica_files (
 CREATE INDEX IF NOT EXISTS idx_replica_grp ON replica_files(grp);
 
 CREATE TABLE IF NOT EXISTS audit (
-    id     INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts     TEXT,
-    user   TEXT,
-    action TEXT,
-    detail TEXT
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts        TEXT,
+    user      TEXT,
+    action    TEXT,
+    detail    TEXT,
+    prev_hash TEXT NOT NULL DEFAULT '',   -- подпись предыдущей записи (1.20.0)
+    hash      TEXT NOT NULL DEFAULT '',   -- HMAC-SHA256 этой записи вместе с prev_hash
+    kid       TEXT NOT NULL DEFAULT ''    -- отпечаток ключа подписи
 );
 
 -- Групповые действия над ящиками: что, кем и над какими ящиками сделано,

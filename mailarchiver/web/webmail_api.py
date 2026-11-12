@@ -15,11 +15,13 @@ from __future__ import annotations
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from .. import webmail as wm
 from .. import webmail_more as wx
+from .. import webmail_dav as wdav
+from .. import webmail_secure as wsec
 from .. import webmail_tools as wt
 from ..errors import ValidationError
 from ..models import AuthType
@@ -522,6 +524,8 @@ class DraftUpdateBody(BaseModel):
     from_addr: Optional[str] = Field(default=None, max_length=300)
     priority: Optional[bool] = None
     receipt: Optional[bool] = None
+    smime_sign: Optional[bool] = None
+    smime_encrypt: Optional[bool] = None
     #: положить и в «Черновики» сервера (при «Сохранить» и закрытии окна, не при автосохранении)
     to_server: bool = False
 
@@ -576,26 +580,165 @@ def webmail_draft_detach(request: Request, draft_id: int, n: int, user: dict = D
     return {"ok": True}
 
 
+class SendBody(BaseModel):
+    #: пользователь подтвердил предупреждения проверки перед отправкой (1.20.0)
+    confirm: bool = False
+
+
+def _presend_response(exc: "wm.PresendWarning") -> JSONResponse:
+    return JSONResponse(status_code=409, content={"error": True, "code": "presend_warn", "message": exc.message,
+                                                  "hint": None, "items": exc.items})
+
+
 @router.post("/drafts/{draft_id}/send")
-def webmail_draft_send(request: Request, draft_id: int, user: dict = Depends(_user)):
+def webmail_draft_send(request: Request, draft_id: int, body: Optional[SendBody] = None, user: dict = Depends(_user)):
     svc = _svc(request)
     _row, acc = _draft_account(svc, user, draft_id)
     _require_act(svc, user, acc)
-    return wm.send(svc, acc, draft_id, _owner(svc, user), actor=_actor(user))
+    try:
+        return wm.send(svc, acc, draft_id, _owner(svc, user), actor=_actor(user),
+                       confirmed=bool(body and body.confirm))
+    except wm.PresendWarning as exc:
+        return _presend_response(exc)
 
 
 class ScheduleBody(BaseModel):
     send_at: str = Field(min_length=10, max_length=40)
+    confirm: bool = False
 
 
 @router.post("/drafts/{draft_id}/schedule")
 def webmail_draft_schedule(request: Request, draft_id: int, body: ScheduleBody, user: dict = Depends(_user)):
     """Отправить позже: письмо уйдёт в назначенное время, даже если клиент закрыт."""
     svc = _svc(request)
-    _row, acc = _draft_account(svc, user, draft_id)
+    row, acc = _draft_account(svc, user, draft_id)
     _require_act(svc, user, acc)
+    try:
+        _msg, rcpts, atts = wm.build_message(svc, acc, row, wm.get_identity(svc, acc))
+        wm.check_before_send(svc, acc, row, rcpts, atts, confirmed=body.confirm, actor=_actor(user))
+    except wm.PresendWarning as exc:
+        return _presend_response(exc)
     return wt.schedule_send(svc, acc, draft_id, _owner(svc, user), body.send_at, actor=_actor(user),
                             role=str(user.get("role") or ""))
+
+
+class ArchivedBody(BaseModel):
+    message_ids: List[int] = Field(min_length=1, max_length=20)
+
+
+@router.post("/drafts/{draft_id}/archived")
+def webmail_draft_archived(request: Request, draft_id: int, body: ArchivedBody, user: dict = Depends(_user)):
+    """Приложить письма из архива (.eml): сотрудник — из своих ящиков, администратор — из любых (1.20.0)."""
+    svc = _svc(request)
+    _row, acc = _draft_account(svc, user, draft_id)
+    allowed = set(auth_mod.mailbox_ids(user)) if _is_mailbox(user) else None
+    try:
+        items = wsec.attach_archived(svc, draft_id, _owner(svc, user), body.message_ids, allowed)
+    except ValidationError as exc:
+        if exc.code == "not_found":
+            raise HTTPException(404, exc.message) from None
+        raise
+    if not _is_mailbox(user):
+        svc.db.add_audit(_actor(user), "webmail_attach_archive",
+                         f"ящик «{acc.name}»: к письму приложены письма архива #{', #'.join(map(str, body.message_ids))}")
+    return {"items": items}
+
+
+# ---------------------------------------------------------------------------
+#  S/MIME (1.20.0): сертификат ящика, сертификаты получателей, расшифровка
+# ---------------------------------------------------------------------------
+@router.get("/smime")
+def webmail_smime(request: Request, account_id: int, user: dict = Depends(_user)):
+    svc = _svc(request)
+    acc = _account(svc, user, account_id)
+    return {"key": wsec.key_info(svc, acc),
+            "certs": int(svc.db.scalar("SELECT COUNT(*) FROM webmail_smime_certs") or 0)}
+
+
+@router.post("/smime/key")
+def webmail_smime_key(request: Request, account_id: int = Form(...), password: str = Form(""),
+                      file: UploadFile = File(...), user: dict = Depends(_user)):
+    svc = _svc(request)
+    acc = _account(svc, user, account_id)
+    if not _is_mailbox(user):
+        _require_act(svc, user, acc)
+    return wsec.upload_key(svc, acc, file.file.read(256 * 1024 + 1), password, _actor(user))
+
+
+@router.delete("/smime/key")
+def webmail_smime_key_delete(request: Request, account_id: int, user: dict = Depends(_user)):
+    svc = _svc(request)
+    acc = _account(svc, user, account_id)
+    if not _is_mailbox(user):
+        _require_act(svc, user, acc)
+    wsec.delete_key(svc, acc, _actor(user))
+    return {"ok": True}
+
+
+@router.get("/smime/certs")
+def webmail_smime_certs(request: Request, q: str = "", user: dict = Depends(_user)):
+    return {"items": wsec.list_certs(_svc(request), q[:200])}
+
+
+@router.post("/smime/certs")
+def webmail_smime_cert_upload(request: Request, file: UploadFile = File(...), user: dict = Depends(_user)):
+    return wsec.import_cert(_svc(request), file.file.read(64 * 1024), _actor(user))
+
+
+@router.delete("/smime/certs")
+def webmail_smime_cert_delete(request: Request, email: str, user: dict = Depends(_user)):
+    if _is_mailbox(user):
+        raise HTTPException(403, "Удалять сертификаты получателей может администратор.")
+    wsec.delete_cert(_svc(request), email[:320], _actor(user))
+    return {"ok": True}
+
+
+@router.get("/smime/recipients")
+def webmail_smime_recipients(request: Request, account_id: int, emails: str = "", user: dict = Depends(_user)):
+    from email.utils import getaddresses
+    svc = _svc(request)
+    acc = _account(svc, user, account_id)
+    addrs = [a for _n, a in getaddresses([emails[:20000]]) if a]
+    return wsec.recipients_state(svc, acc, addrs)
+
+
+def _decrypted(svc, user: dict, account_id: int, pk: int) -> bytes:
+    acc = _account(svc, user, account_id)
+    row = _message_row(svc, acc, pk)
+    if int(row["size"] or 0) > 30 * 1024 * 1024:
+        raise ValidationError("Письмо слишком большое, чтобы расшифровать его здесь.")
+    return wsec.decrypt(svc, acc, svc.store.read_message(int(acc.id), row["stored_path"]))
+
+
+@router.get("/decrypted")
+def webmail_decrypted(request: Request, account_id: int, id: int, user: dict = Depends(_user)):
+    """Зашифрованное S/MIME письмо — расшифрованным (на сервере ничего не сохраняется)."""
+    from ..mailview import summarize_source
+    svc = _svc(request)
+    data = _decrypted(svc, user, account_id, id)
+    import io
+    parsed = summarize_source(lambda: io.BytesIO(data), len(data))
+    parsed["id"] = id
+    acc = svc.db.get_account(int(account_id))
+    svc.db.add_audit(_actor(user), "webmail_decrypt", f"ящик «{acc.name if acc else account_id}»: письмо #{id}")
+    return parsed
+
+
+@router.get("/decrypted/attachment")
+def webmail_decrypted_attachment(request: Request, account_id: int, id: int, index: int, user: dict = Depends(_user)):
+    import io
+    from urllib.parse import quote
+    from ..mailview import attachment_from_source
+    svc = _svc(request)
+    data = _decrypted(svc, user, account_id, id)
+    att = attachment_from_source(lambda: io.BytesIO(data), len(data), int(index))
+    if att is None:
+        raise HTTPException(404, "Вложение не найдено")
+    name, _ctype, chunks, _length = att
+    safe = "".join(ch if 32 <= ord(ch) < 127 and ch not in '"\\' else "_" for ch in (name or "file")) or "file"
+    return Response(b"".join(chunks), media_type="application/octet-stream",
+                    headers={"Content-Disposition": f'attachment; filename="{safe}"; filename*=UTF-8\'\'{quote(name or "file")}'})
+
 
 
 @router.post("/drafts/{draft_id}/unschedule")
@@ -998,8 +1141,85 @@ def webmail_invite(request: Request, body: InviteBody, user: dict = Depends(_use
     svc = _svc(request)
     acc = _account(svc, user, body.account_id)
     _require_act(svc, user, acc)
-    return wt.invite_reply(svc, acc, _message_row(svc, acc, body.id), body.partstat, comment=body.comment,
-                           actor=_actor(user))
+    row = _message_row(svc, acc, body.id)
+    res = wt.invite_reply(svc, acc, row, body.partstat, comment=body.comment, actor=_actor(user))
+    if body.partstat in ("ACCEPTED", "TENTATIVE"):
+        try:
+            _info, ics = wt._invite_of(svc, acc, row)  # noqa: SLF001
+            res["calendar"] = wdav.add_invitation(svc, acc, ics, body.partstat)
+        except ValidationError:
+            res["calendar"] = False
+    return res
+
+
+# ---------------------------------------------------------------------------
+#  Календарь и контакты сервера (CalDAV, CardDAV — 1.20.0)
+# ---------------------------------------------------------------------------
+class DavBody(BaseModel):
+    account_id: int
+    url: str = Field(default="", max_length=1000)
+    username: str = Field(default="", max_length=320)
+    calendar: str = Field(default="", max_length=2000)
+    addressbook: str = Field(default="", max_length=2000)
+
+
+@router.get("/dav")
+def webmail_dav(request: Request, account_id: int, user: dict = Depends(_user)):
+    svc = _svc(request)
+    acc = _account(svc, user, account_id)
+    out = wdav.settings(svc, acc)
+    out["can_configure"] = not _is_mailbox(user)
+    return out
+
+
+@router.put("/dav")
+def webmail_dav_save(request: Request, body: DavBody, user: dict = Depends(_user)):
+    """Подключить календарь и контакты сервера: адрес задаёт администратор (запросы идут с сервера архива)."""
+    svc = _svc(request)
+    acc = _account(svc, user, body.account_id)
+    if _is_mailbox(user):
+        raise HTTPException(403, "Адрес календаря и контактов задаёт администратор архива.")
+    return wdav.configure(svc, acc, body.url, calendar=body.calendar, addressbook=body.addressbook,
+                          username=body.username, actor=_actor(user))
+
+
+class AccountOnly(BaseModel):
+    account_id: int
+
+
+@router.post("/dav/contacts")
+def webmail_dav_contacts(request: Request, body: AccountOnly, user: dict = Depends(_user)):
+    svc = _svc(request)
+    acc = _account(svc, user, body.account_id)
+    _require_online(svc, user, acc)
+    return wdav.sync_contacts(svc, acc)
+
+
+@router.get("/calendar")
+def webmail_calendar(request: Request, account_id: int, days: int = 30, user: dict = Depends(_user)):
+    svc = _svc(request)
+    acc = _account(svc, user, account_id)
+    _require_online(svc, user, acc)
+    return {"items": wdav.events(svc, acc, days)}
+
+
+class EventBody(BaseModel):
+    account_id: int
+    summary: str = Field(max_length=500)
+    start: str = Field(max_length=40)
+    end: str = Field(default="", max_length=40)
+    location: str = Field(default="", max_length=500)
+    description: str = Field(default="", max_length=4000)
+    all_day: bool = False
+
+
+@router.post("/calendar")
+def webmail_calendar_add(request: Request, body: EventBody, user: dict = Depends(_user)):
+    svc = _svc(request)
+    acc = _account(svc, user, body.account_id)
+    _require_act(svc, user, acc)
+    return wdav.add_event(svc, acc, summary=body.summary, start=body.start, end=body.end, location=body.location,
+                          description=body.description, all_day=body.all_day, actor=_actor(user))
 
 
 @router.get("/invite.ics")

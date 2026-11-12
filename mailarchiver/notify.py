@@ -1,17 +1,24 @@
 """
-Уведомления по e-mail (SMTP). Отправляются по завершении заданий согласно
-настройкам ``notifications`` (об ошибках и/или об успехе). Полностью
-опциональны и не влияют на основную работу при сбое отправки.
+Уведомления: e-mail (SMTP), Telegram и вебхук (1.20.0). Отправляются по завершении заданий
+согласно настройкам ``notifications`` (об ошибках и/или об успехе), а также сводка и
+предупреждения мониторинга. Каждый настроенный канал получает то же сообщение; сбой одного
+канала не мешает остальным. Полностью опциональны и не влияют на основную работу.
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 import queue
 import smtplib
+import socket
 import ssl
 import threading
 import time
+import urllib.error
+import urllib.request
 from email.message import EmailMessage
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from .logging_setup import get_logger
 
@@ -87,7 +94,88 @@ class Notifier:
             log.warning("Не удалось отправить уведомление: %s", exc)
             return False
 
+    def _get(self, key: str, default=None):
+        return self.services.db.get_setting(f"notifications.{key}", self._cfg().get(key, default))
+
+    def channels(self) -> Dict[str, bool]:
+        """Какие каналы настроены."""
+        mail_to = self._get("mail_to", [])
+        return {"email": bool(self._get("smtp_host", "")) and bool(mail_to),
+                "telegram": bool(self._get("telegram_bot_token", "")) and bool(str(self._get("telegram_chat_id", "")).strip()),
+                "webhook": bool(str(self._get("webhook_url", "") or "").strip())}
+
     def send(self, subject: str, body: str) -> None:
+        """Отправить во все настроенные каналы. Ошибка — если не ушло ни в один."""
+        results = self.send_all(subject, body)
+        if not results:
+            raise RuntimeError("Не настроен ни один канал уведомлений: заполните SMTP и получателей, Telegram "
+                               "или адрес вебхука.")
+        if all(results.values()):
+            raise RuntimeError("; ".join(f"{k}: {v}" for k, v in results.items()))
+        for name, err in results.items():
+            if err:
+                log.warning("Уведомление «%s» не ушло в канал %s: %s", subject, name, err)
+
+    def send_all(self, subject: str, body: str) -> Dict[str, str]:
+        """Отправить во все настроенные каналы: {канал: текст ошибки или ''}."""
+        out: Dict[str, str] = {}
+        senders = {"email": self.send_email, "telegram": self.send_telegram, "webhook": self.send_webhook}
+        for name, on in self.channels().items():
+            if not on:
+                continue
+            try:
+                senders[name](subject, body)
+                out[name] = ""
+            except Exception as exc:  # noqa: BLE001 - один канал не мешает другим
+                out[name] = str(getattr(exc, "reason", None) or exc)[:300]
+        return out
+
+    # --- Telegram ---
+    def send_telegram(self, subject: str, body: str) -> None:
+        token = str(self._get("telegram_bot_token", "") or "").strip()
+        chat = str(self._get("telegram_chat_id", "") or "").strip()
+        base = str(self._get("telegram_api_url", "") or "https://api.telegram.org").strip().rstrip("/")
+        if not token or not chat:
+            raise RuntimeError("Не заданы токен бота и чат Telegram.")
+        if not base.startswith("https://"):
+            raise RuntimeError("Адрес API Telegram должен начинаться с https://.")
+        text = f"{subject}\n\n{body}"
+        if len(text) > TELEGRAM_MAX:
+            text = text[:TELEGRAM_MAX - 20] + "\n… (сокращено)"
+        payload = json.dumps({"chat_id": chat, "text": text, "disable_web_page_preview": True}).encode("utf-8")
+        data = _post(f"{base}/bot{token}/sendMessage", payload, {"Content-Type": "application/json"},
+                     secret_in_url=token)
+        try:
+            ok = bool(json.loads(data.decode("utf-8", "replace")).get("ok"))
+        except ValueError:
+            ok = False
+        if not ok:
+            raise RuntimeError("Telegram не принял сообщение: " + data.decode("utf-8", "replace")[:200])
+        log.info("Уведомление отправлено в Telegram: %s", subject)
+
+    # --- вебхук ---
+    def send_webhook(self, subject: str, body: str) -> None:
+        from .version import __version__
+        url = str(self._get("webhook_url", "") or "").strip()
+        if not url.startswith(("https://", "http://")):
+            raise RuntimeError("Адрес вебхука должен начинаться с https:// или http://.")
+        fmt = str(self._get("webhook_format", "json") or "json").strip().lower()
+        if fmt == "slack":
+            doc = {"text": f"*{subject}*\n{body}"}
+        else:
+            doc = {"event": "notification", "subject": subject, "text": body, "host": socket.gethostname(),
+                   "version": __version__, "ts": int(time.time())}
+        payload = json.dumps(doc, ensure_ascii=False).encode("utf-8")
+        headers = {"Content-Type": "application/json; charset=utf-8"}
+        secret = str(self._get("webhook_secret", "") or "")
+        if secret:
+            headers["X-MailArchiver-Signature"] = "sha256=" + hmac.new(secret.encode("utf-8"), payload,
+                                                                       hashlib.sha256).hexdigest()
+        _post(url, payload, headers)
+        log.info("Уведомление отправлено на вебхук: %s", subject)
+
+    # --- e-mail ---
+    def send_email(self, subject: str, body: str) -> None:
         cfg = self._cfg()
         host = self.services.db.get_setting("notifications.smtp_host", cfg.get("smtp_host", ""))
         if not host:
@@ -137,3 +225,25 @@ class Notifier:
                     s.login(user, password)
                 s.send_message(msg)
         log.info("Уведомление отправлено: %s", subject)
+
+
+#: Предел длины сообщения Telegram (4096 знаков).
+TELEGRAM_MAX = 4000
+
+
+def _post(url: str, payload: bytes, headers: Dict[str, str], secret_in_url: str = "") -> bytes:
+    """POST с таймаутом; текст ошибки — без секрета из адреса (токен бота)."""
+    req = urllib.request.Request(url, data=payload, headers={**headers, "User-Agent": "MailArchiver"},
+                                 method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=20, context=ssl.create_default_context()) as resp:
+            return resp.read(65536)
+    except urllib.error.HTTPError as exc:
+        text = exc.read(300).decode("utf-8", "replace") if hasattr(exc, "read") else ""
+        raise RuntimeError(f"HTTP {exc.code}: {text}".replace(secret_in_url, "***") if secret_in_url
+                           else f"HTTP {exc.code}: {text}") from None
+    except (urllib.error.URLError, OSError) as exc:
+        reason = str(getattr(exc, "reason", None) or exc)
+        if secret_in_url:
+            reason = reason.replace(secret_in_url, "***")
+        raise RuntimeError(f"нет связи: {reason}") from None

@@ -392,8 +392,9 @@ PARAM_HELP: Dict[str, dict] = {
     },
     # ---- notifications ----
     "notifications.enabled": {
-        "title": "Уведомления по e-mail",
-        "help": "Отправлять письма о результатах заданий (по SMTP).",
+        "title": "Уведомления",
+        "help": ("Сообщать о результатах заданий, сводку и предупреждения мониторинга: по e-mail (SMTP), в Telegram "
+                 "и на вебхук — во все настроенные каналы."),
         "recommend": "Включите, чтобы узнавать об ошибках бэкапа вовремя.",
         "example": "false", "default": "false",
     },
@@ -467,6 +468,47 @@ PARAM_HELP: Dict[str, dict] = {
         "recommend": "В начале рабочей недели: 0 8 * * 1.",
         "example": "0 8 * * 1", "default": "0 8 * * 1",
     },
+    "notifications.telegram_bot_token": {
+        "title": "Telegram: токен бота",
+        "help": ("Те же уведомления — в Telegram. Создайте бота у @BotFather и вставьте его токен; добавьте бота в "
+                 "группу или канал (в канал — администратором). Хранится в базе зашифрованным."),
+        "recommend": "Отдельный бот только для уведомлений архива.",
+        "example": "123456789:AA…", "default": "(пусто)",
+    },
+    "notifications.telegram_chat_id": {
+        "title": "Telegram: чат",
+        "help": ("Куда писать: номер чата или группы (например -1001234567890) или @имя публичного канала. Номер "
+                 "группы покажет любой бот вида @getidsbot, если добавить его в группу."),
+        "recommend": "Группа дежурных администраторов.",
+        "example": "-1001234567890", "default": "(пусто)",
+    },
+    "notifications.telegram_api_url": {
+        "title": "Telegram: адрес Bot API",
+        "help": ("Обычно не меняется. Свой сервер Bot API (telegram-bot-api) или шлюз — если сервер архива не "
+                 "ходит в api.telegram.org напрямую. Только https://; при смене адреса токен вводится заново."),
+        "recommend": "https://api.telegram.org.",
+        "example": "https://api.telegram.org", "default": "https://api.telegram.org",
+    },
+    "notifications.webhook_url": {
+        "title": "Вебхук: адрес",
+        "help": ("Каждое уведомление — POST с JSON на этот адрес: для своего сервиса, системы заявок, Slack, "
+                 "Mattermost, Rocket.Chat. Формат «json»: поля event, subject, text, host, version, ts."),
+        "recommend": "https:// — без шифрования текст уведомлений (имена ящиков, ошибки) уходит открыто.",
+        "example": "https://hooks.example.ru/mailarchiver", "default": "(пусто)",
+    },
+    "notifications.webhook_format": {
+        "title": "Вебхук: формат",
+        "help": "json — свой сервис (полный набор полей); slack — {\"text\": …} для Slack, Mattermost, Rocket.Chat.",
+        "recommend": "json для своего сервиса, slack для мессенджеров.",
+        "example": "json", "default": "json",
+    },
+    "notifications.webhook_secret": {
+        "title": "Вебхук: секрет подписи",
+        "help": ("Если задан, каждый запрос подписывается: заголовок X-MailArchiver-Signature: sha256=<HMAC-SHA256 "
+                 "тела запроса с этим секретом>. Получатель проверяет, что запрос пришёл от архива."),
+        "recommend": "Задайте, если вебхук доступен из интернета.",
+        "example": "(секрет)", "default": "(пусто)",
+    },
 
     # ---- search ----
     "search.enabled": {
@@ -499,6 +541,27 @@ PARAM_HELP: Dict[str, dict] = {
         "help": "Сколько текста одного письма индексировать. Длинные рассылки и выгрузки обрезаются.",
         "recommend": "16 — обычное письмо целиком.",
         "example": "16", "default": "16",
+    },
+    "search.index_attachments": {
+        "title": "Искать по тексту вложений",
+        "help": ("Индексировать текст вложений: PDF (текстовый слой), Word, Excel, PowerPoint, OpenDocument, RTF, "
+                 "текстовые файлы, HTML и вложенные письма — без внешних программ. Сканы (картинки) не "
+                 "распознаются. Действует вместе с «Искать по тексту писем» и, как он, выключается при шифровании "
+                 "копии. Уже проиндексированные письма получат текст вложений после «Перестроить индекс»."),
+        "recommend": "Включено.",
+        "example": "true", "default": "true",
+    },
+    "search.attachment_max_kb": {
+        "title": "Крупнейшее вложение для индекса, КБ",
+        "help": "Вложения крупнее не разбираются (разбор держит файл в памяти).",
+        "recommend": "10240 (10 МБ).",
+        "example": "10240", "default": "10240",
+    },
+    "search.attachment_text_kb": {
+        "title": "Текста вложений в индексе, КБ",
+        "help": "Сколько текста всех вложений одного письма индексировать. Длинные документы обрезаются.",
+        "recommend": "64.",
+        "example": "64", "default": "64",
     },
 
     # ---- replies ----
@@ -662,6 +725,189 @@ PARAM_HELP: Dict[str, dict] = {
                  "«Спам»."),
         "recommend": "Адрес ИБ или администратора почты, например security@company.ru.",
         "example": "security@company.ru", "default": "",
+    },
+    "webmail.dlp_mode": {
+        "title": "Конфиденциальные данные в письме",
+        "help": ("Перед отправкой клиент ищет в теме, тексте и вложениях номера банковских карт (с проверкой по "
+                 "алгоритму Луна), СНИЛС (с контрольным числом), паспортные данные и ИНН. warn — предупредить: "
+                 "отправить можно, подтвердив (подтверждение — в аудите, webmail_dlp_override); block_external — за "
+                 "пределы организации такие письма не отправляются, внутри — предупреждение; off — не проверять."),
+        "recommend": "warn; block_external — если так требует политика безопасности.",
+        "example": "warn", "default": "warn",
+    },
+    "webmail.warn_external": {
+        "title": "Предупреждать о внешних адресатах",
+        "help": ("Перед отправкой показать, что письмо уйдёт за пределы организации (адресаты не из доменов ящиков, "
+                 "сотрудников и «Ответы на письма → свои домены»)."),
+        "recommend": "Включено.",
+        "example": "true", "default": "true",
+    },
+    "webmail.warn_recipients": {
+        "title": "Предупреждать о большом списке адресатов",
+        "help": ("Если в «Кому» и «Копии» больше адресатов, чем указано, клиент предупредит, что все увидят адреса "
+                 "друг друга, и предложит «Скрытую копию». 0 — не предупреждать."),
+        "recommend": "20.",
+        "example": "20", "default": "20",
+    },
+
+    # ---- journal ----
+    "journal.enabled": {
+        "title": "Принимать журналирование по SMTP",
+        "help": ("Почтовый сервер отправляет копию каждого письма на этот приёмник, и она сразу попадает в архив "
+                 "ящиков отправителя и получателей (папка «Журнал») — даже если письмо удалят до очередного "
+                 "копирования. Exchange: правило журналирования на адрес-контакт, ведущий сюда; Postfix: always_bcc "
+                 "и транспорт smtp:[сервер-архива]:порт. Ящик находится по логину или адресу сотрудника."),
+        "recommend": "Включите, если нужен полный архив, включая удалённые письма.",
+        "example": "false", "default": "false",
+    },
+    "journal.listen": {
+        "title": "Адрес приёма",
+        "help": "На каком адресе слушать SMTP: 127.0.0.1 — только эта машина, 0.0.0.0 — все адреса.",
+        "recommend": "Адрес во внутренней сети, доступный почтовому серверу.",
+        "example": "0.0.0.0", "default": "127.0.0.1",
+    },
+    "journal.port": {
+        "title": "Порт приёма",
+        "help": "TCP-порт SMTP-приёмника (порты ниже 1024 служба без прав root открыть не сможет).",
+        "recommend": "2525.",
+        "example": "2525", "default": "2525",
+    },
+    "journal.allowed_ips": {
+        "title": "Кому можно отправлять журнал",
+        "help": "Адреса или сети (через запятую) почтовых серверов; с остальных подключение отклоняется.",
+        "recommend": "Только адреса своих почтовых серверов.",
+        "example": "10.0.0.10, 10.0.1.0/24", "default": "127.0.0.1, ::1",
+    },
+    "journal.address": {
+        "title": "Адрес журнала",
+        "help": "Служебный адрес, на который сервер отправляет копии (в конверте письма). Ящиком он не считается.",
+        "recommend": "Например journal@company.ru.",
+        "example": "journal@company.ru", "default": "(пусто)",
+    },
+    "journal.folder": {
+        "title": "Папка для журнала",
+        "help": "В какую папку архива ящика класть письма из журнала.",
+        "recommend": "Журнал.",
+        "example": "Журнал", "default": "Журнал",
+    },
+    "journal.unwrap_exchange": {
+        "title": "Разворачивать отчёты Exchange",
+        "help": ("Exchange присылает «журнальный отчёт»: исходное письмо — вложением, а все адресаты (и скрытые) — "
+                 "в тексте отчёта. Включено — в архив кладётся исходное письмо, адресаты берутся из отчёта."),
+        "recommend": "Включено.",
+        "example": "true", "default": "true",
+    },
+    "journal.tls_cert": {
+        "title": "Сертификат для STARTTLS",
+        "help": "Путь к сертификату (PEM) — включает шифрование STARTTLS при приёме. Пусто — без шифрования.",
+        "recommend": "Сертификат сервера архива, если журнал идёт по сети.",
+        "example": "/etc/ssl/archive.pem", "default": "(пусто)",
+    },
+    "journal.tls_key": {
+        "title": "Ключ для STARTTLS",
+        "help": "Путь к закрытому ключу (PEM) к сертификату выше; пусто — ключ в том же файле.",
+        "recommend": "Права на файл — только для службы.",
+        "example": "/etc/ssl/archive.key", "default": "(пусто)",
+    },
+    "journal.require_tls": {
+        "title": "Только с шифрованием",
+        "help": "Не принимать письма, пока отправитель не включит STARTTLS.",
+        "recommend": "Включите, если журнал идёт не по локальной сети.",
+        "example": "false", "default": "false",
+    },
+    "journal.max_size_mb": {
+        "title": "Крупнейшее письмо, МБ",
+        "help": "Письма крупнее отклоняются с ошибкой 552 (сервер-отправитель сообщит об этом).",
+        "recommend": "50.",
+        "example": "50", "default": "50",
+    },
+
+    # ---- ldap ----
+    "ldap.enabled": {
+        "title": "Вход через LDAP / Active Directory",
+        "help": ("Администраторы и операторы входят доменным логином и паролем; роль — по группе каталога. "
+                 "Учётные записи архива для них заводятся сами при первом входе; убрали из группы — вход "
+                 "запрещается, открытые сеансы завершаются. Локальные пользователи архива продолжают входить как раньше."),
+        "recommend": "Включите, если есть Active Directory, FreeIPA или OpenLDAP.",
+        "example": "false", "default": "false",
+    },
+    "ldap.url": {
+        "title": "Сервер LDAP",
+        "help": "ldaps://сервер (порт 636) или ldap://сервер (389) со StartTLS. Без шифрования пароль не отправляется.",
+        "recommend": "ldaps://dc01.company.local.",
+        "example": "ldaps://dc01.company.local", "default": "(пусто)",
+    },
+    "ldap.starttls": {
+        "title": "StartTLS для ldap://",
+        "help": "Для адреса ldap:// — включить шифрование командой StartTLS. Для ldaps:// не нужен.",
+        "recommend": "Включено.",
+        "example": "true", "default": "true",
+    },
+    "ldap.verify_ssl": {
+        "title": "Проверять сертификат сервера LDAP",
+        "help": ("Выключайте, только если сертификат контроллера выдан внутренним центром, которого нет в системе "
+                 "(лучше добавить корневой сертификат в систему)."),
+        "recommend": "Включено.",
+        "example": "true", "default": "true",
+    },
+    "ldap.bind_dn": {
+        "title": "Служебная учётная запись",
+        "help": ("Кем искать пользователей в каталоге: DN (CN=svc-archive,OU=Service,DC=company,DC=local) или "
+                 "svc-archive@company.local. Достаточно права чтения. Пусто — анонимный поиск."),
+        "recommend": "Отдельная учётная запись только для чтения.",
+        "example": "svc-archive@company.local", "default": "(пусто)",
+    },
+    "ldap.bind_password": {
+        "title": "Пароль служебной учётной записи",
+        "help": "Хранится в базе зашифрованным; при смене адреса сервера вводится заново.",
+        "recommend": "Длинный случайный пароль.",
+        "example": "(секрет)", "default": "(пусто)",
+    },
+    "ldap.base_dn": {
+        "title": "Где искать пользователей (base DN)",
+        "help": "Узел каталога, внутри которого ищутся пользователи.",
+        "recommend": "Корень домена или OU с сотрудниками.",
+        "example": "DC=company,DC=local", "default": "(пусто)",
+    },
+    "ldap.user_filter": {
+        "title": "Фильтр пользователя",
+        "help": ("Как найти пользователя по введённому логину; {login} заменяется логином (часть до «\\» "
+                 "отбрасывается). Active Directory: (&(objectClass=user)(sAMAccountName={login})); FreeIPA/OpenLDAP: "
+                 "(uid={login}); вход по адресу: (|(sAMAccountName={login})(userPrincipalName={login})(mail={login}))."),
+        "recommend": "Как в примере для вашего каталога.",
+        "example": "(&(objectClass=user)(sAMAccountName={login}))",
+        "default": "(&(objectClass=user)(sAMAccountName={login}))",
+    },
+    "ldap.admin_group": {
+        "title": "Группа администраторов",
+        "help": "DN группы, члены которой входят администраторами архива.",
+        "recommend": "Отдельная группа, например CN=MailArchiver-Admins,OU=Groups,DC=company,DC=local.",
+        "example": "CN=MailArchiver-Admins,OU=Groups,DC=company,DC=local", "default": "(пусто)",
+    },
+    "ldap.operator_group": {
+        "title": "Группа операторов",
+        "help": "DN группы, члены которой входят операторами (следят за копированием, писем не читают).",
+        "recommend": "Группа дежурной смены.",
+        "example": "CN=MailArchiver-Operators,OU=Groups,DC=company,DC=local", "default": "(пусто)",
+    },
+    "ldap.nested_groups": {
+        "title": "Учитывать вложенные группы",
+        "help": "Член группы, которая входит в группу администраторов, — тоже администратор (Active Directory).",
+        "recommend": "Включено для Active Directory.",
+        "example": "true", "default": "true",
+    },
+    "ldap.employee_login": {
+        "title": "Сотрудники входят доменным паролем",
+        "help": ("Сотрудник, не входящий в группы выше, может войти доменным логином и паролем в архив своих ящиков: "
+                 "ящик находится по адресу mail из каталога (логин ящика или адрес в справочнике сотрудников)."),
+        "recommend": "Включите, если сотрудникам удобнее доменный пароль, чем пароль почты.",
+        "example": "false", "default": "false",
+    },
+    "ldap.timeout_s": {
+        "title": "Ожидание ответа LDAP, с",
+        "help": "Сколько ждать сервер каталога при входе.",
+        "recommend": "10.",
+        "example": "10", "default": "10",
     },
 
     # ---- mailadmin ----
@@ -1354,7 +1600,9 @@ SETTINGS_SECTIONS: List[dict] = [
      "keys": ["level", "to_stdout"]},
     {"section": "notifications", "title": "Уведомления", "icon": "✉️",
      "keys": ["enabled", "smtp_host", "smtp_port", "smtp_security", "smtp_user", "smtp_password",
-              "mail_from", "mail_to", "on_success", "on_failure", "summary_enabled", "summary_cron"]},
+              "mail_from", "mail_to", "on_success", "on_failure", "summary_enabled", "summary_cron",
+              "telegram_bot_token", "telegram_chat_id", "telegram_api_url", "webhook_url", "webhook_format",
+              "webhook_secret"]},
     {"section": "monitoring", "title": "Мониторинг (Prometheus, Zabbix)", "icon": "📈",
      "keys": ["metrics_enabled", "metrics_token", "metrics_allowed_ips", "per_account_metrics"]},
     {"section": "employees", "title": "Сотрудники", "icon": "👥",
@@ -1368,14 +1616,21 @@ SETTINGS_SECTIONS: List[dict] = [
               "account_use_master", "account_use_axigen_ftp",
               "dismiss_from_file", "dismiss_missing_days", "dismissed_action", "dismissed_keep_years"]},
     {"section": "search", "title": "Поиск по письмам", "icon": "🔎",
-     "keys": ["enabled", "index_bodies", "index_bodies_encrypted", "body_max_kb"]},
+     "keys": ["enabled", "index_bodies", "index_bodies_encrypted", "body_max_kb", "index_attachments",
+              "attachment_max_kb", "attachment_text_kb"]},
     {"section": "replies", "title": "Ответы на письма", "icon": "↩️",
      "keys": ["enabled", "sla_hours", "sla_business", "work_days", "work_hours", "internal_domains",
               "exclude_senders", "match_subject"]},
     {"section": "webmail", "title": "Почтовый клиент", "icon": "✉️",
      "keys": ["enabled", "admin_actions", "mark_read", "auto_refresh_s", "max_attachments_mb", "save_sent",
               "drafts_keep_days", "undo_send_s", "rules_interval_min", "push", "drafts_on_server",
-              "phishing_report_to"]},
+              "phishing_report_to", "dlp_mode", "warn_external", "warn_recipients"]},
+    {"section": "journal", "title": "Приём журналирования (SMTP)", "icon": "📨",
+     "keys": ["enabled", "listen", "port", "allowed_ips", "address", "folder", "unwrap_exchange", "tls_cert",
+              "tls_key", "require_tls", "max_size_mb"]},
+    {"section": "ldap", "title": "Вход через LDAP / Active Directory", "icon": "🏢",
+     "keys": ["enabled", "url", "starttls", "verify_ssl", "bind_dn", "bind_password", "base_dn", "user_filter",
+              "admin_group", "operator_group", "nested_groups", "employee_login", "timeout_s"]},
     {"section": "mailadmin", "title": "Вход в ящики через администратора почты", "icon": "🗝️",
      "keys": ["enabled", "host", "user", "password", "mode", "separator"]},
     {"section": "axigen", "title": "Сервер Axigen", "icon": "📮",

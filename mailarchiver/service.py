@@ -200,9 +200,21 @@ class Services:
             self.queue.start()
             self.scheduler.start()
         self._started = True
+        if self.role == "web":
+            try:
+                from .journal import ensure as _journal_ensure
+                _journal_ensure(self)          # приём журналирования по SMTP (1.20.0), если включён
+            except Exception:  # noqa: BLE001
+                log.exception("Приём журналирования не запущен")
         log.info("Сервис запущен.")
 
     def stop(self) -> None:
+        try:
+            from .journal import _server as _journal_server, stop as _journal_stop
+            if _journal_server is not None and _journal_server.svc is self:
+                _journal_stop()
+        except Exception:  # noqa: BLE001
+            log.debug("Приём журналирования не остановлен", exc_info=True)
         try:
             from .webmail import shutdown as _webmail_shutdown
             _webmail_shutdown(self)        # соединения почтового клиента с ящиками

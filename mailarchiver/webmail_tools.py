@@ -1277,7 +1277,7 @@ def send_due(svc) -> int:
                            (f"Запланированная отправка не состоялась: {problem}.", utcnow_iso(), int(row["id"])))
             continue
         try:
-            wm.send(svc, acc, int(row["id"]), row["owner"], actor=actor or "")
+            wm.send(svc, acc, int(row["id"]), row["owner"], actor=actor or "", confirmed=True)
             sent += 1
         except (MailArchiverError, ValidationError) as exc:
             log.warning("Запланированное письмо #%s не отправлено: %s", row["id"], exc.message)

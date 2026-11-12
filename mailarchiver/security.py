@@ -64,6 +64,9 @@ class SecretBox:
         # Производим 32-байтовый ключ Fernet из секрета приложения.
         digest = hashlib.sha256(b"mailarchiver-fernet-v1:" + app_secret).digest()
         self._fernet = Fernet(base64.urlsafe_b64encode(digest))
+        #: ключ подписи цепочки записей аудита (1.20.0): файл секретного ключа лежит вне базы, поэтому
+        #: правка аудита прямо в базе не может пересчитать подписи
+        self.audit_key = hashlib.sha256(b"mailarchiver-audit-chain-v1:" + app_secret).digest()
 
     def encrypt(self, plaintext: Optional[str]) -> str:
         if plaintext is None:

@@ -60,13 +60,17 @@ MIN_SCHEDULE_INTERVAL_S = 60
 
 # Параметры-секреты: не отдаются через GET /settings и не затираются пустым
 # значением при сохранении (пустое поле = «оставить как есть»).
-SECRET_SETTINGS = {"notifications.smtp_password", "employees.source_url_password",
+SECRET_SETTINGS = {"notifications.smtp_password", "notifications.telegram_bot_token", "ldap.bind_password",
+                   "notifications.webhook_secret", "employees.source_url_password",
                    "replica.s3_secret_key", "monitoring.metrics_token", "mailadmin.password",
                    "axigen.admin_password", "axigen.ftp_password"}
 #: Секрет, который уходит на адрес из настроек: при смене адреса его нужно ввести заново
 #: (иначе администратор архива мог бы перенаправить пароль администратора почты на свой сервер).
 SECRET_BOUND_TO = {"axigen.admin_password": "axigen.host", "axigen.ftp_password": "axigen.host",
-                   "mailadmin.password": "mailadmin.host"}
+                   "mailadmin.password": "mailadmin.host",
+                   "notifications.telegram_bot_token": "notifications.telegram_api_url",
+                   "notifications.webhook_secret": "notifications.webhook_url",
+                   "ldap.bind_password": "ldap.url"}
 
 
 def _require_axigen_password(svc, new_values: Dict[str, Any]) -> None:
@@ -1111,6 +1115,11 @@ def set_hold(request: Request, account_id: int, body: HoldBody, user: dict = Dep
     from ..util import parse_day
     svc = svc_dep(request)
     acc = svc.require_account(account_id)
+    if acc.hold_reason == "case":
+        from ..cases import hold_cases_text
+        raise ValidationError(f"Архив ящика удерживается {hold_cases_text(svc, account_id) or 'делом'} — "
+                              f"удержание снимается закрытием дела.",
+                              hint="Раздел «Дела»: закройте дело или уберите из него ящик.")
     raw = (body.until or "").strip().lower()
     if raw in ("forever", "бессрочно"):
         until = HOLD_FOREVER
@@ -2553,6 +2562,9 @@ def update_settings(request: Request, body: SettingsBody, user: dict = Depends(a
     except Exception:  # noqa: BLE001
         log.exception("Не удалось применить расписания после сохранения настроек")
     _after_retention_change(svc, before_retention)
+    if any(k.startswith("journal.") for k in changed):
+        from ..journal import ensure as journal_ensure
+        journal_ensure(svc)
     shown = [k + ("=***" if k in SECRET_SETTINGS else "") for k in changed]
     svc.db.add_audit(user["username"], "settings_update", ", ".join(shown[:30]))
     result = {"ok": True, "changed": changed}
@@ -2888,6 +2900,55 @@ def monitoring_summary_preview(request: Request, user: dict = Depends(auth_mod.r
             "next_run": svc.scheduler.next_run_of("weekly_summary")}
 
 
+class LdapTestBody(BaseModel):
+    username: str = Field("", max_length=320)
+    password: str = Field("", max_length=1000)
+
+
+@router.post("/ldap/test")
+def ldap_test(request: Request, body: LdapTestBody, user: dict = Depends(auth_mod.require_admin)):
+    """Проверить подключение к каталогу: служебная учётная запись, поиск пользователя, его группы и роль."""
+    from .. import ldapauth
+    svc = svc_dep(request)
+    if not str(svc.rt("ldap", "url") or "").strip():
+        raise ValidationError("Не указан сервер LDAP.")
+    try:
+        info = ldapauth.lookup(svc, body.username or "", body.password or None) if body.username.strip() else None
+        if info is None:
+            conn = ldapauth._connect(svc)  # noqa: SLF001
+            try:
+                dn = str(svc.rt("ldap", "bind_dn") or "")
+                conn.bind(dn, str(svc.rt("ldap", "bind_password") or "") if dn else "")
+            finally:
+                conn.close()
+            info = {"ok": True, "bind_only": True}
+    except (ldapauth.LdapError, OSError) as exc:
+        svc.db.add_audit(user["username"], "ldap_test", f"ошибка: {exc}"[:300])
+        return {"ok": False, "error": str(exc)}
+    svc.db.add_audit(user["username"], "ldap_test", f"{body.username or 'служебная учётная запись'}: "
+                     + ("найден, роль " + (info.get("role") or "нет") if info.get("ok") and not info.get("bind_only")
+                        else "подключение работает" if info.get("ok") else info.get("reason", "не найден")))
+    return {"ok": bool(info.get("ok")), **{k: v for k, v in info.items() if k != "ok"}}
+
+
+@router.get("/journal/status")
+def journal_status(request: Request, user: dict = Depends(auth_mod.require_admin)):
+    """Приём журналирования по SMTP: работает ли, сколько писем принято и сохранено."""
+    from ..journal import status
+    return status(svc_dep(request))
+
+
+@router.post("/notifications/test")
+def notifications_test(request: Request, user: dict = Depends(auth_mod.require_admin)):
+    """Проверочное сообщение во все настроенные каналы (почта, Telegram, вебхук) — итог по каждому."""
+    svc = svc_dep(request)
+    results = svc.notifier.send_all("MailArchiver: проверка уведомлений",
+                                    f"Проверочное сообщение. Отправил: {user['username']}.")
+    svc.db.add_audit(user["username"], "notify_test",
+                     ", ".join(f"{k}: {'ok' if not v else 'ошибка'}" for k, v in results.items()) or "каналов нет")
+    return {"results": results}
+
+
 @router.post("/monitoring/summary")
 def monitoring_summary_send(request: Request, user: dict = Depends(auth_mod.require_admin)):
     from ..monitoring import send_weekly_summary
@@ -2944,8 +3005,49 @@ def get_audit(request: Request, limit: int = 200, before_id: Optional[int] = Non
     svc = svc_dep(request)
     limit = max(1, min(1000, int(limit)))
     rows = svc.db.list_audit(limit, before_id=before_id, query=(q or "")[:200])
-    return [{"id": r["id"], "ts": r["ts"], "user": r["user"], "action": r["action"], "detail": r["detail"]}
-            for r in rows]
+    return [{"id": r["id"], "ts": r["ts"], "user": r["user"], "action": r["action"], "detail": r["detail"],
+             "signed": bool(_row_get(r, "hash"))} for r in rows]
+
+
+@router.get("/audit/verify")
+def verify_audit(request: Request, user: dict = Depends(auth_mod.require_admin)):
+    """Проверить цепочку подписей аудита (1.20.0): изменённые, удалённые и вставленные записи."""
+    svc = svc_dep(request)
+    res = svc.db.verify_audit()
+    svc.db.add_audit(user["username"], "audit_verify",
+                     "цепочка цела" if res["ok"] else f"нарушений: {len(res['broken'])}, первое — #{res['broken'][0]['id']}")
+    return res
+
+
+@router.get("/audit/export.csv")
+def export_audit(request: Request, q: Optional[str] = None, user: dict = Depends(auth_mod.require_admin)):
+    """Аудит в CSV (новые записи первыми) — с подписями цепочки, для передачи проверяющим."""
+    import csv
+    import io
+    svc = svc_dep(request)
+    query = (q or "")[:200]
+    svc.db.add_audit(user["username"], "audit_export", f"выгрузка аудита в CSV{(' — отбор: ' + query) if query else ''}")
+
+    def rows():
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["id", "ts_utc", "user", "action", "detail", "prev_hash", "hash", "kid"])
+        yield "\ufeff" + buf.getvalue()
+        before = None
+        while True:
+            chunk = svc.db.list_audit(1000, before_id=before, query=query)
+            if not chunk:
+                break
+            buf = io.StringIO()
+            w = csv.writer(buf)
+            for r in chunk:
+                w.writerow([r["id"], r["ts"], r["user"], r["action"], r["detail"], _row_get(r, "prev_hash") or "",
+                            _row_get(r, "hash") or "", _row_get(r, "kid") or ""])
+            yield buf.getvalue()
+            before = int(chunk[-1]["id"])
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
+    return StreamingResponse(rows(), media_type="text/csv; charset=utf-8",
+                             headers={"Content-Disposition": f'attachment; filename="audit_{stamp}.csv"'})
 
 
 # =====================================================================
@@ -3533,12 +3635,45 @@ def add_employee_account(request: Request, employee_id: int, body: EmployeeAccou
 # =====================================================================
 #  Пользователи (только администратор)
 # =====================================================================
+class TokenBody(BaseModel):
+    name: str = Field("", max_length=100)
+    role: str = Field("operator", max_length=20)
+    days: int = Field(365, ge=0, le=3650)
+    user_id: Optional[int] = None
+
+
+@router.get("/tokens")
+def list_api_tokens(request: Request, user: dict = Depends(auth_mod.require_admin)):
+    from ..apitokens import list_tokens
+    return {"items": list_tokens(svc_dep(request))}
+
+
+@router.post("/tokens")
+def create_api_token(request: Request, body: TokenBody, user: dict = Depends(auth_mod.require_admin)):
+    """Выпустить API-токен: показывается ОДИН раз, в базе — только его SHA-256."""
+    from ..apitokens import create
+    return create(svc_dep(request), user, name=body.name, role=body.role, days=body.days, user_id=body.user_id)
+
+
+@router.delete("/tokens/{token_id}")
+def revoke_api_token(request: Request, token_id: int, user: dict = Depends(auth_mod.require_admin)):
+    from ..apitokens import revoke
+    try:
+        revoke(svc_dep(request), user, token_id)
+    except ValidationError as exc:
+        if exc.code == "not_found":
+            raise HTTPException(404, exc.message) from None
+        raise
+    return {"ok": True}
+
+
 @router.get("/users")
 def list_users(request: Request, user: dict = Depends(auth_mod.require_admin)):
     svc = svc_dep(request)
     return [{"id": r["id"], "username": r["username"], "role": r["role"], "created_at": r["created_at"],
              "last_login": r["last_login"], "disabled": bool(r["disabled"]),
-             "totp_enabled": bool(r["totp_enabled"])} for r in svc.db.list_users()]
+             "totp_enabled": bool(r["totp_enabled"]), "auth_source": _row_get(r, "auth_source") or "local"}
+            for r in svc.db.list_users()]
 
 
 @router.post("/users/{user_id}/2fa/reset")

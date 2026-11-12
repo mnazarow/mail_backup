@@ -757,3 +757,13 @@ table.tbl select[data-role]:focus { outline: none; border-color: var(--primary);
 .docs-bar input[type=search] { width: 300px; max-width: 100%; padding: 8px 11px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg-elev); color: var(--text); }
 .docs-frame { display: block; width: 100%; height: calc(100vh - 170px); min-height: 420px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-elev); }
 @media(max-width:700px){ .docs-bar select, .docs-bar input[type=search] { flex: 1 1 100%; max-width: none; } .docs-frame { height: calc(100vh - 220px); } }
+
+/* 1.20.0: проверки перед отправкой, календарь */
+.presend { padding-left: 20px; margin: 4px 0 10px; }
+.presend li { margin: 6px 0; line-height: 1.4; }
+.mail-event { display: flex; gap: 12px; padding: 8px 4px; border-bottom: 1px solid var(--border); }
+.mail-event .w { flex: 0 0 230px; color: var(--text-dim); font-size: .86rem; }
+.mail-event .s { flex: 1; min-width: 0; }
+@media (max-width: 640px) { .mail-event { flex-direction: column; gap: 2px; } .mail-event .w { flex: none; } }
+.case-exp td { white-space: nowrap; }
+.case-exp tr.case-sha td { white-space: normal; padding-top: 0; border-top: none; }

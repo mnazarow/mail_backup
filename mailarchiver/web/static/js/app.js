@@ -145,11 +145,12 @@ function modal(title, bodyHtml, {wide=false, footer='', onClose=null, locked=fal
   if(first) { try{ first.focus(); }catch(e){} }
   return { el:back, close, body:back.querySelector('.modal-body'), foot:back.querySelector('.modal-foot') };
 }
-function confirmDlg(title, message, {okText='Подтвердить', okClass='danger'}={}){
+function confirmDlg(title, message, {okText='Подтвердить', okClass='danger', html=false}={}){
   return new Promise(res=>{
     // Промис обязан разрешиться при ЛЮБОМ закрытии: иначе «await confirmDlg»
     // висел вечно, и кнопка выглядела сломанной.
-    const m=modal(title, `<p>${esc(message)}</p>`,
+    // html — сообщение уже собрано из экранированных частей (список предупреждений)
+    const m=modal(title, html?message:`<p>${esc(message)}</p>`,
       {onClose:()=>res(false),
        footer:`<button class="btn ghost" data-c>Отмена</button><button class="btn ${okClass}" data-ok>${esc(okText)}</button>`});
     m.foot.querySelector('[data-c]').onclick=()=>{m.close();};
@@ -346,6 +347,7 @@ const NAV = [
   {id:'analytics', icon:'📈', title:'Аналитика', roles:'ao'},
   {id:'mailanalytics', icon:'🔎', title:'Аналитика писем', roles:'a'},
   {id:'replies', icon:'↩️', title:'Ответы на письма', roles:'am'},
+  {id:'cases', icon:'⚖️', title:'Дела', roles:'a'},
   {id:'mail', icon:'📧', title:'Почта', roles:'am'},
   {id:'accounts', icon:'📬', title:'Почтовые ящики', roles:'ao'},
   {id:'employees', icon:'🧑‍💼', title:'Сотрудники', roles:'a'},
@@ -550,7 +552,7 @@ function route(){
   const c=h('<div class="view-host"><div class="empty"><div class="spinner"></div></div></div>');
   content.appendChild(c);
   State.routeSeq=(State.routeSeq||0)+1;
-  const map={dashboard:viewDashboard,analytics:viewAnalytics,mailanalytics:viewMailAnalytics,replies:viewReplies,mail:viewMail,accounts:viewAccounts,employees:viewEmployees,jobs:viewJobs,exports:viewExports,schedules:viewSchedules,axigen:viewAxigen,mailservers:viewMailservers,server:viewServer,logs:viewLogs,settings:viewSettings,users:viewUsers,security:viewSecurity,audit:viewAudit,docs:viewDocs};
+  const map={dashboard:viewDashboard,analytics:viewAnalytics,mailanalytics:viewMailAnalytics,replies:viewReplies,cases:viewCases,mail:viewMail,accounts:viewAccounts,employees:viewEmployees,jobs:viewJobs,exports:viewExports,schedules:viewSchedules,axigen:viewAxigen,mailservers:viewMailservers,server:viewServer,logs:viewLogs,settings:viewSettings,users:viewUsers,security:viewSecurity,audit:viewAudit,docs:viewDocs};
   (map[view]||viewDashboard)(c).catch(toastErr);
 }
 
@@ -2486,12 +2488,18 @@ function holdDate(until){ return until==='9999-12-31' ? 'бессрочно' : f
 function holdTags(a){
   const out=[];
   if(a.dismissed_at) out.push(`<span class="tag" title="Сотрудник уволен ${esc(fmtDate(a.dismissed_at))}${a.auto_disabled?'; копирование выключено автоматически':''}">уволен</span>`);
-  if(a.on_hold) out.push(`<span class="tag ok" title="Письма ящика не удаляются по сроку хранения${a.hold_reason==='dismissed'?' (архив уволенного сотрудника)':''}">🔒 ${a.hold_until==='9999-12-31'?'бессрочно':'до '+esc(holdDate(a.hold_until))}</span>`);
+  if(a.on_hold) out.push(a.hold_reason==='case'?'<span class="tag ok" title="Архив удерживается открытым делом (раздел «Дела»): письма не удаляются, пока дело не закрыто">🔒 по делу</span>'
+    :`<span class="tag ok" title="Письма ящика не удаляются по сроку хранения${a.hold_reason==='dismissed'?' (архив уволенного сотрудника)':''}">🔒 ${a.hold_until==='9999-12-31'?'бессрочно':'до '+esc(holdDate(a.hold_until))}</span>`);
   else if(a.hold_expired) out.push(`<span class="tag warn" title="Срок удержания архива прошёл — архив можно удалить (меню ящика)">удержание истекло</span>`);
   return out.join(' ');
 }
 
 function holdModal(a){
+  if(a.hold_reason==='case'){
+    modal(`Удержание архива: ${a.name}`, `<p>Архив ящика удерживается <b>открытым делом</b>: письма не удаляются ни по сроку хранения, ни вручную.
+      Удержание снимается, когда дело закрывают или убирают из него ящик.</p>${isAdmin()?'<p><a href="#/cases">Открыть раздел «Дела»</a></p>':''}`);
+    return;
+  }
   const cur=a.hold_until||'';
   const m=modal(`Удержание архива: ${a.name}`, `
     <p class="small">Пока действует удержание, письма ящика <b>не удаляются</b> очисткой по сроку хранения — даже если у ящика
@@ -3275,6 +3283,7 @@ const ENUM_OPTS = {
   'export.pst_format':[['unicode','Unicode (Outlook 2003+)'],['ansi','ANSI (Outlook 97–2002)']],
   'export.outlook_target':[['2016+','2016+'],['2013','2013'],['2010','2010'],['2007','2007'],['2003','2003'],['2002','2002 и старше'],['365','365']],
   'notifications.smtp_security':[['starttls','STARTTLS'],['ssl','SSL'],['none','Без шифрования']],
+  'notifications.webhook_format':[['json','JSON (свой сервис)'],['slack','Slack, Mattermost, Rocket.Chat']],
   'employees.source_type':[['file','Файл на сервере'],['url','Адрес (URL)']],
   'employees.source_url_format':[['auto','Определять автоматически'],['csv','CSV'],['xlsx','Excel (XLSX)']],
   'employees.account_security':[['ssl','SSL/TLS'],['starttls','STARTTLS'],['plain','Без шифрования']],
@@ -3285,6 +3294,7 @@ const ENUM_OPTS = {
   'axigen.ftp_tls':[['none','Без шифрования (только эта же машина)'],['implicit','TLS сразу (SSL-слушатель, implicit)'],['explicit','AUTH TLS на обычном порту (explicit)']],
   'axigen.ftp_name_encoding':[['auto','Определять'],['utf7','UTF-7 (по умолчанию у Axigen)'],['utf8','UTF-8']],
   'axigen.new_mailbox_auth':[['axigen_ftp','Через FTP Backup (без пароля)'],['password','По IMAP с паролем']],
+  'webmail.dlp_mode':[['warn','Предупреждать'],['block_external','Не отправлять наружу, внутри — предупреждать'],['off','Не проверять']],
 };
 // Параметры, которые имеют смысл не всегда: показываем только когда включено то,
 // от чего они зависят. Иначе в разделе «Сотрудники» рядом стоят путь к файлу и
@@ -3338,6 +3348,34 @@ const SETTING_DEPS = {
   'notifications.on_failure':    v=>!!v['notifications.enabled'],
   'notifications.summary_enabled': v=>!!v['notifications.enabled'],
   'notifications.summary_cron':  v=>!!v['notifications.enabled'] && !!v['notifications.summary_enabled'],
+  'notifications.telegram_bot_token': v=>!!v['notifications.enabled'],
+  'notifications.telegram_chat_id':   v=>!!v['notifications.enabled'],
+  'notifications.telegram_api_url':   v=>!!v['notifications.enabled'],
+  'notifications.webhook_url':        v=>!!v['notifications.enabled'],
+  'notifications.webhook_format':     v=>!!v['notifications.enabled'],
+  'notifications.webhook_secret':     v=>!!v['notifications.enabled'] && !!v['notifications.webhook_url'],
+  'ldap.url': v=>!!v['ldap.enabled'],
+  'journal.listen': v=>!!v['journal.enabled'],
+  'journal.port': v=>!!v['journal.enabled'],
+  'journal.allowed_ips': v=>!!v['journal.enabled'],
+  'journal.address': v=>!!v['journal.enabled'],
+  'journal.folder': v=>!!v['journal.enabled'],
+  'journal.unwrap_exchange': v=>!!v['journal.enabled'],
+  'journal.tls_cert': v=>!!v['journal.enabled'],
+  'journal.tls_key': v=>!!v['journal.enabled'] && !!v['journal.tls_cert'],
+  'journal.require_tls': v=>!!v['journal.enabled'] && !!v['journal.tls_cert'],
+  'journal.max_size_mb': v=>!!v['journal.enabled'],
+  'ldap.starttls': v=>!!v['ldap.enabled'] && !/^ldaps:/i.test(v['ldap.url']||''),
+  'ldap.verify_ssl': v=>!!v['ldap.enabled'],
+  'ldap.bind_dn': v=>!!v['ldap.enabled'],
+  'ldap.bind_password': v=>!!v['ldap.enabled'],
+  'ldap.base_dn': v=>!!v['ldap.enabled'],
+  'ldap.user_filter': v=>!!v['ldap.enabled'],
+  'ldap.admin_group': v=>!!v['ldap.enabled'],
+  'ldap.operator_group': v=>!!v['ldap.enabled'],
+  'ldap.nested_groups': v=>!!v['ldap.enabled'],
+  'ldap.employee_login': v=>!!v['ldap.enabled'],
+  'ldap.timeout_s': v=>!!v['ldap.enabled'],
   'employees.account_use_master':  v=>!!v['employees.create_accounts'],
   'employees.account_use_axigen_ftp': v=>!!v['employees.create_accounts'],
   'mailadmin.host':      v=>!!v['mailadmin.enabled'],
@@ -3416,6 +3454,8 @@ async function viewSettings(c){
     if(sec.section==='monitoring') monitoringCard(card, rows, set, data.secrets_set||{});
     if(sec.section==='mailadmin') mailadminCard(card, ()=>Object.keys(changed).some(k=>k.startsWith('mailadmin.')));
     if(sec.section==='search') searchCard(card);
+    if(sec.section==='ldap') ldapCard(card, ()=>Object.keys(changed).some(k=>k.startsWith('ldap.')));
+    if(sec.section==='journal') journalCard(card);
     if(sec.section==='axigen') axigenSettingsCard(card, ()=>Object.keys(changed).some(k=>k.startsWith('axigen.')));
   });
   applyDeps();
@@ -3553,7 +3593,7 @@ async function searchCard(card){
   const box=h(`<div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border)">
     <h4 style="margin:0 0 8px">🔎 Индекс поиска</h4>
     ${st.available?`<div class="small">Проиндексировано <b>${fmtNum(st.indexed)}</b> из ${fmtNum(st.total)} писем (${pct}%).${st.active_job?` Идёт индексация — задание #${st.active_job}.`:(st.pending?' Остальные проиндексируются в фоне (каждые 10 минут).':'')}</div>
-      <div class="small muted" style="margin-top:4px">${st.bodies?'Ищется и по тексту писем.':'Текст писем не индексируется — поиск по теме, адресам и вложениям.'}${st.bodies_blocked_by_encryption?' Текст не индексируется, потому что включено шифрование копии.':''}</div>
+      <div class="small muted" style="margin-top:4px">${st.bodies?('Ищется и по тексту писем'+(st.attachments?' и вложений (PDF, Word, Excel, PowerPoint, OpenDocument, RTF)':'')+'.'):'Текст писем не индексируется — поиск по теме, адресам и вложениям.'}${st.bodies_blocked_by_encryption?' Текст не индексируется, потому что включено шифрование копии.':''}</div>
       <div class="btn-row" style="margin-top:10px"><button class="btn sm" data-re>Перестроить индекс</button></div>`
     :'<div class="hint" style="border-color:var(--warn)">SQLite на этом сервере собран без FTS5 — поиск работает только по теме и отправителю.</div>'}</div>`);
   card.appendChild(box);
@@ -3603,8 +3643,21 @@ function summaryCard(card, unsaved){
     <h4 style="margin:0 0 8px">🗓️ Еженедельная сводка</h4>
     <div class="small muted">Письмо администраторам: ящики, требующие внимания, итоги недели, место на диске, копия вне сервера.</div>
     <div class="btn-row" style="margin-top:10px"><button class="btn sm" data-preview>Посмотреть сводку</button>
-      <button class="btn sm" data-send>Отправить сейчас</button></div></div>`);
+      <button class="btn sm" data-send>Отправить сейчас</button></div>
+    <h4 style="margin:14px 0 8px">🔔 Каналы</h4>
+    <div class="small muted">Проверочное сообщение уходит во все настроенные каналы: почту, Telegram и вебхук.</div>
+    <div class="btn-row" style="margin-top:10px"><button class="btn sm" data-test>Отправить проверочное уведомление</button></div></div>`);
   card.appendChild(box);
+  box.querySelector('[data-test]').onclick=async(ev)=>{
+    if(unsaved()) return toast('Сначала сохраните настройки','Проверка использует сохранённые настройки.','warn');
+    const b=ev.currentTarget; b.disabled=true;
+    try{
+      const r=await api('/notifications/test',{method:'POST'});
+      const NAMES={email:'E-mail', telegram:'Telegram', webhook:'Вебхук'};
+      modal('Проверка каналов уведомлений', Object.keys(r.results).length?`<div class="table-wrap"><table class="tbl"><tbody>${Object.entries(r.results).map(([k,v])=>`<tr><td>${NAMES[k]||esc(k)}</td><td>${v?'<span class="tag err">не отправлено</span> '+esc(v):'<span class="tag ok">отправлено</span>'}</td></tr>`).join('')}</tbody></table></div>`
+        :'<div class="hint">Не настроен ни один канал: заполните SMTP и получателей, Telegram или адрес вебхука.</div>');
+    }catch(e){ toastErr(e); } finally{ b.disabled=false; }
+  };
   box.querySelector('[data-preview]').onclick=async()=>{
     try{
       const r=await api('/monitoring/summary');
@@ -3617,6 +3670,41 @@ function summaryCard(card, unsaved){
     const b=ev.currentTarget; b.disabled=true;
     try{ const r=await api('/monitoring/summary',{method:'POST'}); toast('Сводка отправлена', r.subject); }
     catch(e){ toastErr(e); } finally{ b.disabled=false; }
+  };
+}
+
+/** Блок «Приём журналирования»: работает ли SMTP-приёмник и сколько писем принято. */
+async function journalCard(card){
+  let st; try{ st=await api('/journal/status'); }catch(e){ return; }
+  card.appendChild(h(`<div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border)">
+    <h4 style="margin:0 0 8px">📨 Состояние приёма</h4>
+    <div class="small">${st.running?`<span class="tag ok">принимает</span> SMTP на <span class="mono">${esc(st.listen)}</span>${st.tls?' · STARTTLS':''}`:(st.enabled?'<span class="tag err">не запущен</span>':'<span class="tag">выключен</span>')}
+      ${st.last_error?`<div class="hint" style="margin-top:6px;border-color:var(--danger)">${esc(st.last_error)}</div>`:''}</div>
+    <div class="small muted" style="margin-top:6px">С запуска службы: принято писем ${fmtNum(st.received)}, сохранено копий ${fmtNum(st.stored)}, повторов ${fmtNum(st.duplicates)}, без ящика ${fmtNum(st.unmatched)}, отклонено подключений ${fmtNum(st.rejected)}${st.errors?`, ошибок ${fmtNum(st.errors)}`:''}. В архиве из журнала: ${fmtNum(st.in_archive)} писем.${st.last_at?' Последнее: '+fmtDate(st.last_at)+'.':''}</div></div>`));
+}
+
+/** Блок «Проверить вход через LDAP»: служебная учётная запись, поиск, группы и роль пользователя. */
+function ldapCard(card, unsaved){
+  const ROLE={admin:'администратор', operator:'оператор', mailbox:'сотрудник (архив своих ящиков)'};
+  const box=h(`<div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border)">
+    <h4 style="margin:0 0 8px">🏢 Проверка</h4>
+    <div class="small muted">Без логина — проверяется подключение служебной учётной записью; с логином — поиск пользователя, его группы и роль в архиве; с паролем — и сам вход.</div>
+    <div class="grid2" style="margin-top:8px"><div class="form-row"><label>Логин</label><input type="text" data-u autocomplete="off" placeholder="ivanov"></div>
+      <div class="form-row"><label>Пароль (необязательно)</label><input type="password" data-p autocomplete="new-password"></div></div>
+    <div class="btn-row"><button class="btn sm" data-t>Проверить</button></div></div>`);
+  card.appendChild(box);
+  box.querySelector('[data-t]').onclick=async(ev)=>{
+    if(unsaved()) return toast('Сначала сохраните настройки','Проверка использует сохранённые настройки.','warn');
+    const b=ev.currentTarget; b.disabled=true;
+    try{
+      const r=await api('/ldap/test',{method:'POST',body:{username:box.querySelector('[data-u]').value.trim(), password:box.querySelector('[data-p]').value}});
+      if(!r.ok) modal('Проверка LDAP', `<div class="hint" style="border-color:var(--danger)">${esc(r.error||r.reason||'Пользователь не найден')}</div>`);
+      else if(r.bind_only) toast('Подключение работает', 'Служебная учётная запись входит в каталог.');
+      else modal('Проверка LDAP', `<div class="kv"><span class="k">DN</span><span class="small">${esc(r.dn)}</span></div>
+        <div class="kv"><span class="k">Имя</span><span>${esc(r.name||'—')}</span></div><div class="kv"><span class="k">Почта</span><span>${esc(r.mail||'—')}</span></div>
+        <div class="kv"><span class="k">Роль в архиве</span><span>${r.role?'<span class="tag ok">'+esc(ROLE[r.role]||r.role)+'</span>':'<span class="tag err">нет — вход запрещён</span>'}</span></div>
+        <details><summary class="small">Группы (${(r.groups||[]).length})</summary><div class="small mono">${(r.groups||[]).map(esc).join('<br>')}</div></details>`, {wide:true});
+    }catch(e){ toastErr(e); } finally{ b.disabled=false; }
   };
 }
 
@@ -3678,7 +3766,7 @@ async function viewUsers(c){
       : `<select data-role aria-label="Роль пользователя ${esc(u.username)}" title="Сменить роль (сеансы пользователя будут завершены)">
           <option value="admin" ${u.role==='admin'?'selected':''}>администратор</option>
           <option value="operator" ${u.role==='operator'?'selected':''}>оператор</option></select>`;
-    const tr=h(`<tr><td><strong>${esc(u.username)}</strong>${u.disabled?' <span class="tag">выключен</span>':''}</td><td>${roleCell}</td>
+    const tr=h(`<tr><td><strong>${esc(u.username)}</strong>${u.auth_source==='ldap'?' <span class="tag" title="Входит доменным паролем; роль — по группе каталога LDAP">🏢 из каталога</span>':''}${u.disabled?' <span class="tag">выключен</span>':''}</td><td>${roleCell}</td>
       <td>${u.totp_enabled?'<span class="tag ok">🔐 вкл.</span>':'<span class="tag">нет</span>'}</td>
       <td class="small muted">${fmtDate(u.created_at)}</td><td class="small muted">${fmtDate(u.last_login)}</td>
       <td style="text-align:right;white-space:nowrap"><button class="btn sm" data-pw>Пароль</button><button class="btn sm" data-logout title="Завершить все открытые сеансы этого пользователя (его текущие cookie перестанут действовать)">Завершить сеансы</button>${u.totp_enabled && u.id!==State.user.id?'<button class="btn sm" data-reset2fa title="Отключить двухфакторный вход (например, пользователь потерял телефон)">Сбросить 2FA</button>':''}<button class="btn danger sm" data-del>✕</button></td></tr>`);
@@ -3700,6 +3788,52 @@ async function viewUsers(c){
     tb.appendChild(tr);
   });
   c.appendChild(wrap);
+  await apiTokensCard(c, users);
+}
+
+/** API-токены для скриптов и интеграций (1.20.0). */
+async function apiTokensCard(c, users){
+  const d=await api('/tokens');
+  const STATE={active:'<span class="tag ok">действует</span>', expired:'<span class="tag warn">истёк</span>', revoked:'<span class="tag">отозван</span>'};
+  const card=h(`<div class="card" style="margin-top:14px"><div style="display:flex;align-items:center;gap:8px"><h3 style="margin:0">🔑 API-токены</h3><div class="spacer" style="flex:1"></div>
+    <a class="btn ghost sm" href="${docsHref('apitokens')}">📖 Как пользоваться</a><button class="btn sm primary" data-new>＋ Выпустить токен</button></div>
+    <div class="small muted" style="margin:6px 0 10px">Для скриптов, мониторинга и интеграций: запрос с заголовком <span class="mono">Authorization: Bearer ma_…</span> выполняется от имени владельца с ролью токена. Пароль, двухфакторный вход, пользователи и токены с токеном недоступны.</div>
+    <div class="table-wrap"><table class="tbl"><thead><tr><th>Имя</th><th>Владелец</th><th>Роль</th><th>Токен</th><th>Действует до</th><th>Последнее использование</th><th>Состояние</th><th></th></tr></thead><tbody></tbody></table></div></div>`);
+  const tb=card.querySelector('tbody');
+  (d.items||[]).forEach(t=>{
+    const tr=h(`<tr><td><b>${esc(t.name)}</b><div class="small muted">выпустил ${esc(t.created_by)} ${fmtDate(t.created_at)}</div></td><td>${esc(t.owner)}</td><td>${esc(ROLE_LABELS[t.role]||t.role)}</td>
+      <td class="mono small">${esc(t.hint)}</td><td class="small">${t.expires_at?fmtDate(t.expires_at):'бессрочно'}</td>
+      <td class="small">${t.last_used_at?fmtDate(t.last_used_at)+'<div class="muted">'+esc(t.last_ip||'')+'</div>':'—'}</td><td>${STATE[t.state]||esc(t.state)}</td>
+      <td>${t.state==='active'?'<button class="btn danger sm" data-revoke>Отозвать</button>':''}</td></tr>`);
+    const rv=tr.querySelector('[data-revoke]');
+    if(rv) rv.onclick=async()=>{ if(!await confirmDlg('Отозвать токен?', `Скрипты с токеном «${t.name}» сразу перестанут работать.`, {okText:'Отозвать'})) return;
+      try{ await api('/tokens/'+t.id,{method:'DELETE'}); toast('Токен отозван'); route(); }catch(e){ toastErr(e); } };
+    tb.appendChild(tr);
+  });
+  if(!tb.children.length) tb.innerHTML='<tr><td colspan="8" class="empty">Токенов нет</td></tr>';
+  card.querySelector('[data-new]').onclick=()=>{
+    const m=modal('Выпустить API-токен', `<div class="form-row"><label>Имя — для чего токен</label><input id="tk-name" maxlength="100" placeholder="Например: Zabbix, скрипт ночной выгрузки"></div>
+      <div class="form-row"><label>Владелец</label><select id="tk-user">${users.filter(u=>!u.disabled).map(u=>`<option value="${u.id}" ${u.id===State.user.id?'selected':''}>${esc(u.username)} (${esc(ROLE_LABELS[u.role]||u.role)})</option>`).join('')}</select></div>
+      <div class="form-row"><label>Роль токена</label><select id="tk-role"><option value="operator">Оператор — смотреть состояние и запускать копирование</option><option value="admin">Администратор — всё, что может владелец</option></select></div>
+      <div class="form-row"><label>Срок действия</label><select id="tk-days"><option value="30">30 дней</option><option value="90">90 дней</option><option value="365" selected>1 год</option><option value="0">Бессрочно</option></select></div>`,
+      {footer:'<button class="btn" data-c>Отмена</button><button class="btn primary" data-ok>Выпустить</button>'});
+    m.foot.querySelector('[data-c]').onclick=()=>m.close();
+    m.foot.querySelector('[data-ok]').onclick=async(ev)=>{
+      const b=ev.currentTarget; b.disabled=true;
+      try{
+        const r=await api('/tokens',{method:'POST',body:{name:m.body.querySelector('#tk-name').value, role:m.body.querySelector('#tk-role').value,
+          days:Number(m.body.querySelector('#tk-days').value), user_id:Number(m.body.querySelector('#tk-user').value)}});
+        m.close();
+        const shown=modal('Токен выпущен', `<div class="hint" style="border-color:var(--warn)">Скопируйте токен сейчас — больше он показан не будет. В базе хранится только его отпечаток.</div>
+          <div class="form-row"><input id="tk-val" class="mono" readonly value="${esc(r.token)}" style="width:100%"></div>
+          <div class="small muted">Пример: <span class="mono">curl -H "Authorization: Bearer ${esc(r.token.slice(0,10))}…" ${esc(location.origin)}/api/state</span></div>`,
+          {footer:'<button class="btn" data-copy>Скопировать</button><button class="btn primary" data-done>Готово</button>', onClose:()=>route()});
+        shown.foot.querySelector('[data-copy]').onclick=async()=>{ try{ await navigator.clipboard.writeText(r.token); toast('Скопировано'); }catch(e){ shown.body.querySelector('#tk-val').select(); } };
+        shown.foot.querySelector('[data-done]').onclick=()=>shown.close();
+      }catch(e){ toastErr(e); } finally{ b.disabled=false; }
+    };
+  };
+  c.appendChild(card);
 }
 function userModal(){
   const m=modal('Новый пользователь',`<div class="form-row"><label>Имя</label><input id="u-name" type="text" autocomplete="off"></div>
@@ -3715,10 +3849,190 @@ function userModal(){
   m.foot.querySelector('[data-ok]').onclick=async()=>{try{await api('/users',{method:'POST',body:{username:m.body.querySelector('#u-name').value,password:m.body.querySelector('#u-pass').value,role:m.body.querySelector('#u-role').value}});toast('Создан');m.close();route();}catch(e){toastErr(e);}};
 }
 // ===================================================================
+//  Раздел «Дела» — юридическое удержание и выгрузка писем (1.20.0)
+// ===================================================================
+const CASE_ACTIONS={case_create:'дело создано', case_update:'дело изменено', case_custodians:'изменён состав ящиков',
+  case_close:'дело закрыто', case_reopen:'дело открыто заново', case_delete:'дело удалено', case_export:'запущена выгрузка',
+  case_export_done:'выгрузка готова', case_download:'скачана выгрузка', case_view:'просмотр писем дела'};
+const CASE_EXPORT_STATUS={pending:'ждёт', running:'идёт', success:'готова', partial:'готова с ошибками', failed:'ошибка', cancelled:'отменена'};
+async function viewCases(c){
+  if(State.caseId){ return caseDetail(c, State.caseId); }
+  const d=await api('/cases');
+  c.innerHTML='';
+  c.appendChild(h(`<div class="section-title"><h2 style="margin:0">⚖️ Дела</h2><div class="spacer"></div>
+    <a class="btn ghost sm" href="${docsHref('cases')}">📖 Как это работает</a> <button class="btn primary" id="csNew">＋ Новое дело</button></div>`));
+  c.appendChild(h(`<div class="hint" style="margin-bottom:12px">Дело собирает переписку для проверки, спора или запроса: ящики сотрудников, период и
+    поисковый запрос. Пока дело открыто, архив его ящиков удерживается — письма не удаляются ни по сроку хранения, ни вручную.
+    Найденные письма выгружаются в ZIP с описью и контрольными суммами SHA-256.</div>`));
+  const wrap=h('<div class="card table-wrap"><table class="tbl"><thead><tr><th>№</th><th>Дело</th><th>Ящиков</th><th>Удержание</th><th>Выгрузок</th><th>Создано</th><th>Состояние</th></tr></thead><tbody></tbody></table></div>');
+  const tb=wrap.querySelector('tbody');
+  (d.items||[]).forEach(x=>{
+    const tr=h(`<tr class="clickable" data-id="${x.id}" tabindex="0"><td>${x.id}</td><td><b>${esc(x.name)}</b>${x.query?`<div class="small muted">запрос: ${esc(x.query)}</div>`:''}</td>
+      <td>${x.custodians}</td><td>${x.hold&&x.status==='open'?'<span class="tag ok">🔒 удерживается</span>':'<span class="tag">нет</span>'}</td>
+      <td>${x.exports}</td><td class="small">${fmtDate(x.created_at)}<div class="muted">${esc(x.created_by)}</div></td>
+      <td>${x.status==='open'?'<span class="tag warn">открыто</span>':'<span class="tag">закрыто '+esc(fmtDateShort(x.closed_at))+'</span>'}</td></tr>`);
+    const open=()=>{ State.caseId=x.id; viewCases(c).catch(toastErr); };
+    tr.onclick=open; tr.onkeydown=(e)=>{ if(e.key==='Enter') open(); };
+    tb.appendChild(tr);
+  });
+  if(!tb.children.length) tb.innerHTML='<tr><td colspan="7" class="empty">Дел пока нет</td></tr>';
+  c.appendChild(wrap);
+  $('#csNew',c).onclick=()=>caseForm(null, (id)=>{ State.caseId=id; viewCases(c).catch(toastErr); });
+}
+
+/** Выбор ящиков: поиск по названию, логину и сотруднику, флажки. Возвращает выбранные id (или null). */
+async function accountPickerDlg(title, preselected){
+  const accs=await api('/accounts'); State.accounts=accs;
+  const chosen=new Set((preselected||[]).map(Number));
+  return new Promise(resolve=>{
+    let done=false;
+    const m=modal(title, `<input type="search" id="apQ" placeholder="Поиск: ящик, логин, сотрудник…" style="width:100%">
+      <div class="small muted" style="margin:6px 0" id="apInfo"></div>
+      <div id="apList" style="max-height:52vh;overflow:auto;border:1px solid var(--border);border-radius:var(--radius-sm)"></div>`,
+      {wide:true, footer:'<button class="btn ghost" data-all>Отметить найденные</button><button class="btn ghost" data-none>Снять все</button><div class="spacer" style="flex:1"></div><button class="btn" data-c>Отмена</button><button class="btn primary" data-ok>Готово</button>',
+       onClose:()=>{ if(!done){ done=true; resolve(null); } }});
+    const list=m.body.querySelector('#apList'), info=m.body.querySelector('#apInfo');
+    let shown=[];
+    const draw=()=>{
+      const q=m.body.querySelector('#apQ').value.trim().toLowerCase();
+      shown=accs.filter(a=>!q || [a.name,a.username,a.employee_name].some(v=>String(v||'').toLowerCase().includes(q)));
+      list.innerHTML=shown.slice(0,500).map(a=>`<label class="ap-row" style="display:flex;gap:8px;align-items:center;padding:5px 10px;border-bottom:1px solid var(--border)">
+        <input type="checkbox" data-id="${a.id}" ${chosen.has(a.id)?'checked':''}><span style="flex:1"><b>${esc(a.name)}</b> <span class="muted small">${esc(a.username||'')}</span></span>
+        <span class="small muted">${esc(a.employee_name||'')}</span><span class="small muted">${fmtNum(a.messages)} писем</span></label>`).join('')
+        || '<div class="empty">Ничего не найдено</div>';
+      info.textContent=`Выбрано: ${chosen.size}. Найдено: ${shown.length}${shown.length>500?' (показаны первые 500)':''}.`;
+    };
+    list.onchange=(e)=>{ const id=Number(e.target.dataset.id); if(!id) return; if(e.target.checked) chosen.add(id); else chosen.delete(id); draw(); };
+    m.body.querySelector('#apQ').oninput=draw;
+    m.foot.querySelector('[data-all]').onclick=()=>{ shown.forEach(a=>chosen.add(a.id)); draw(); };
+    m.foot.querySelector('[data-none]').onclick=()=>{ chosen.clear(); draw(); };
+    m.foot.querySelector('[data-c]').onclick=()=>m.close();
+    m.foot.querySelector('[data-ok]').onclick=()=>{ done=true; resolve(Array.from(chosen)); m.close(); };
+    draw();
+  });
+}
+
+function caseForm(cs, onSaved){
+  const isNew=!cs; let picked=[];
+  const m=modal(isNew?'Новое дело':'Изменить дело', `
+    <div class="form-row"><label>Название</label><input id="cfName" maxlength="200" value="${esc(cs?cs.name:'')}" placeholder="Например: Проверка закупок 2026"></div>
+    <div class="form-row"><label>Описание</label><textarea id="cfDesc" rows="3" maxlength="4000" placeholder="Основание, номер запроса, ответственный">${esc(cs?cs.description:'')}</textarea></div>
+    <div class="form-row"><label>Поисковый запрос</label><input id="cfQuery" maxlength="1000" value="${esc(cs?cs.query:'')}" placeholder="пусто — все письма ящиков за период">
+      <div class="small muted">Как в поиске писем: слова через пробел, «фраза в кавычках», поля тема:, от:, кому:, вложение:, текст:.</div></div>
+    <div class="form-row" style="display:flex;gap:12px;flex-wrap:wrap"><label style="flex:1">С даты<input type="date" id="cfFrom" value="${esc(cs?cs.date_from:'')}"></label>
+      <label style="flex:1">По дату<input type="date" id="cfTo" value="${esc(cs?cs.date_to:'')}"></label></div>
+    <label class="check"><input type="checkbox" id="cfHold" ${!cs||cs.hold?'checked':''}> Удерживать архив ящиков, пока дело открыто</label>
+    ${isNew?`<div class="form-row" style="margin-top:10px"><label>Ящики</label><div style="display:flex;gap:8px;align-items:center"><button class="btn sm" type="button" id="cfPick">Выбрать ящики…</button><span class="small muted" id="cfPicked">не выбраны</span></div></div>`:''}`,
+    {footer:'<button class="btn" data-c>Отмена</button><button class="btn primary" data-ok>'+(isNew?'Создать дело':'Сохранить')+'</button>'});
+  m.foot.querySelector('[data-c]').onclick=()=>m.close();
+  const pick=m.body.querySelector('#cfPick');
+  if(pick) pick.onclick=async()=>{ const ids=await accountPickerDlg('Ящики дела', picked); if(ids){ picked=ids; m.body.querySelector('#cfPicked').textContent=`выбрано: ${ids.length}`; } };
+  m.foot.querySelector('[data-ok]').onclick=async(ev)=>{
+    const b=ev.currentTarget; b.disabled=true;
+    const body={name:m.body.querySelector('#cfName').value.trim(), description:m.body.querySelector('#cfDesc').value,
+      query:m.body.querySelector('#cfQuery').value.trim(), date_from:m.body.querySelector('#cfFrom').value, date_to:m.body.querySelector('#cfTo').value,
+      hold:m.body.querySelector('#cfHold').checked};
+    try{
+      if(isNew){ body.account_ids=picked; const r=await api('/cases',{method:'POST',body}); toast('Дело создано'); m.close(); onSaved&&onSaved(r.id); }
+      else{ await api('/cases/'+cs.id,{method:'PUT',body}); toast('Сохранено'); m.close(); onSaved&&onSaved(cs.id); }
+    }catch(e){ toastErr(e); } finally{ b.disabled=false; }
+  };
+}
+
+async function caseDetail(c, id){
+  let cs; try{ cs=await api('/cases/'+id); }catch(e){ State.caseId=null; if(e.status===404) return viewCases(c); throw e; }
+  const open=cs.status==='open';
+  c.innerHTML='';
+  const head=h(`<div class="section-title"><button class="btn ghost sm" id="cdBack">← Все дела</button>
+    <h2 style="margin:0 0 0 8px">⚖️ ${esc(cs.name)}</h2> ${open?'<span class="tag warn">открыто</span>':'<span class="tag">закрыто</span>'}
+    <div class="spacer"></div>
+    ${open?'<button class="btn sm" id="cdEdit">✏️ Изменить</button> <button class="btn sm" id="cdAdd">＋ Ящики</button> <button class="btn sm primary" id="cdExport">📦 Выгрузить</button> <button class="btn sm" id="cdClose">Закрыть дело</button>'
+      :'<button class="btn sm" id="cdReopen">Открыть заново</button> <button class="btn sm danger" id="cdDelete">Удалить дело</button>'}</div>`);
+  c.appendChild(head);
+  const info=h(`<div class="card"><div class="kv"><span class="k">Описание</span><span>${esc(cs.description||'—')}</span></div>
+    <div class="kv"><span class="k">Запрос</span><span>${cs.query?'<code>'+esc(cs.query)+'</code>':'все письма ящиков'}</span></div>
+    <div class="kv"><span class="k">Период</span><span>${cs.date_from?esc(cs.date_from):'с начала'} — ${cs.date_to?esc(cs.date_to):'по сегодня'}</span></div>
+    <div class="kv"><span class="k">Удержание архива</span><span>${cs.hold?(open?'<span class="tag ok">🔒 действует</span> письма ящиков не удаляются':'снято вместе с закрытием дела'):'не включено'}</span></div>
+    <div class="kv"><span class="k">Писем по условиям</span><span><b>${fmtNum(cs.count)}</b> (${fmtBytes(cs.size)}) в ${cs.custodians} ящ.</span></div>
+    <div class="kv"><span class="k">Создано</span><span>${fmtDate(cs.created_at)} · ${esc(cs.created_by)}${cs.closed_at?` · закрыто ${fmtDate(cs.closed_at)} · ${esc(cs.closed_by)}`:''}</span></div>
+    ${cs.index_pending?`<div class="hint" style="margin-top:8px;border-color:var(--warn)">Индекс поиска ещё не охватывает ${fmtNum(cs.index_pending)} новейших писем архива — подходящие под запрос среди них появятся в деле после индексации.</div>`:''}
+    ${cs.query && !cs.fts?'<div class="hint" style="margin-top:8px;border-color:var(--warn)">SQLite без FTS5: запрос ищется только по теме и отправителю.</div>':''}</div>`);
+  c.appendChild(info);
+  // Ящики
+  const accCard=h(`<div class="card" style="margin-top:12px"><h3 style="margin-top:0">Ящики дела (${cs.accounts.length})</h3><div class="table-wrap"><table class="tbl"><thead><tr><th>Ящик</th><th>Сотрудник</th><th>Писем</th><th>Удержание</th>${open?'<th></th>':''}</tr></thead><tbody></tbody></table></div></div>`);
+  const atb=accCard.querySelector('tbody');
+  cs.accounts.forEach(a=>{
+    const tr=h(`<tr><td><b>${esc(a.name)}</b> <span class="small muted">${esc(a.username)}</span>${a.dismissed?' <span class="tag">уволен</span>':''}</td><td>${esc(a.employee||'—')}</td><td>${fmtNum(a.messages)}</td>
+      <td>${a.hold_reason==='case'?'<span class="tag ok">🔒 по делу</span>':esc(a.hold)}</td>${open?'<td><button class="btn ghost sm" data-rm="'+a.id+'" title="Убрать из дела">✕</button></td>':''}</tr>`);
+    atb.appendChild(tr);
+  });
+  if(!atb.children.length) atb.innerHTML=`<tr><td colspan="5" class="empty">Ящиков нет — добавьте их кнопкой «＋ Ящики»</td></tr>`;
+  atb.onclick=async(e)=>{
+    const b=e.target.closest('[data-rm]'); if(!b) return;
+    if(!await confirmDlg('Убрать ящик из дела?', 'Если ящик не держит другое дело, ему вернётся удержание, которое было до дела.', {okText:'Убрать'})) return;
+    try{ await api(`/cases/${id}/custodians`,{method:'POST',body:{remove:[Number(b.dataset.rm)]}}); caseDetail(c,id).catch(toastErr); }catch(err){ toastErr(err); }
+  };
+  c.appendChild(accCard);
+  // Выгрузки
+  const expCard=h(`<div class="card" style="margin-top:12px"><div style="display:flex;align-items:center"><h3 style="margin:0">Выгрузки</h3><div class="spacer" style="flex:1"></div><button class="btn ghost sm" id="cdRefresh">↻ Обновить</button></div>
+    <div class="table-wrap" style="margin-top:8px"><table class="tbl case-exp"><thead><tr><th>Когда</th><th>Кто</th><th>Состояние</th><th>Писем</th><th>Размер</th><th></th></tr></thead><tbody></tbody></table></div></div>`);
+  const etb=expCard.querySelector('tbody');
+  cs.export_list.forEach(x=>{
+    etb.appendChild(h(`<tr><td class="small">${fmtDate(x.created_at)}</td><td class="small">${esc(x.created_by||'')}</td>
+      <td><span class="tag ${x.status==='success'?'ok':(x.status==='partial'?'warn':(x.status==='failed'?'err':''))}">${esc(CASE_EXPORT_STATUS[x.status]||x.status)}</span>${x.job_id?` <a class="small" href="#/jobs">#${x.job_id}</a>`:''}${x.error?`<div class="small muted">${esc(x.error)}</div>`:''}</td>
+      <td>${x.count?fmtNum(x.count):'—'}</td><td>${x.size?fmtBytes(x.size):'—'}</td>
+      <td style="text-align:right">${x.ready?`<a class="btn sm" href="/api/cases/${id}/exports/${x.id}/download" download>⬇ Скачать</a>`:''}</td></tr>`));
+    if(x.sha256) etb.appendChild(h(`<tr class="case-sha"><td colspan="6" class="small muted">SHA-256 архива: <code style="word-break:break-all">${esc(x.sha256)}</code></td></tr>`));
+  });
+  if(!etb.children.length) etb.innerHTML='<tr><td colspan="7" class="empty">Выгрузок ещё не было</td></tr>';
+  c.appendChild(expCard);
+  // Письма
+  const msgCard=h(`<div class="card" style="margin-top:12px"><h3 style="margin-top:0">Письма дела</h3><div class="table-wrap"><table class="tbl"><thead><tr><th>Дата</th><th>Ящик</th><th>От</th><th>Тема</th></tr></thead><tbody></tbody></table></div>
+    <div style="margin-top:10px;text-align:center"><button class="btn" hidden data-more>Показать ещё</button></div></div>`);
+  const mtb=msgCard.querySelector('tbody'), more=msgCard.querySelector('[data-more]');
+  let offset=0;
+  const snip=(s)=>esc(s||'').replace(/\u0002/g,'<mark>').replace(/\u0003/g,'</mark>');
+  const loadMsgs=async()=>{
+    const r=await api(`/cases/${id}/messages?offset=${offset}`);
+    r.results.forEach(x=>{
+      const tr=h(`<tr class="clickable"><td class="small">${fmtDate(x.date)}</td><td class="small">${esc(x.account_name)}<div class="muted">${esc(x.folder)}</div></td>
+        <td class="small">${esc(x.from)}</td><td>${x.has_attach?'📎 ':''}${esc(x.subject||'(без темы)')}${x.gone?' <span class="tag" title="Письма уже нет на почтовом сервере — копия в архиве">нет на сервере</span>':''}${x.snippet?`<div class="small muted">${snip(x.snippet)}</div>`:''}</td></tr>`);
+      tr.onclick=()=>openMailMessage(x.account_id, x.id, x.folder);
+      mtb.appendChild(tr);
+    });
+    offset+=r.results.length; more.hidden=!r.more;
+    if(!mtb.children.length) mtb.innerHTML='<tr><td colspan="4" class="empty">Писем по условиям дела нет</td></tr>';
+  };
+  more.onclick=()=>loadMsgs().catch(toastErr);
+  c.appendChild(msgCard);
+  // История
+  const hist=h(`<div class="card" style="margin-top:12px"><h3 style="margin-top:0">История дела</h3><div class="table-wrap"><table class="tbl"><tbody>${(cs.history||[]).map(r=>`<tr><td class="small muted">${fmtDate(r.ts)}</td><td class="small">${esc(r.user)}</td><td class="small">${esc(CASE_ACTIONS[r.action]||r.action)}</td><td class="small">${esc(r.detail.replace(/^case=\d+\s*/,''))}</td></tr>`).join('')||'<tr><td class="empty">Записей нет</td></tr>'}</tbody></table></div></div>`);
+  c.appendChild(hist);
+  const reload=()=>caseDetail(c,id).catch(toastErr);
+  $('#cdBack',c).onclick=()=>{ State.caseId=null; viewCases(c).catch(toastErr); };
+  $('#cdRefresh',c).onclick=reload;
+  const on=(sel,fn)=>{ const el=$(sel,c); if(el) el.onclick=fn; };
+  on('#cdEdit', ()=>caseForm(cs, reload));
+  on('#cdAdd', async()=>{ const ids=await accountPickerDlg('Добавить ящики в дело', []); if(!ids||!ids.length) return;
+    try{ const r=await api(`/cases/${id}/custodians`,{method:'POST',body:{add:ids}}); toast('Готово', `Добавлено ящиков: ${r.added}`); reload(); }catch(e){ toastErr(e); } });
+  on('#cdExport', async()=>{
+    if(!await confirmDlg('Выгрузить письма дела?', `В ZIP попадут ${fmtNum(cs.count)} писем (${fmtBytes(cs.size)}) с описью и контрольными суммами. Выгрузка идёт заданием очереди; скачивание файла попадёт в аудит.`, {okText:'Выгрузить', okClass:'primary'})) return;
+    try{ const r=await api(`/cases/${id}/export`,{method:'POST'}); toast('Выгрузка запущена', `Задание #${r.job_id}. Когда оно закончится, нажмите «↻ Обновить».`); reload(); }catch(e){ toastErr(e); } });
+  on('#cdClose', async()=>{
+    if(!await confirmDlg('Закрыть дело?', 'Удержание архива по этому делу будет снято: ящикам вернётся удержание, которое было до дела (если их не держит другое открытое дело). Выгрузки и история сохранятся.', {okText:'Закрыть дело'})) return;
+    try{ await api(`/cases/${id}/close`,{method:'POST'}); toast('Дело закрыто'); reload(); }catch(e){ toastErr(e); } });
+  on('#cdReopen', async()=>{ try{ await api(`/cases/${id}/reopen`,{method:'POST'}); toast('Дело открыто'); reload(); }catch(e){ toastErr(e); } });
+  on('#cdDelete', async()=>{
+    if(!await confirmDlg('Удалить дело?', 'Дело, его выгрузки (файлы ZIP) и состав ящиков будут удалены. Записи аудита останутся. Письма в архиве не удаляются.', {okText:'Удалить'})) return;
+    try{ await api(`/cases/${id}`,{method:'DELETE'}); toast('Дело удалено'); State.caseId=null; viewCases(c).catch(toastErr); }catch(e){ toastErr(e); } });
+  await loadMsgs();
+}
+
+// ===================================================================
 //  Документация — встроенная справка внутри интерфейса
 // ===================================================================
 //: Глава справки для каждого раздела: «📖 Справка» в шапке открывает её.
-const DOC_ANCHORS={dashboard:'dashboard', analytics:'analytics', mailanalytics:'mailanalytics', replies:'replies', mail:'mailview',
+const DOC_ANCHORS={dashboard:'dashboard', analytics:'analytics', mailanalytics:'mailanalytics', replies:'replies', cases:'cases', mail:'mailview',
   accounts:'mailboxes', employees:'employees', jobs:'jobs', exports:'export', schedules:'schedules', axigen:'axigen',
   mailservers:'mailservers', server:'serverbulk', logs:'jobs', settings:'settings', users:'roles',
   security:'secjournal', audit:'audit'};
@@ -3845,7 +4159,9 @@ async function viewAudit(c){
   let q='', seq=0;
   c.innerHTML=''; c.appendChild(h('<div class="section-title"><h2 style="margin:0">Аудит действий</h2></div>'));
   const bar=h(`<div class="an-toolbar"><input id="auQ" type="search" aria-label="Поиск в аудите" placeholder="Поиск: пользователь, действие, ящик, адрес…"
-    style="width:360px;padding:8px 11px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg-elev);color:var(--text)"></div>`);
+    style="width:360px;padding:8px 11px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg-elev);color:var(--text)">
+    <span class="spacer" style="flex:1"></span><button class="btn sm" id="auVerify" title="Проверить подписи всех записей аудита">🔏 Проверить целостность</button>
+    <a class="btn sm ghost" id="auCsv" href="/api/audit/export.csv" download>⬇ CSV</a></div>`);
   const wrap=h('<div class="card table-wrap"><table class="tbl"><thead><tr><th>Время</th><th>Пользователь</th><th>Действие</th><th>Детали</th></tr></thead><tbody></tbody></table></div>');
   const more=h('<div style="margin-top:10px;text-align:center"><button class="btn" hidden>Показать ещё</button></div>');
   const tb=wrap.querySelector('tbody'), btn=more.querySelector('button');
@@ -3866,7 +4182,28 @@ async function viewAudit(c){
   let t=null;
   bar.querySelector('#auQ').oninput=(e)=>{ clearTimeout(t); t=setTimeout(()=>{ q=e.target.value.trim(); load(false).catch(toastErr); }, 350); };
   btn.onclick=()=>load(true).catch(toastErr);
+  bar.querySelector('#auVerify').onclick=async(ev)=>{
+    const b=ev.currentTarget; b.disabled=true;
+    try{ auditVerifyResult(await api('/audit/verify')); }catch(e){ toastErr(e); } finally{ b.disabled=false; }
+  };
+  const csv=bar.querySelector('#auCsv');
+  csv.onclick=()=>{ csv.href='/api/audit/export.csv'+(q?'?q='+encodeURIComponent(q):''); };
   await load(false);
+}
+
+/** Итог проверки цепочки подписей аудита. */
+function auditVerifyResult(r){
+  const bad=r.broken||[];
+  modal(r.ok?'Аудит цел':'Аудит изменён', `
+    ${r.ok?'<div class="hint" style="border-color:var(--success)">✅ Цепочка подписей не нарушена: ни одна запись не изменена, не удалена и не вставлена задним числом.</div>'
+      :`<div class="hint" style="border-color:var(--danger)">⛔ Нарушений: ${bad.length}${bad.length>=200?' (показаны первые 200)':''}. Записи аудита меняли в обход приложения.</div>`}
+    <div class="kv"><span class="k">Записей</span><span>${fmtNum(r.total)}, проверено подписей: ${fmtNum(r.verified)}</span></div>
+    ${r.legacy?`<div class="kv"><span class="k">Без подписи</span><span>${fmtNum(r.legacy)} — записаны версией до 1.20.0</span></div>`:''}
+    ${r.other_key?`<div class="kv"><span class="k">Другим ключом</span><span>${fmtNum(r.other_key)} — подписаны прежним файлом секретного ключа, проверить нельзя</span></div>`:''}
+    ${r.purged_upto?`<div class="kv"><span class="k">Удалены по сроку</span><span>записи до #${r.purged_upto} (аудит хранится год)</span></div>`:''}
+    <div class="kv"><span class="k">Последняя запись</span><span>#${r.head_id} · <code class="small" style="word-break:break-all">${esc(r.head_hash||'—')}</code></span></div>
+    <p class="small muted">Сохраняйте подпись последней записи вне сервера (например, в журнале проверок): по ней видно, если записи потом удалят с конца.</p>
+    ${bad.length?`<div class="table-wrap"><table class="tbl"><thead><tr><th>Запись</th><th>Время</th><th>Что не так</th></tr></thead><tbody>${bad.map(x=>`<tr><td>#${x.id}</td><td class="small">${x.ts?fmtDate(x.ts):'—'}</td><td>${esc(x.reason)}</td></tr>`).join('')}</tbody></table></div>`:''}`, {wide:true});
 }
 
 // ===================================================================
@@ -4024,11 +4361,14 @@ async function viewMail(c){
     tools.appendChild(h(`<button class="btn sm primary" id="mailCompose" ${mailCanSend()?'':'disabled'} title="${esc(mailCanSend()?'Новое письмо (c)':(Mail.st.send_problem||''))}">✏️ Написать</button>`));
     tools.appendChild(h(`<button class="btn sm" id="mailSync" ${mailOnline()?'':'disabled'} title="Проверить почту на сервере">🔄 Проверить почту</button>`));
     tools.appendChild(h(`<button class="btn sm ghost" id="mailBook" title="Адресная книга ящика">📒</button>`));
+    tools.appendChild(h(`<button class="btn sm ghost" id="mailCal" title="Календарь почтового сервера (CalDAV)">📅</button>`));
     tools.appendChild(h(`<button class="btn sm ghost" id="mailIdent" title="Настройки клиента: отправитель и подпись${isAdmin()?', сервер отправки':''}, правила, автоответ, метки, шаблоны, вид">⚙️</button>`));
     $('#mailCompose',tools).onclick=()=>mailCompose('new');
     $('#mailSync',tools).onclick=()=>mailSync(true);
     $('#mailIdent',tools).onclick=()=>mailSettingsDialog(accId);
     $('#mailBook',tools).onclick=()=>mailSettingsDialog(accId, 'book');
+    $('#mailCal',tools).onclick=async()=>{ let d={}; try{ d=await api(`/webmail/dav?account_id=${accId}`); }catch(e){ /* покажем подсказку */ }
+      if(d.calendar) mailCalendarDlg(accId); else toast('Календарь не подключён', 'Подключите календарь сервера: ⚙ Настройки ящика → «Календарь и контакты».', 'warn', 7000); };
     mailArButton(accId);
     try{ Mail.tags=(await api(`/webmail/tags?account_id=${accId}`, {bg:true})).items||[]; }catch(e){ Mail.tags=[]; }
   }else Mail.tags=[];
@@ -4380,6 +4720,22 @@ async function loadMailFolders(accId, {refresh=false, quiet=false}={}){
   }
   // письмо, открытое из отчёта аналитики
   if(Mail.openAfter && Mail.openAfter.acc===accId){ const id=Mail.openAfter.id; Mail.openAfter=null; loadMailMessage(accId, id); }
+  // ссылка mailto:, открытая этим клиентом (обработчик ссылок почты в браузере)
+  const mt=/[?&]compose=([^&]+)/.exec(location.hash);
+  if(mt){ history.replaceState(null, '', '#/mail'); let u=''; try{ u=decodeURIComponent(mt[1]); }catch(e){ u=''; } if(u) setTimeout(()=>mailComposeFromMailto(u), 300); }
+}
+
+/** Новое письмо по ссылке mailto: (адрес, копия, тема, текст). */
+function mailComposeFromMailto(url){
+  const m=/^mailto:([^?]*)(?:\?(.*))?$/i.exec(String(url||'').trim()); if(!m) return;
+  const dec=(v)=>{ try{ return decodeURIComponent(String(v||'').replace(/\+/g,' ')); }catch(e){ return String(v||''); } };
+  const p=new URLSearchParams(m[2]||'');
+  const get=(k)=>{ for(const [kk,v] of p.entries()) if(kk.toLowerCase()===k) return v; return ''; };
+  const to=[dec(m[1]), get('to')].filter(Boolean).join(', ');
+  const body=get('body');
+  if(!mailCanSend()) return toast('Отправка недоступна', (Mail.st&&Mail.st.send_problem)||'Откройте ящик, из которого можно отправлять письма.', 'warn', 7000);
+  mailCompose('new', null, {to_addrs:to.slice(0,5000), cc_addrs:get('cc').slice(0,5000), subject:get('subject').slice(0,998),
+    body:body?esc(body).replace(/\r?\n/g,'<br>'):''});
 }
 
 function renderMailFolders(accId){
@@ -4911,13 +5267,15 @@ async function composeWindow(draft){
         <span class="sep"></span><button data-cmd="insertUnorderedList" title="Список">• ≡</button><button data-cmd="insertOrderedList" title="Нумерованный список">1. ≡</button><button data-cmd="quote" title="Цитата">❝</button>
         <span class="sep"></span><button data-cmd="link" title="Ссылка">🔗</button><button data-cmd="removeFormat" title="Убрать оформление">⌫</button>
         <span class="sep"></span><button data-tpl title="Вставить шаблон или сохранить письмо как шаблон">📄 Шаблон</button>
-        <span class="spacer" style="flex:1"></span><label class="btn ghost sm compose-attach" title="Прикрепить файлы">📎 Прикрепить<input type="file" multiple hidden></label></div>
+        <span class="spacer" style="flex:1"></span><button class="btn ghost sm" data-archived title="Приложить письма из архива (.eml)">🗄 Из архива</button><label class="btn ghost sm compose-attach" title="Прикрепить файлы">📎 Прикрепить<input type="file" multiple hidden></label></div>
       <div class="compose-body" contenteditable="true" role="textbox" aria-multiline="true" aria-label="Текст письма" spellcheck="true" lang="ru"></div>
       <div class="compose-atts"></div>
       <div class="compose-foot"><span class="compose-sendgrp"><button class="btn primary" data-send title="Отправить (Ctrl+Enter)">📨 Отправить</button><button class="btn primary" data-later title="Отправить позже — в назначенное время, даже если клиент закрыт" aria-label="Отправить позже">🕓</button></span>
         <button class="btn ghost sm" data-save>💾 Сохранить</button>
         <label class="compose-opt" title="Письмо придёт с пометкой «Важное»"><input type="checkbox" data-opt="priority" ${draft.priority?'checked':''}> ❗ Важное</label>
         <label class="compose-opt" title="Попросить получателя прислать уведомление о прочтении"><input type="checkbox" data-opt="receipt" ${draft.receipt?'checked':''}> ✅ Уведомить о прочтении</label>
+        <label class="compose-opt" data-smime hidden title="Подписать письмо сертификатом ящика (S/MIME): получатель увидит, что письмо от вас и не изменено"><input type="checkbox" data-opt="smime_sign" ${draft.smime_sign?'checked':''}> 🔏 Подписать</label>
+        <label class="compose-opt" title="Зашифровать письмо (S/MIME): прочитать его смогут только получатели со своим сертификатом"><input type="checkbox" data-opt="smime_encrypt" ${draft.smime_encrypt?'checked':''}> 🔒 Зашифровать</label>
         <span class="spacer" style="flex:1"></span>
         <button class="btn ghost sm danger" data-discard title="Удалить черновик">🗑</button></div>
     </div>
@@ -4938,6 +5296,12 @@ async function composeWindow(draft){
       try{ await api(`/webmail/drafts/${draft.id}/attachments/${b.dataset.n}`, {method:'DELETE'}); atts=atts.filter(x=>String(x.n)!==b.dataset.n); renderAtts(); }catch(e){ toastErr(e); } });
   };
   renderAtts();
+  // S/MIME: «Подписать» — только если у ящика есть сертификат с ключом
+  api(`/webmail/smime?account_id=${draft.account_id}`, {bg:true}).then(r=>{ const k=r.key||{}; const lab=g('[data-smime]'); if(lab && k.present && !k.expired) lab.hidden=false; }).catch(()=>{});
+  g('[data-archived]').onclick=async(e)=>{ e.preventDefault();
+    const ids=await archivePickerDlg(draft.account_id); if(!ids||!ids.length) return;
+    try{ const r=await api(`/webmail/drafts/${draft.id}/archived`, {method:'POST', body:{message_ids:ids}}); atts.push(...r.items); renderAtts(); toast('Приложено', `Писем: ${r.items.length}`); }
+    catch(err){ toastErr(err); } };
   const fields=()=>{ const o={body:body.innerHTML}; w.querySelectorAll('[data-f]').forEach(x=>{ o[x.dataset.f]=x.dataset.f==='account_id'?parseInt(x.value):x.value; });
     w.querySelectorAll('[data-opt]').forEach(x=>{ o[x.dataset.opt]=x.checked; }); return o; };
   let serverDirty=false;
@@ -5029,7 +5393,14 @@ async function composeWindow(draft){
     if(!await preflight()) return;
     mailWhenPicker(anchor, 'Отправить', async(iso, label)=>{
       clearTimeout(timer); dirty=true;
-      try{ await save(true); const d=await api(`/webmail/drafts/${draft.id}/schedule`, {method:'POST', body:{send_at:iso}});
+      try{ await save(true);
+        let d;
+        try{ d=await api(`/webmail/drafts/${draft.id}/schedule`, {method:'POST', body:{send_at:iso}}); }
+        catch(err){
+          if(!(err.status===409 && err.data && err.data.code==='presend_warn')) throw err;
+          if(!await mailPresendConfirm(err.data.items||[])) return;
+          d=await api(`/webmail/drafts/${draft.id}/schedule`, {method:'POST', body:{send_at:iso, confirm:true}});
+        }
         Object.assign(draft, d); closed=true; w.remove();
         toast('Отправка запланирована', `${label}. Письмо — в «Неотправленных»; уйдёт, даже если клиент закрыт.`, 'success', 7000);
         if(Mail.acc) loadMailFolders(Mail.acc, {quiet:true});
@@ -5049,7 +5420,14 @@ async function composeWindow(draft){
         w.hidden=true;
         if(await mailUndoWait(undoS, f.subject)){ w.hidden=false; sending=false; btn.disabled=false; btn.innerHTML='📨 Отправить'; body.focus(); return; }
       }
-      const r=await api(`/webmail/drafts/${draft.id}/send`, {method:'POST'});
+      let r;
+      try{ r=await api(`/webmail/drafts/${draft.id}/send`, {method:'POST'}); }
+      catch(err){
+        if(!(err.status===409 && err.data && err.data.code==='presend_warn')) throw err;
+        w.hidden=false;
+        if(!await mailPresendConfirm(err.data.items||[])){ sending=false; btn.disabled=false; btn.innerHTML='📨 Отправить'; return; }
+        r=await api(`/webmail/drafts/${draft.id}/send`, {method:'POST', body:{confirm:true}});
+      }
       closed=true; w.remove();
       Mail.drafts=Mail.drafts.filter(x=>x.id!==draft.id);
       toast('Письмо отправлено', `Получателей: ${fmtNum(r.recipients)}${r.saved_to?` · копия в «${r.saved_to}»`:''}`);
@@ -5069,6 +5447,83 @@ async function composeWindow(draft){
   const to=g('[data-f="to_addrs"]');
   if(!to.value.trim()) to.focus();
   else{ body.focus(); try{ const r=document.createRange(); r.setStart(body, 0); r.collapse(true); const s=window.getSelection(); s.removeAllRanges(); s.addRange(r); }catch(e){ /* пустое тело */ } }
+}
+
+/** Предупреждения проверки перед отправкой: отправить всё равно или вернуться к письму. */
+async function mailPresendConfirm(items){
+  const icon={external:'🌐', many:'👥', sensitive:'🛡'};
+  return confirmDlg('Проверьте письмо перед отправкой', `<ul class="presend">${items.map(i=>`<li>${icon[i.code]||'⚠️'} ${esc(i.text)}</li>`).join('')}</ul>
+    <div class="small muted">Если всё верно — отправьте письмо. Отправка с конфиденциальными данными записывается в аудит.</div>`,
+    {okText:'Всё верно, отправить', okClass:'primary', html:true});
+}
+
+/** Выбрать письма из архива (поиск по своим ящикам) — для вложения в письмо. */
+async function archivePickerDlg(accId){
+  return new Promise(resolve=>{
+    let done=false; const chosen=new Map();
+    const m=modal('Приложить письма из архива', `<div style="display:flex;gap:8px"><input type="search" id="apq" placeholder="Поиск: тема, отправитель, текст…" style="flex:1"><button class="btn" id="apgo">Найти</button></div>
+      <div class="small muted" style="margin:6px 0">Поиск — во всех ваших ящиках. Выбранные письма приложатся файлами .eml (до 20).</div>
+      <div id="apres" style="max-height:50vh;overflow:auto;border:1px solid var(--border);border-radius:var(--radius-sm)"><div class="empty small">Введите запрос</div></div>`,
+      {wide:true, footer:'<span class="small muted" id="apcnt"></span><div class="spacer" style="flex:1"></div><button class="btn" data-c>Отмена</button><button class="btn primary" data-ok>Приложить</button>',
+       onClose:()=>{ if(!done){ done=true; resolve(null); } }});
+    const res=m.body.querySelector('#apres'), cnt=m.foot.querySelector('#apcnt');
+    const upd=()=>{ cnt.textContent=chosen.size?`выбрано: ${chosen.size}`:''; };
+    const go=async()=>{
+      const q=m.body.querySelector('#apq').value.trim(); if(!q) return;
+      res.innerHTML='<div class="empty"><div class="spinner"></div></div>';
+      try{
+        const r=await api(`/search?q=${encodeURIComponent(q)}&scope=all&limit=50`+(accId?`&account_id=${accId}`:''));
+        res.innerHTML=(r.results||[]).map(x=>`<label style="display:flex;gap:8px;align-items:flex-start;padding:6px 10px;border-bottom:1px solid var(--border)"><input type="checkbox" data-id="${x.id}" ${chosen.has(x.id)?'checked':''}>
+          <span style="flex:1"><b>${esc(x.subject||'(без темы)')}</b><div class="small muted">${esc(x.from)} · ${esc(fmtDate(x.date))} · ${esc(x.account_name)}</div></span></label>`).join('') || '<div class="empty small">Ничего не найдено</div>';
+      }catch(e){ res.innerHTML=`<div class="empty small">${esc(e.message)}</div>`; }
+    };
+    m.body.querySelector('#apgo').onclick=go;
+    m.body.querySelector('#apq').onkeydown=(e)=>{ if(e.key==='Enter'){ e.preventDefault(); go(); } };
+    res.onchange=(e)=>{ const id=Number(e.target.dataset.id); if(!id) return; if(e.target.checked){ if(chosen.size>=20){ e.target.checked=false; return toast('Не больше 20 писем','','warn'); } chosen.set(id,true); } else chosen.delete(id); upd(); };
+    m.foot.querySelector('[data-c]').onclick=()=>m.close();
+    m.foot.querySelector('[data-ok]').onclick=()=>{ done=true; resolve(Array.from(chosen.keys())); m.close(); };
+  });
+}
+
+/** Настройки S/MIME ящика: свой сертификат с ключом и сертификаты получателей. */
+async function mailSmimeSection(pane, accId){
+  let d; try{ d=await api(`/webmail/smime?account_id=${accId}`); }catch(e){ return; }
+  const k=d.key||{};
+  const sec=h(`<div class="mail-sieve"><h3 class="mset-h">🔏 Подпись и шифрование (S/MIME)</h3>
+    <p class="small muted" style="margin-top:0">Сертификат ящика с закрытым ключом (.p12 или .pfx — его выдаёт удостоверяющий центр или служба ИБ) позволяет подписывать письма и читать зашифрованные. Ключ хранится на сервере архива зашифрованным. Сертификаты получателей собираются сами из писем с верной подписью.</p>
+    ${k.present?`<div class="hint" style="${k.expired?'border-color:var(--danger)':''}">${k.expired?'⛔ Срок сертификата истёк. ':'✔ '}Сертификат: <b>${esc(k.name||'')}</b> ${esc((k.emails||[]).join(', '))}${k.issuer?`, выдан: ${esc(k.issuer)}`:''}, действует до ${esc(fmtDateShort(k.valid_until))}.</div>`:'<div class="hint">Сертификат ящика не загружен.</div>'}
+    <div class="grid2"><div class="form-row"><label for="sm-file">Файл .p12 / .pfx</label><input id="sm-file" type="file" accept=".p12,.pfx"></div>
+      <div class="form-row"><label for="sm-pass">Пароль файла</label><input id="sm-pass" type="password" autocomplete="new-password"></div></div>
+    <div class="btn-row"><button class="btn primary" data-up>${k.present?'Заменить сертификат':'Загрузить сертификат'}</button>${k.present?'<button class="btn danger" data-del>Удалить сертификат</button>':''}
+      <span class="spacer" style="flex:1"></span><button class="btn ghost" data-certs>Сертификаты получателей (${fmtNum(d.certs||0)})</button></div></div>`);
+  sec.querySelector('[data-up]').onclick=async()=>{
+    const f=sec.querySelector('#sm-file').files[0]; if(!f) return toast('Выберите файл .p12 или .pfx','','warn');
+    const fd=new FormData(); fd.append('account_id', accId); fd.append('password', sec.querySelector('#sm-pass').value); fd.append('file', f);
+    try{ await api('/webmail/smime/key', {method:'POST', body:fd}); toast('Сертификат загружен'); sec.remove(); mailSmimeSection(pane, accId); }catch(e){ toastErr(e); }
+  };
+  const del=sec.querySelector('[data-del]');
+  if(del) del.onclick=async()=>{ if(!await confirmDlg('Удалить сертификат ящика?', 'Подписывать письма и читать зашифрованные будет нельзя, пока не загрузите сертификат снова.', {okText:'Удалить'})) return;
+    try{ await api(`/webmail/smime/key?account_id=${accId}`, {method:'DELETE'}); toast('Удалено'); sec.remove(); mailSmimeSection(pane, accId); }catch(e){ toastErr(e); } };
+  sec.querySelector('[data-certs]').onclick=()=>mailSmimeCerts();
+  pane.appendChild(sec);
+}
+async function mailSmimeCerts(){
+  const m=modal('Сертификаты получателей', `<div style="display:flex;gap:8px;align-items:center"><input type="search" id="sc-q" placeholder="Адрес или имя" style="flex:1">
+    <label class="btn sm">⬆ Загрузить .cer<input type="file" id="sc-file" accept=".cer,.crt,.pem,.der" hidden></label></div>
+    <div id="sc-list" style="margin-top:8px;max-height:55vh;overflow:auto"></div>`, {wide:true});
+  const list=m.body.querySelector('#sc-list');
+  const SRC={signed:'из письма с подписью', upload:'загружен', own:'сертификат ящика'};
+  const load=async()=>{
+    const q=m.body.querySelector('#sc-q').value.trim();
+    let r; try{ r=await api('/webmail/smime/certs?q='+encodeURIComponent(q)); }catch(e){ list.innerHTML=`<div class="empty small">${esc(e.message)}</div>`; return; }
+    list.innerHTML=r.items.length?`<table class="tbl"><thead><tr><th>Адрес</th><th>Владелец</th><th>До</th><th>Откуда</th>${isAdmin()?'<th></th>':''}</tr></thead><tbody>${r.items.map(c=>`<tr><td>${esc(c.email)}</td><td class="small">${esc(c.name)}<div class="muted">${esc(c.issuer)}</div></td><td class="small">${c.expired?'<span class="tag err">истёк</span>':esc(fmtDateShort(c.valid_until))}</td><td class="small">${esc(SRC[c.source]||c.source)}</td>${isAdmin()?`<td><button class="btn ghost sm" data-del="${esc(c.email)}">✕</button></td>`:''}</tr>`).join('')}</tbody></table>`
+      :'<div class="empty small">Сертификатов пока нет: они появятся, когда придут письма с подписью S/MIME.</div>';
+  };
+  list.onclick=async(e)=>{ const b=e.target.closest('[data-del]'); if(!b) return; try{ await api('/webmail/smime/certs?email='+encodeURIComponent(b.dataset.del), {method:'DELETE'}); load(); }catch(err){ toastErr(err); } };
+  m.body.querySelector('#sc-q').oninput=()=>load();
+  m.body.querySelector('#sc-file').onchange=async(e)=>{ const f=e.target.files[0]; if(!f) return; const fd=new FormData(); fd.append('file', f);
+    try{ const r=await api('/webmail/smime/certs', {method:'POST', body:fd}); toast('Сертификат добавлен', r.emails.join(', ')); load(); }catch(err){ toastErr(err); } e.target.value=''; };
+  load();
 }
 
 /** Вставленный HTML — без скриптов, обработчиков, стилей страницы и внешних картинок. */
@@ -5180,7 +5635,79 @@ async function mailIdentityPane(pane, accId){
       try{ Mail.st=await api(`/webmail/status?account_id=${accId}`); }catch(e){ /* обновится при следующем входе */ }
       const cb=$('#mailCompose'); if(cb){ cb.disabled=!mailCanSend(); cb.title=mailCanSend()?'Новое письмо (c)':(Mail.st.send_problem||''); }
     }catch(e){ toastErr(e); }
+  };  mailSmimeSection(pane, accId);
+  mailDavSection(pane, accId);
+  mailAppSection(pane);
+}
+
+/** Календарь и контакты почтового сервера (CalDAV, CardDAV). */
+async function mailDavSection(pane, accId){
+  let d; try{ d=await api(`/webmail/dav?account_id=${accId}`); }catch(e){ return; }
+  const found=d.found||{calendars:[], addressbooks:[]};
+  const opts=(list, cur)=>list.map(x=>`<option value="${esc(x.href)}" ${x.href===cur?'selected':''}>${esc(x.name||x.href)}</option>`).join('');
+  const sec=h(`<div class="mail-sieve"><h3 class="mset-h">📅 Календарь и контакты (CalDAV, CardDAV)</h3>
+    <p class="small muted" style="margin-top:0">Календарь и адресная книга почтового сервера (Nextcloud, SOGo, Zimbra, Яндекс, Mail.ru, Dovecot с Radicale и другие): контакты сервера попадают в подсказку адресов, ближайшие события видны в окне «📅», принятое приглашение ложится в календарь. Вход — логином и паролем ящика.</p>
+    ${d.supported?'':'<div class="hint">Доступно ящикам с паролем.</div>'}
+    ${d.url?`<div class="hint">✔ Подключено: ${esc(d.url)}${d.calendar?' · календарь':''}${d.addressbook?' · контакты':''}${d.contacts_synced_at?` · контакты загружены ${esc(fmtDate(d.contacts_synced_at))} (${fmtNum(d.contacts||0)})`:''}</div>`:''}
+    ${d.can_configure?`<div class="grid2"><div class="form-row"><label for="dv-url">Адрес сервера</label><input id="dv-url" type="url" value="${esc(d.url||'')}" placeholder="https://mail.company.ru"></div>
+      <div class="form-row"><label for="dv-user">Логин <span class="muted small">(если другой)</span></label><input id="dv-user" type="text" value="${esc(d.username||'')}" autocomplete="off"></div></div>
+      ${found.calendars.length?`<div class="form-row"><label for="dv-cal">Календарь</label><select id="dv-cal">${opts(found.calendars, d.calendar)}</select></div>`:''}
+      ${found.addressbooks.length?`<div class="form-row"><label for="dv-book">Адресная книга</label><select id="dv-book">${opts(found.addressbooks, d.addressbook)}</select></div>`:''}`:''}
+    <div class="btn-row mset-foot">${d.can_configure&&d.supported?'<button class="btn primary" data-dv>Найти и подключить</button>':''}
+      ${d.addressbook?'<button class="btn" data-sync>⟳ Загрузить контакты</button>':''}${d.calendar?'<button class="btn" data-cal>📅 Календарь</button>':''}</div></div>`);
+  const g=s=>sec.querySelector(s);
+  const save=g('[data-dv]');
+  if(save) save.onclick=async()=>{ save.disabled=true;
+    try{ const body={account_id:accId, url:g('#dv-url').value.trim(), username:g('#dv-user').value.trim(), calendar:g('#dv-cal')?g('#dv-cal').value:'', addressbook:g('#dv-book')?g('#dv-book').value:''};
+      const r=await api('/webmail/dav', {method:'PUT', body}); const f=r.found||{calendars:[],addressbooks:[]};
+      toast(r.url?'Подключено':'Отключено', r.url?`Календарей: ${f.calendars.length}, адресных книг: ${f.addressbooks.length}`:''); sec.remove(); mailDavSection(pane, accId); }
+    catch(e){ toastErr(e); } finally{ save.disabled=false; } };
+  const sy=g('[data-sync]');
+  if(sy) sy.onclick=async()=>{ sy.disabled=true; try{ const r=await api('/webmail/dav/contacts', {method:'POST', body:{account_id:accId}}); toast('Контакты загружены', `Новых: ${r.added}, обновлено: ${r.updated}`); sec.remove(); mailDavSection(pane, accId); }catch(e){ toastErr(e); } finally{ sy.disabled=false; } };
+  const cl=g('[data-cal]'); if(cl) cl.onclick=()=>mailCalendarDlg(accId);
+  pane.appendChild(sec);
+}
+
+/** Ближайшие события календаря сервера и новое событие. */
+async function mailCalendarDlg(accId){
+  const m=modal('📅 Календарь', `<div class="btn-row"><button class="btn sm primary" data-new>＋ Событие</button><span class="spacer" style="flex:1"></span><button class="btn sm ghost" data-reload>↻ Обновить</button></div>
+    <div data-form hidden class="card" style="margin:8px 0"><div class="form-row"><label>Название</label><input data-f="summary" maxlength="500"></div>
+      <div class="grid2"><div class="form-row"><label>Начало</label><input type="datetime-local" data-f="start"></div><div class="form-row"><label>Конец</label><input type="datetime-local" data-f="end"></div></div>
+      <div class="form-row"><label>Где</label><input data-f="location" maxlength="500"></div>
+      <label class="check"><input type="checkbox" data-f="all_day"> Весь день</label>
+      <div class="btn-row"><button class="btn primary sm" data-add>Добавить в календарь</button></div></div>
+    <div data-list><div class="empty"><div class="spinner"></div></div></div>`, {wide:true});
+  const list=m.body.querySelector('[data-list]'), form=m.body.querySelector('[data-form]');
+  const fmtWhen=(e)=>{ const s=new Date(e.start); if(e.all_day) return s.toLocaleDateString('ru-RU',{weekday:'short', day:'2-digit', month:'long'})+' · весь день';
+    const en=e.end?new Date(e.end):null; return s.toLocaleString('ru-RU',{weekday:'short', day:'2-digit', month:'long', hour:'2-digit', minute:'2-digit'})+(en?' – '+en.toLocaleTimeString('ru-RU',{hour:'2-digit', minute:'2-digit'}):''); };
+  const load=async()=>{
+    list.innerHTML='<div class="empty"><div class="spinner"></div></div>';
+    let r; try{ r=await api(`/webmail/calendar?account_id=${accId}&days=30`); }catch(e){ list.innerHTML=`<div class="empty small">${esc(e.message)}</div>`; return; }
+    list.innerHTML=r.items.length?r.items.map(e=>`<div class="mail-event"><div class="w">${esc(fmtWhen(e))}${e.rrule?' · 🔁':''}</div><div class="s"><b>${esc(e.summary||'(без названия)')}</b>${e.location?` <span class="muted">· ${esc(e.location)}</span>`:''}</div></div>`).join('')
+      :'<div class="empty small">На ближайшие 30 дней событий нет.</div>';
   };
+  m.body.querySelector('[data-reload]').onclick=load;
+  m.body.querySelector('[data-new]').onclick=()=>{ form.hidden=!form.hidden; if(!form.hidden){ const d=new Date(Date.now()+3600e3); d.setMinutes(0,0,0); const iso=(x)=>new Date(x-x.getTimezoneOffset()*60e3).toISOString().slice(0,16);
+    form.querySelector('[data-f="start"]').value=iso(d); form.querySelector('[data-f="end"]').value=iso(new Date(d.getTime()+3600e3)); form.querySelector('[data-f="summary"]').focus(); } };
+  form.querySelector('[data-add]').onclick=async(ev)=>{
+    const b=ev.currentTarget; b.disabled=true; const v=s=>form.querySelector(`[data-f="${s}"]`);
+    const toIso=(x)=>x?new Date(x).toISOString():'';
+    try{ await api('/webmail/calendar', {method:'POST', body:{account_id:accId, summary:v('summary').value, start:toIso(v('start').value), end:toIso(v('end').value), location:v('location').value, all_day:v('all_day').checked}});
+      toast('Событие добавлено'); form.hidden=true; load(); }catch(e){ toastErr(e); } finally{ b.disabled=false; }
+  };
+  load();
+}
+
+/** Клиент как приложение: установка и ссылки mailto:. */
+function mailAppSection(pane){
+  const secure=window.isSecureContext;
+  const sec=h(`<div class="mail-sieve"><h3 class="mset-h">📱 Как приложение</h3>
+    <p class="small muted" style="margin-top:0">Клиент можно установить как отдельное приложение: в Chrome, Edge и Яндекс Браузере — меню браузера → «Установить приложение» (на телефоне — «Добавить на главный экран»). Тогда он открывается в своём окне, как почтовая программа.</p>
+    <div class="btn-row"><button class="btn" data-mailto ${secure&&navigator.registerProtocolHandler?'':'disabled'}>Открывать ссылки mailto: здесь</button></div>
+    ${secure?'':'<div class="small muted">Нужно открытие по https:// (или с этой же машины по localhost).</div>'}</div>`);
+  const b=sec.querySelector('[data-mailto]');
+  b.onclick=()=>{ try{ navigator.registerProtocolHandler('mailto', location.origin+'/#/mail?compose=%s'); toast('Готово', 'Браузер спросит разрешения: после этого ссылки mailto: будут открывать новое письмо в этом клиенте.'); }catch(e){ toastErr(e); } };
+  pane.appendChild(sec);
 }
 
 // ---------- Почтовый клиент 1.18.0: метки, «напомнить позже», архивы, отмена, правила, адресная книга ----------
@@ -5407,7 +5934,7 @@ function mailRenderExtras(el, accId, pk, x, {act, send}){
         <a class="btn sm ghost" href="/api/webmail/invite.ics?account_id=${accId}&id=${pk}" download>📅 Добавить в календарь (.ics)</a></div></div>`);
     c.querySelectorAll('[data-p]').forEach(b=>b.onclick=async()=>{
       c.querySelectorAll('[data-p]').forEach(x=>x.disabled=true);
-      try{ const r=await api('/webmail/invite', {method:'POST', body:{account_id:accId, id:pk, partstat:b.dataset.p}}); toast('Ответ отправлен', `${b.textContent.trim()} — организатору ${r.to}`); }
+      try{ const r=await api('/webmail/invite', {method:'POST', body:{account_id:accId, id:pk, partstat:b.dataset.p}}); toast('Ответ отправлен', `${b.textContent.trim()} — организатору ${r.to}${r.calendar?'. Событие добавлено в календарь.':''}`); }
       catch(e){ toastErr(e); c.querySelectorAll('[data-p]').forEach(x=>x.disabled=false); }
     });
     box.appendChild(c);
@@ -5911,8 +6438,27 @@ function mailRenderTrust(el, accId, pk, x, act){
   if(sm && sm.kind==='signed' && sm.signer && sm.signer.name){
     box.appendChild(h(`<div class="small muted mail-smime">🔏 ${esc(sm.text||'')} Подписал: ${esc(sm.signer.name)}${(sm.signer.emails||[]).length?` &lt;${esc(sm.signer.emails.join(', '))}&gt;`:''}${sm.signer.issuer?`, выдан: ${esc(sm.signer.issuer)}`:''}${sm.signer.expired?' — сертификат истёк':''}.</div>`));
   }else if(sm && sm.text && sm.kind!=='signed'){
-    box.appendChild(h(`<div class="small muted mail-smime">🔒 ${esc(sm.text)}</div>`));
+    const b=h(`<div class="small muted mail-smime">🔒 ${esc(sm.text)}${sm.can_decrypt?' <button class="btn sm" data-decrypt>🔓 Расшифровать</button>':''}</div>`);
+    const dbtn=b.querySelector('[data-decrypt]'); if(dbtn) dbtn.onclick=()=>mailShowDecrypted(el, accId, pk, dbtn);
+    box.appendChild(b);
   }
+}
+/** Расшифровать письмо S/MIME (на сервере, без сохранения) и показать его текст и вложения. */
+async function mailShowDecrypted(el, accId, pk, btn){
+  if(btn) btn.disabled=true;
+  let m; try{ m=await api(`/webmail/decrypted?account_id=${accId}&id=${pk}`); }catch(e){ if(btn) btn.disabled=false; return toastErr(e); }
+  const body=el.querySelector('#mbody'); if(!body) return;
+  const atts=(m.attachments||[]).filter(a=>!a.inline);
+  const url=a=>`/api/webmail/decrypted/attachment?account_id=${accId}&id=${pk}&index=${a.index}`;
+  body.innerHTML='';
+  body.appendChild(h(`<div class="hint" style="margin-bottom:8px">🔓 Расшифровано для просмотра. На сервере расшифрованный текст не сохраняется.</div>`));
+  if(atts.length) body.appendChild(h(`<div class="mail-atts">${atts.map(a=>`<a class="attach-chip" href="${url(a)}" download>📎 ${esc(a.filename)} <span class="muted">(${fmtBytes(a.size)})</span></a>`).join('')}</div>`));
+  if(m.html && m.html.trim()){
+    const f=document.createElement('iframe'); f.className='mail-body-frame';
+    f.setAttribute('sandbox','allow-popups allow-popups-to-escape-sandbox'); f.setAttribute('referrerpolicy','no-referrer');
+    f.srcdoc=mailSrcdoc(m.html, false).srcdoc; body.appendChild(f);
+  }else body.appendChild(h(`<div class="mail-body-text">${esc(m.text||'(пустое тело)')}</div>`));
+  if(btn) btn.remove();
 }
 async function mailReportPhish(accId, ids){
   const to=Mail.st && Mail.st.phishing_report_to;
@@ -5999,7 +6545,7 @@ const STATUS_LBL = {queued:'в очереди',running:'выполняется',
 // Задания, которые меняли почтовый сервер: «Повторить» у них нет — повтор вслепую изменил бы ещё раз и
 // уже изменённые ящики. Их запускают заново из раздела, с проверкой.
 const NO_RETRY_JOBS = new Set(['axigen_action','server_action']);
-const JOBLBL = {backup:'Резервное копирование',restore:'Восстановление',export:'Экспорт',import_pst:'Импорт PST',test:'Проверка подключения',retention:'Очистка (ретеншн)',verify:'Проверка целостности',analyze:'Глубокий анализ писем',sync_employees:'Синхронизация сотрудников',storage_convert:'Шифрование копии',check_logins:'Проверка паролей',replicate:'Копия вне сервера',db_snapshot:'Снимок базы',search_index:'Индексация поиска',dedup_report:'Отчёт об одинаковых вложениях',cleanup:'Удаление архивов и прежних копий',backup_all:'Копирование всех ящиков по очереди',quarantine_check:'Сравнение прежней копии с новой',quarantine_rescue:'Возврат писем из прежней копии',folders_check:'Проверка папок на сервере',search_reindex:'Переиндексация поиска',axigen_sync:'Сверка с сервером Axigen',axigen_action:'Действия на сервере Axigen',server_action:'Действия с ящиками на сервере',server_sync:'Сверка с почтовым сервером',reply_index:'Индекс ответов на письма'};
+const JOBLBL = {backup:'Резервное копирование',restore:'Восстановление',export:'Экспорт',import_pst:'Импорт PST',test:'Проверка подключения',retention:'Очистка (ретеншн)',verify:'Проверка целостности',analyze:'Глубокий анализ писем',sync_employees:'Синхронизация сотрудников',storage_convert:'Шифрование копии',check_logins:'Проверка паролей',replicate:'Копия вне сервера',db_snapshot:'Снимок базы',search_index:'Индексация поиска',dedup_report:'Отчёт об одинаковых вложениях',cleanup:'Удаление архивов и прежних копий',backup_all:'Копирование всех ящиков по очереди',quarantine_check:'Сравнение прежней копии с новой',quarantine_rescue:'Возврат писем из прежней копии',folders_check:'Проверка папок на сервере',search_reindex:'Переиндексация поиска',axigen_sync:'Сверка с сервером Axigen',axigen_action:'Действия на сервере Axigen',server_action:'Действия с ящиками на сервере',server_sync:'Сверка с почтовым сервером',reply_index:'Индекс ответов на письма',case_export:'Выгрузка дела'};
 function cvar(n,f){ const v=getComputedStyle(document.documentElement).getPropertyValue(n).trim(); return v||f; }
 function fmtNum(n){ return Number(n||0).toLocaleString('ru-RU'); }
 function trunc(s,n){ s=String(s==null?'':s); return s.length>n? s.slice(0,n-1)+'…':s; }

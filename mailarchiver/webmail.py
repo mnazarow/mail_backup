@@ -133,6 +133,8 @@ _LATE_COLUMNS = (
     ("webmail_drafts", "send_at", "TEXT"),                               # отправить в это время (UTC, ISO)
     ("webmail_drafts", "actor", "TEXT NOT NULL DEFAULT ''"),             # кто отправляет (для аудита)
     ("webmail_drafts", "server_copy", "TEXT NOT NULL DEFAULT ''"),       # копия в «Черновиках» сервера (1.19.0)
+    ("webmail_drafts", "smime_sign", "INTEGER NOT NULL DEFAULT 0"),      # подписать S/MIME (1.20.0)
+    ("webmail_drafts", "smime_encrypt", "INTEGER NOT NULL DEFAULT 0"),   # зашифровать S/MIME (1.20.0)
 )
 
 
@@ -143,6 +145,8 @@ def ensure_schema(conn) -> None:
         if col not in have:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
     conn.commit()
+    from .webmail_secure import ensure_schema as _secure_schema
+    _secure_schema(conn)
     from .webmail_tools import ensure_schema as _tools_schema
     _tools_schema(conn)
     from .webmail_more import ensure_schema as _more_schema
@@ -1931,7 +1935,9 @@ def thread(svc, account_id: int, pk: int, limit: int = 60) -> List[Dict]:
 # ===========================================================================
 #  Черновики
 # ===========================================================================
-DRAFT_FIELDS = ("to_addrs", "cc_addrs", "bcc_addrs", "subject", "body", "from_addr", "priority", "receipt")
+DRAFT_FIELDS = ("to_addrs", "cc_addrs", "bcc_addrs", "subject", "body", "from_addr", "priority", "receipt",
+                "smime_sign", "smime_encrypt")
+_BOOL_FIELDS = ("priority", "receipt", "smime_sign", "smime_encrypt")
 
 
 def _drafts_root(svc) -> str:
@@ -2013,7 +2019,7 @@ def update_draft(svc, draft_id: int, owner: str, fields: Dict) -> Dict:
             v = fields[key]
             if key == "body":
                 vals[key] = _clean_body(v)
-            elif key in ("priority", "receipt"):
+            elif key in _BOOL_FIELDS:
                 vals[key] = 1 if v else 0
             else:
                 vals[key] = _one_line(v, MAX_SUBJECT if key == "subject" else 300 if key == "from_addr" else 5000)
@@ -2367,7 +2373,7 @@ def build_message(svc, account: Account, draft, ident: Dict, *, as_draft: bool =
         total += len(data)
         if total > limit:
             raise ValidationError(f"Вложения письма больше {limit // (1024 * 1024)} МБ.")
-        if item.get("eml"):
+        if item.get("eml") or (item.get("ctype") or "").lower() == "message/rfc822":
             msg.add_attachment(message_from_bytes(data, policy=policy.default), filename=item.get("name") or "message.eml")
             continue
         maintype, _sep, subtype = (item.get("ctype") or "application/octet-stream").partition("/")
@@ -2395,8 +2401,49 @@ def _save_policy(ident: Dict) -> bool:
     return not _AUTO_SAVES_SENT.search(ident.get("smtp_host") or "")
 
 
-def send(svc, account: Account, draft_id: int, owner: str, *, actor: str = "") -> Dict:
-    """Отправить черновик: SMTP, копия в «Отправленные» (и в архив), отметка «Отвечено» у исходного письма."""
+class PresendWarning(ValidationError):
+    """Перед отправкой есть предупреждения: письмо уйдёт, если пользователь подтвердит (1.20.0)."""
+    code = "presend_warn"
+
+    def __init__(self, items: List[Dict]) -> None:
+        super().__init__("; ".join(i["text"] for i in items)[:1000])
+        self.items = items
+
+
+def check_before_send(svc, account: Account, row, msg_rcpts: Sequence[str], atts: Sequence[Dict], *,
+                      confirmed: bool, actor: str = "") -> List[Dict]:
+    """Проверки перед отправкой: запрет — ошибка, предупреждения — PresendWarning (если не подтверждены)."""
+    from . import webmail_secure as wsec
+    from .attachtext import kind_of
+    files: List[Tuple[str, str, bytes]] = []
+    for item in atts:
+        name, ctype = item.get("name") or "", item.get("ctype") or ""
+        if not kind_of(name, ctype) or int(item.get("size") or 0) > 10 * 1024 * 1024:
+            continue
+        try:
+            files.append((name, ctype, _attachment_bytes(svc, account, int(row["id"]), item)))
+        except (MailArchiverError, OSError):
+            continue
+    items = wsec.presend_checks(svc, account, row, msg_rcpts, files)
+    blocks = [i for i in items if i["level"] == "block"]
+    if blocks:
+        raise ValidationError(blocks[0]["text"], code="presend_block",
+                              hint="Уберите эти данные из письма или отправьте его только адресатам организации.")
+    if items and not confirmed:
+        raise PresendWarning(items)
+    if items and actor and any(i["code"] == "sensitive" for i in items):
+        svc.db.add_audit(actor, "webmail_dlp_override",
+                         f"ящик «{account.name}»: «{_one_line(row['subject'], 120)}» — "
+                         + "; ".join(i["text"] for i in items if i["code"] == "sensitive")[:600])
+    return items
+
+
+def send(svc, account: Account, draft_id: int, owner: str, *, actor: str = "", confirmed: bool = True) -> Dict:
+    """Отправить черновик: SMTP, копия в «Отправленные» (и в архив), отметка «Отвечено» у исходного письма.
+
+    ``confirmed=False`` (кнопка «Отправить» в клиенте) — предупреждения проверки перед отправкой возвращаются
+    пользователю (:class:`PresendWarning`); запреты (``webmail.dlp_mode = block_external``) действуют всегда.
+    """
     row = get_draft_row(svc, draft_id, owner)
     if int(row["account_id"]) != int(account.id):
         raise ValidationError("Черновик относится к другому ящику.")
@@ -2410,10 +2457,20 @@ def send(svc, account: Account, draft_id: int, owner: str, *, actor: str = "") -
         if problem:
             raise ValidationError(problem)
         msg, rcpts, _atts = build_message(svc, account, row, ident)
-        data = msg.as_bytes()
+        check_before_send(svc, account, row, rcpts, _atts, confirmed=confirmed, actor=actor)
+        keys = row.keys()
+        sign = bool(row["smime_sign"]) if "smime_sign" in keys else False
+        encrypt = bool(row["smime_encrypt"]) if "smime_encrypt" in keys else False
+        if sign or encrypt:
+            from .webmail_secure import protect
+            data = protect(svc, account, msg, rcpts, draft_sender(ident, row), sign=sign, encrypt=encrypt)
+        else:
+            data = msg.as_bytes()
         refused = _smtp_send(svc, account, ident, draft_sender(ident, row), rcpts, data)
     except BaseException as exc:
         text = exc.message if isinstance(exc, MailArchiverError) else f"{type(exc).__name__}: {exc}"
+        if isinstance(exc, PresendWarning):
+            text = ""                          # не ошибка: ждём подтверждения пользователя
         svc.db.execute("UPDATE webmail_drafts SET status='draft', send_at=NULL, error=?, updated_at=? WHERE id=?",
                        (text[:1000], utcnow_iso(), int(draft_id)))
         raise

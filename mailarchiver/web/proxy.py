@@ -385,6 +385,8 @@ def host_is_trusted(host_header: str, public_url: str = "", forwarded_host: str 
 #: поставить его на межсайтовый запрос без разрешения CORS (а его сервис не
 #: даёт), поэтому его наличие доказывает, что запрос не подделан формой.
 MARKER_HEADER = "x-requested-with"
+#: Начало API-токена (см. mailarchiver/apitokens.py).
+API_TOKEN_PREFIX = "ma_"
 
 
 def check_origin(scope, public_url: str = "", require_marker: bool = False) -> bool:
@@ -403,7 +405,11 @@ def check_origin(scope, public_url: str = "", require_marker: bool = False) -> b
         referer = headers.get("referer") or ""
         if not referer:
             if require_marker:
-                return bool((headers.get(MARKER_HEADER) or "").strip())
+                # API-токен в заголовке Authorization (1.20.0) — тоже не форма: браузер не подставит
+                # его в межсайтовый запрос сам, а CORS для чужих источников не открыт.
+                authz = (headers.get("authorization") or "").strip()
+                return bool((headers.get(MARKER_HEADER) or "").strip()) or \
+                    (authz[:7].lower() == "bearer " and authz[7:].strip().startswith(API_TOKEN_PREFIX))
             # WebSocket без Origin — не браузер (браузер шлёт его всегда).
             return True
         origin = referer

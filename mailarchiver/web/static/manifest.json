@@ -1,0 +1,16 @@
+{
+  "name": "MailArchiver — почта и архив",
+  "short_name": "MailArchiver",
+  "description": "Почтовый клиент и архив писем",
+  "lang": "ru",
+  "start_url": "/#/mail",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#0f172a",
+  "theme_color": "#2f6fed",
+  "icons": [
+    {"src": "/static/img/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+    {"src": "/static/img/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+    {"src": "/static/favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any"}
+  ]
+}

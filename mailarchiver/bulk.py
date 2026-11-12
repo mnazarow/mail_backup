@@ -722,6 +722,8 @@ class HoldSetAction(Handler):
         ctx.data["until"] = day.isoformat()
 
     def check(self, ctx, acc):
+        if acc.hold_reason == "case":
+            return "архив удерживается делом — удержание меняется только в разделе «Дела»"
         return "удержание уже такое" if acc.hold_until == ctx.data["until"] else ""
 
     def plan(self, ctx, acc):
@@ -743,6 +745,8 @@ class HoldClearAction(Handler):
     desc = "Письма ящиков снова будут удаляться по сроку хранения (если он задан), архив можно будет удалить."
 
     def check(self, ctx, acc):
+        if acc.hold_reason == "case":
+            return "архив удерживается делом — удержание снимается закрытием дела"
         return "" if acc.hold_until else "удержания нет"
 
     def plan(self, ctx, acc):

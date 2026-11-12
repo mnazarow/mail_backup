@@ -137,12 +137,22 @@ DEFAULTS: Dict[str, Any] = {
         "on_failure": True,
         "summary_enabled": True,       # еженедельная сводка администраторам (если уведомления включены)
         "summary_cron": "0 8 * * 1",  # когда отправлять сводку (по умолчанию понедельник 08:00)
+        # Telegram и вебхук (1.20.0): то же сообщение, что уходит на почту
+        "telegram_bot_token": "",      # токен бота от @BotFather (хранится зашифрованным)
+        "telegram_chat_id": "",        # чат, группа или канал, куда писать (число или @имя канала)
+        "telegram_api_url": "https://api.telegram.org",  # свой сервер Bot API, если нужен
+        "webhook_url": "",             # адрес, на который POST-ом уходит JSON
+        "webhook_format": "json",      # json (свой сервис) | slack (Slack, Mattermost, Rocket.Chat)
+        "webhook_secret": "",          # подпись HMAC-SHA256 в заголовке X-MailArchiver-Signature
     },
     "search": {
         "enabled": True,               # индексировать письма для поиска (раздел «Почта» → поиск)
         "index_bodies": True,          # искать и по тексту писем (иначе — тема, адреса, вложения)
         "index_bodies_encrypted": False,  # индексировать текст, даже если копия шифруется (текст ляжет в базу открыто)
         "body_max_kb": 16,             # сколько текста письма индексировать, КБ (цитаты прошлых писем отбрасываются)
+        "index_attachments": True,     # искать и по тексту вложений: PDF, Word, Excel, PowerPoint, OpenDocument, RTF (1.20.0)
+        "attachment_max_kb": 10240,    # вложения крупнее (КБ) не разбираются
+        "attachment_text_kb": 64,      # сколько текста вложений одного письма индексировать, КБ
     },
     "replies": {
         # Раздел «Ответы на письма» (1.16.0): связи «письмо — ответ» по заголовкам In-Reply-To и References.
@@ -169,6 +179,40 @@ DEFAULTS: Dict[str, Any] = {
         "push": True,                  # новая почта сразу (IMAP IDLE), пока клиент открыт
         "drafts_on_server": True,      # черновики клиента — и в папку «Черновики» сервера (видны на телефоне)
         "phishing_report_to": "",      # «Сообщить о фишинге»: адрес службы безопасности ('' — только в «Спам»)
+        # проверки перед отправкой (1.20.0)
+        "dlp_mode": "warn",            # конфиденциальные данные в письме: off | warn | block_external
+        "warn_external": True,         # предупреждать, что письмо уходит за пределы организации
+        "warn_recipients": 20,         # предупреждать, если в «Кому» и «Копии» больше адресатов (0 — нет)
+    },
+    "journal": {
+        # Приём журналирования по SMTP (1.20.0): копия каждого письма организации — сразу в архив
+        "enabled": False,
+        "listen": "127.0.0.1",         # адрес, на котором слушать (0.0.0.0 — все)
+        "port": 2525,
+        "allowed_ips": ["127.0.0.1", "::1"],  # почтовые серверы, которым можно отправлять журнал
+        "address": "",                 # адрес журнала (в конверте): сам он ящиком не считается
+        "folder": "Журнал",            # папка архива ящика для писем из журнала
+        "unwrap_exchange": True,       # разворачивать журнальные отчёты Exchange (исходное письмо — вложением)
+        "tls_cert": "",                # сертификат и ключ для STARTTLS (PEM)
+        "tls_key": "",
+        "require_tls": False,          # не принимать письма без STARTTLS
+        "max_size_mb": 50,
+    },
+    "ldap": {
+        # Вход администраторов и операторов через LDAP / Active Directory (1.20.0)
+        "enabled": False,
+        "url": "",                    # ldaps://dc.company.local или ldap://dc.company.local (со StartTLS)
+        "starttls": True,             # для ldap:// — включить шифрование StartTLS
+        "verify_ssl": True,           # проверять сертификат сервера
+        "bind_dn": "",                # служебная учётная запись для поиска (DN или svc@company.local)
+        "bind_password": "",          # её пароль (хранится зашифрованным)
+        "base_dn": "",                # где искать пользователей: DC=company,DC=local
+        "user_filter": "(&(objectClass=user)(sAMAccountName={login}))",  # {login} — введённый логин
+        "admin_group": "",            # DN группы администраторов архива
+        "operator_group": "",         # DN группы операторов
+        "nested_groups": True,        # учитывать вложенные группы (Active Directory)
+        "employee_login": False,      # сотрудники входят доменным паролем в архив своих ящиков (по адресу mail)
+        "timeout_s": 10,
     },
     "mailadmin": {
         # Вход в ящики учётной записью администратора почты — без паролей сотрудников.
@@ -342,11 +386,17 @@ VALUE_RANGES: Dict[str, tuple] = {
     "axigen.alert_quota_percent": (0, 100),
     # replica
     "search.body_max_kb": (1, 1024),
+    "search.attachment_max_kb": (64, 512000),
+    "search.attachment_text_kb": (1, 4096),
     "replies.sla_hours": (1, 8760),
     "webmail.auto_refresh_s": (0, 3600),
     "webmail.max_attachments_mb": (1, 30),
     "webmail.drafts_keep_days": (1, 365),
     "webmail.undo_send_s": (0, 30),
+    "webmail.warn_recipients": (0, 1000),
+    "ldap.timeout_s": (2, 120),
+    "journal.port": (1, 65535),
+    "journal.max_size_mb": (1, 500),
     "webmail.rules_interval_min": (0, 1440),
     "replica.db_snapshot_keep": (0, 365),
     "replica.max_delete_percent": (0, 100),
@@ -436,7 +486,9 @@ VALUE_CHOICES: Dict[str, tuple] = {
     "export.default_engine": ("auto", "aspose", "native", "mbox", "eml"),
     "export.pst_format": ("unicode", "ansi"),
     "notifications.smtp_security": ("starttls", "ssl", "none"),
+    "notifications.webhook_format": ("json", "slack"),
     "webmail.save_sent": ("auto", "always", "never"),
+    "webmail.dlp_mode": ("off", "warn", "block_external"),
     "employees.source_type": ("file", "url"),
     "employees.source_url_format": ("auto", "csv", "xlsx"),
     "employees.account_security": ("ssl", "starttls", "plain"),

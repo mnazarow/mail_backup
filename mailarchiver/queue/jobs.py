@@ -1928,6 +1928,11 @@ def _axigen_jobs():
     return axigen_jobs
 
 
+def _cases():
+    from .. import cases
+    return cases
+
+
 def _server_jobs():
     from ..serverops import jobs as server_jobs
     return server_jobs
@@ -2620,6 +2625,7 @@ HANDLERS: Dict[str, Callable[[JobContext], Dict]] = {
     JobType.DB_SNAPSHOT: handle_db_snapshot,
     JobType.SEARCH_INDEX: handle_search_index,
     JobType.REPLY_INDEX: handle_reply_index,
+    JobType.CASE_EXPORT: lambda ctx: _cases().handle_export(ctx),
     JobType.DEDUP_REPORT: handle_dedup_report,
     JobType.BACKUP_ALL: handle_backup_all,
     JobType.CLEANUP: handle_cleanup,

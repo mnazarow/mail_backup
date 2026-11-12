@@ -531,8 +531,13 @@ def smime_status(svc, account: Account, row) -> Optional[Dict]:
     if not kind:
         return None
     if kind == "encrypted":
-        return {"kind": "encrypted", "text": "Письмо зашифровано S/MIME — прочитать его может только получатель "
-                                             "в почтовой программе со своим сертификатом."}
+        from .webmail_secure import key_info
+        if key_info(svc, account).get("present"):
+            return {"kind": "encrypted", "can_decrypt": True,
+                    "text": "Письмо зашифровано S/MIME. У ящика есть сертификат с ключом — письмо можно расшифровать."}
+        return {"kind": "encrypted", "can_decrypt": False,
+                "text": "Письмо зашифровано S/MIME. Чтобы прочитать его здесь, загрузите сертификат ящика с ключом "
+                        "(Почта → ⚙ → S/MIME) — или откройте письмо в почтовой программе со своим сертификатом."}
     out: Dict = {"kind": "signed", "valid": None, "trusted": None, "signer": {}, "text": ""}
     exe = _openssl()
     if not exe:
@@ -562,7 +567,11 @@ def smime_status(svc, account: Account, row) -> Optional[Dict]:
                 out["error"] = (r2.stderr or b"").decode("utf-8", "replace").strip().splitlines()[-1:][0][:300] \
                     if r2.stderr else ""
         if os.path.exists(cert):
-            out["signer"] = _cert_info(open(cert, "rb").read())
+            pem = open(cert, "rb").read()
+            out["signer"] = _cert_info(pem)
+            if out["valid"]:
+                from .webmail_secure import remember_signer
+                remember_signer(svc, pem)      # для шифрования писем этому адресату (1.20.0)
     except (OSError, subprocess.SubprocessError) as exc:
         out["text"] = f"Подпись S/MIME не проверена: {exc}"
         return out
