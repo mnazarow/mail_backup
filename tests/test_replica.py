@@ -397,6 +397,11 @@ def test_rsync_replica_to_local_path(services, tmp_path):
 # ---------------------------------------------------------------------------
 #  Снимки базы
 # ---------------------------------------------------------------------------
+#: Снимок файла SQLite (на PostgreSQL снимок — pg_dump: tests/test_postgres.py)
+_sqlite_only = pytest.mark.skipif(bool(os.environ.get("MA_TEST_PG")), reason="снимок файла SQLite")
+
+
+@_sqlite_only
 def test_snapshot_roundtrip(services, tmp_path):
     svc = services
     from mailarchiver import models
@@ -413,6 +418,7 @@ def test_snapshot_roundtrip(services, tmp_path):
     assert len(snapshots.list_snapshots(svc.cfg)) == 2
 
 
+@_sqlite_only
 def test_encrypted_snapshot_needs_the_key(services, tmp_path):
     from mailarchiver.errors import StorageError
     from mailarchiver.storage import crypto
@@ -441,7 +447,14 @@ def test_cli_restore_snapshot(services, tmp_path, capsys):
     assert main(["restore-snapshot", info["name"], "--force"]) == 0
     out = capsys.readouterr().out
     assert "База восстановлена" in out
-    assert any(n.startswith("mailarchiver.db.before-restore-") for n in os.listdir(svc.cfg.data_dir))
+    if svc.db.is_pg:                                              # прежняя схема — под другим именем
+        from mailarchiver.pgcompat import split_url
+        schema = split_url(svc.cfg.db_url)[1]
+        old = svc.db.scalar("SELECT nspname FROM pg_namespace WHERE nspname LIKE ?", (schema + "_before_%",))
+        assert old
+        svc.db.execute(f"DROP SCHEMA {old} CASCADE")
+    else:
+        assert any(n.startswith("mailarchiver.db.before-restore-") for n in os.listdir(svc.cfg.data_dir))
 
 
 # ---------------------------------------------------------------------------

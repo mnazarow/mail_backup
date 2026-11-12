@@ -206,7 +206,9 @@ def stop_push(svc=None) -> None:
 # ===========================================================================
 #  Беседы: письма одной переписки — одной строкой списка
 # ===========================================================================
-_TKEY = "COALESCE(NULLIF(r.root, ''), NULLIF(r.mid, ''), 'id:' || m.id)"
+#: Ключ беседы: отпечаток первого письма цепочки, иначе своего, иначе номер письма (строкой — одного типа и в
+#: SQLite, и в PostgreSQL).
+_TKEY = "COALESCE(CAST(r.root AS TEXT), CAST(r.mid AS TEXT), 'id:' || m.id)"
 
 
 def list_threads(svc, account_id: int, folder: str, *, offset: int = 0, limit: int = 50, filt: str = "all",

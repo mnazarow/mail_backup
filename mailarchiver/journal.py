@@ -330,9 +330,9 @@ class _Handler(socketserver.StreamRequestHandler):
     def handle(self) -> None:  # noqa: C901 - протокол — один цикл команд
         ip = self.client_address[0]
         if not _allowed(self.svc, ip):
-            self._send("554 5.7.1 Access denied")
-            with _lock:
+            with _lock:                                   # учесть до ответа: клиент может спросить сразу после
                 _stats["rejected"] = int(_stats["rejected"]) + 1
+            self._send("554 5.7.1 Access denied")
             log.warning("Журналирование: отклонено подключение с %s (нет в journal.allowed_ips).", ip)
             return
         host = socket.gethostname()

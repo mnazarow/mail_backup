@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -138,7 +139,10 @@ def _ma_lower(value):
 
 
 class Database:
-    def __init__(self, path: str, secret_box: SecretBox, *, busy_timeout_ms: int = 10000, wal: bool = True) -> None:
+    def __init__(self, path: str, secret_box: SecretBox, *, busy_timeout_ms: int = 10000, wal: bool = True,
+                 pool_size: int = 20) -> None:
+        """``path`` — файл SQLite или (1.24.0) адрес PostgreSQL ``postgresql://…`` (см. :mod:`pgcompat`)."""
+        from . import pgcompat
         self.path = path
         self.secret = secret_box
         self.busy_timeout_ms = busy_timeout_ms
@@ -147,10 +151,45 @@ class Database:
         self._write_lock = threading.RLock()
         #: расшифрованные секреты по шифротексту (см. _decrypt_opt)
         self._plain_cache: Dict[Tuple[int, str], str] = {}
+        #: «sqlite» или «postgresql» (1.24.0)
+        self.dialect = "postgresql" if pgcompat.is_url(path) else "sqlite"
+        self._pg = pgcompat.Engine(path, pool_size) if self.dialect == "postgresql" else None
+
+    @property
+    def is_pg(self) -> bool:
+        return self.dialect == "postgresql"
+
+    def describe(self) -> str:
+        """Где база — для журналов и интерфейса (адрес PostgreSQL без пароля)."""
+        if self._pg is not None:
+            from .pgcompat import redact
+            return redact(self.path)
+        return self.path
+
+    def size_bytes(self) -> int:
+        """Сколько занимает база: файл SQLite с журналом WAL или таблицы схемы PostgreSQL."""
+        if self._pg is not None:
+            try:
+                return int(self.scalar("SELECT COALESCE(SUM(pg_total_relation_size(c.oid)), 0) FROM pg_class c "
+                                       "WHERE c.relnamespace = current_schema()::regnamespace "
+                                       "AND c.relkind IN ('r', 'm')") or 0)
+            except sqlite3.Error:
+                return 0
+        total = 0
+        for suffix in ("", "-wal"):
+            try:
+                total += os.path.getsize(self.path + suffix)
+            except OSError:
+                pass
+        return total
 
     # -- соединения ----------------------------------------------------------
     def connect(self) -> sqlite3.Connection:
         conn = getattr(self._local, "conn", None)
+        if conn is None and self._pg is not None:
+            from .pgcompat import Session
+            conn = self._local.conn = Session(self._pg)
+            return conn
         if conn is None:
             conn = sqlite3.connect(self.path, timeout=self.busy_timeout_ms / 1000.0, check_same_thread=False)
             conn.row_factory = sqlite3.Row
@@ -170,6 +209,12 @@ class Database:
         if conn is not None:
             conn.close()
             self._local.conn = None
+
+    def close_all(self) -> None:
+        """Закрыть всё (PostgreSQL — пул соединений); вызывается при остановке службы."""
+        self.close()
+        if self._pg is not None:
+            self._pg.close()
 
     # -- низкоуровневые помощники -------------------------------------------
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
@@ -200,7 +245,7 @@ class Database:
         """Откатить транзакцию, не маскируя исходную ошибку."""
         try:
             conn.rollback()
-        except sqlite3.Error as exc:  # pragma: no cover - крайне редкий случай
+        except (sqlite3.Error, OSError) as exc:  # pragma: no cover - крайне редкий случай
             log.warning("Не удалось откатить транзакцию: %s", exc)
 
     @contextmanager
@@ -2783,7 +2828,12 @@ class Database:
             res["broken"].insert(0, {"id": int(first), "ts": "", "reason": f"удалены записи #{purged + 1}–#{int(first) - 1} "
                                                                            f"(не по сроку хранения аудита)"})
         try:
-            seq = self.scalar("SELECT seq FROM sqlite_sequence WHERE name='audit'")
+            if self.is_pg:
+                # наибольший выданный номер записи (PostgreSQL: счётчик identity; NULL — ещё не выдавался)
+                seq = self.scalar("SELECT last_value FROM pg_sequences WHERE schemaname = current_schema() "
+                                  "AND sequencename = 'audit_id_seq'")
+            else:
+                seq = self.scalar("SELECT seq FROM sqlite_sequence WHERE name='audit'")
         except sqlite3.Error:
             seq = None
         last = int(self.scalar("SELECT MAX(id) FROM audit") or 0)

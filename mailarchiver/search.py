@@ -16,12 +16,19 @@
 
 Если SQLite собран без FTS5, поиск работает «по-простому»: по теме и
 отправителю из индекса писем (медленнее, без текста писем).
+
+На PostgreSQL (1.24.0) индекс — обычная таблица ``mail_fts`` с полем ``tsv``
+(tsvector, индекс GIN). Слова для неё выделяются здесь же, тем же правилом, что и
+слова запроса (буквы и цифры, без учёта регистра, «ё» = «е», без надстрочных
+знаков у латиницы), — результат не зависит от настроек языка сервера базы. Поля
+различаются весами: A — тема, B — адреса, C — вложения, D — текст.
 """
 from __future__ import annotations
 
 import html as html_mod
 import re
 import time
+import unicodedata
 from email.utils import getaddresses
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -65,8 +72,26 @@ _BREAK_RE = re.compile(r"<\s*(?:br|/p|/div|/tr|/li|/h\d)\s*/?\s*>", re.IGNORECAS
 # ---------------------------------------------------------------------------
 #  Схема
 # ---------------------------------------------------------------------------
+def is_pg(conn_or_db) -> bool:
+    return getattr(conn_or_db, "dialect", "sqlite") == "postgresql"
+
+
+#: Поля индекса и их веса в tsvector PostgreSQL.
+_FIELDS = ("subject", "addrs", "attach", "body")
+_WEIGHTS = {"subject": "A", "addrs": "B", "attach": "C", "body": "D"}
+#: Наибольшая позиция слова в tsvector PostgreSQL.
+_PG_MAX_POS = 16383
+
+
 def ensure_schema(conn) -> bool:
     """Создать таблицу FTS5 и триггер удаления. False — FTS5 в этой сборке SQLite нет."""
+    if is_pg(conn):
+        conn.execute(f"CREATE TABLE IF NOT EXISTS {FTS_TABLE} (rowid BIGINT PRIMARY KEY, subject TEXT, addrs TEXT, "
+                     "attach TEXT, body TEXT, tsv TSVECTOR)")
+        conn.execute(f"CREATE INDEX IF NOT EXISTS {FTS_TABLE}_tsv ON {FTS_TABLE} USING GIN (tsv)")
+        conn.execute(f"CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages BEGIN "
+                     f"DELETE FROM {FTS_TABLE} WHERE rowid = old.id; END")
+        return True
     try:
         conn.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS {FTS_TABLE} USING fts5("
                      "subject, addrs, attach, body, tokenize='unicode61 remove_diacritics 2')")
@@ -204,6 +229,8 @@ def _ocr_tools() -> Dict[str, bool]:
 
 def _db_size(db) -> int:
     try:
+        if is_pg(db):
+            return db.size_bytes()
         return int(db.scalar("SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()") or 0)
     except Exception:  # noqa: BLE001
         return 0
@@ -352,6 +379,35 @@ def _row_has(row, key: str):
         return None
 
 
+def tsvector_text(fields: Dict[str, str]) -> str:
+    """tsvector PostgreSQL для полей письма: слова с позициями и весом поля (слова выделяет Python, а не
+    сервер — так и запрос, и индекс делят текст одинаково)."""
+    lexemes: Dict[str, List[str]] = {}
+    pos = 0
+    for name in _FIELDS:
+        weight = _WEIGHTS[name]
+        for word in _terms(fields.get(name) or ""):
+            pos = min(pos + 1, _PG_MAX_POS)
+            lexemes.setdefault(_fold(word)[:500], []).append(f"{pos}{weight}")
+        pos = min(pos + 1, _PG_MAX_POS)              # фраза не переходит из поля в поле
+    return " ".join("'" + w + "':" + ",".join(dict.fromkeys(p[-256:])) for w, p in lexemes.items())
+
+
+def _write_rows(conn, batch: List[Tuple]) -> None:
+    """Записать порцию индекса (id, тема, адреса, вложения, текст)."""
+    if not batch:
+        return
+    if is_pg(conn):
+        conn.executemany(f"INSERT INTO {FTS_TABLE}(rowid, subject, addrs, attach, body, tsv) "
+                         f"VALUES(?,?,?,?,?, CAST(? AS tsvector)) ON CONFLICT (rowid) DO UPDATE SET "
+                         f"subject=excluded.subject, addrs=excluded.addrs, attach=excluded.attach, "
+                         f"body=excluded.body, tsv=excluded.tsv",
+                         [tuple(b) + (tsvector_text(dict(zip(_FIELDS, b[1:]))),) for b in batch])
+        return
+    conn.executemany(f"INSERT OR REPLACE INTO {FTS_TABLE}(rowid, subject, addrs, attach, body) "
+                     f"VALUES(?,?,?,?,?)", batch)
+
+
 def index_pending(svc, *, progress=None, cancelled=None, event=None, max_seconds: Optional[float] = None) -> Dict:
     """Проиндексировать письма, появившиеся после последнего прохода."""
     db = svc.db
@@ -388,8 +444,7 @@ def index_pending(svc, *, progress=None, cancelled=None, event=None, max_seconds
             now_gen = conn.execute("SELECT value FROM meta WHERE key=?", (_META_GEN,)).fetchone()
             if (now_gen[0] if now_gen else "0") != gen:
                 break                          # индекс перестроили во время прохода — эта порция устарела
-            conn.executemany(f"INSERT OR REPLACE INTO {FTS_TABLE}(rowid, subject, addrs, attach, body) "
-                             f"VALUES(?,?,?,?,?)", batch)
+            _write_rows(conn, batch)
             conn.execute("INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET "
                          "value=excluded.value", (_META_WATERMARK, str(last)))
             if attach_cap:
@@ -475,8 +530,7 @@ def reindex_accounts(svc, account_ids: Iterable[int], *, progress=None, cancelle
                     have = {int(r[0]) for r in conn.execute(
                         f"SELECT rowid FROM {FTS_TABLE} WHERE rowid IN ({marks})", tuple(failed_ids))}
                     batch = [b for b in batch if int(b[0]) not in have]
-                conn.executemany(f"INSERT OR REPLACE INTO {FTS_TABLE}(rowid, subject, addrs, attach, body) "
-                                 f"VALUES(?,?,?,?,?)", batch)
+                _write_rows(conn, batch)
             stat["indexed"] += len(batch)
             done += len(batch)
             if progress is not None:
@@ -549,8 +603,7 @@ def backfill_attachments(svc, *, progress=None, cancelled=None, event=None,
             now_gen = conn.execute("SELECT value FROM meta WHERE key=?", (_META_GEN,)).fetchone()
             if (now_gen[0] if now_gen else "0") != gen:
                 break                             # индекс перестроили — он и так прочитает вложения
-            conn.executemany(f"INSERT OR REPLACE INTO {FTS_TABLE}(rowid, subject, addrs, attach, body) "
-                             f"VALUES(?,?,?,?,?)", batch)
+            _write_rows(conn, batch)
             conn.execute("INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET "
                          "value=excluded.value", (_META_ATTACH, str(last)))
         done += len(batch)
@@ -564,6 +617,94 @@ def backfill_attachments(svc, *, progress=None, cancelled=None, event=None,
 # ---------------------------------------------------------------------------
 def _terms(text: str) -> List[str]:
     return _WORD_RE.findall(normalize(text).lower())
+
+
+def _fold(word: str) -> str:
+    """Без надстрочных знаков у латиницы («café» = «cafe»), как ``remove_diacritics`` в SQLite; «й» остаётся «й»."""
+    if word.isascii():
+        return word
+    out: List[str] = []
+    for ch in unicodedata.normalize("NFD", word):
+        if unicodedata.combining(ch) and out and out[-1].isascii():
+            continue
+        out.append(ch)
+    return unicodedata.normalize("NFC", "".join(out))
+
+
+def build_tsquery(query: str) -> str:
+    """Запрос пользователя → tsquery PostgreSQL с тем же смыслом, что и ``build_match``."""
+    tokens = re.findall(r'"[^"]*"|\S+', query or "")
+    parts: List[str] = []
+    for tok in tokens:
+        weight = ""
+        m = re.match(r"^([^\W\d_]+):(.*)$", tok, re.UNICODE)
+        if m and m.group(1).lower() in _FIELD_ALIASES:
+            weight = _WEIGHTS[_FIELD_ALIASES[m.group(1).lower()]]
+            tok = m.group(2)
+        phrase = tok.startswith('"') and tok.endswith('"') and len(tok) >= 2
+        words = [_fold(w)[:500] for w in _terms(tok[1:-1] if phrase else tok)]
+        if not words:
+            continue
+        lex = [f"'{w}'" + (":" + weight if weight else "") for w in words]
+        if not phrase:
+            lex[-1] = f"'{words[-1]}':*" + weight
+        parts.append("(" + " <-> ".join(lex) + ")" if len(lex) > 1 else lex[0])
+    return " & ".join(parts)
+
+
+def _query_terms(query: str) -> List[Tuple[str, bool, str]]:
+    """Слова запроса для выделения в отрывке: (слово, по началу ли, поле или '')."""
+    out: List[Tuple[str, bool, str]] = []
+    for tok in re.findall(r'"[^"]*"|\S+', query or ""):
+        field = ""
+        m = re.match(r"^([^\W\d_]+):(.*)$", tok, re.UNICODE)
+        if m and m.group(1).lower() in _FIELD_ALIASES:
+            field = _FIELD_ALIASES[m.group(1).lower()]
+            tok = m.group(2)
+        phrase = tok.startswith('"') and tok.endswith('"') and len(tok) >= 2
+        words = [_fold(w) for w in _terms(tok[1:-1] if phrase else tok)]
+        for i, w in enumerate(words):
+            out.append((w, not phrase and i == len(words) - 1, field))
+    return out
+
+
+def make_snippet(fields: Dict[str, str], query: str, tokens: int = 12) -> str:
+    """Отрывок с найденными словами (``\x02``…``\x03``) — как ``snippet()`` FTS5: поле, где совпадений больше,
+    окно в ``tokens`` слов."""
+    terms = _query_terms(query)
+    best: Tuple[int, str, list, List[int]] = (0, "", [], [])
+    for name in _FIELDS:
+        text = fields.get(name) or ""
+        if not text:
+            continue
+        words = list(_WORD_RE.finditer(normalize(text)))
+        hits = []
+        for i, w in enumerate(words):
+            low = _fold(w.group(0).lower())
+            if any((low.startswith(t) if pre else low == t) for t, pre, f in terms if not f or f == name):
+                hits.append(i)
+        score = len({_fold(words[i].group(0).lower()) for i in hits})
+        if score > best[0]:
+            best = (score, name, words, hits)
+    score, name, words, hits = best
+    if not score:
+        return ""
+    text = fields[name]
+    start = max(0, min(hits[0] - 2, len(words) - tokens))
+    stop = min(len(words), start + tokens)
+    out = ["…"] if start > 0 else []
+    pos = words[start].start()
+    hitset = set(hits)
+    for i in range(start, stop):
+        w = words[i]
+        out.append(text[pos:w.start()])
+        out.append("\x02" + text[w.start():w.end()] + "\x03" if i in hitset else text[w.start():w.end()])
+        pos = w.end()
+    if stop < len(words):
+        out.append("…")
+    elif stop:
+        out.append(text[pos:])
+    return "".join(out).strip()
 
 
 def build_match(query: str) -> str:
@@ -593,6 +734,17 @@ def build_match(query: str) -> str:
     return " AND ".join(parts)
 
 
+def match_ids(db, query: str) -> set:
+    """Номера писем индекса, подходящих под запрос (без отбора по ящикам; для проверок и отладки)."""
+    if is_pg(db):
+        q = build_tsquery(query)
+        sql = f"SELECT rowid FROM {FTS_TABLE} WHERE tsv @@ CAST(? AS tsquery)"
+    else:
+        q = build_match(query)
+        sql = f"SELECT rowid FROM {FTS_TABLE} WHERE {FTS_TABLE} MATCH ?"
+    return {int(r[0]) for r in db.query(sql, (q,))} if q else set()
+
+
 def search(svc, query: str, *, account_ids: Optional[Iterable[int]] = None, folder: str = "",
            date_from: str = "", date_to: str = "", with_attachments: bool = False,
            order: str = "date", offset: int = 0, limit: int = PAGE) -> Dict:
@@ -620,12 +772,25 @@ def search(svc, query: str, *, account_ids: Optional[Iterable[int]] = None, fold
     if with_attachments:
         where.append("m.has_attach = 1")
     use_fts = fts_available(db)
-    match = build_match(query)
+    pg = is_pg(db)
+    match = build_tsquery(query) if pg else build_match(query)
     if not match:
         return {"results": [], "more": False, "fts": use_fts, "empty_query": True}
     cols = ("m.id, m.account_id, m.folder, m.internaldate, m.subject, m.from_addr, m.has_attach, m.size, "
             "a.name AS account_name")
-    if use_fts:
+    if use_fts and pg:
+        sql = (f"SELECT {cols}, f.subject AS f_subject, f.addrs AS f_addrs, f.attach AS f_attach, "
+               f"f.body AS f_body FROM {FTS_TABLE} f JOIN messages m ON m.id = f.rowid "
+               f"JOIN accounts a ON a.id = m.account_id WHERE f.tsv @@ CAST(? AS tsquery)")
+        params = [match] + args
+        if where:
+            sql += " AND " + " AND ".join(where)
+        if order == "rank":
+            sql += " ORDER BY ts_rank(f.tsv, CAST(? AS tsquery)) DESC, f.rowid DESC"
+            params.append(match)
+        else:
+            sql += " ORDER BY f.rowid DESC"
+    elif use_fts:
         sql = (f"SELECT {cols}, snippet({FTS_TABLE}, -1, char(2), char(3), '…', 12) AS snip "
                f"FROM {FTS_TABLE} JOIN messages m ON m.id = {FTS_TABLE}.rowid "
                f"JOIN accounts a ON a.id = m.account_id WHERE {FTS_TABLE} MATCH ?")
@@ -657,5 +822,7 @@ def search(svc, query: str, *, account_ids: Optional[Iterable[int]] = None, fold
         results.append({"id": row["id"], "account_id": row["account_id"], "account_name": row["account_name"],
                         "folder": row["folder"], "date": row["internaldate"], "subject": row["subject"] or "",
                         "from": row["from_addr"] or "", "has_attach": bool(row["has_attach"]),
-                        "size": int(row["size"] or 0), "snippet": row["snip"] or ""})
+                        "size": int(row["size"] or 0),
+                        "snippet": (make_snippet({k: row["f_" + k] for k in _FIELDS}, query) if use_fts and pg
+                                    else row["snip"] or "")})
     return {"results": results, "more": len(rows) > limit, "fts": use_fts, "offset": offset}

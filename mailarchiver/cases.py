@@ -400,7 +400,7 @@ def _check_query(query: str) -> None:
 
 def _where(svc, row, ids: List[int]) -> Tuple[str, List, str]:
     """Условия отбора писем дела: (where, args, match)."""
-    from .search import build_match, fts_available
+    from .search import build_match, build_tsquery, fts_available, is_pg
     where = [f"m.account_id IN ({','.join('?' * len(ids))})"]
     args: List = list(ids)
     since, until = svc.day_bounds_utc(row["date_from"] or None, row["date_to"] or None)
@@ -411,6 +411,8 @@ def _where(svc, row, ids: List[int]) -> Tuple[str, List, str]:
         where.append("m.internaldate < ?")
         args.append(until)
     match = build_match(row["query"] or "") if (row["query"] or "").strip() else ""
+    if match and is_pg(svc.db):
+        match = build_tsquery(row["query"] or "")
     if match and not fts_available(svc.db):
         from .search import _terms
         for word in _terms(row["query"]):
@@ -421,11 +423,12 @@ def _where(svc, row, ids: List[int]) -> Tuple[str, List, str]:
 
 
 def _select(svc, row, ids: List[int], cols: str, tail: str, extra_args: Tuple = ()) -> List:
-    from .search import FTS_TABLE
+    from .search import FTS_TABLE, is_pg
     where, args, match = _where(svc, row, ids)
     if match:
+        cond = f"{FTS_TABLE}.tsv @@ CAST(? AS tsquery)" if is_pg(svc.db) else f"{FTS_TABLE} MATCH ?"
         sql = (f"SELECT {cols} FROM {FTS_TABLE} JOIN messages m ON m.id = {FTS_TABLE}.rowid "
-               f"JOIN accounts a ON a.id = m.account_id WHERE {FTS_TABLE} MATCH ? AND {where} {tail}")
+               f"JOIN accounts a ON a.id = m.account_id WHERE {cond} AND {where} {tail}")
         params = [match] + args + list(extra_args)
     else:
         sql = f"SELECT {cols} FROM messages m JOIN accounts a ON a.id = m.account_id WHERE {where} {tail}"
@@ -446,7 +449,7 @@ def count_messages(svc, row, ids: Optional[List[int]] = None) -> Dict[str, int]:
 
 
 def list_messages(svc, case_id: int, offset: int = 0, limit: int = PAGE) -> Dict:
-    from .search import FTS_TABLE
+    from .search import FTS_TABLE, is_pg, make_snippet
     row = get_case(svc, case_id)
     ids = custodian_ids(svc, case_id)
     limit = max(1, min(200, int(limit)))
@@ -454,15 +457,20 @@ def list_messages(svc, case_id: int, offset: int = 0, limit: int = PAGE) -> Dict
     if not ids:
         return {"results": [], "more": False, "offset": offset}
     _, _, match = _where(svc, row, ids)
-    snip = f"snippet({FTS_TABLE}, -1, char(2), char(3), '…', 12)" if match else "''"
+    pg = bool(match) and is_pg(svc.db)
+    snip = f"snippet({FTS_TABLE}, -1, char(2), char(3), '…', 12)" if match and not pg else "''"
     cols = (f"m.id, m.account_id, m.folder, m.internaldate, m.subject, m.from_addr, m.has_attach, m.size, m.gone, "
             f"a.name AS account_name, {snip} AS snip")
+    if pg:
+        cols += "".join(", %s.%s AS f_%s" % (FTS_TABLE, k, k) for k in ("subject", "addrs", "attach", "body"))
     rows = _select(svc, row, ids, cols, "ORDER BY m.internaldate DESC, m.id DESC LIMIT ? OFFSET ?",
                    (limit + 1, offset))
     results = [{"id": r["id"], "account_id": r["account_id"], "account_name": r["account_name"],
                 "folder": r["folder"], "date": r["internaldate"], "subject": r["subject"] or "",
                 "from": r["from_addr"] or "", "has_attach": bool(r["has_attach"]), "size": int(r["size"] or 0),
-                "gone": bool(r["gone"]), "snippet": r["snip"] or ""} for r in rows[:limit]]
+                "gone": bool(r["gone"]),
+                "snippet": (make_snippet({k: r["f_" + k] for k in ("subject", "addrs", "attach", "body")},
+                                         row["query"] or "") if pg else r["snip"] or "")} for r in rows[:limit]]
     return {"results": results, "more": len(rows) > limit, "offset": offset}
 
 

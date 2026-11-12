@@ -398,7 +398,7 @@ async function mailPushLoop(accId){
 // сохранённые поиски
 async function mailSaveSearch(accId){
   if(!Mail.search) return;
-  const name=window.prompt('Название поиска', Mail.search.q.slice(0,60)); if(name===null) return;
+  const name=window.prompt(t('Название поиска'), Mail.search.q.slice(0,60)); if(name===null) return;
   try{ await api('/webmail/searches', {method:'POST', body:{name:name.trim(), q:Mail.search.q, scope:Mail.search.scope||'account', attach:!!Mail.search.attach}});
     toast('Поиск сохранён', 'Он — под папками, в «Поисках».'); await mailLoadSearches(); renderMailFolders(accId); }
   catch(e){ toastErr(e); }

@@ -32,9 +32,9 @@ function mailWhen(iso){
   if(!iso) return '';
   try{
     const d=new Date(iso), now=new Date();
-    if(d.toDateString()===now.toDateString()) return d.toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'});
-    if(d.getFullYear()===now.getFullYear()) return d.toLocaleDateString('ru-RU',{day:'numeric',month:'short'});
-    return d.toLocaleDateString('ru-RU',{day:'2-digit',month:'2-digit',year:'2-digit'});
+    if(d.toDateString()===now.toDateString()) return d.toLocaleTimeString(UI_LOCALE,{hour:'2-digit',minute:'2-digit'});
+    if(d.getFullYear()===now.getFullYear()) return d.toLocaleDateString(UI_LOCALE,{day:'numeric',month:'short'});
+    return d.toLocaleDateString(UI_LOCALE,{day:'2-digit',month:'2-digit',year:'2-digit'});
   }catch(e){ return ''; }
 }
 function mailFolderInfo(name){ return Mail.folders.find(f=>f.name===name)||null; }
@@ -816,7 +816,7 @@ function mailSrcdoc(html, allowImages){
   return {srcdoc: doctype + head + body, remote};
 }
 
-function fmtDateShort(iso){ if(!iso) return ''; try{ const d=new Date(iso); return d.toLocaleDateString('ru-RU',{day:'2-digit',month:'2-digit',year:'2-digit'}); }catch(e){ return ''; } }
+function fmtDateShort(iso){ if(!iso) return ''; try{ const d=new Date(iso); return d.toLocaleDateString(UI_LOCALE,{day:'2-digit',month:'2-digit',year:'2-digit'}); }catch(e){ return ''; } }
 
 // ---------- Письмо ----------
 async function loadMailMessage(accId, pk){
@@ -1101,7 +1101,7 @@ async function composeWindow(draft){
     state.textContent='Сохраняю…';
     const body=fields(); if(toServer && serverDirty){ body.to_server=true; serverDirty=false; }
     saving=api(`/webmail/drafts/${draft.id}`, {method:'PUT', body, bg:!manual})
-      .then(d=>{ const srv=d.server; delete d.server; Object.assign(draft, d); state.textContent='Сохранено '+new Date().toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'})+(srv&&srv.saved?' (и на сервере)':'');
+      .then(d=>{ const srv=d.server; delete d.server; Object.assign(draft, d); state.textContent='Сохранено '+new Date().toLocaleTimeString(UI_LOCALE,{hour:'2-digit',minute:'2-digit'})+(srv&&srv.saved?' (и на сервере)':'');
         if(srv && srv.warning && manual) toast('Черновик сохранён только здесь', srv.warning, 'warn', 7000); })
       .catch(e=>{ dirty=true; state.textContent='Не сохранено'; if(manual) toastErr(e); });
     await saving; saving=null;
@@ -1125,7 +1125,7 @@ async function composeWindow(draft){
   g('.compose-toolbar').querySelectorAll('[data-cmd]').forEach(b=>b.onclick=(e)=>{
     e.preventDefault(); body.focus();
     const c=b.dataset.cmd;
-    if(c==='link'){ const url=window.prompt('Адрес ссылки (https://…)', 'https://'); if(url && /^(https?:|mailto:)/i.test(url.trim())) document.execCommand('createLink', false, url.trim()); }
+    if(c==='link'){ const url=window.prompt(t('Адрес ссылки (https://…)'), 'https://'); if(url && /^(https?:|mailto:)/i.test(url.trim())) document.execCommand('createLink', false, url.trim()); }
     else if(c==='quote') document.execCommand('formatBlock', false, 'blockquote');
     else document.execCommand(c, false, null);
     touch();
@@ -1480,8 +1480,8 @@ async function mailCalendarDlg(accId){
   let view='list', month=new Date(); month.setDate(1); month.setHours(0,0,0,0);
   let editing=null, items=[];
   const local=(x)=>new Date(x-x.getTimezoneOffset()*60e3).toISOString().slice(0,16);
-  const fmtWhen=(e)=>{ const s=new Date(e.start); if(e.all_day) return s.toLocaleDateString('ru-RU',{weekday:'short', day:'2-digit', month:'long'})+' · весь день';
-    const en=e.end?new Date(e.end):null; return s.toLocaleString('ru-RU',{weekday:'short', day:'2-digit', month:'long', hour:'2-digit', minute:'2-digit'})+(en?' – '+en.toLocaleTimeString('ru-RU',{hour:'2-digit', minute:'2-digit'}):''); };
+  const fmtWhen=(e)=>{ const s=new Date(e.start); if(e.all_day) return s.toLocaleDateString(UI_LOCALE,{weekday:'short', day:'2-digit', month:'long'})+' · весь день';
+    const en=e.end?new Date(e.end):null; return s.toLocaleString(UI_LOCALE,{weekday:'short', day:'2-digit', month:'long', hour:'2-digit', minute:'2-digit'})+(en?' – '+en.toLocaleTimeString(UI_LOCALE,{hour:'2-digit', minute:'2-digit'}):''); };
   const acts=(e,i)=>e.rrule?'<span class="small muted" title="Повторяющееся событие меняйте в программе календаря">🔁</span>':`<button class="btn ghost sm" data-edit="${i}" title="Изменить">✏️</button><button class="btn ghost sm" data-del="${i}" title="Удалить">🗑</button>`;
   const renderList=()=>{
     list.innerHTML=items.length?items.map((e,i)=>`<div class="mail-event"><div class="w">${esc(fmtWhen(e))}</div><div class="s"><b>${esc(e.summary||'(без названия)')}</b>${e.location?` <span class="muted">· ${esc(e.location)}</span>`:''}${e.description?`<div class="small muted">${esc(e.description.slice(0,200))}</div>`:''}</div><div class="a">${acts(e,i)}</div></div>`).join('')
@@ -1494,10 +1494,10 @@ async function mailCalendarDlg(accId){
     const by={}; items.forEach((e,i)=>{ const d=new Date(e.start); (by[key(d)]=by[key(d)]||[]).push(i); });
     const today=key(new Date());
     list.innerHTML=`<div class="cal-grid">${['Пн','Вт','Ср','Чт','Пт','Сб','Вс'].map(x=>`<div class="cal-h">${x}</div>`).join('')}${days.map(d=>{
-      const evs=(by[key(d)]||[]).map(i=>{ const e=items[i]; const t=e.all_day?'':new Date(e.start).toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'})+' ';
+      const evs=(by[key(d)]||[]).map(i=>{ const e=items[i]; const t=e.all_day?'':new Date(e.start).toLocaleTimeString(UI_LOCALE,{hour:'2-digit',minute:'2-digit'})+' ';
         return `<button class="cal-ev" ${e.rrule?'':`data-edit="${i}"`} title="${esc(fmtWhen(e))}${e.location?' · '+esc(e.location):''}">${esc(t)}${esc(e.summary||'(без названия)')}</button>`; }).join('');
       return `<div class="cal-d ${d.getMonth()!==month.getMonth()?'out':''} ${key(d)===today?'today':''}"><div class="n">${d.getDate()}</div>${evs}</div>`; }).join('')}</div>`;
-    g('[data-title]').textContent=month.toLocaleDateString('ru-RU',{month:'long', year:'numeric'});
+    g('[data-title]').textContent=month.toLocaleDateString(UI_LOCALE,{month:'long', year:'numeric'});
   };
   const load=async()=>{
     list.innerHTML='<div class="empty"><div class="spinner"></div></div>';
@@ -1646,7 +1646,7 @@ function mailWhenOptions(){
 }
 function mailWhenPicker(anchor, verb, onPick){
   mailClosePops();
-  const fmt=(d)=>d.toLocaleString('ru-RU',{weekday:'short', day:'numeric', month:'short', hour:'2-digit', minute:'2-digit'});
+  const fmt=(d)=>d.toLocaleString(UI_LOCALE,{weekday:'short', day:'numeric', month:'short', hour:'2-digit', minute:'2-digit'});
   const opts=mailWhenOptions();
   const local=(d)=>{ const z=new Date(d.getTime()-d.getTimezoneOffset()*60000); return z.toISOString().slice(0,16); };
   const pop=h(`<div class="mail-pop mail-when" role="menu"><div class="muted small" style="padding:4px 8px">${esc(verb)}:</div><div class="mail-pop-list">

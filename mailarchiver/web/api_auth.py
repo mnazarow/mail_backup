@@ -25,6 +25,7 @@ def needs_setup(request: Request):
     from .. import oidc, saml
     svc = svc_dep(request)
     return {"needs_setup": svc.db.count_users() == 0, "auth_enabled": bool(svc.rt("security", "auth_enabled")),
+            "ui_language": str(svc.rt("server", "ui_language") or "ru"),
             "oidc": {"enabled": oidc.enabled(svc),
                      "button": str(svc.rt("oidc", "button_text") or "Войти через единый вход")},
             "saml": {"enabled": saml.enabled(svc) and saml.available(),

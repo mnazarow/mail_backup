@@ -1,5 +1,29 @@
-"""Общие фикстуры для тестов MailArchiver."""
+"""Общие фикстуры для тестов MailArchiver.
+
+``MA_TEST_PG=postgresql://…`` — весь набор на PostgreSQL (1.24.0): у каждого каталога данных своя схема,
+после теста пулы закрываются, схемы удаляются.
+"""
+import os
+
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _pg_cleanup():
+    yield
+    if not os.environ.get("MA_TEST_PG"):
+        return
+    from mailarchiver import pgcompat
+    schemas = set()
+    for engine in pgcompat.engines():
+        engine.close()
+        if engine.schema and engine.schema.startswith("t_"):
+            schemas.add(engine.schema)
+    if schemas:
+        import psycopg
+        with psycopg.connect(pgcompat.split_url(os.environ["MA_TEST_PG"])[0], autocommit=True) as conn:
+            for schema in schemas:
+                conn.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
 
 
 @pytest.fixture()

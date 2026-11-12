@@ -30,9 +30,10 @@ class Services:
         self.cfg = cfg
         self.secret_box = SecretBox(cfg.secret_key())
         self.db = Database(
-            cfg.db_path, self.secret_box,
+            cfg.db_target, self.secret_box,
             busy_timeout_ms=int(cfg.get("database", "busy_timeout_ms", 10000)),
             wal=bool(cfg.get("database", "wal", True)),
+            pool_size=int(cfg.get("database", "pool_size", 20) or 20),
         )
         self.store = MaildirStore(
             cfg.mail_root,
@@ -223,6 +224,7 @@ class Services:
         except Exception:  # noqa: BLE001
             log.debug("Соединения почтового клиента не закрыты", exc_info=True)
         if not self._started:
+            self._close_db()
             return
         if self.worker is not None:
             self.worker.stop()
@@ -230,7 +232,16 @@ class Services:
             self.scheduler.stop()
             self.queue.stop()
         self._started = False
+        self._close_db()
         log.info("Сервис остановлен.")
+
+    def _close_db(self) -> None:
+        """PostgreSQL (1.24.0): закрыть пул соединений (у SQLite закрывать нечего — файл)."""
+        if getattr(self.db, "is_pg", False):
+            try:
+                self.db.close_all()
+            except Exception:  # noqa: BLE001
+                log.debug("Пул соединений PostgreSQL не закрыт", exc_info=True)
 
     # -- настройки (БД переопределяет конфиг) --------------------------------
     def rt(self, section: str, key: str):

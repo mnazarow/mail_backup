@@ -499,7 +499,13 @@ pf_service_access(){
 # подключён, и обновление завело бы новую, пустую базу рядом с настоящей.
 # Путь к базе — у установленной сейчас версии; не ответила — не отказ.
 PF_DB=""              # файл базы (пусто — узнать не удалось)
+PF_DB_PG=0            # база в PostgreSQL: файла нет
 pf_database(){
+  if db_is_postgres; then
+    PF_DB_PG=1
+    ok "База службы — в PostgreSQL (файла базы в каталоге данных нет)."
+    return 0
+  fi
   PF_DB="$(cfg_value db_path)"
   if [ "$DATA_DIR_BAD" = "1" ]; then return 0; fi      # о каталоге данных уже сказано
   if [ -z "$PF_DB" ] || [ -f "$PF_DB" ]; then return 0; fi
@@ -592,6 +598,10 @@ pf_free_space(){
     return 0
   fi
   if [ "$DATA_DIR_BAD" = "1" ]; then return 0; fi      # о каталоге данных уже сказано
+  if [ "$PF_DB_PG" = "1" ]; then
+    info "База — в PostgreSQL: скрипт копирует только файл SQLite. Копию снимите средствами PostgreSQL (pg_dump) или возьмите свежий снимок службы (snapshots/…sql.gz)."
+    return 0
+  fi
   db="$PF_DB"
   if [ -z "$db" ]; then
     pf_warn "Файл базы не найден (путь узнать не удалось: установленная версия не ответила) — обновление пройдёт без её копии."
@@ -921,6 +931,11 @@ preflight(){
 backup_database(){
   if [ "${MA_SKIP_DB_BACKUP:-0}" = "1" ]; then
     warn "Копия базы пропущена (MA_SKIP_DB_BACKUP=1): при откате база останется как есть."
+    return 0
+  fi
+  if db_is_postgres; then
+    warn "База — в PostgreSQL: перед обновлением скрипт её не копирует (при откате схема останется от новой версии)."
+    DB_PATH=""
     return 0
   fi
   DB_PATH="$(cfg_value db_path)"

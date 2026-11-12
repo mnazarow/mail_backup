@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 
-JS_FILES = ("app.js", "admin.js", "bulk.js", "ops.js", "settings.js", "docs.js", "mail.js", "mail-settings.js",
+JS_FILES = ("i18n-en.js", "i18n.js", "app.js", "admin.js", "bulk.js", "ops.js", "settings.js", "docs.js", "mail.js", "mail-settings.js",
             "analytics.js", "axigen.js", "mailservers.js")
 CSS_FILES = ("app.css",)
 

@@ -46,6 +46,9 @@ DEFAULTS: Dict[str, Any] = {
         # Очередь заданий и планировщик — в отдельном процессе (тот же unit systemd): веб-интерфейс не
         # делит интерпретатор с копированием и не тормозит, пока идут копии. Меняется перезапуском.
         "worker_process": False,
+        # Язык интерфейса по умолчанию (1.24.0): ru | en | auto (по языку браузера). Пользователь может
+        # выбрать свой — на странице входа и в профиле (запоминается в браузере).
+        "ui_language": "ru",
     },
     "security": {
         "auth_enabled": True,          # требовать вход в веб-интерфейс
@@ -66,6 +69,10 @@ DEFAULTS: Dict[str, Any] = {
     "database": {
         "busy_timeout_ms": 10000,      # ожидание блокировки SQLite
         "wal": True,                   # режим WAL (быстрее и надёжнее при конкурентном доступе)
+        # PostgreSQL вместо SQLite (1.24.0): postgresql://пользователь:пароль@сервер:5432/база[?schema=имя].
+        # Пусто — SQLite в каталоге данных. Перенос — «mailarchiver db-migrate» (docs/ru/03-installation.md).
+        "url": "",
+        "pool_size": 20,               # PostgreSQL: соединений в пуле
     },
     "storage": {
         "layout": "maildir",          # формат локального хранилища: maildir (по умолчанию)
@@ -493,6 +500,7 @@ VALUE_RANGES: Dict[str, tuple] = {
     # notifications / database / logging
     "notifications.smtp_port": (1, 65535),
     "database.busy_timeout_ms": (100, 600000),
+    "database.pool_size": (2, 500),
 }
 
 
@@ -573,6 +581,7 @@ VALUE_CHOICES: Dict[str, tuple] = {
     "notifications.smtp_security": ("starttls", "ssl", "none"),
     "notifications.webhook_format": ("json", "slack"),
     "webmail.save_sent": ("auto", "always", "never"),
+    "server.ui_language": ("ru", "en", "auto"),
     "audit.syslog_proto": ("udp", "tcp", "tls"),
     "webmail.dlp_mode": ("off", "warn", "block_external"),
     "employees.source_type": ("file", "url", "ldap"),
@@ -593,7 +602,8 @@ VALUE_CHOICES: Dict[str, tuple] = {
 #: интерфейс недоступным после перезапуска, а исправить это из него же нельзя.
 FILE_ONLY_SETTINGS = frozenset({
     "server.host", "server.port", "server.workers", "logging.to_stdout",
-    "paths.data_dir", "database.busy_timeout_ms", "database.wal", "export.tmp_dir", "server.worker_process",
+    "paths.data_dir", "database.busy_timeout_ms", "database.wal", "database.url", "database.pool_size",
+    "export.tmp_dir", "server.worker_process",
 })
 
 #: Параметры, которые больше ничего не делают (оставлены в DEFAULTS, чтобы
@@ -866,6 +876,27 @@ class Config:
         self.tmp_dir = data["export"].get("tmp_dir") or os.path.join(self.data_dir, "tmp")
 
         self._secret_key: Optional[bytes] = None
+
+    @property
+    def db_url(self) -> str:
+        """Адрес PostgreSQL (1.24.0) или '' — SQLite в каталоге данных.
+
+        Источник: переменная ``MAILARCHIVER_DATABASE_URL`` (удобно не хранить пароль в config.yaml), затем
+        ``database.url``. ``MA_TEST_PG`` — только для прогона тестов на PostgreSQL: своя схема на каждый
+        каталог данных."""
+        url = (os.environ.get("MAILARCHIVER_DATABASE_URL") or str((self.data.get("database") or {}).get("url")
+                                                                   or "")).strip()
+        if not url and os.environ.get("MA_TEST_PG"):
+            import hashlib
+            base = os.environ["MA_TEST_PG"]
+            schema = "t_" + hashlib.sha1(self.data_dir.encode("utf-8")).hexdigest()[:16]
+            url = base + ("&" if "?" in base else "?") + "schema=" + schema
+        return url
+
+    @property
+    def db_target(self) -> str:
+        """Что открывать: адрес PostgreSQL или путь к файлу SQLite."""
+        return self.db_url or self.db_path
 
     # -- доступ к секциям ----------------------------------------------------
     def section(self, name: str) -> Dict[str, Any]:

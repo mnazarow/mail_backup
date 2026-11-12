@@ -56,6 +56,13 @@ openpyxl>=3.1,<4
 # 5.3 — проверенная версия; граница <6 — страховка от смены API проверки в мажорном выпуске.
 signxml>=5.3,<6
 
+# PostgreSQL как база службы (1.24.0, по желанию; по умолчанию — файл SQLite): драйвер и пул соединений.
+# Без адреса базы (database.url) не загружаются. Готовые колёса psycopg-binary (с libpq внутри) — для
+# x86_64 и aarch64; на других процессорах ставится чистый psycopg, ему нужна системная libpq (libpq5).
+psycopg[binary]>=3.2,<4; platform_machine == "x86_64" or platform_machine == "aarch64" or platform_machine == "AMD64" or platform_machine == "arm64"
+psycopg>=3.2,<4; platform_machine != "x86_64" and platform_machine != "aarch64" and platform_machine != "AMD64" and platform_machine != "arm64"
+psycopg-pool>=3.2,<4
+
 # ----------------------------------------------------------------------------
 #  Необязательные зависимости (устанавливаются по желанию):
 #

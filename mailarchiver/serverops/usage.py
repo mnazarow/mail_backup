@@ -61,7 +61,11 @@ _cache: Dict = {}
 def _stamp(db):
     """Отпечаток таблицы: каждая запись (INSERT OR REPLACE) даёт строке новый rowid — кэш видит и записи
     в обход этого модуля."""
-    row = db.query_one("SELECT MAX(rowid) AS m FROM server_usage")
+    if getattr(db, "is_pg", False):
+        # PostgreSQL: у каждой записанной версии строки — свой номер транзакции (xmin)
+        row = db.query_one("SELECT COALESCE(MAX(xmin::text::bigint), 0) || ':' || COUNT(*) AS m FROM server_usage")
+    else:
+        row = db.query_one("SELECT MAX(rowid) AS m FROM server_usage")
     return row["m"] if row is not None else None
 
 
@@ -142,7 +146,7 @@ def _all_trends(db) -> Dict[str, Dict]:
         "SUM(CAST(julianday(day) - julianday(?) AS INTEGER)) AS sx, SUM(used_bytes) AS sy, "
         "SUM(CAST(julianday(day) - julianday(?) AS INTEGER) * used_bytes) AS sxy, "
         "SUM(CAST(julianday(day) - julianday(?) AS INTEGER) * CAST(julianday(day) - julianday(?) AS INTEGER)) "
-        "AS sxx FROM server_usage WHERE day >= ? GROUP BY key HAVING n >= 2",
+        "AS sxx FROM server_usage WHERE day >= ? GROUP BY key HAVING COUNT(*) >= 2",
         (cutoff, cutoff, cutoff, cutoff, cutoff))
     last = {r["key"]: r for r in db.query(
         "SELECT u.key, u.day, u.used_bytes, u.quota_bytes FROM server_usage u JOIN "

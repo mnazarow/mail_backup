@@ -785,6 +785,11 @@ table.tbl select[data-role]:focus { outline: none; border-color: var(--primary);
 
 /* Страница входа: «или» перед единым входом (1.22.0) */
 .auth-or { text-align: center; margin: 10px 0 8px; }
+/* языки интерфейса (1.24.0) */
+.auth-lang { text-align: center; margin-top: 14px; }
+.sidebar-foot { flex-wrap: wrap; }
+.sidebar-foot .side-lang { flex-basis: 100%; }
+.lang-switch a { color: inherit; }
 
 /* уведомления на устройство (1.22.0) */
 .wp-accs label { display: flex; gap: 8px; align-items: center; margin: 3px 0; font-weight: normal; }

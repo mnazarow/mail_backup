@@ -385,10 +385,12 @@ def system_analytics(svc, account_id: Optional[int] = None, *, days: int = 90) -
         disk_free = disk_free_bytes(svc.cfg.mail_root)
     except Exception:  # noqa: BLE001
         disk_free = 0
-    try:
-        db_size = os.path.getsize(svc.cfg.db_path)
-    except OSError:
-        db_size = 0
+    db_size = svc.db.size_bytes() if svc.db.is_pg else 0
+    if not svc.db.is_pg:
+        try:
+            db_size = os.path.getsize(svc.cfg.db_path)
+        except OSError:
+            db_size = 0
     if account_id is None:
         # без обхода ФС в обработчике запроса: кэш или логический объём индекса
         archive_disk = archive_disk_size(svc)

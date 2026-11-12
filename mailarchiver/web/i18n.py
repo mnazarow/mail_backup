@@ -56,6 +56,15 @@ PARAM_HELP: Dict[str, dict] = {
         "recommend": "Адрес вашего nginx/traefik. «*» отключает проверку — так делать не нужно.",
         "example": "127.0.0.1, 10.0.0.0/8", "default": "127.0.0.1, ::1",
     },
+    "server.ui_language": {
+        "title": "Язык интерфейса по умолчанию",
+        "help": ("Язык, которым интерфейс открывается, пока пользователь не выбрал свой (ссылки «Русский · English» "
+                 "на странице входа и в профиле; выбор запоминается в браузере). ru — русский, en — английский, "
+                 "auto — по языку браузера (русский для ru, uk, be, kk, иначе английский). На английский переведены "
+                 "вход и раздел «Почта» с его сообщениями; разделы администрирования пока только на русском."),
+        "recommend": "ru; en или auto — если почтой архива пользуются сотрудники, не говорящие по-русски.",
+        "example": "auto", "default": "ru",
+    },
     "server.worker_process": {
         "title": "Задания в отдельном процессе",
         "help": ("Очередь заданий и расписания работают в отдельном процессе той же службы (одна служба "
@@ -1979,7 +1988,7 @@ PARAM_HELP: Dict[str, dict] = {
 # Порядок и группировка секций для страницы настроек
 SETTINGS_SECTIONS: List[dict] = [
     {"section": "server", "title": "Сервер и сеть", "icon": "🌐",
-     "keys": ["host", "port", "public_url", "behind_proxy", "trusted_proxies", "worker_process"]},
+     "keys": ["host", "port", "public_url", "behind_proxy", "trusted_proxies", "worker_process", "ui_language"]},
     {"section": "security", "title": "Безопасность", "icon": "🔒",
      "keys": ["auth_enabled", "session_ttl_hours", "session_idle_minutes", "min_password_length",
               "max_login_attempts", "lockout_minutes", "secure_cookie", "require_2fa", "mailbox_login",

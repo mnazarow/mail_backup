@@ -428,7 +428,7 @@ async function viewLogs(c){
   $('#logLevel').onchange=load; await load();
 }
 function logLineHtml(l){
-  const d=new Date((l.ts||0)*1000).toLocaleTimeString('ru-RU');
+  const d=new Date((l.ts||0)*1000).toLocaleTimeString(UI_LOCALE);
   return `<div class="l-${esc(l.level)}">${d} [${esc(l.level)}] ${esc(l.message)}</div>`;
 }
 /** append=true — живое обновление: дописываем только новые строки. Раньше

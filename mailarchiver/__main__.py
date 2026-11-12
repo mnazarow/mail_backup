@@ -27,12 +27,36 @@ from .errors import MailArchiverError
 from .version import __version__, APP_TITLE
 
 
+def _ro_rows(cfg, sql: str, params: tuple = ()) -> list:
+    """Строки запроса к базе службы, не трогая её (служба может работать). Нет базы — пустой список;
+    база не читается — ``sqlite3.Error`` (ошибки PostgreSQL приходят тем же классом)."""
+    import sqlite3
+    if cfg.db_url:
+        from . import pgcompat
+        engine = pgcompat.Engine(cfg.db_url, 2)
+        try:
+            return [tuple(r) for r in pgcompat.Session(engine).execute(sql, params).fetchall()]
+        finally:
+            engine.close()
+    if not os.path.exists(cfg.db_path):
+        return []
+    conn = sqlite3.connect(f"file:{cfg.db_path}?mode=ro", uri=True, timeout=5)
+    try:
+        return conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+
+
+def _db_exists(cfg) -> bool:
+    return bool(cfg.db_url) or os.path.exists(cfg.db_path)
+
+
 def _build_db(cfg):
     from .security import SecretBox
     from .database import Database
     box = SecretBox(cfg.secret_key())
-    db = Database(cfg.db_path, box, busy_timeout_ms=int(cfg.get("database", "busy_timeout_ms", 10000)),
-                  wal=bool(cfg.get("database", "wal", True)))
+    db = Database(cfg.db_target, box, busy_timeout_ms=int(cfg.get("database", "busy_timeout_ms", 10000)),
+                  wal=bool(cfg.get("database", "wal", True)), pool_size=int(cfg.get("database", "pool_size", 20) or 20))
     db.init_schema()
     return db
 
@@ -163,23 +187,19 @@ def cmd_storage_key(args) -> int:
     import json
     import sqlite3
     settings, meta, counts = {}, {}, {"total": 0, "encrypted": 0}
-    if os.path.exists(cfg.db_path):
+    if _db_exists(cfg):
         try:
-            conn = sqlite3.connect(f"file:{cfg.db_path}?mode=ro", uri=True, timeout=5)
-            try:
-                for key, value in conn.execute(
-                        "SELECT key, value FROM settings WHERE key LIKE 'storage.%'"):
-                    try:
-                        settings[key] = json.loads(value)
-                    except (TypeError, ValueError):
-                        settings[key] = value
-                for key, value in conn.execute("SELECT key, value FROM meta"):
-                    meta[key] = value
-                row = conn.execute("SELECT COUNT(*), COALESCE(SUM(CASE WHEN stored_path LIKE '%.enc' "
-                                   "THEN 1 ELSE 0 END), 0) FROM messages").fetchone()
-                counts = {"total": int(row[0] or 0), "encrypted": int(row[1] or 0)}
-            finally:
-                conn.close()
+            for key, value in _ro_rows(cfg, "SELECT key, value FROM settings WHERE key LIKE 'storage.%'"):
+                try:
+                    settings[key] = json.loads(value)
+                except (TypeError, ValueError):
+                    settings[key] = value
+            for key, value in _ro_rows(cfg, "SELECT key, value FROM meta"):
+                meta[key] = value
+            rows = _ro_rows(cfg, "SELECT COUNT(*), COALESCE(SUM(CASE WHEN stored_path LIKE '%.enc' "
+                                 "THEN 1 ELSE 0 END), 0) FROM messages")
+            if rows:
+                counts = {"total": int(rows[0][0] or 0), "encrypted": int(rows[0][1] or 0)}
         except sqlite3.Error as exc:
             print(f"База данных не читается ({exc}) — показываю только файл ключа.", file=sys.stderr)
 
@@ -219,17 +239,13 @@ def _replica_values(cfg, args) -> dict:
     import sqlite3
     from .config import DEFAULTS
     values = {key: cfg.get("replica", key) for key in DEFAULTS["replica"]}
-    if os.path.exists(cfg.db_path):
+    if _db_exists(cfg):
         try:
-            conn = sqlite3.connect(f"file:{cfg.db_path}?mode=ro", uri=True, timeout=5)
-            try:
-                for key, value in conn.execute("SELECT key, value FROM settings WHERE key LIKE 'replica.%'"):
-                    try:
-                        values[key.split(".", 1)[1]] = json.loads(value)
-                    except (TypeError, ValueError):
-                        values[key.split(".", 1)[1]] = value
-            finally:
-                conn.close()
+            for key, value in _ro_rows(cfg, "SELECT key, value FROM settings WHERE key LIKE 'replica.%'"):
+                try:
+                    values[key.split(".", 1)[1]] = json.loads(value)
+                except (TypeError, ValueError):
+                    values[key.split(".", 1)[1]] = value
         except sqlite3.Error:
             pass
         secret = values.get("s3_secret_key")
@@ -316,6 +332,9 @@ def cmd_restore_snapshot(args) -> int:
             key_path = os.path.abspath(raw) if raw else os.path.join(cfg.data_dir, "storage.key")
         cipher = crypto.StorageCipher(crypto.load_key_file(key_path))
         print(f"Снимок зашифрован; ключ: {key_path} (отпечаток {cipher.key_id_hex}).")
+    is_sql = ".sql.gz" in os.path.basename(path)
+    if cfg.db_url or is_sql:
+        return _restore_pg(cfg, args, path, cipher, is_sql)
     dest = cfg.db_path
     if os.path.exists(dest):
         if not args.force:
@@ -332,6 +351,75 @@ def cmd_restore_snapshot(args) -> int:
     from .util import human_size
     print(f"База восстановлена из {os.path.basename(path)}: {dest} ({human_size(size)}).")
     print("Проверьте, что на месте secret.key (пароли ящиков) и ключ шифрования писем, затем запустите службу.")
+    return 0
+
+
+def _restore_pg(cfg, args, path: str, cipher, is_sql: bool) -> int:
+    """Снимок PostgreSQL (``….sql.gz``) — в схему службы; текущая схема переименовывается и остаётся."""
+    import time as _time
+    from . import pgcompat
+    from .replica import snapshots
+    if not cfg.db_url:
+        print("Это снимок базы PostgreSQL, а служба настроена на SQLite: укажите адрес базы (database.url в "
+              "config.yaml или MAILARCHIVER_DATABASE_URL) и повторите.", file=sys.stderr)
+        return 1
+    if not is_sql:
+        print("Это снимок файла SQLite, а служба настроена на PostgreSQL. Разверните его без database.url "
+              "(в файл), затем перенесите командой mailarchiver db-migrate.", file=sys.stderr)
+        return 1
+    _, schema = pgcompat.split_url(cfg.db_url)
+    engine = pgcompat.Engine(cfg.db_url, 2)
+    try:
+        session = pgcompat.Session(engine)
+        tables = int(session.execute("SELECT COUNT(*) FROM pg_tables WHERE schemaname = ?", (schema,))
+                     .fetchone()[0] or 0)
+        if tables:
+            if not args.force:
+                print(f"В схеме «{schema}» уже есть база службы. Остановите службу (sudo systemctl stop "
+                      f"mailarchiver) и повторите с --force — текущая схема будет сохранена под другим именем.",
+                      file=sys.stderr)
+                return 1
+            backup = f"{schema}_before_{_time.strftime('%Y%m%d_%H%M%S')}"[:63]
+            session.execute_raw(f'ALTER SCHEMA "{schema}" RENAME TO "{backup}"')
+            print(f"Текущая схема сохранена как {backup} (удалить: DROP SCHEMA {backup} CASCADE).")
+    finally:
+        engine.close()
+    size = snapshots.restore_pg_snapshot(path, cfg.db_url, cipher)
+    from .util import human_size
+    print(f"База восстановлена из {os.path.basename(path)} в схему «{schema}» ({human_size(size)} выгрузки).")
+    print("Проверьте, что на месте secret.key (пароли ящиков) и ключ шифрования писем, затем запустите службу.")
+    return 0
+
+
+def cmd_db_migrate(args) -> int:
+    """Перенести базу службы из файла SQLite в PostgreSQL."""
+    from . import dbmigrate, pgcompat
+    cfg = load_config(args.config, create_dirs=False)
+    url = (args.to or cfg.db_url or "").strip()
+    if not url:
+        print("Укажите адрес PostgreSQL: --to postgresql://пользователь:пароль@сервер:5432/база", file=sys.stderr)
+        return 1
+    print(f"Из:  {cfg.db_path}")
+    print(f"В:   {pgcompat.redact(url)}")
+    print("Служба на время переноса должна быть остановлена (sudo systemctl stop mailarchiver): то, что она "
+          "запишет после переноса, в PostgreSQL не попадёт.")
+    report = dbmigrate.migrate(cfg.db_path, url, force=args.force, say=print)
+    from .util import human_duration
+    rows = sum(int(v) for v in report["tables"].values())
+    print(f"Перенесено таблиц: {len(report['tables'])}, строк: {rows}, за {human_duration(report['seconds'])}.")
+    if report["skipped"]:
+        print(f"Не перенесены (их нет в текущей схеме): {', '.join(report['skipped'])}")
+    if report["fixed"]:
+        print(f"Значений, которые не подошли по типу и стали пустыми: {report['fixed']}")
+    if report["verify"]:
+        for problem in report["verify"]:
+            print(f"ОШИБКА проверки: {problem}", file=sys.stderr)
+        return 1
+    print("Проверка: число строк всех таблиц совпало.")
+    if not cfg.db_url or args.to:
+        print(f"Дальше: в config.yaml — database.url: \"{pgcompat.redact(url)}\" (с паролем) или переменная "
+              f"MAILARCHIVER_DATABASE_URL, затем sudo systemctl start mailarchiver. Файл {cfg.db_path} не изменён "
+              f"(кроме обновления схемы) — вернуться можно, убрав адрес базы.")
     return 0
 
 
@@ -359,7 +447,11 @@ def cmd_check_config(args) -> int:
     print(f"{APP_TITLE} {__version__}")
     print(f"Файл конфигурации : {cfg.source_path or '(значения по умолчанию)'}")
     print(f"Каталог данных    : {cfg.data_dir}")
-    print(f"База данных        : {cfg.db_path}")
+    if cfg.db_url:
+        from .pgcompat import redact
+        print(f"База данных        : PostgreSQL {redact(cfg.db_url)}")
+    else:
+        print(f"База данных        : {cfg.db_path}")
     print(f"Каталог копий      : {cfg.mail_root}")
     print(f"Веб-интерфейс      : http://{cfg.server['host']}:{cfg.server['port']}")
     for warning in cfg.warnings:
@@ -462,10 +554,15 @@ def main(argv=None) -> int:
     p.set_defaults(func=cmd_replica_pull)
 
     p = sub.add_parser("restore-snapshot", help="восстановить базу из снимка")
-    p.add_argument("snapshot", metavar="СНИМОК", help="файл снимка (mailarchiver-….db.gz[.enc])")
+    p.add_argument("snapshot", metavar="СНИМОК", help="файл снимка (mailarchiver-….db.gz[.enc] или ….sql.gz[.enc])")
     p.add_argument("--key", metavar="ФАЙЛ", help="ключ шифрования (для зашифрованного снимка)")
     p.add_argument("--force", action="store_true", help="заменить существующую базу (она сохранится рядом)")
     p.set_defaults(func=cmd_restore_snapshot)
+
+    p = sub.add_parser("db-migrate", help="перенести базу службы из SQLite в PostgreSQL")
+    p.add_argument("--to", metavar="АДРЕС", help="адрес PostgreSQL (по умолчанию — database.url)")
+    p.add_argument("--force", action="store_true", help="очистить схему PostgreSQL, если в ней уже есть данные")
+    p.set_defaults(func=cmd_db_migrate)
 
     p = sub.add_parser("replica-ssh-key", help="SSH-ключ службы для копии по rsync (создаётся при первом вызове)")
     p.set_defaults(func=cmd_replica_ssh_key)

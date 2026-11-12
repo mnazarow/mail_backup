@@ -1298,6 +1298,14 @@ svc_prop(){ { systemctl show "$APP_NAME" -p "$1" 2>/dev/null || true; } | sed -n
 # такого значения не знает), — вызывающий обходится без него.
 # Относительные пути конфигурации (data_dir: "data") служба считает от своего
 # рабочего каталога — от него же считаем и здесь, иначе база «не находилась».
+# База службы — в PostgreSQL (1.24.0): database.url в config.yaml или MAILARCHIVER_DATABASE_URL у службы.
+# Тогда файла mailarchiver.db в каталоге данных нет, и копировать перед обновлением нечего.
+db_is_postgres(){
+  [ "$(cfg_value db_url)" = "1" ] && return 0
+  systemctl show -p Environment "${APP_NAME:-mailarchiver}" 2>/dev/null | grep -q 'MAILARCHIVER_DATABASE_URL=' && return 0
+  return 1
+}
+
 cfg_value(){
   venv_py - "$CONFIG_FILE" "$1" "${APP_DIR:-}" <<'PY' 2>/dev/null || true
 import os, sys
@@ -1309,6 +1317,8 @@ from mailarchiver.config import load_config
 cfg = load_config(sys.argv[1], create_dirs=False)
 if sys.argv[2] == "db_path":
     print(cfg.db_path)
+elif sys.argv[2] == "db_url":
+    print("1" if getattr(cfg, "db_url", "") else "")
 elif sys.argv[2] == "data_dir":
     print(cfg.data_dir)
 else:

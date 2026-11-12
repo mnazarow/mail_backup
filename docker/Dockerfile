@@ -25,13 +25,14 @@ FROM python:3.12-slim
 
 LABEL org.opencontainers.image.title="MailArchiver" \
       org.opencontainers.image.description="Резервное копирование почтовых ящиков по IMAP с веб-интерфейсом" \
-      org.opencontainers.image.version="1.23.0"
+      org.opencontainers.image.version="1.24.0"
 
 # readpst — запасной способ разбора .pst (основной встроен в службу);
 # ca-certificates — для TLS/OAuth2;
-# rsync и ssh — для копии архива на другой сервер по SSH
+# rsync и ssh — для копии архива на другой сервер по SSH;
+# postgresql-client (pg_dump, psql) — снимки базы, если она в PostgreSQL (1.24.0)
 RUN apt-get update \
- && apt-get install -y --no-install-recommends pst-utils ca-certificates curl rsync openssh-client \
+ && apt-get install -y --no-install-recommends pst-utils ca-certificates curl rsync openssh-client postgresql-client \
  && rm -rf /var/lib/apt/lists/*
 
 # непривилегированный пользователь

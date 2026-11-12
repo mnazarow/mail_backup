@@ -47,7 +47,7 @@ async function viewDashboard(c){
   c.innerHTML='';
   const stats=h(`<div class="grid cols-4" style="margin-bottom:16px">
     <div class="card stat-card"><div class="label">📬 Ящиков всего</div><div class="value">${s.totals.accounts}</div><div class="sub">${(()=>{const en=(s.accounts||[]).filter(a=>a.enabled).length; const off=s.totals.accounts-en; return `под копированием: ${en}${off?` · выключено: ${off}`:''}`;})()}</div></div>
-    <div class="card stat-card"><div class="label">✉️ Писем в архиве</div><div class="value">${s.totals.messages.toLocaleString('ru-RU')}</div><div class="sub">${esc(s.totals.bytes_h)}</div></div>
+    <div class="card stat-card"><div class="label">✉️ Писем в архиве</div><div class="value">${s.totals.messages.toLocaleString(UI_LOCALE)}</div><div class="sub">${esc(s.totals.bytes_h)}</div></div>
     <div class="card stat-card"><div class="label">⚙️ В очереди / работе</div><div class="value" id="dq">${(s.job_counts.queued||0)+(s.job_counts.running||0)}</div><div class="sub">воркеров: ${s.workers}</div></div>
     <div class="card stat-card"><div class="label">💽 Свободно на диске</div><div class="value">${esc(s.disk.free_h)}</div><div class="sub">каталог копий</div></div>
   </div>`);
@@ -560,6 +560,7 @@ async function employeeSyncNow(){
 
 // ---------- Резервное копирование по кнопке ----------
 function plural(n, one, few, many){
+  if(uiLang()==='en') return Math.abs(Number(n))===1 ? one : many;   // «письмо/писем» переводит каталог
   const m10=n%10, m100=n%100;
   if(m10===1 && m100!==11) return one;
   if(m10>=2 && m10<=4 && (m100<12 || m100>14)) return few;
@@ -725,7 +726,7 @@ function loginCell(a){
 }
 
 /** Даты резервных копий ящика — для колонки «Резервные копии». */
-function fmtDay(iso){ if(!iso) return '—'; try{ return new Date(iso).toLocaleDateString('ru-RU',{day:'2-digit',month:'2-digit',year:'numeric'}); }catch(e){ return iso; } }
+function fmtDay(iso){ if(!iso) return '—'; try{ return new Date(iso).toLocaleDateString(UI_LOCALE,{day:'2-digit',month:'2-digit',year:'numeric'}); }catch(e){ return iso; } }
 /** Колонка «Резервные копии»: последняя копия — строкой, первая (только дата), число писем и объём — второй;
  *  extra (ссылка «история») дописывается в конец, чтобы строка ящика не вырастала ещё на одну. */
 function backupCell(a, extra=''){

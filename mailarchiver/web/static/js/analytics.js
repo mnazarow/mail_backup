@@ -12,7 +12,7 @@ const STATUS_LBL = {queued:'в очереди',running:'выполняется',
 const NO_RETRY_JOBS = new Set(['axigen_action','server_action']);
 const JOBLBL = {backup:'Резервное копирование',restore:'Восстановление',export:'Экспорт',import_pst:'Импорт PST',test:'Проверка подключения',retention:'Очистка (ретеншн)',verify:'Проверка целостности',analyze:'Глубокий анализ писем',sync_employees:'Синхронизация сотрудников',storage_convert:'Шифрование копии',check_logins:'Проверка паролей',replicate:'Копия вне сервера',db_snapshot:'Снимок базы',search_index:'Индексация поиска',dedup_report:'Отчёт об одинаковых вложениях',cleanup:'Удаление архивов и прежних копий',backup_all:'Копирование всех ящиков по очереди',quarantine_check:'Сравнение прежней копии с новой',quarantine_rescue:'Возврат писем из прежней копии',folders_check:'Проверка папок на сервере',search_reindex:'Переиндексация поиска',axigen_sync:'Сверка с сервером Axigen',axigen_action:'Действия на сервере Axigen',server_action:'Действия с ящиками на сервере',server_sync:'Сверка с почтовым сервером',reply_index:'Индекс ответов на письма',case_export:'Выгрузка дела',search_attach:'Чтение текста вложений',restore_drill:'Проверка восстановления'};
 function cvar(n,f){ const v=getComputedStyle(document.documentElement).getPropertyValue(n).trim(); return v||f; }
-function fmtNum(n){ return Number(n||0).toLocaleString('ru-RU'); }
+function fmtNum(n){ return Number(n||0).toLocaleString(UI_LOCALE); }
 function trunc(s,n){ s=String(s==null?'':s); return s.length>n? s.slice(0,n-1)+'…':s; }
 function hexA(hex,a){ hex=String(hex).replace('#',''); if(hex.length===3)hex=hex.split('').map(c=>c+c).join(''); const r=parseInt(hex.slice(0,2),16),g=parseInt(hex.slice(2,4),16),b=parseInt(hex.slice(4,6),16); return `rgba(${r||0},${g||0},${b||0},${a})`; }
 function niceStep(v){ const p=Math.pow(10,Math.floor(Math.log10(v))); const n=v/p; let m; if(n<=1)m=1;else if(n<=2)m=2;else if(n<=2.5)m=2.5;else if(n<=5)m=5;else m=10; return m*p; }
@@ -346,7 +346,7 @@ function fmtDur(s){
   if(s<86400){ const hh=Math.floor(s/3600), mm=Math.round((s%3600)/60); return hh+' ч'+(mm?' '+mm+' мин':''); }
   const d=Math.floor(s/86400), hh=Math.round((s%86400)/3600); return d+' д'+(hh?' '+hh+' ч':'');
 }
-function fmtPct(v){ return v==null?'—':(Number(v).toLocaleString('ru-RU',{maximumFractionDigits:1})+'%'); }
+function fmtPct(v){ return v==null?'—':(Number(v).toLocaleString(UI_LOCALE,{maximumFractionDigits:1})+'%'); }
 /** Изменение к прошлому периоду: стрелка и цвет — «хорошо» или «плохо» (better: 'up' | 'down'). */
 function rpDelta(cur, prev, better, kind){
   if(cur==null || prev==null) return '';
@@ -354,7 +354,7 @@ function rpDelta(cur, prev, better, kind){
   const good = better==='up' ? diff>0 : diff<0;
   const cls = better==='none' ? 'same' : (good?'good':'bad');
   let txt;
-  if(kind==='pct') txt=(diff>0?'+':'−')+Math.abs(diff).toLocaleString('ru-RU',{maximumFractionDigits:1})+' п.п.';
+  if(kind==='pct') txt=(diff>0?'+':'−')+Math.abs(diff).toLocaleString(UI_LOCALE,{maximumFractionDigits:1})+' п.п.';
   else if(kind==='dur') txt=(diff>0?'+':'−')+fmtDur(Math.abs(diff));
   else { const rel=prev? Math.round(100*diff/prev):null; txt=(diff>0?'+':'−')+fmtNum(Math.abs(diff))+(rel!=null&&isFinite(rel)?` (${diff>0?'+':'−'}${Math.abs(rel)}%)`:''); }
   return `<span class="rp-delta ${cls}" title="К прошлому такому же периоду">${diff>0?'▲':'▼'} ${txt}</span>`;
@@ -513,7 +513,7 @@ function rpStatus(box, st, meta, c){
     <div style="min-width:240px;flex:1"><strong>${running?'<span class="spinner"></span> ':''}Индекс ответов: разобрано ${fmtNum(st.indexed)} из ${fmtNum(st.total)} писем (${part}%)</strong>
       <div class="rp-progress"><span style="width:${part}%"></span></div>
       <div class="muted small">${st.pending<=0?'Идёт разбор новых писем.':[
-        st.since?`Разобраны письма с ${esc(new Date(st.since).toLocaleDateString('ru-RU'))} по сегодня — за этот срок цифры полные; более давние разбираются в фоне (раз в 10 минут, порциями, от новых к старым).`:'',
+        st.since?`Разобраны письма с ${esc(new Date(st.since).toLocaleDateString(UI_LOCALE))} по сегодня — за этот срок цифры полные; более давние разбираются в фоне (раз в 10 минут, порциями, от новых к старым).`:'',
         (st.readdress||[]).length?(st.readdress.length===1?`У ящика «${esc(st.readdress[0])}» поменялись адреса — его письма разбираются заново, цифры по нему пока неполные.`:`У ящиков ${st.readdress.slice(0,3).map(n=>'«'+esc(n)+'»').join(', ')}${st.readdress.length>3?' и ещё '+fmtNum(st.readdress.length-3):''} поменялись адреса — их письма разбираются заново, цифры по ним пока неполные.`):'',
         !st.since&&!(st.readdress||[]).length?'Остальные письма разбираются в фоне (раз в 10 минут, порциями) — цифры раздела пока неполные.':''].filter(Boolean).join(' ')}</div></div>
     ${meta.is_admin&&!running?'<button class="btn sm" id="rpIdxRun">▶ Разобрать сейчас</button>':''}</div>`);
@@ -527,14 +527,14 @@ function rpRender(body, d, meta){
   const redraws=[]; const reg=fn=>{ fn(); redraws.push(fn); };
   const C={ontime:cvar('--success','#1f9d55'), late:cvar('--warn','#d98a00'), flag:'#7c5cff', waiting:cvar('--info','#2b8ca6'), overdue:cvar('--danger','#d64545'), primary:cvar('--primary','#2f6fed'), dim:cvar('--text-dim','#888')};
   const slaTxt=`${String(prm.sla_hours).replace('.',',')} ч${prm.sla_business?' рабочих':''}`;
-  const span=`${new Date(d.period.since*1000).toLocaleDateString('ru-RU')} — ${new Date((d.period.until-1)*1000).toLocaleDateString('ru-RU')}`;
+  const span=`${new Date(d.period.since*1000).toLocaleDateString(UI_LOCALE)} — ${new Date((d.period.until-1)*1000).toLocaleDateString(UI_LOCALE)}`;
   if(!s.in_total && !s.out_total){
     body.appendChild(h(`<div class="card"><div class="empty"><div class="big">↩️</div>За ${esc(span)} писем по этому отбору нет.<br><span class="muted small">Попробуйте период длиннее или другие фильтры. Если архив только что обновлён — дождитесь разбора писем (полоса выше).</span></div></div>`));
     registerCharts(redraws); return;
   }
   const kpi=(l,v,sub,delta,ac,cls)=>`<div class="kpi ${ac?'accent':''} ${cls||''}"><div class="k-label">${l}</div><div class="k-value">${v}</div><div class="k-sub">${sub||''}</div>${delta?`<div class="k-sub">${delta}</div>`:''}</div>`;
   const pv=k=>p?p[k]:null;
-  body.appendChild(h(`<div><div class="rp-period muted small">Период: <b>${esc(span)}</b>${p?` · сравнение с ${esc(new Date(p.since*1000).toLocaleDateString('ru-RU'))} — ${esc(new Date((p.until-1)*1000).toLocaleDateString('ru-RU'))}`:''} · срок ответа ${esc(slaTxt)} · рабочее время ${esc(prm.work_hours)}, ${esc(prm.timezone)}</div>
+  body.appendChild(h(`<div><div class="rp-period muted small">Период: <b>${esc(span)}</b>${p?` · сравнение с ${esc(new Date(p.since*1000).toLocaleDateString(UI_LOCALE))} — ${esc(new Date((p.until-1)*1000).toLocaleDateString(UI_LOCALE))}`:''} · срок ответа ${esc(slaTxt)} · рабочее время ${esc(prm.work_hours)}, ${esc(prm.timezone)}</div>
   <div class="an-kpis">
     ${kpi('📥 Входящих',fmtNum(s.in_total),'ждут ответа сейчас: '+fmtNum(s.waiting),rpDelta(s.in_total,pv('in_total'),'none'),true)}
     ${kpi('✅ Отвечено',fmtPct(s.answered_pct),fmtNum(s.answered)+' из '+fmtNum(s.in_total)+(s.by_subject_in?` · <span title="Ответ написан новым письмом — найден по теме и собеседнику">по теме: ${fmtNum(s.by_subject_in)}</span>`:''),rpDelta(s.answered_pct,pv('answered_pct'),'up','pct'))}

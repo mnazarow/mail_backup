@@ -16,8 +16,8 @@ const root = () => document.getElementById('root');
 
 function h(html){ const t=document.createElement('template'); t.innerHTML=html.trim(); return t.content.firstElementChild; }
 function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-function fmtDate(iso){ if(!iso) return '—'; try{ const d=new Date(iso); return d.toLocaleString('ru-RU',{day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'}); }catch(e){ return iso; } }
-function fmtBytes(n){ n=Number(n||0); const u=['Б','КБ','МБ','ГБ','ТБ']; let i=0; while(n>=1024&&i<u.length-1){n/=1024;i++;} return (i===0?n:n.toFixed(1))+' '+u[i]; }
+function fmtDate(iso){ if(!iso) return '—'; try{ const d=new Date(iso); return d.toLocaleString(UI_LOCALE,{day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'}); }catch(e){ return iso; } }
+function fmtBytes(n){ n=Number(n||0); const u=['Б','КБ','МБ','ГБ','ТБ'].map(x=>t(x)); let i=0; while(n>=1024&&i<u.length-1){n/=1024;i++;} return (i===0?n:n.toFixed(1))+' '+u[i]; }
 
 const State = { user:null, help:null, view:null, ws:null, wsTimer:null, engines:[], accounts:[], logLevel:'' };
 
@@ -170,6 +170,7 @@ function confirmDlg(title, message, {okText='Подтвердить', okClass='d
 async function boot(){
   try{
     const ns = await api('/needs-setup');
+    i18nInit(ns.ui_language);
     if(ns.needs_setup) return renderSetup();
     if(!ns.auth_enabled){ try{ State.user=await api('/me'); }catch(_){ State.user={username:'admin',role:'admin'}; } return startApp(); }
     try{ State.user = await api('/me'); startApp(); }
@@ -192,6 +193,7 @@ function renderLogin(sso){
     <button class="btn primary" id="lb" style="width:100%;justify-content:center">Войти</button>
     ${ssoBtns?`<div class="auth-or small muted">или</div>${ssoBtns}`:''}
     ${ssoFailed?'<div class="hint" style="margin-top:10px;border-color:var(--danger)">Единый вход не удался. Попробуйте ещё раз; если не помогает — сообщите администратору (подробности — в аудите архива).</div>':''}
+    <div class="auth-lang small muted">🌐 ${langSwitchHtml()}</div>
   </div></div>`);
   root().appendChild(card);
   if(ssoFailed) history.replaceState(null, '', location.pathname+location.hash);
@@ -477,7 +479,7 @@ async function startApp(){
     <aside class="sidebar">
       <div class="brand"><div class="logo">📥</div><div><div class="name">MailArchiver</div><div class="ver">${State.user.version?'v'+esc(State.user.version):''}</div></div></div>
       <nav class="nav" id="nav"></nav>
-      <div class="sidebar-foot"><a href="#" id="profileLink" title="Профиль и двухфакторный вход${isOperator()?' · роль: оператор':''}">${State.user.totp_enabled?'🔐 ':''}${esc(State.user.username)}${isOperator()?' <span class="tag">оператор</span>':''}</a><a href="#" id="logout" title="Выход">Выход ⎋</a></div>
+      <div class="sidebar-foot"><a href="#" id="profileLink" title="Профиль и двухфакторный вход${isOperator()?' · роль: оператор':''}">${State.user.totp_enabled?'🔐 ':''}${esc(State.user.username)}${isOperator()?' <span class="tag">оператор</span>':''}</a><a href="#" id="logout" title="Выход">Выход ⎋</a><div class="small muted side-lang">🌐 ${langSwitchHtml()}</div></div>
     </aside>
     <div class="nav-backdrop" id="navBack"></div>
     <main class="main">
@@ -551,7 +553,7 @@ function route(){
   // молча пропадали. Отказ возвращает адрес прежнего раздела, не перерисовывая его.
   if(State.leaveGuard && State.view && State.view!==view){
     const warn=State.leaveGuard();
-    if(warn && !window.confirm(warn)){ history.replaceState(null, '', '#/'+State.view); setActiveNav(State.view); return; }
+    if(warn && !window.confirm(t(warn))){ history.replaceState(null, '', '#/'+State.view); setActiveNav(State.view); return; }
   }
   State.leaveGuard=null;
   State.view=view; setActiveNav(view); State.redraw=null;

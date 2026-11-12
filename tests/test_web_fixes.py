@@ -117,7 +117,7 @@ def test_live_endpoint_and_background_requests_do_not_extend_session(client):
     svc = client.app.state.services
     live = client.get("/api/live", headers={"X-MA-Background": "1"})
     assert live.status_code == 200 and "active_jobs" in live.json() and "job_counts" in live.json()
-    token = svc.db.scalar("SELECT token FROM sessions ORDER BY rowid DESC LIMIT 1")
+    token = svc.db.scalar("SELECT token FROM sessions ORDER BY created_at DESC LIMIT 1")
     old = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
     svc.db.execute("UPDATE sessions SET last_seen=? WHERE token=?", (old, token))
     assert client.get("/api/live", headers={"X-MA-Background": "1"}).status_code == 200

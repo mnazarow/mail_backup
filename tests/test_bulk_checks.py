@@ -87,8 +87,7 @@ def _mail(svc, account_id, uid, word):
 
 
 def _body_hits(svc, word):
-    return {int(r["rowid"]) for r in svc.db.query(f"SELECT rowid FROM {search_mod.FTS_TABLE} "
-                                                  f"WHERE {search_mod.FTS_TABLE} MATCH ?", (f"body : {word}",))}
+    return search_mod.match_ids(svc.db, f"текст:{word}")
 
 
 def test_search_reindex_refreshes_only_selected_mailboxes(services):
@@ -120,8 +119,7 @@ def test_search_reindex_counts_unreadable_files(services):
     assert res["final_status"] == JobStatus.PARTIAL and res["errors"] == 1
     assert "не перечитано" in res["items"][0]["detail"]
     # по теме письмо по-прежнему находится
-    assert services.db.query(f"SELECT rowid FROM {search_mod.FTS_TABLE} WHERE {search_mod.FTS_TABLE} MATCH ?",
-                             ("subject : письмо",))
+    assert search_mod.match_ids(services.db, "тема:письмо")
 
 
 # ---------------------------------------------------------------------------

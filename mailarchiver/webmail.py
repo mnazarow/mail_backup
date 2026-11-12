@@ -1891,7 +1891,7 @@ def contacts(svc, account: Account, q: str, limit: int = 10) -> List[Dict]:
         if len(out) >= limit:
             break
     like = f"%{q}%"
-    for r in svc.db.query("SELECT from_addr AS a, COUNT(*) AS n FROM messages WHERE account_id=? AND from_addr LIKE ? "
+    for r in svc.db.query("SELECT MIN(from_addr) AS a, COUNT(*) AS n FROM messages WHERE account_id=? AND from_addr LIKE ? "
                           "GROUP BY lower(from_addr) ORDER BY n DESC LIMIT 20", (int(account.id), like)):
         a = (r["a"] or "").strip()
         if "@" in a:

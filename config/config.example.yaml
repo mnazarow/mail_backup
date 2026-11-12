@@ -24,6 +24,8 @@ server:                  # задаётся ТОЛЬКО здесь; после 
   # Очередь заданий и расписания — в отдельном процессе той же службы: копирование не делит
   # интерпретатор с веб-интерфейсом, и интерфейс не тормозит во время копий (ещё ~60–100 МБ памяти).
   worker_process: false
+  # Язык интерфейса, пока пользователь не выбрал свой: ru | en | auto (по языку браузера)
+  ui_language: "ru"
 
 security:
   auth_enabled: true
@@ -36,6 +38,12 @@ security:
   require_2fa: false     # true — администраторы обязаны включить вход с кодом из приложения
   mailbox_login: true    # вход сотрудников по email и паролю своего ящика
   imap_ssl_verify: true  # проверять TLS-сертификат IMAP-сервера
+
+# База службы. По умолчанию — файл SQLite в каталоге данных. PostgreSQL 16+ (1.24.0) — адрес ниже
+# или переменная MAILARCHIVER_DATABASE_URL; перенос действующей базы — mailarchiver db-migrate.
+# database:
+#   url: "postgresql://mailarchiver:пароль@db.example.ru:5432/mailarchiver?sslmode=require"
+#   pool_size: 20
 
 paths:
   data_dir: ""           # пусто = /var/lib/mailarchiver (или ./data при запуске из исходников)
