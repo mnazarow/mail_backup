@@ -553,10 +553,13 @@ def smime_status(svc, account: Account, row) -> Optional[Dict]:
         with open(src, "wb") as fh:
             fh.write(raw)
 
+        ca_file = str(svc.rt("webmail", "smime_ca_file") or "").strip()
+        ca = ["-CAfile", ca_file] if ca_file and os.path.isfile(ca_file) else []
+
         def run(*extra):
             return subprocess.run([exe, "smime", "-verify", "-in", src, "-signer", cert, "-out", os.devnull, *extra],
                                   capture_output=True, timeout=15, check=False)
-        r = run("-purpose", "any")
+        r = run("-purpose", "any", *ca)
         if r.returncode == 0:
             out["valid"], out["trusted"] = True, True
         else:
@@ -569,9 +572,13 @@ def smime_status(svc, account: Account, row) -> Optional[Dict]:
         if os.path.exists(cert):
             pem = open(cert, "rb").read()
             out["signer"] = _cert_info(pem)
+            sender = (row["from_addr"] or "").strip().lower()
+            out["matches_sender"] = bool(sender) and sender in [e.lower() for e in out["signer"].get("emails") or []]
             if out["valid"]:
+                # для шифрования писем этому адресату — только доверенная подпись с адресом
+                # отправителя в сертификате (1.21.0)
                 from .webmail_secure import remember_signer
-                remember_signer(svc, pem)      # для шифрования писем этому адресату (1.20.0)
+                remember_signer(svc, pem, sender, trusted=bool(out["trusted"]))
     except (OSError, subprocess.SubprocessError) as exc:
         out["text"] = f"Подпись S/MIME не проверена: {exc}"
         return out
@@ -618,7 +625,12 @@ def _cert_info(pem: bytes) -> Dict:
         until = cert.not_valid_after_utc
     except AttributeError:
         until = cert.not_valid_after.replace(tzinfo=timezone.utc)
-    return {"name": attr(cert.subject, NameOID.COMMON_NAME), "emails": emails,
+    try:
+        from cryptography.hazmat.primitives import hashes
+        fingerprint = cert.fingerprint(hashes.SHA256()).hex()
+    except Exception:  # noqa: BLE001
+        fingerprint = ""
+    return {"name": attr(cert.subject, NameOID.COMMON_NAME), "emails": emails, "fingerprint": fingerprint,
             "issuer": attr(cert.issuer, NameOID.COMMON_NAME) or attr(cert.issuer, NameOID.ORGANIZATION_NAME),
             "valid_until": until.isoformat(), "expired": until < datetime.now(timezone.utc)}
 

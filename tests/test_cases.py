@@ -76,12 +76,21 @@ def test_hold_follows_open_cases(world):
 
 
 def test_previous_hold_restored(world):
-    svc, a, _, _ = world
+    svc, a, b, _ = world
+    svc.db.mark_account_dismissed(a, "2026-01-01T00:00:00+00:00")
     svc.db.set_account_hold(a, "2031-05-05", "dismissed")
     cid = cases.create_case(svc, "admin", name="Дело", account_ids=[a])
     cases.set_custodians(svc, "admin", cid, remove=[a])
     acc = svc.db.get_account(a)
     assert acc.hold_until == "2031-05-05" and acc.hold_reason == "dismissed"
+    # сотрудника вернули на работу во время дела — после дела удержание «уволен» не возвращается (1.21.0)
+    svc.db.mark_account_dismissed(b, "2026-01-01T00:00:00+00:00")
+    svc.db.set_account_hold(b, "2031-05-05", "dismissed")
+    cid = cases.create_case(svc, "admin", name="Дело 2", account_ids=[b])
+    svc.db.mark_account_dismissed(b, None)
+    cases.set_custodians(svc, "admin", cid, remove=[b])
+    acc = svc.db.get_account(b)
+    assert acc.hold_until == "" and acc.hold_reason == ""
 
 
 def test_case_messages_query_and_period(world):
@@ -179,3 +188,98 @@ def test_ui_has_cases_section():
     for needle in ("{id:'cases'", "async function viewCases", "accountPickerDlg", "/exports/${x.id}/download",
                    "cases:viewCases", "🔒 по делу"):
         assert needle in js, needle
+
+
+def _run_export(svc, cid, **opts):
+    from mailarchiver.queue.jobs import HANDLERS, JobContext
+    out = cases.start_export(svc, "admin", cid, **opts)
+    job = svc.db.get_job(out["job_id"])
+    import json as _json
+    params = _json.loads(job["params"]) if isinstance(job["params"], str) else dict(job["params"])
+    return HANDLERS[JobType.CASE_EXPORT](JobContext(svc, out["job_id"], JobType.CASE_EXPORT, None, params))
+
+
+def test_case_export_signed_and_password(world, tmp_path):
+    """Опись подписана ключом Ed25519 сервера; архив под паролем — WinZip AES-256 (1.21.0)."""
+    import shutil
+    import subprocess
+    from cryptography.hazmat.primitives.serialization import load_pem_public_key
+    svc, a, b, ids = world
+    cid = cases.create_case(svc, "admin", name="Подпись", query="договор", account_ids=[a, b])
+    res = _run_export(svc, cid)
+    with zipfile.ZipFile(res["path"]) as zf:
+        base = zf.namelist()[0].split("/")[0]
+        manifest, sig = zf.read(f"{base}/manifest.csv"), zf.read(f"{base}/manifest.sig")
+        pem = zf.read(f"{base}/signing_key.pem")
+        report = zf.read(f"{base}/report.txt").decode()
+    load_pem_public_key(pem).verify(sig, manifest)                       # подпись верна
+    info = cases.public_key_info(svc)
+    assert info["pem"].encode() == pem and info["fingerprint"] in report
+    if shutil.which("openssl"):
+        for name, data in (("m.csv", manifest), ("m.sig", sig), ("k.pem", pem)):
+            (tmp_path / name).write_bytes(data)
+        r = subprocess.run(["openssl", "pkeyutl", "-verify", "-pubin", "-inkey", str(tmp_path / "k.pem"), "-rawin",
+                            "-in", str(tmp_path / "m.csv"), "-sigfile", str(tmp_path / "m.sig")],
+                           capture_output=True, check=False)
+        assert r.returncode == 0, r.stderr
+    with pytest.raises(ValidationError):
+        cases.start_export(svc, "admin", cid, password="short")
+    pyzipper = pytest.importorskip("pyzipper")
+    res = _run_export(svc, cid, password="Секрет-12345")
+    assert "password" not in str(svc.db.get_job(res.get("job_id", 0)) or "")
+    with zipfile.ZipFile(res["path"]) as zf:
+        with pytest.raises(Exception):
+            zf.read(zf.namelist()[0])                                    # без пароля не прочитать
+    with pyzipper.AESZipFile(res["path"]) as zf:
+        zf.setpassword("Секрет-12345".encode())
+        base = zf.namelist()[0].split("/")[0]
+        rows = list(csv.DictReader(io.StringIO(zf.read(f"{base}/manifest.csv").decode("utf-8-sig"))))
+        assert len(rows) == 2
+        for row in rows:
+            assert hashlib.sha256(zf.read(f"{base}/{row['file']}")).hexdigest() == row["sha256"]
+    exp = cases.case_dict(svc, cases.get_case(svc, cid), full=True)["export_list"][0]
+    assert exp["protected"] and exp["format"] == "eml"
+
+
+def test_case_export_pst_and_purge(world):
+    from mailarchiver.export.registry import NativePstExportEngine
+    svc, a, b, ids = world
+    cid = cases.create_case(svc, "admin", name="PST", account_ids=[a])
+    if not NativePstExportEngine.available()[0]:
+        pytest.skip("движок PST недоступен")
+    res = _run_export(svc, cid, fmt="pst")
+    assert res["count"] >= 1
+    with zipfile.ZipFile(res["path"]) as zf:
+        names = zf.namelist()
+        assert any(n.endswith("mailbox.pst") for n in names)
+        pst = zf.read([n for n in names if n.endswith("mailbox.pst")][0])
+        assert pst[:4] == b"!BDN"
+    # срок хранения выгрузок дел
+    svc.db.execute("UPDATE case_exports SET created_at='2000-01-01T00:00:00+00:00'")
+    assert cases.purge_old_exports(svc) == 0                             # по умолчанию — не удалять
+    svc.set_rt("cases", "export_keep_days", 30)
+    assert cases.purge_old_exports(svc) == 1 and not os.path.exists(res["path"])
+
+
+def test_hold_only_matching_messages(world):
+    """Удержание «письма по условиям дела»: очистка по сроку удаляет остальные старые письма (1.21.0)."""
+    from mailarchiver.queue.jobs import HANDLERS, JobContext
+    svc, a, b, ids = world
+    svc.db.execute("UPDATE accounts SET retention_days=1 WHERE id=?", (a,))
+    svc.db.execute("UPDATE messages SET internaldate='2020-01-01T00:00:00+00:00' WHERE id IN (?,?)",
+                   (ids["a1"], ids["a2"]))
+    cid = cases.create_case(svc, "admin", name="Договоры", query="договор", account_ids=[a], hold_scope="matching")
+    assert svc.db.get_account(a).hold_reason == "case"          # архив ящика всё равно нельзя удалить
+    before = {r["id"] for r in svc.db.query("SELECT id FROM messages WHERE account_id=?", (a,))}
+    job_id = svc.db.enqueue_job(JobType.RETENTION, a, {}, 4, 1, "admin")
+    res = HANDLERS[JobType.RETENTION](JobContext(svc, job_id, JobType.RETENTION, a, {}))
+    after = {r["id"] for r in svc.db.query("SELECT id FROM messages WHERE account_id=?", (a,))}
+    assert ids["a1"] in after                                     # подходит под «договор» — осталось
+    assert ids["a2"] not in after and ids["a3"] not in after and after < before
+    assert "по условиям открытых дел: 1" in res["summary"]
+    # «весь архив» — очистка не трогает ящик вовсе
+    cases.update_case(svc, "admin", cid, {"hold_scope": "all"})
+    job_id = svc.db.enqueue_job(JobType.RETENTION, a, {}, 4, 1, "admin")
+    assert HANDLERS[JobType.RETENTION](JobContext(svc, job_id, JobType.RETENTION, a, {}))["removed"] == 0
+    with pytest.raises(ValidationError):
+        cases.create_case(svc, "admin", name="X", account_ids=[a], hold_scope="some")

@@ -109,7 +109,7 @@ notifications:
 
 employees:
   sync_enabled: false        # синхронизировать справочник сотрудников по расписанию
-  source_type: "file"        # file (файл на сервере) | url (адрес выгрузки)
+  source_type: "file"        # file (файл на сервере) | url (адрес выгрузки) | ldap (каталог AD)
   source_file: ""            # путь к CSV/XLSX/XML на сервере
   source_url: ""             # https://… (при source_type: url)
   source_url_user: ""
@@ -178,6 +178,11 @@ search:                      # поиск по письмам (docs/ru/15-search
   index_attachments: true    # искать и по тексту вложений (PDF, Word, Excel, PowerPoint, OpenDocument, RTF)
   attachment_max_kb: 10240   # вложения крупнее не разбираются
   attachment_text_kb: 64     # текста вложений одного письма в индексе, КБ
+  attachment_time_s: 10      # предел времени на разбор одного вложения, секунд
+  ocr: false                 # распознавать сканы и картинки (нужны tesseract-ocr, tesseract-ocr-rus, poppler-utils)
+  ocr_lang: "rus+eng"
+  ocr_max_pages: 5           # страниц скана в PDF, не больше
+  ocr_time_s: 60             # предел времени на распознавание одного вложения, секунд
 
 replies:                     # раздел «Ответы на письма» (docs/ru/06-analytics.md)
   enabled: true              # вести индекс ответов (фоновое задание читает заголовки новых писем)
@@ -191,7 +196,7 @@ replies:                     # раздел «Ответы на письма» (
 
 webmail:                     # почтовый клиент раздела «Почта» (docs/ru/22-mailclient.md)
   enabled: true              # писать письма и менять ящик на сервере из «Почты»
-  admin_actions: true        # администратор может писать и менять ящики сотрудников (с записью в аудит)
+  admin_actions: false       # администратор может писать и менять ящики сотрудников (с записью в аудит)
   mark_read: true            # открытое сотрудником письмо отмечать прочитанным
   auto_refresh_s: 120        # проверять новую почту открытой папки, секунд (0 — не проверять)
   max_attachments_mb: 25     # вложения одного письма, МБ (1–30)
@@ -205,8 +210,10 @@ webmail:                     # почтовый клиент раздела «П
   dlp_mode: "warn"           # конфиденциальные данные в письме: off | warn | block_external
   warn_external: true        # предупреждать, что письмо уходит за пределы организации
   warn_recipients: 20        # предупреждать о большом списке адресатов в «Кому» и «Копии» (0 — нет)
+  smime_ca_file: ""          # доверенные центры организации для подписей S/MIME (PEM), кроме системных
+  send_limit_hour: 300       # адресатов в час с одного ящика (0 — без предела)
 
-journal:                     # приём журналирования по SMTP (docs/ru/13-replica.md → «Журналирование»)
+journal:                     # приём журналирования по SMTP (docs/ru/23-compliance.md)
   enabled: false
   listen: "127.0.0.1"        # 0.0.0.0 — принимать на всех адресах
   port: 2525
@@ -217,7 +224,28 @@ journal:                     # приём журналирования по SMTP
   tls_cert: ""               # сертификат и ключ для STARTTLS (PEM)
   tls_key: ""
   require_tls: false
+  auth_user: ""              # SMTP AUTH почтового сервера ('' — без входа); вход — только после STARTTLS
+  auth_password: ""          # лучше задать в интерфейсе — там хранится зашифрованным
+  client_ca: ""              # центр сертификатов почтовых серверов (PEM): без сертификата — отказ
   max_size_mb: 50
+
+audit:                       # аудит (docs/ru/23-compliance.md)
+  keep_days: 365             # хранить записи, дней (0 — всегда)
+  message_views: true        # записывать, кто из персонала открывал письма ящиков
+  syslog_host: ""            # копия аудита на сервер журналов / SIEM ('' — не пересылать)
+  syslog_port: 514
+  syslog_proto: "udp"        # udp | tcp | tls
+  syslog_tls_verify: true
+  syslog_hostname: ""
+
+cases:                       # дела (docs/ru/23-compliance.md)
+  export_keep_days: 0        # хранить выгрузки дел, дней (0 — пока не удалено дело)
+  sign_exports: true         # подписывать опись выгрузки ключом Ed25519 сервера
+
+drill:                       # проверка восстановления (docs/ru/23-compliance.md)
+  enabled: true
+  cron: "15 5 1 * *"         # 1-го числа в 05:15
+  sample: 50                 # писем на ящик
 
 ldap:                        # вход через LDAP / Active Directory (docs/ru/08-security.md)
   enabled: false
@@ -232,6 +260,9 @@ ldap:                        # вход через LDAP / Active Directory (docs
   operator_group: ""         # DN группы операторов
   nested_groups: true
   employee_login: false      # сотрудники входят доменным паролем в архив своих ящиков
+  sync_users: true           # раз в час сверять пользователей из каталога: исключённых — отключать
+  employee_base_dn: ""       # источник справочника сотрудников (employees.source_type: ldap): где искать
+  employee_filter: "(&(objectCategory=person)(objectClass=user)(mail=*))"
   timeout_s: 10
 
 mailadmin:                   # вход в ящики через администратора почты (docs/ru/16-mailadmin.md)

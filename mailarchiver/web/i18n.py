@@ -563,6 +563,40 @@ PARAM_HELP: Dict[str, dict] = {
         "recommend": "64.",
         "example": "64", "default": "64",
     },
+    "search.attachment_time_s": {
+        "title": "Время на одно вложение, секунд",
+        "help": ("Сколько секунд может разбираться текст одного вложения. Дольше — у PDF в индекс попадает "
+                 "прочитанное начало, у остальных файлов — ничего (запись в журнале службы)."),
+        "recommend": "10.",
+        "example": "10", "default": "10",
+    },
+    "search.ocr": {
+        "title": "Распознавать сканы и картинки (OCR)",
+        "help": ("Текст картинок (PNG, JPEG, TIFF…) и PDF без текстового слоя (сканы договоров, счетов) "
+                 "распознаётся программой tesseract и попадает в поиск. Нужны пакеты tesseract-ocr (и "
+                 "tesseract-ocr-rus), для PDF — poppler-utils (pdftoppm). Нет программ — настройка не действует. "
+                 "Распознавание медленное: для уже проиндексированных писем — «Дочитать вложения»."),
+        "recommend": "Включите, если в почте много сканов; на слабом сервере — с небольшим числом страниц.",
+        "example": "true", "default": "false",
+    },
+    "search.ocr_lang": {
+        "title": "Языки распознавания",
+        "help": "Языки tesseract через «+», например rus+eng. Для каждого нужен свой пакет (tesseract-ocr-rus).",
+        "recommend": "rus+eng.",
+        "example": "rus+eng", "default": "rus+eng",
+    },
+    "search.ocr_max_pages": {
+        "title": "Страниц скана, не больше",
+        "help": "Сколько первых страниц PDF без текста распознавать.",
+        "recommend": "5: этого хватает, чтобы найти договор по номеру и сторонам.",
+        "example": "5", "default": "5",
+    },
+    "search.ocr_time_s": {
+        "title": "Время на распознавание, секунд",
+        "help": "Предел времени на распознавание одного вложения; дольше — в индекс попадает распознанное начало.",
+        "recommend": "60.",
+        "example": "60", "default": "60",
+    },
 
     # ---- replies ----
     "replies.enabled": {
@@ -750,6 +784,23 @@ PARAM_HELP: Dict[str, dict] = {
         "example": "20", "default": "20",
     },
 
+    "webmail.smime_ca_file": {
+        "title": "Доверенные центры S/MIME (файл PEM)",
+        "help": ("Сертификаты удостоверяющих центров организации (внутренний УЦ), которым доверять при проверке "
+                 "подписей S/MIME — в дополнение к системным. Сертификат из письма запоминается для шифрования, "
+                 "только если подпись доверенная и адрес отправителя есть в сертификате."),
+        "recommend": "Путь к файлу с корневым сертификатом вашего УЦ; пусто, если сертификаты от публичных центров.",
+        "example": "/etc/mailarchiver/company-ca.pem", "default": "(пусто)",
+    },
+    "webmail.send_limit_hour": {
+        "title": "Предел отправки, адресатов в час",
+        "help": ("Сколько адресатов в час может получить письма одного ящика из «Почты». Превышение — отказ, "
+                 "запись в аудите (webmail_send_limit) и уведомление: украденная сессия сотрудника не превратится "
+                 "в рассылку с его адреса. 0 — без предела."),
+        "recommend": "300; для ящиков рассылок поднимите или отправляйте рассылки другим способом.",
+        "example": "300", "default": "300",
+    },
+
     # ---- journal ----
     "journal.enabled": {
         "title": "Принимать журналирование по SMTP",
@@ -814,6 +865,27 @@ PARAM_HELP: Dict[str, dict] = {
         "help": "Не принимать письма, пока отправитель не включит STARTTLS.",
         "recommend": "Включите, если журнал идёт не по локальной сети.",
         "example": "false", "default": "false",
+    },
+    "journal.auth_user": {
+        "title": "Логин почтового сервера (SMTP AUTH)",
+        "help": ("Если задан, почтовый сервер должен войти (AUTH PLAIN или LOGIN) после STARTTLS — иначе письма "
+                 "не принимаются. Защищает от подложенных писем с других узлов разрешённой сети. Нужен сертификат "
+                 "для STARTTLS."),
+        "recommend": "Задайте, если журнал идёт не с того же сервера.",
+        "example": "postfix-journal", "default": "(пусто)",
+    },
+    "journal.auth_password": {
+        "title": "Пароль почтового сервера (SMTP AUTH)",
+        "help": "Хранится в базе зашифрованным. В Postfix — smtp_sasl_password_maps для транспорта журнала.",
+        "recommend": "Длинный случайный пароль.",
+        "example": "(секрет)", "default": "(пусто)",
+    },
+    "journal.client_ca": {
+        "title": "Центр сертификатов почтовых серверов (PEM)",
+        "help": ("Если задан, при STARTTLS почтовый сервер обязан предъявить сертификат, выданный этим центром, — "
+                 "иначе соединение рвётся. Субъект сертификата сохраняется у каждого принятого письма."),
+        "recommend": "Для Exchange и Postfix с сертификатами внутреннего УЦ.",
+        "example": "/etc/mailarchiver/mx-ca.pem", "default": "(пусто)",
     },
     "journal.max_size_mb": {
         "title": "Крупнейшее письмо, МБ",
@@ -902,6 +974,29 @@ PARAM_HELP: Dict[str, dict] = {
                  "ящик находится по адресу mail из каталога (логин ящика или адрес в справочнике сотрудников)."),
         "recommend": "Включите, если сотрудникам удобнее доменный пароль, чем пароль почты.",
         "example": "false", "default": "false",
+    },
+    "ldap.sync_users": {
+        "title": "Сверять пользователей с каталогом",
+        "help": ("Раз в час проверять пользователей, вошедших через каталог: удалённый из каталога, отключённый в "
+                 "нём или исключённый из групп архива отключается сразу (сессии закрываются, API-токены перестают "
+                 "действовать), смена группы меняет роль. Каталог недоступен — ничего не меняется."),
+        "recommend": "Включено.",
+        "example": "true", "default": "true",
+    },
+    "ldap.employee_base_dn": {
+        "title": "Где искать сотрудников (для справочника)",
+        "help": ("Узел каталога, из которого берётся справочник сотрудников, когда «Сотрудники → Источник списка» — "
+                 "ldap. Пусто — как «Где искать пользователей»."),
+        "recommend": "OU с учётными записями сотрудников, без служебных и сервисных.",
+        "example": "OU=Staff,DC=company,DC=local", "default": "(пусто)",
+    },
+    "ldap.employee_filter": {
+        "title": "Кто — сотрудник (фильтр)",
+        "help": ("Фильтр LDAP для справочника сотрудников. Каталог читается постранично — ограничения AD в 1000 "
+                 "записей нет."),
+        "recommend": "Оставьте как есть или добавьте условие группы: (memberOf=CN=Staff,OU=Groups,DC=company,DC=local).",
+        "example": "(&(objectCategory=person)(objectClass=user)(mail=*))",
+        "default": "(&(objectCategory=person)(objectClass=user)(mail=*))",
     },
     "ldap.timeout_s": {
         "title": "Ожидание ответа LDAP, с",
@@ -1387,8 +1482,8 @@ PARAM_HELP: Dict[str, dict] = {
     },
     "employees.source_type": {
         "title": "Источник списка",
-        "help": "Откуда брать список сотрудников: «Файл на сервере» — служба читает CSV/XLSX по пути на диске; «Адрес (URL)» — служба сама скачивает выгрузку по ссылке http(s) при каждой синхронизации.",
-        "recommend": "URL удобнее, когда кадровая система умеет отдавать выгрузку ссылкой: файл не нужно копировать на сервер архива.",
+        "help": "Откуда брать список сотрудников: «Файл на сервере» — служба читает CSV/XLSX по пути на диске; «Адрес (URL)» — служба сама скачивает выгрузку по ссылке http(s) при каждой синхронизации; ldap — каталог Active Directory / LDAP из раздела «Вход через LDAP» (ФИО, почта и дополнительные адреса, должность, отдел, телефоны; отключённые в AD — «не работает»).",
+        "recommend": "ldap, если сотрудники ведутся в Active Directory; URL — когда кадровая система умеет отдавать выгрузку ссылкой.",
         "example": "file", "default": "file",
     },
     "employees.source_url": {
@@ -1565,6 +1660,93 @@ PARAM_HELP: Dict[str, dict] = {
         "recommend": "По внутренним правилам организации; часто 3–5 лет.",
         "example": "5", "default": "5",
     },
+
+    # ---- audit (1.21.0) ----
+    "audit.keep_days": {
+        "title": "Хранить аудит, дней",
+        "help": ("Записи аудита старше удаляются при ежечасном обслуживании (удаление по сроку проверка "
+                 "целостности нарушением не считает). 0 — хранить всегда."),
+        "recommend": "365 и больше; по требованиям вашей службы ИБ (часто 3 года — 1095).",
+        "example": "1095", "default": "365",
+    },
+    "audit.message_views": {
+        "title": "Записывать просмотры писем персоналом",
+        "help": ("Кто из администраторов и операторов открывал письма ящиков, вложения и исходные файлы "
+                 "(message_view). Сотрудник в своём ящике не записывается; одно и то же действие с письмом — не "
+                 "чаще раза в час."),
+        "recommend": "Включено: это ответ на вопрос «кто читал переписку».",
+        "example": "true", "default": "true",
+    },
+    "audit.syslog_host": {
+        "title": "Сервер журналов (syslog / SIEM)",
+        "help": ("Каждая запись аудита с подписью цепочки уходит на этот сервер в формате RFC 5424 (facility "
+                 "authpriv): копия аудита вне сервера архива. Пусто — не пересылать."),
+        "recommend": "Адрес коллектора SIEM (MaxPatrol, KUMA, Splunk, Graylog, rsyslog).",
+        "example": "siem.company.local", "default": "(пусто)",
+    },
+    "audit.syslog_port": {
+        "title": "Порт сервера журналов",
+        "help": "514 — UDP и TCP, 6514 — TLS.",
+        "recommend": "514 или 6514 для TLS.",
+        "example": "514", "default": "514",
+    },
+    "audit.syslog_proto": {
+        "title": "Протокол",
+        "help": ("udp — без подтверждения доставки (RFC 5426); tcp — с длиной сообщения (RFC 6587); tls — tcp "
+                 "с шифрованием (RFC 5425). Недоступный сервер не мешает работе: записи ждут в очереди."),
+        "recommend": "tls, если коллектор его принимает; иначе tcp.",
+        "example": "tcp", "default": "udp",
+    },
+    "audit.syslog_tls_verify": {
+        "title": "Проверять сертификат сервера журналов",
+        "help": "Для протокола tls: сертификат коллектора проверяется по системным доверенным центрам.",
+        "recommend": "Включено.",
+        "example": "true", "default": "true",
+    },
+    "audit.syslog_hostname": {
+        "title": "Имя узла в сообщениях",
+        "help": "Поле HOSTNAME сообщений syslog. Пусто — имя сервера.",
+        "recommend": "Оставьте пустым или задайте понятное имя (mailarchiver).",
+        "example": "mailarchiver", "default": "(пусто)",
+    },
+
+    # ---- cases (1.21.0) ----
+    "cases.export_keep_days": {
+        "title": "Хранить выгрузки дел, дней",
+        "help": ("Выгрузки дел старше удаляются при ежечасном обслуживании (в истории дела и аудите остаются). "
+                 "0 — хранить, пока не удалено дело."),
+        "recommend": "0, если выгрузки забирают сразу, — или срок, за который их точно передадут (например, 90).",
+        "example": "90", "default": "0",
+    },
+    "cases.sign_exports": {
+        "title": "Подписывать опись выгрузки",
+        "help": ("Опись выгрузки дела (manifest.csv) подписывается ключом Ed25519 сервера; в архиве — подпись и "
+                 "открытый ключ, в отчёте — отпечаток ключа. «Дела → 🔏 Ключ подписи» — отпечаток для получателей."),
+        "recommend": "Включено.",
+        "example": "true", "default": "true",
+    },
+
+    # ---- drill (1.21.0) ----
+    "drill.enabled": {
+        "title": "Проверять восстановление по расписанию",
+        "help": ("Раз в месяц случайные письма каждого ящика читаются из архива (с расшифровкой), сверяются с "
+                 "суммой SHA-256, записанной при сохранении, и разбираются целиком — как при восстановлении. "
+                 "Заодно проверяется, что снимок базы и копия вне сервера свежие. Проблемы — в уведомлениях."),
+        "recommend": "Включено.",
+        "example": "true", "default": "true",
+    },
+    "drill.cron": {
+        "title": "Когда проверять (cron)",
+        "help": "Расписание в формате cron по часовому поясу планировщика.",
+        "recommend": "Раз в месяц ночью: 15 5 1 * *.",
+        "example": "15 5 1 * *", "default": "15 5 1 * *",
+    },
+    "drill.sample": {
+        "title": "Писем на ящик",
+        "help": "Сколько случайных писем каждого ящика проверять (1–1000).",
+        "recommend": "50; для небольшого архива можно больше.",
+        "example": "50", "default": "50",
+    },
 }
 
 # Порядок и группировка секций для страницы настроек
@@ -1617,20 +1799,30 @@ SETTINGS_SECTIONS: List[dict] = [
               "dismiss_from_file", "dismiss_missing_days", "dismissed_action", "dismissed_keep_years"]},
     {"section": "search", "title": "Поиск по письмам", "icon": "🔎",
      "keys": ["enabled", "index_bodies", "index_bodies_encrypted", "body_max_kb", "index_attachments",
-              "attachment_max_kb", "attachment_text_kb"]},
+              "attachment_max_kb", "attachment_text_kb", "attachment_time_s",
+              "ocr", "ocr_lang", "ocr_max_pages", "ocr_time_s"]},
     {"section": "replies", "title": "Ответы на письма", "icon": "↩️",
      "keys": ["enabled", "sla_hours", "sla_business", "work_days", "work_hours", "internal_domains",
               "exclude_senders", "match_subject"]},
     {"section": "webmail", "title": "Почтовый клиент", "icon": "✉️",
      "keys": ["enabled", "admin_actions", "mark_read", "auto_refresh_s", "max_attachments_mb", "save_sent",
               "drafts_keep_days", "undo_send_s", "rules_interval_min", "push", "drafts_on_server",
-              "phishing_report_to", "dlp_mode", "warn_external", "warn_recipients"]},
+              "phishing_report_to", "dlp_mode", "warn_external", "warn_recipients", "smime_ca_file",
+              "send_limit_hour"]},
     {"section": "journal", "title": "Приём журналирования (SMTP)", "icon": "📨",
      "keys": ["enabled", "listen", "port", "allowed_ips", "address", "folder", "unwrap_exchange", "tls_cert",
-              "tls_key", "require_tls", "max_size_mb"]},
+              "tls_key", "require_tls", "auth_user", "auth_password", "client_ca", "max_size_mb"]},
+    {"section": "audit", "title": "Аудит", "icon": "🔏",
+     "keys": ["keep_days", "message_views", "syslog_host", "syslog_port", "syslog_proto", "syslog_tls_verify",
+              "syslog_hostname"]},
+    {"section": "cases", "title": "Дела", "icon": "⚖️",
+     "keys": ["export_keep_days", "sign_exports"]},
+    {"section": "drill", "title": "Проверка восстановления", "icon": "🧪",
+     "keys": ["enabled", "cron", "sample"]},
     {"section": "ldap", "title": "Вход через LDAP / Active Directory", "icon": "🏢",
      "keys": ["enabled", "url", "starttls", "verify_ssl", "bind_dn", "bind_password", "base_dn", "user_filter",
-              "admin_group", "operator_group", "nested_groups", "employee_login", "timeout_s"]},
+              "admin_group", "operator_group", "nested_groups", "employee_login", "sync_users", "employee_base_dn",
+              "employee_filter", "timeout_s"]},
     {"section": "mailadmin", "title": "Вход в ящики через администратора почты", "icon": "🗝️",
      "keys": ["enabled", "host", "user", "password", "mode", "separator"]},
     {"section": "axigen", "title": "Сервер Axigen", "icon": "📮",

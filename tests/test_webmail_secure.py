@@ -88,26 +88,131 @@ def test_sign_encrypt_and_decrypt(box, smtp):
     assert st["kind"] == "encrypted" and st["can_decrypt"]
 
 
-def test_signer_certificate_remembered(box):
+def _ca_pair(tmp_dir):
+    """Удостоверяющий центр организации и путь к его сертификату (PEM)."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Test CA")])
+    now = dt.datetime.now(dt.timezone.utc)
+    cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key())
+            .serial_number(x509.random_serial_number()).not_valid_before(now - dt.timedelta(days=1))
+            .not_valid_after(now + dt.timedelta(days=3650))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), True)
+            .add_extension(x509.KeyUsage(False, False, False, False, False, True, True, False, False), True)
+            .sign(key, hashes.SHA256()))
+    path = os.path.join(tmp_dir, "ca.pem")
+    os.makedirs(tmp_dir, exist_ok=True)
+    open(path, "wb").write(cert.public_bytes(serialization.Encoding.PEM))
+    return key, cert, path
+
+
+def _leaf(ca_key, ca_cert, email_addr, name):
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    now = dt.datetime.now(dt.timezone.utc)
+    cert = (x509.CertificateBuilder().subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, name)]))
+            .issuer_name(ca_cert.subject).public_key(key.public_key()).serial_number(x509.random_serial_number())
+            .not_valid_before(now - dt.timedelta(days=1)).not_valid_after(now + dt.timedelta(days=365))
+            .add_extension(x509.SubjectAlternativeName([x509.RFC822Name(email_addr)]), False)
+            .sign(ca_key, hashes.SHA256()))
+    return key, cert
+
+
+def _signed_raw(key, cert, frm, mid):
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.serialization import pkcs7
-    if not shutil.which("openssl"):
-        pytest.skip("нет openssl")
-    svc, world, acc = box
-    key, cert, _p, _pem = _cert("client@ext.ru", "Клиент")
     entity = "Content-Type: text/plain; charset=utf-8\r\n\r\nПодписанный текст\r\n".encode("utf-8")
     signed = pkcs7.PKCS7SignatureBuilder().set_data(entity).add_signer(cert, key, hashes.SHA256()).sign(
         serialization.Encoding.SMIME, [pkcs7.PKCS7Options.DetachedSignature])
-    raw = b"From: client@ext.ru\r\nTo: ivanov@x.ru\r\nSubject: Signed\r\nMessage-ID: <sg@ext>\r\n" + \
+    return (f"From: {frm}\r\nTo: ivanov@x.ru\r\nSubject: Signed {mid}\r\nMessage-ID: <{mid}@ext>\r\n").encode() + \
         signed.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
-    world.add("ivanov@x.ru", "INBOX", raw)
+
+
+def test_signer_certificate_remembered(box):
+    """Сертификат из письма — только при доверенной подписи и адресе отправителя в сертификате (1.21.0)."""
+    if not shutil.which("openssl"):
+        pytest.skip("нет openssl")
+    svc, world, acc = box
+    ca_key, ca_cert, ca_path = _ca_pair(svc.cfg.tmp_dir)
+    svc.set_rt("webmail", "smime_ca_file", ca_path)
+    good_key, good = _leaf(ca_key, ca_cert, "client@ext.ru", "Клиент")
+    forged_key, forged, _p, _pem = _cert("director@x.ru", "Самозванец")       # самоподписанный на чужой адрес
+    other_key, other = _leaf(ca_key, ca_cert, "someone@ext.ru", "Другой")       # доверенный, но не адрес From
+    world.add("ivanov@x.ru", "INBOX", _signed_raw(good_key, good, "client@ext.ru", "g1"))
+    world.add("ivanov@x.ru", "INBOX", _signed_raw(forged_key, forged, "director@x.ru", "f1"))
+    world.add("ivanov@x.ru", "INBOX", _signed_raw(other_key, other, "client@ext.ru", "o1"))
     base._backup(svc, acc.id)
-    pk = [i for i in _ids(svc, acc.id) if svc.db.get_message(i)["subject"] == "Signed"][0]
-    st = wx.smime_status(svc, acc, svc.db.get_message(pk))
-    assert st["valid"]
-    assert [c["email"] for c in wsec.list_certs(svc)] == ["client@ext.ru"]
+    by_subj = {svc.db.get_message(i)["subject"]: i for i in _ids(svc, acc.id)}
+    st = wx.smime_status(svc, acc, svc.db.get_message(by_subj["Signed g1"]))
+    assert st["valid"] and st["trusted"] and st["matches_sender"] and len(st["signer"]["fingerprint"]) == 64
+    st = wx.smime_status(svc, acc, svc.db.get_message(by_subj["Signed f1"]))
+    assert st["valid"] and st["trusted"] is False                                  # подпись верна, но не доверенная
+    st = wx.smime_status(svc, acc, svc.db.get_message(by_subj["Signed o1"]))
+    assert st["trusted"] and not st["matches_sender"]
+    assert [c["email"] for c in wsec.list_certs(svc)] == ["client@ext.ru"]          # ни director@, ни someone@
     found, missing = wsec.certs_for(svc, ["client@ext.ru", "nobody@ext.ru"])
     assert list(found) == ["client@ext.ru"] and missing == ["nobody@ext.ru"]
+    # загруженный администратором сертификат подпись из письма не вытесняет
+    _k2, admin_cert, _p2, admin_pem = _cert("client@ext.ru", "Клиент (от ИБ)")
+    wsec.import_cert(svc, admin_pem, "adm")
+    row = wsec.list_certs(svc)[0]
+    assert row["source"] == "upload" and row["changed_at"]
+    assert svc.db.query_one("SELECT 1 FROM audit WHERE action='webmail_smime_cert_change'")
+    wx.smime_status(svc, acc, svc.db.get_message(by_subj["Signed g1"]))
+    assert wsec.list_certs(svc)[0]["source"] == "upload"
+
+
+def test_personal_certs_and_own_key(box):
+    """Сотрудник пополняет только свой список; сертификат ящика — только для адресов ящика (1.21.0)."""
+    svc, world, acc = box
+    _k, _c, _p, pem = _cert("partner@ext.ru", "Партнёр")
+    wsec.import_cert(svc, pem, "ivanov@x.ru", account=acc)
+    assert wsec.list_certs(svc) == [] and [c["email"] for c in wsec.list_certs(svc, account=acc)] == ["partner@ext.ru"]
+    found, missing = wsec.certs_for(svc, ["partner@ext.ru"], acc)
+    assert list(found) == ["partner@ext.ru"] and not missing
+    assert wsec.certs_for(svc, ["partner@ext.ru"])[1] == ["partner@ext.ru"]       # другим ящикам не виден
+    st = wsec.recipients_state(svc, acc, ["partner@ext.ru", "x@ext.ru"])
+    assert st["missing"] == ["x@ext.ru"] and st["certs"][0]["source"] == "personal" and st["certs"][0]["fingerprint"]
+    # сертификат ящика на чужой адрес не попадает в общий справочник
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.hazmat.primitives.serialization import pkcs12
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    now = dt.datetime.now(dt.timezone.utc)
+    subj = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Иванов")])
+    cert = (x509.CertificateBuilder().subject_name(subj).issuer_name(subj).public_key(key.public_key())
+            .serial_number(1).not_valid_before(now - dt.timedelta(days=1)).not_valid_after(now + dt.timedelta(days=30))
+            .add_extension(x509.SubjectAlternativeName([x509.RFC822Name("ivanov@x.ru"),
+                                                        x509.RFC822Name("director@x.ru")]), False)
+            .sign(key, hashes.SHA256()))
+    p12 = pkcs12.serialize_key_and_certificates(b"t", key, cert, None, serialization.BestAvailableEncryption(b"s"))
+    wsec.upload_key(svc, acc, p12, "s", "ivanov@x.ru")
+    assert [c["email"] for c in wsec.list_certs(svc)] == ["ivanov@x.ru"]
+
+
+def test_api_certs_access(api):
+    admin, mb, svc, a, b = api
+    _k, _c, _p, pem = _cert("partner@ext.ru", "Партнёр")
+    r = mb.post("/api/webmail/smime/certs", files={"file": ("p.pem", pem)})
+    assert r.status_code == 400                                         # сотруднику — только в свой ящик
+    r = mb.post("/api/webmail/smime/certs", files={"file": ("p.pem", pem)}, data={"account_id": str(a)})
+    assert r.status_code == 200 and r.json()["fingerprint"]
+    assert mb.get("/api/webmail/smime/certs").status_code == 400
+    assert [c["email"] for c in mb.get(f"/api/webmail/smime/certs?account_id={a}").json()["items"]] == ["partner@ext.ru"]
+    assert mb.get(f"/api/webmail/smime/certs?account_id={b}").status_code == 403
+    assert admin.get("/api/webmail/smime/certs").json()["items"] == []
+    assert mb.delete("/api/webmail/smime/certs?email=partner@ext.ru").status_code == 403
+    assert mb.delete(f"/api/webmail/smime/certs?email=partner@ext.ru&account_id={a}").status_code == 200
+    assert admin.post("/api/webmail/smime/certs", files={"file": ("p.pem", pem)}).status_code == 200
+    assert [c["email"] for c in admin.get("/api/webmail/smime/certs").json()["items"]] == ["partner@ext.ru"]
 
 
 def test_find_sensitive():

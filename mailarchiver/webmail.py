@@ -35,7 +35,7 @@ import socket
 import ssl
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email import message_from_bytes, policy
 from email.message import EmailMessage
 from email.parser import BytesHeaderParser
@@ -80,6 +80,14 @@ CREATE TABLE IF NOT EXISTS webmail_folders (
     updated_at  TEXT,
     PRIMARY KEY (account_id, name)
 );
+-- сколько адресатов получили письма ящика (предел отправки в час, 1.21.0)
+CREATE TABLE IF NOT EXISTS webmail_send_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER NOT NULL,
+    at         TEXT NOT NULL,
+    rcpts      INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_webmail_send_log ON webmail_send_log(account_id, at);
 CREATE TABLE IF NOT EXISTS webmail_drafts (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     account_id      INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
@@ -1819,7 +1827,10 @@ def _addresses(value: str, *, what: str = "Кому", limit: int = MAX_RECIPIENT
     if re.search(r"[\r\n\x00]", text):
         raise ValidationError(f"В поле «{what}» перевод строки — так нельзя.")
     pairs = []
-    for name, addr in getaddresses([text.replace(";", ",")]):
+    # пустые части («a@b, , c@d» — так бывает после подсказки адресов) строгий разбор Python 3.13 считает
+    # ошибкой и не возвращает ни одного адреса: убираем их заранее
+    text = ",".join(x for x in text.replace(";", ",").split(",") if x.strip())
+    for name, addr in getaddresses([text]):
         addr = (addr or "").strip()
         if not addr and not (name or "").strip():
             continue
@@ -2055,6 +2066,7 @@ def purge_drafts(svc) -> int:
     for r in rows:
         svc.db.execute("DELETE FROM webmail_drafts WHERE id=?", (r["id"],))
         shutil.rmtree(_draft_dir(svc, r["id"]), ignore_errors=True)
+    svc.db.execute("DELETE FROM webmail_send_log WHERE at < ?", (sent_cutoff,))
     # каталоги черновиков, записи которых уже нет (удалён ящик)
     root = _drafts_root(svc)
     if os.path.isdir(root):
@@ -2410,6 +2422,52 @@ class PresendWarning(ValidationError):
         self.items = items
 
 
+def check_send_limit(svc, account: Account, count: int, *, actor: str = "") -> None:
+    """Предел отправки: адресатов в час с одного ящика (``webmail.send_limit_hour``, 1.21.0).
+
+    Украденная сессия сотрудника не превратится в рассылку с его адреса: превышение — отказ,
+    запись в аудите и уведомление администратору (раз в час на ящик).
+    """
+    try:
+        limit = int(svc.rt("webmail", "send_limit_hour") or 0)
+    except (TypeError, ValueError):
+        limit = 0
+    if limit <= 0:
+        return
+    since = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    used = int(svc.db.scalar("SELECT COALESCE(SUM(rcpts), 0) FROM webmail_send_log WHERE account_id=? AND at>=?",
+                             (int(account.id), since)) or 0)
+    if used + int(count) <= limit:
+        return
+    last = svc.db.scalar("SELECT MAX(ts) FROM audit WHERE action='webmail_send_limit' AND detail LIKE ? AND ts>=?",
+                         (f"ящик «{account.name}»%", since))
+    if not last:
+        svc.db.add_audit(actor or "system", "webmail_send_limit",
+                         f"ящик «{account.name}»: за час {used} адресатов, письмо ещё на {count} — отправка остановлена "
+                         f"(предел {limit})")
+        notifier = getattr(svc, "notifier", None)
+        if notifier is not None:
+            try:
+                notifier.send_all(f"MailArchiver: предел отправки ящика «{account.name}»",
+                                  f"С ящика «{account.name}» за последний час отправлено писем на {used} адресатов; "
+                                  f"новое письмо ещё на {count} не отправлено (предел {limit} в час, "
+                                  f"«Настройки → Почтовый клиент»). Если это не рассылка сотрудника — смените "
+                                  f"пароль ящика и закройте его сессии.")
+            except Exception as exc:  # noqa: BLE001 - уведомление не должно мешать ответу
+                log.warning("Уведомление о пределе отправки не ушло: %s", exc)
+    raise ValidationError(f"С этого ящика за последний час отправлено писем на {used} адресатов — предел {limit} в "
+                          f"час. Письмо не отправлено.", code="send_limit",
+                          hint="Подождите или попросите администратора поднять предел (Настройки → Почтовый клиент).")
+
+
+def _log_send(svc, account: Account, count: int) -> None:
+    try:
+        svc.db.execute("INSERT INTO webmail_send_log(account_id, at, rcpts) VALUES(?,?,?)",
+                       (int(account.id), utcnow_iso(), int(count)))
+    except Exception as exc:  # noqa: BLE001 - журнал предела не должен мешать отправке
+        log.debug("Журнал отправки не записан: %s", exc)
+
+
 def check_before_send(svc, account: Account, row, msg_rcpts: Sequence[str], atts: Sequence[Dict], *,
                       confirmed: bool, actor: str = "") -> List[Dict]:
     """Проверки перед отправкой: запрет — ошибка, предупреждения — PresendWarning (если не подтверждены)."""
@@ -2458,15 +2516,26 @@ def send(svc, account: Account, draft_id: int, owner: str, *, actor: str = "", c
             raise ValidationError(problem)
         msg, rcpts, _atts = build_message(svc, account, row, ident)
         check_before_send(svc, account, row, rcpts, _atts, confirmed=confirmed, actor=actor)
+        check_send_limit(svc, account, len(rcpts), actor=actor)
         keys = row.keys()
         sign = bool(row["smime_sign"]) if "smime_sign" in keys else False
         encrypt = bool(row["smime_encrypt"]) if "smime_encrypt" in keys else False
+        sender = draft_sender(ident, row)
         if sign or encrypt:
             from .webmail_secure import protect
-            data = protect(svc, account, msg, rcpts, draft_sender(ident, row), sign=sign, encrypt=encrypt)
+            bcc = [a.lower() for _n, a in _draft_addrs(row["bcc_addrs"], "Скрытая копия", False)] if encrypt else []
+            main = [r for r in rcpts if r.lower() not in set(bcc)]
+            # Зашифрованное письмо перечисляет сертификаты всех получателей — скрытые адресаты
+            # получают отдельные копии, зашифрованные только для них (1.21.0).
+            copies = [(addr, protect(svc, account, msg, [addr], sender, sign=sign, encrypt=encrypt)) for addr in bcc]
+            data = protect(svc, account, msg, main, sender, sign=sign, encrypt=encrypt)
+            refused = _smtp_send(svc, account, ident, sender, main, data) if main else {}
+            for addr, copy in copies:
+                refused.update(_smtp_send(svc, account, ident, sender, [addr], copy))
         else:
             data = msg.as_bytes()
-        refused = _smtp_send(svc, account, ident, draft_sender(ident, row), rcpts, data)
+            refused = _smtp_send(svc, account, ident, sender, rcpts, data)
+        _log_send(svc, account, len(rcpts))
     except BaseException as exc:
         text = exc.message if isinstance(exc, MailArchiverError) else f"{type(exc).__name__}: {exc}"
         if isinstance(exc, PresendWarning):

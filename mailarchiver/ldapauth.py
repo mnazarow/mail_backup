@@ -331,6 +331,63 @@ class Connection:
                 raise LdapError(f"неожиданный ответ сервера LDAP (тег {tag:#x})")
 
 
+    def search_paged(self, base: str, flt: str, attrs: List[str], page_size: int = 500,
+                     limit: int = 200000) -> List[Tuple[str, Dict[str, List[str]]]]:
+        """Поиск со страничной выдачей (RFC 2696): Active Directory без неё отдаёт не больше 1000 записей."""
+        out: List[Tuple[str, Dict[str, List[str]]]] = []
+        cookie = b""
+        while True:
+            op = seq(ber_str(base), ber_int(2, 0x0A), ber_int(0, 0x0A), ber_int(0), ber_int(int(self.timeout)),
+                     ber_bool(False), parse_filter(flt), seq(*[ber_str(a) for a in attrs]), tag=0x63)
+            # criticality FALSE — значение по умолчанию, поэтому не передаётся (строгие серверы его не ждут)
+            control = seq(ber_str(PAGED_OID), ber_str(seq(ber_int(page_size), ber_str(cookie))))
+            self.msg_id += 1
+            mid = self.msg_id
+            self.sock.sendall(seq(ber_int(mid), op, tlv(0xA0, control)))
+            cookie = b""
+            while True:
+                _t, body, _e = read_tlv(self._recv_message())
+                parts = children(body)
+                if len(parts) < 2 or to_int(parts[0][1]) != mid:
+                    continue
+                tag, val = parts[1]
+                if tag == 0x64:
+                    items = children(val)
+                    dn = items[0][1].decode("utf-8", "replace")
+                    attrs_out: Dict[str, List[str]] = {}
+                    for _tg, pa in children(items[1][1]) if len(items) > 1 else []:
+                        pv = children(pa)
+                        name = pv[0][1].decode("utf-8", "replace").lower()
+                        attrs_out[name] = [v.decode("utf-8", "replace") for _x, v in children(pv[1][1])] \
+                            if len(pv) > 1 else []
+                    out.append((dn, attrs_out))
+                    if len(out) >= limit:
+                        raise LdapError(f"в каталоге больше {limit} записей — уточните фильтр")
+                elif tag == 0x73:
+                    continue
+                elif tag == 0x65:
+                    code, msg = _result(val)
+                    if code not in (0, 4):
+                        raise LdapError(msg or f"поиск: код {code}", code)
+                    for ctag, cval in parts[2:]:
+                        if ctag != 0xA0:
+                            continue
+                        for _x, ctl in children(cval):
+                            fields = children(ctl)
+                            if fields and fields[0][1] == PAGED_OID.encode() and len(fields) > 1:
+                                inner = children(read_tlv(fields[-1][1])[1])
+                                if len(inner) > 1:
+                                    cookie = inner[1][1]
+                    break
+                else:
+                    raise LdapError(f"неожиданный ответ сервера LDAP (тег {tag:#x})")
+            if not cookie:
+                return out
+
+
+PAGED_OID = "1.2.840.113556.1.4.319"
+
+
 def _result(value: bytes) -> Tuple[int, str]:
     parts = children(value)
     code = to_int(parts[0][1]) if parts else -1
@@ -382,7 +439,7 @@ def lookup(svc, username: str, password: Optional[str]) -> Dict:
         login = username.split("\\", 1)[-1]
         flt = str(svc.rt("ldap", "user_filter") or "(sAMAccountName={login})").replace("{login}", escape(login)) \
             .replace("{username}", escape(username))
-        attrs = ["mail", "displayName", "cn", "memberOf", "userPrincipalName"]
+        attrs = ["mail", "displayName", "cn", "memberOf", "userPrincipalName", "userAccountControl"]
         found = conn.search(str(svc.rt("ldap", "base_dn") or ""), flt, attrs, size_limit=2)
         if len(found) != 1:
             return {"ok": False, "reason": "не найден" if not found else "найдено несколько записей"}
@@ -397,6 +454,12 @@ def lookup(svc, username: str, password: Optional[str]) -> Dict:
                 raise
             finally:
                 user_conn.close()
+        try:
+            uac = int((a.get("useraccountcontrol") or ["0"])[0])
+        except ValueError:
+            uac = 0
+        if uac & 2:                                         # ACCOUNTDISABLE: учётная запись отключена в AD
+            return {"ok": False, "reason": "учётная запись отключена в каталоге", "disabled": True, "dn": dn}
         groups = a.get("memberof", [])
         role = ""
         if _is_member(conn, svc, dn, groups, str(svc.rt("ldap", "admin_group") or "")):
@@ -422,3 +485,116 @@ def mailbox_for(svc, mail: str):
     row = svc.db.query_one("SELECT a.id FROM employees e JOIN accounts a ON a.employee_id = e.id WHERE "
                            "lower(e.email)=? AND a.enabled=1 ORDER BY a.id LIMIT 1", (mail,))
     return svc.db.get_account(int(row["id"])) if row is not None else None
+
+
+def sync_users(svc) -> Dict:
+    """Сверка учётных записей из каталога (раз в час, ``ldap.sync_users``, 1.21.0).
+
+    Кого нет в каталоге, кто отключён в нём или больше не состоит в группах архива — отключается
+    сразу (сессии закрываются, API-токены перестают действовать), а не при следующей попытке входа;
+    смена группы меняет роль. Каталог недоступен — ничего не меняется.
+    """
+    out = {"checked": 0, "disabled": 0, "roles": 0, "error": ""}
+    if not enabled(svc) or not bool(svc.rt("ldap", "sync_users")):
+        return out
+    rows = svc.db.query("SELECT id, username, role FROM users WHERE auth_source='ldap' AND disabled=0")
+    for row in rows:
+        try:
+            info = lookup(svc, row["username"], None)
+        except (LdapError, OSError, ValueError) as exc:
+            out["error"] = str(exc)[:300]
+            log.warning("Сверка с каталогом прервана: %s", exc)
+            break
+        out["checked"] += 1
+        role = info.get("role") if info.get("ok") else ""
+        if role in ("admin", "operator"):
+            if role != row["role"]:
+                svc.db.set_user_role(int(row["id"]), role)
+                svc.db.delete_user_sessions(int(row["id"]))
+                svc.db.add_audit("system", "user_role", f"{row['username']}: роль из каталога LDAP — {role} (сверка)")
+                out["roles"] += 1
+            continue
+        why = info.get("reason") or "больше не в группах архива"
+        if svc.db.set_user_disabled(int(row["id"]), True, by="ldap"):
+            svc.db.add_audit("system", "user_disable", f"{row['username']}: {why} (сверка с каталогом LDAP)")
+            out["disabled"] += 1
+        else:
+            log.warning("Пользователь %s не отключён: это последний администратор", row["username"])
+    return out
+
+
+# ---------------------------------------------------------------------------
+#  Справочник сотрудников из каталога (1.21.0)
+# ---------------------------------------------------------------------------
+EMPLOYEE_ATTRS = ["mail", "displayName", "cn", "sn", "givenName", "middleName", "title", "department",
+                  "telephoneNumber", "mobile", "ipPhone", "employeeID", "employeeNumber", "sAMAccountName",
+                  "proxyAddresses", "userAccountControl", "accountExpires"]
+_AD_NEVER = (0, 9223372036854775807)
+
+
+def _expired(value: str) -> bool:
+    """accountExpires (Active Directory, сотни наносекунд с 1601 г.) — в прошлом?"""
+    try:
+        ticks = int(value)
+    except (TypeError, ValueError):
+        return False
+    if ticks in _AD_NEVER:
+        return False
+    import time as _time
+    return (ticks / 10_000_000 - 11644473600) < _time.time()
+
+
+def employee_rows(svc) -> Tuple[List[Dict], List[Dict]]:
+    """Сотрудники из каталога — в том же виде, что строки файла-источника (``employees.source_type = ldap``).
+
+    Отключённые в AD (userAccountControl) и с истёкшим сроком учётной записи (accountExpires) приходят
+    как «не работает»: в справочник не добавляются, а увольнение уже заведённых решают правила раздела
+    «Сотрудники» (``dismiss_missing_days``, ``dismiss_from_file``).
+    """
+    if not enabled(svc):
+        from .errors import ValidationError
+        raise ValidationError("Вход через LDAP не настроен — каталог как источник сотрудников недоступен.",
+                              hint="Заполните раздел «Настройки → Вход через LDAP / Active Directory».")
+    conn = _connect(svc)
+    try:
+        bind_dn = str(svc.rt("ldap", "bind_dn") or "")
+        conn.bind(bind_dn, str(svc.rt("ldap", "bind_password") or "") if bind_dn else "")
+        base = str(svc.rt("ldap", "employee_base_dn") or "").strip() or str(svc.rt("ldap", "base_dn") or "")
+        flt = str(svc.rt("ldap", "employee_filter") or "").strip() or "(&(objectClass=user)(mail=*))"
+        found = conn.search_paged(base, flt, EMPLOYEE_ATTRS)
+    finally:
+        conn.close()
+    rows: List[Dict] = []
+    problems: List[Dict] = []
+    for n, (dn, a) in enumerate(found, start=1):
+        def one(*names):
+            for name in names:
+                v = a.get(name.lower()) or []
+                if v and v[0].strip():
+                    return v[0].strip()
+            return ""
+        mail = one("mail").lower()
+        extra = []
+        for p in a.get("proxyaddresses") or []:
+            if p.lower().startswith("smtp:"):
+                addr = p[5:].strip().lower()
+                if addr and addr != mail and addr not in extra:
+                    extra.append(addr)
+        try:
+            uac = int(one("userAccountControl") or 0)
+        except ValueError:
+            uac = 0
+        first, last, middle = one("givenName"), one("sn"), one("middleName")
+        full = one("displayName", "cn") or " ".join(x for x in (last, first, middle) if x)
+        if not full and not mail:
+            problems.append({"row": n, "reason": f"нет имени и почты: {dn[:120]}"})
+            continue
+        rows.append({"row": n, "full_name": full, "email": mail, "extra_emails": extra[:20],
+                     "position": one("title"), "department": one("department"),
+                     "phone": one("mobile", "telephoneNumber", "ipPhone"),
+                     "external_id": one("employeeID", "employeeNumber", "sAMAccountName"),
+                     "last_name": last, "first_name": first, "middle_name": middle,
+                     "phone_mobile": one("mobile"), "phone_work": one("telephoneNumber"), "phone_ext": one("ipPhone"),
+                     "employed": "", "employed_until": "", "dismissed": "",
+                     "inactive": bool(uac & 2) or _expired(one("accountExpires"))})
+    return rows, problems

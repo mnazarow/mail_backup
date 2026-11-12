@@ -56,8 +56,23 @@ CREATE TABLE IF NOT EXISTS webmail_smime_certs (
     name        TEXT NOT NULL DEFAULT '',
     issuer      TEXT NOT NULL DEFAULT '',
     valid_until TEXT NOT NULL DEFAULT '',
-    source      TEXT NOT NULL DEFAULT '',  -- signed | upload
-    updated_at  TEXT NOT NULL DEFAULT ''
+    source      TEXT NOT NULL DEFAULT '',  -- signed | upload | own
+    updated_at  TEXT NOT NULL DEFAULT '',
+    fingerprint TEXT NOT NULL DEFAULT '',  -- SHA-256 (1.21.0)
+    prev_fingerprint TEXT NOT NULL DEFAULT '',
+    changed_at  TEXT NOT NULL DEFAULT ''
+);
+-- личные сертификаты получателей, загруженные сотрудником для своего ящика (1.21.0)
+CREATE TABLE IF NOT EXISTS webmail_smime_user_certs (
+    account_id  INTEGER NOT NULL,
+    email       TEXT NOT NULL,
+    cert_pem    TEXT NOT NULL,
+    name        TEXT NOT NULL DEFAULT '',
+    issuer      TEXT NOT NULL DEFAULT '',
+    valid_until TEXT NOT NULL DEFAULT '',
+    fingerprint TEXT NOT NULL DEFAULT '',
+    updated_at  TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (account_id, email)
 );
 """
 
@@ -66,6 +81,10 @@ DLP_MODES = ("off", "warn", "block_external")
 
 def ensure_schema(conn) -> None:
     conn.executescript(SCHEMA)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(webmail_smime_certs)").fetchall()}
+    for col in ("fingerprint", "prev_fingerprint", "changed_at"):
+        if col not in cols:                                  # база 1.20.0
+            conn.execute(f"ALTER TABLE webmail_smime_certs ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
 
 
 # ===========================================================================
@@ -109,8 +128,13 @@ def upload_key(svc, account: Account, data: bytes, password: str, actor: str) ->
                    (int(account.id), cert_pem.decode("ascii"), chain, svc.db.secret.encrypt(key_pem),
                     info.get("name", ""), ",".join(info.get("emails") or []), info.get("issuer", ""),
                     info.get("valid_until", ""), utcnow_iso(), actor))
+    # В справочник получателей — только адреса самого ящика: иначе сертификат «на чужой адрес»,
+    # загруженный в свой ящик, подменил бы сертификат коллеги (1.21.0).
+    from .webmail import own_addresses
+    mine = own_addresses(svc, account)
     for email in info.get("emails") or []:
-        _remember(svc, email, cert_pem, info, "own")
+        if email.strip().lower() in mine:
+            _remember(svc, email, cert_pem, info, "own", actor=actor)
     svc.db.add_audit(actor, "webmail_smime_key", f"ящик «{account.name}»: загружен сертификат {info.get('name', '')} "
                      f"({', '.join(info.get('emails') or [])}) до {info.get('valid_until', '')[:10]}")
     return key_info(svc, account)
@@ -148,35 +172,95 @@ def _load_key(svc, account: Account):
     return cert, key, chain
 
 
-def _remember(svc, email: str, cert_pem: bytes, info: Dict, source: str) -> None:
+def _fp(cert_pem) -> str:
+    """SHA-256 сертификата (hex) — по нему получатель сверяет, тот ли это сертификат."""
+    try:
+        x509, hashes, _s, _p7, _p12 = _crypto()
+        pem = cert_pem if isinstance(cert_pem, bytes) else cert_pem.encode("ascii")
+        return x509.load_pem_x509_certificate(pem).fingerprint(hashes.SHA256()).hex()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def fp_short(fp: str) -> str:
+    """Отпечаток для глаз: первые 16 знаков группами по 4 (как в почтовых программах)."""
+    fp = (fp or "").upper()
+    return " ".join(fp[i:i + 4] for i in range(0, min(len(fp), 16), 4))
+
+
+#: насколько сертификату можно верить: загруженный администратором и сертификат самого ящика —
+#: выше, чем собранный из письма с доверенной подписью
+_RANK = {"upload": 3, "own": 3, "signed": 2}
+
+
+def _remember(svc, email: str, cert_pem: bytes, info: Dict, source: str, actor: str = "system") -> bool:
+    """Запомнить сертификат адресата (общий справочник). → True, если сертификат сменился или добавлен.
+
+    Правила (1.21.0): сертификат из письма (``signed``) не заменяет загруженный администратором или
+    сертификат ящика, пока тот действует; смена сертификата адреса — в аудите с обоими отпечатками,
+    а в окне письма — предупреждение «сертификат сменился».
+    """
     email = (email or "").strip().lower()
     if not email or "@" not in email:
-        return
-    old = svc.db.query_one("SELECT valid_until, source FROM webmail_smime_certs WHERE email=?", (email,))
-    # загруженный вручную сертификат письмом с подписью не заменяется на более старый
-    if old is not None and (old["valid_until"] or "") > (info.get("valid_until") or "") and old["source"] == "upload":
-        return
-    svc.db.execute("INSERT OR REPLACE INTO webmail_smime_certs(email, cert_pem, name, issuer, valid_until, source, "
-                   "updated_at) VALUES(?,?,?,?,?,?,?)",
-                   (email, cert_pem.decode("ascii") if isinstance(cert_pem, bytes) else cert_pem,
-                    info.get("name", ""), info.get("issuer", ""), info.get("valid_until", ""), source, utcnow_iso()))
+        return False
+    pem = cert_pem.decode("ascii") if isinstance(cert_pem, bytes) else cert_pem
+    fp = info.get("fingerprint") or _fp(pem)
+    now = utcnow_iso()
+    old = svc.db.query_one("SELECT * FROM webmail_smime_certs WHERE email=?", (email,))
+    if old is not None:
+        old_fp = (old["fingerprint"] if "fingerprint" in old.keys() else "") or _fp(old["cert_pem"])
+        if old_fp == fp:
+            svc.db.execute("UPDATE webmail_smime_certs SET updated_at=?, fingerprint=? WHERE email=?", (now, fp, email))
+            return False
+        old_expired = bool(old["valid_until"]) and old["valid_until"] < datetime.now(timezone.utc).isoformat()
+        if not old_expired and _RANK.get(source, 0) < _RANK.get(old["source"], 0):
+            log.info("Сертификат %s из письма не заменяет %s (%s)", email, old["source"], fp_short(old_fp))
+            return False
+        if source == "signed" and old["source"] == "signed" and not old_expired \
+                and (info.get("valid_until") or "") < (old["valid_until"] or ""):
+            return False                                   # более старый сертификат не вытесняет новый
+        svc.db.execute("UPDATE webmail_smime_certs SET cert_pem=?, name=?, issuer=?, valid_until=?, source=?, "
+                       "updated_at=?, fingerprint=?, prev_fingerprint=?, changed_at=? WHERE email=?",
+                       (pem, info.get("name", ""), info.get("issuer", ""), info.get("valid_until", ""), source,
+                        now, fp, old_fp, now, email))
+        svc.db.add_audit(actor, "webmail_smime_cert_change",
+                         f"{email}: сертификат сменился {fp_short(old_fp)} → {fp_short(fp)} ({source})")
+        return True
+    svc.db.execute("INSERT INTO webmail_smime_certs(email, cert_pem, name, issuer, valid_until, source, updated_at, "
+                   "fingerprint) VALUES(?,?,?,?,?,?,?,?)",
+                   (email, pem, info.get("name", ""), info.get("issuer", ""), info.get("valid_until", ""), source,
+                    now, fp))
+    return True
 
 
-def remember_signer(svc, cert_pem: bytes) -> None:
-    """Сертификат из письма с верной подписью — для шифрования писем этому адресату."""
+def _addr_of(value: str) -> str:
+    addrs = [a.strip().lower() for _n, a in getaddresses([value or ""]) if a and "@" in a]
+    return addrs[0] if addrs else ""
+
+
+def remember_signer(svc, cert_pem: bytes, sender: str = "", trusted: bool = False) -> bool:
+    """Сертификат из письма с верной подписью — для шифрования писем этому адресату.
+
+    Запоминается, только если подпись **доверенная** (цепочка до удостоверяющего центра) и адрес
+    отправителя (From) есть в сертификате — и только для этого адреса (1.21.0). Иначе любой мог бы
+    прислать письмо с самодельным сертификатом на чужой адрес и подменить сертификат получателя.
+    """
     info = _info(cert_pem)
-    if not info or info.get("expired"):
-        return
+    if not info or info.get("expired") or not trusted:
+        return False
+    sender = _addr_of(sender)
+    emails = [e.strip().lower() for e in info.get("emails") or []]
+    if not sender or sender not in emails:
+        return False
     pem = cert_pem.split(b"-----END CERTIFICATE-----")[0] + b"-----END CERTIFICATE-----\n"
-    for email in info.get("emails") or []:
-        try:
-            _remember(svc, email, pem, info, "signed")
-        except Exception as exc:  # noqa: BLE001 - сбор сертификатов не должен мешать просмотру письма
-            log.debug("Сертификат %s не сохранён: %s", email, exc)
+    try:
+        return _remember(svc, sender, pem, info, "signed")
+    except Exception as exc:  # noqa: BLE001 - сбор сертификатов не должен мешать просмотру письма
+        log.debug("Сертификат %s не сохранён: %s", sender, exc)
+        return False
 
 
-def import_cert(svc, data: bytes, actor: str) -> Dict:
-    """Сертификат получателя из файла .cer/.crt/.pem (DER или PEM)."""
+def _parse_cert(data: bytes):
     x509, _h, serialization, _p7, _p12 = _crypto()
     try:
         cert = x509.load_pem_x509_certificate(data) if b"-----BEGIN" in data else x509.load_der_x509_certificate(data)
@@ -188,47 +272,131 @@ def import_cert(svc, data: bytes, actor: str) -> Dict:
         raise ValidationError("В сертификате нет адреса почты — для S/MIME он не подходит.")
     if info.get("expired"):
         raise ValidationError(f"Срок действия сертификата истёк ({info.get('valid_until', '')[:10]}).")
-    for email in info["emails"]:
-        _remember(svc, email, pem, info, "upload")
-    svc.db.add_audit(actor, "webmail_smime_cert", f"сертификат получателя {', '.join(info['emails'])}")
-    return {"emails": info["emails"], "name": info.get("name", ""), "valid_until": info.get("valid_until", "")}
+    return pem, info
 
 
-def list_certs(svc, q: str = "") -> List[Dict]:
-    rows = svc.db.query("SELECT email, name, issuer, valid_until, source, updated_at FROM webmail_smime_certs "
-                        "ORDER BY email LIMIT 2000")
+def import_cert(svc, data: bytes, actor: str, account: Optional[Account] = None) -> Dict:
+    """Сертификат получателя из файла .cer/.crt/.pem (DER или PEM).
+
+    Администратор (``account`` не задан) пополняет общий справочник. Сотрудник — только **свой**
+    список (для своего ящика, 1.21.0): его сертификат не меняет того, чем шифруют письма коллеги.
+    """
+    pem, info = _parse_cert(data)
+    fp = info.get("fingerprint") or _fp(pem)
+    if account is None:
+        for email in info["emails"]:
+            _remember(svc, email, pem, info, "upload", actor=actor)
+        svc.db.add_audit(actor, "webmail_smime_cert", f"сертификат получателя {', '.join(info['emails'])} "
+                         f"({fp_short(fp)})")
+    else:
+        now = utcnow_iso()
+        for email in info["emails"]:
+            svc.db.execute("INSERT OR REPLACE INTO webmail_smime_user_certs(account_id, email, cert_pem, name, issuer, "
+                           "valid_until, fingerprint, updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                           (int(account.id), email.strip().lower(), pem.decode("ascii"), info.get("name", ""),
+                            info.get("issuer", ""), info.get("valid_until", ""), fp, now))
+        svc.db.add_audit(actor, "webmail_smime_cert", f"ящик «{account.name}»: личный сертификат получателя "
+                         f"{', '.join(info['emails'])} ({fp_short(fp)})")
+    return {"emails": info["emails"], "name": info.get("name", ""), "valid_until": info.get("valid_until", ""),
+            "fingerprint": fp_short(fp)}
+
+
+def _cert_row(r, now: str, personal: bool = False) -> Dict:
+    keys = r.keys()
+    return {"email": r["email"], "name": r["name"], "issuer": r["issuer"], "valid_until": r["valid_until"],
+            "source": "personal" if personal else r["source"], "updated_at": r["updated_at"],
+            "fingerprint": fp_short(r["fingerprint"] if "fingerprint" in keys else ""),
+            "changed_at": (r["changed_at"] if "changed_at" in keys else "") or "",
+            "expired": bool(r["valid_until"]) and r["valid_until"] < now}
+
+
+def list_certs(svc, q: str = "", account: Optional[Account] = None) -> List[Dict]:
+    """Список сертификатов: общий справочник (администратору) или личный список ящика (сотруднику)."""
     q = (q or "").strip().lower()
     now = datetime.now(timezone.utc).isoformat()
-    return [{"email": r["email"], "name": r["name"], "issuer": r["issuer"], "valid_until": r["valid_until"],
-             "source": r["source"], "updated_at": r["updated_at"], "expired": bool(r["valid_until"]) and
-             r["valid_until"] < now} for r in rows if not q or q in r["email"] or q in (r["name"] or "").lower()]
+    if account is None:
+        rows = svc.db.query("SELECT * FROM webmail_smime_certs ORDER BY email LIMIT 2000")
+        items = [_cert_row(r, now) for r in rows]
+    else:
+        rows = svc.db.query("SELECT * FROM webmail_smime_user_certs WHERE account_id=? ORDER BY email LIMIT 2000",
+                            (int(account.id),))
+        items = [_cert_row(r, now, personal=True) for r in rows]
+    return [c for c in items if not q or q in c["email"] or q in (c["name"] or "").lower()]
 
 
-def delete_cert(svc, email: str, actor: str) -> None:
-    svc.db.execute("DELETE FROM webmail_smime_certs WHERE email=?", ((email or "").strip().lower(),))
-    svc.db.add_audit(actor, "webmail_smime_cert", f"удалён сертификат получателя {email}")
+def delete_cert(svc, email: str, actor: str, account: Optional[Account] = None) -> None:
+    email = (email or "").strip().lower()
+    if account is None:
+        svc.db.execute("DELETE FROM webmail_smime_certs WHERE email=?", (email,))
+        svc.db.add_audit(actor, "webmail_smime_cert", f"удалён сертификат получателя {email}")
+    else:
+        svc.db.execute("DELETE FROM webmail_smime_user_certs WHERE account_id=? AND email=?", (int(account.id), email))
+        svc.db.add_audit(actor, "webmail_smime_cert", f"ящик «{account.name}»: удалён личный сертификат {email}")
 
 
-def certs_for(svc, emails: Iterable[str]) -> Tuple[Dict[str, bytes], List[str]]:
-    """Сертификаты получателей: (найденные действующие, адреса без сертификата)."""
+def certs_count(svc, account: Optional[Account] = None) -> int:
+    if account is None:
+        return int(svc.db.scalar("SELECT COUNT(*) FROM webmail_smime_certs") or 0)
+    return int(svc.db.scalar("SELECT COUNT(*) FROM webmail_smime_user_certs WHERE account_id=?",
+                             (int(account.id),)) or 0)
+
+
+def _lookup(svc, email: str, account: Optional[Account], now: str):
+    row = svc.db.query_one("SELECT * FROM webmail_smime_certs WHERE email=?", (email,))
+    if row is not None and not (row["valid_until"] and row["valid_until"] < now):
+        return row, False
+    if account is not None:
+        mine = svc.db.query_one("SELECT * FROM webmail_smime_user_certs WHERE account_id=? AND email=?",
+                                (int(account.id), email))
+        if mine is not None and not (mine["valid_until"] and mine["valid_until"] < now):
+            return mine, True
+    return None, False
+
+
+def certs_for(svc, emails: Iterable[str], account: Optional[Account] = None) -> Tuple[Dict[str, bytes], List[str]]:
+    """Сертификаты получателей: (найденные действующие, адреса без сертификата).
+
+    Сначала общий справочник, затем личный список ящика ``account`` (1.21.0).
+    """
     found: Dict[str, bytes] = {}
     missing: List[str] = []
     now = datetime.now(timezone.utc).isoformat()
     for email in dict.fromkeys(e.strip().lower() for e in emails if e):
-        row = svc.db.query_one("SELECT cert_pem, valid_until FROM webmail_smime_certs WHERE email=?", (email,))
-        if row is None or (row["valid_until"] and row["valid_until"] < now):
+        row, _personal = _lookup(svc, email, account, now)
+        if row is None:
             missing.append(email)
         else:
             found[email] = row["cert_pem"].encode("ascii")
     return found, missing
 
 
+#: сколько дней после смены сертификата адресата окно письма предупреждает об этом
+CHANGED_WARN_DAYS = 14
+
+
 def recipients_state(svc, account: Account, emails: Iterable[str]) -> Dict:
-    """Для окна письма: можно ли подписать и зашифровать письмо этим адресатам."""
-    found, missing = certs_for(svc, emails)
+    """Для окна письма: можно ли подписать и зашифровать письмо этим адресатам, чьими сертификатами."""
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat()
+    from datetime import timedelta
+    recent = (now_dt - timedelta(days=CHANGED_WARN_DAYS)).isoformat()
+    certs: List[Dict] = []
+    missing: List[str] = []
+    for email in dict.fromkeys(e.strip().lower() for e in emails if e):
+        row, personal = _lookup(svc, email, account, now)
+        if row is None:
+            missing.append(email)
+            continue
+        keys = row.keys()
+        changed = (row["changed_at"] if "changed_at" in keys else "") or ""
+        certs.append({"email": email, "name": row["name"], "valid_until": row["valid_until"],
+                      "fingerprint": fp_short(row["fingerprint"] if "fingerprint" in keys else "") or
+                      fp_short(_fp(row["cert_pem"])),
+                      "source": "personal" if personal else row["source"],
+                      "changed_at": changed if changed >= recent else ""})
     key = key_info(svc, account)
     return {"can_sign": bool(key.get("present")) and not key.get("expired"), "key": key,
-            "missing": missing, "have": sorted(found)}
+            "missing": missing, "have": [c["email"] for c in certs], "certs": certs}
 
 
 # ===========================================================================
@@ -273,9 +441,9 @@ def protect(svc, account: Account, msg: EmailMessage, rcpts: Sequence[str], send
         body = signed
     if encrypt:
         if not hasattr(pkcs7, "PKCS7EnvelopeBuilder"):
-            raise ValidationError("Шифрование S/MIME требует библиотеку cryptography версии 45 или новее.",
+            raise ValidationError("Шифрование S/MIME требует библиотеку cryptography версии 44 или новее.",
                                   hint="Обновите MailArchiver скриптом update.sh — он поставит нужную версию.")
-        found, missing = certs_for(svc, rcpts)
+        found, missing = certs_for(svc, rcpts, account)
         if missing:
             raise ValidationError("Нет сертификата получателя: " + ", ".join(missing[:10])
                                   + (" …" if len(missing) > 10 else "") + ".",
@@ -284,11 +452,15 @@ def protect(svc, account: Account, msg: EmailMessage, rcpts: Sequence[str], send
         own = svc.db.query_one("SELECT cert_pem FROM webmail_smime_keys WHERE account_id=?", (int(account.id),))
         pems = list(found.values()) + ([own["cert_pem"].encode("ascii")] if own is not None else [])
         if own is None:
-            mine, _ = certs_for(svc, [sender])
+            mine, _ = certs_for(svc, [sender], account)
             pems += list(mine.values())
         if body.startswith(b"MIME-Version:"):
             body = body.split(b"\r\n", 1)[1]
         env = pkcs7.PKCS7EnvelopeBuilder().set_data(body)
+        if hasattr(env, "set_content_encryption_algorithm"):
+            # AES-256 (cryptography 45+); в 44 — AES-128-CBC, его тоже читают все почтовые программы (1.21.0)
+            from cryptography.hazmat.primitives.ciphers import algorithms
+            env = env.set_content_encryption_algorithm(algorithms.AES256)
         seen = set()
         for pem in pems:
             cert = x509.load_pem_x509_certificate(pem)

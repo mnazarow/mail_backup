@@ -37,7 +37,8 @@ log = get_logger("db")
 _ENCRYPTED_SETTINGS = {"notifications.smtp_password", "notifications.telegram_bot_token", "ldap.bind_password",
                        "notifications.webhook_secret", "employees.source_url_password",
                        "replica.s3_secret_key", "monitoring.metrics_token", "mailadmin.password",
-                       "axigen.admin_password", "axigen.ftp_password"}
+                       "axigen.admin_password", "axigen.ftp_password",
+                       "journal.auth_password"}
 
 
 #: Выборка сотрудника вместе с ОСНОВНЫМ ящиком и числом всех его ящиков.
@@ -204,10 +205,18 @@ class Database:
 
     @contextmanager
     def transaction(self):
-        """Несколько операторов одной транзакцией: всё или ничего."""
+        """Несколько операторов одной транзакцией: всё или ничего.
+
+        Транзакция открывается сразу с блокировкой записи (``BEGIN IMMEDIATE``, 1.21.0): без этого
+        sqlite3 начинал её только перед первой записью, и чтение «прочитать → решить → записать»
+        (подпись аудита, удержание по делу) шло вне транзакции — другой процесс (задания в отдельном
+        процессе, CLI) успевал записать между чтением и записью.
+        """
         conn = self.connect()
         with self._write_lock:
             try:
+                if not conn.in_transaction:
+                    conn.execute("BEGIN IMMEDIATE")
                 yield conn
                 conn.commit()
             except BaseException:
@@ -279,6 +288,9 @@ class Database:
             # API-токены для скриптов и интеграций (1.20.0)
             from .apitokens import ensure_schema as _ensure_tokens
             _ensure_tokens(conn)
+            # откуда пришли письма журнала (1.21.0)
+            from .journal import ensure_schema as _ensure_journal
+            _ensure_journal(conn)
         self._encrypt_plain_settings()
 
     def _encrypt_plain_settings(self) -> None:
@@ -365,6 +377,8 @@ class Database:
             ("audit", "kid", "TEXT NOT NULL DEFAULT ''"),
             # откуда учётная запись: local | ldap (1.20.0)
             ("users", "auth_source", "TEXT NOT NULL DEFAULT 'local'"),
+            # кто отключил: admin — вручную (каталог не включает обратно), ldap — сверка с каталогом (1.21.0)
+            ("users", "disabled_by", "TEXT NOT NULL DEFAULT ''"),
             # письма, которых в папке на сервере больше нет (удалены, перенесены) — почтовый клиент их
             # не показывает, архив хранит (1.17.0)
             ("messages", "gone", "INTEGER NOT NULL DEFAULT 0"),
@@ -710,7 +724,8 @@ class Database:
         return self.query_one("SELECT * FROM users WHERE id=?", (user_id,))
 
     def list_users(self) -> List[sqlite3.Row]:
-        return self.query("SELECT id, username, role, created_at, last_login, disabled, totp_enabled, auth_source "
+        return self.query("SELECT id, username, role, created_at, last_login, disabled, totp_enabled, auth_source, "
+                          "disabled_by "
                           "FROM users ORDER BY id")
 
     def set_user_password(self, user_id: int, password_hash: str) -> None:
@@ -740,16 +755,21 @@ class Database:
             cur = self.execute(f"UPDATE users SET role=? WHERE id=? AND {self._KEEPS_ADMIN}", (role, user_id))
         return bool(cur.rowcount)
 
-    def set_user_disabled(self, user_id: int, disabled: bool) -> bool:
-        """Отключить или включить. False — отключался последний включённый администратор."""
+    def set_user_disabled(self, user_id: int, disabled: bool, by: str = "admin") -> bool:
+        """Отключить или включить. False — отключался последний включённый администратор.
+
+        ``by`` — кто отключил (``admin`` или ``ldap``): отключённого администратором вход через
+        каталог обратно не включает (1.21.0).
+        """
         if disabled:
-            cur = self.execute(f"UPDATE users SET disabled=1 WHERE id=? AND {self._KEEPS_ADMIN}", (user_id,))
+            cur = self.execute(f"UPDATE users SET disabled=1, disabled_by=? WHERE id=? AND {self._KEEPS_ADMIN}",
+                               (by, user_id))
             if not cur.rowcount:
                 return False
             self.delete_user_sessions(user_id)
             self.drop_user_otp_challenges(user_id)
             return True
-        cur = self.execute("UPDATE users SET disabled=0 WHERE id=?", (user_id,))
+        cur = self.execute("UPDATE users SET disabled=0, disabled_by='' WHERE id=?", (user_id,))
         return bool(cur.rowcount)
 
     def delete_user(self, user_id: int) -> bool:
@@ -1067,17 +1087,18 @@ class Database:
         запоминается и вернётся, когда ящик перестанет удерживать последнее дело. Так ни увольнение,
         ни групповые действия не снимут удержание, поставленное для проверки или спора.
         """
-        if reason != "case":
-            try:
-                held = self.query_one("SELECT 1 FROM case_holds WHERE account_id=?", (account_id,))
-            except sqlite3.OperationalError:
-                held = None
-            if held is not None:
-                self.execute("UPDATE case_holds SET prev_until=?, prev_reason=? WHERE account_id=?",
-                             (hold_until or "", reason if hold_until else "", account_id))
-                return
-        self.execute("UPDATE accounts SET hold_until=?, hold_reason=?, updated_at=? WHERE id=?",
-                     (hold_until or "", reason if hold_until else "", utcnow_iso(), account_id))
+        with self.transaction() as conn:              # проверка и запись — одной транзакцией (1.21.0)
+            if reason != "case":
+                try:
+                    held = conn.execute("SELECT 1 FROM case_holds WHERE account_id=?", (account_id,)).fetchone()
+                except sqlite3.OperationalError:
+                    held = None
+                if held is not None:
+                    conn.execute("UPDATE case_holds SET prev_until=?, prev_reason=? WHERE account_id=?",
+                                 (hold_until or "", reason if hold_until else "", account_id))
+                    return
+            conn.execute("UPDATE accounts SET hold_until=?, hold_reason=?, updated_at=? WHERE id=?",
+                         (hold_until or "", reason if hold_until else "", utcnow_iso(), account_id))
 
     def mark_account_dismissed(self, account_id: int, dismissed_at: Optional[str]) -> None:
         self.execute("UPDATE accounts SET dismissed_at=?, updated_at=? WHERE id=?",
@@ -2662,15 +2683,24 @@ class Database:
                         "errors": int(r["errors"] or 0) if r else 0})
         return out
 
+    #: куда ещё отправлять записи аудита (syslog/SIEM, :mod:`mailarchiver.auditlog`, 1.21.0)
+    audit_hook = None
+
     def add_audit(self, user: str, action: str, detail: str = "") -> None:
         with self.transaction() as conn:
-            self._audit_insert(conn, user, action, detail)
+            rec = self._audit_insert(conn, user, action, detail)
+        hook = self.audit_hook
+        if hook is not None and rec:
+            try:
+                hook(rec)
+            except Exception:  # noqa: BLE001 - пересылка не должна мешать записи аудита
+                log.debug("Пересылка записи аудита не удалась", exc_info=True)
 
     def _audit_key(self) -> bytes:
         key = getattr(self.secret, "audit_key", None)
         return key if isinstance(key, bytes) and key else b"mailarchiver-audit-chain-no-key"
 
-    def _audit_insert(self, conn, user: str, action: str, detail: str = "") -> None:
+    def _audit_insert(self, conn, user: str, action: str, detail: str = "") -> Dict[str, Any]:
         """Запись аудита с подписью цепочки (1.20.0).
 
         Подпись — HMAC-SHA256 (ключ из файла секретного ключа, его в базе нет) от подписи
@@ -2683,9 +2713,10 @@ class Database:
         last = conn.execute("SELECT hash FROM audit ORDER BY id DESC LIMIT 1").fetchone()
         prev = (last[0] if last is not None else "") or ""
         key = self._audit_key()
-        conn.execute("INSERT INTO audit(ts, user, action, detail, prev_hash, hash, kid) VALUES(?,?,?,?,?,?,?)",
-                     (ts, user, action, detail, prev, audit_sign(key, prev, ts, user, action, detail),
-                      audit_kid(key)))
+        sign = audit_sign(key, prev, ts, user, action, detail)
+        cur = conn.execute("INSERT INTO audit(ts, user, action, detail, prev_hash, hash, kid) VALUES(?,?,?,?,?,?,?)",
+                           (ts, user, action, detail, prev, sign, audit_kid(key)))
+        return {"id": cur.lastrowid, "ts": ts, "user": user, "action": action, "detail": detail, "hash": sign}
 
     def verify_audit(self, batch: int = 5000) -> Dict[str, Any]:
         """Проверить цепочку подписей аудита от первой записи до последней."""

@@ -115,3 +115,52 @@ def test_employee_login_and_test_endpoint(client, ldap_dir):
     client.post("/api/logout")
     r = _login(client, "ivan", "Iv4n")
     assert r.status_code == 200 and r.json()["user"]["role"] == "mailbox" and r.json()["user"]["account_id"] == aid
+
+
+def test_sync_users_disables_and_respects_admin(services, ldap_dir):
+    """Сверка с каталогом (1.21.0): исключённый из групп и отключённый в AD — отключаются сразу; отключённого
+    администратором вход через каталог не включает."""
+    from mailarchiver.web import auth
+    d, srv = ldap_dir
+    _configure(services, srv.port, sync_users=True)
+    db = services.db
+    ids = {}
+    for name, role in (("anna", "admin"), ("bob", "operator"), ("ivan", "operator")):
+        ids[name] = db.create_user(name, "x", role)
+        db.execute("UPDATE users SET auth_source='ldap' WHERE id=?", (ids[name],))
+    local_admin = db.create_user("root", "x", "admin")
+    d.entries["CN=Борис,OU=U,DC=t"]["useraccountcontrol"] = ["514"]          # отключён в AD
+    res = ldapauth.sync_users(services)
+    assert res["checked"] == 3 and res["disabled"] == 2                        # bob (отключён), ivan (нет групп)
+    assert db.get_user_by_id(ids["anna"])["disabled"] == 0
+    assert db.get_user_by_id(ids["bob"])["disabled_by"] == "ldap"
+    assert db.get_user_by_id(local_admin)["disabled"] == 0
+    # каталог недоступен — никого не трогаем
+    srv.stop()
+    services.set_rt("ldap", "timeout_s", 1)
+    assert ldapauth.sync_users(services)["error"] and db.get_user_by_id(ids["anna"])["disabled"] == 0
+    # отключён администратором — вход через каталог не включает
+    db.set_user_disabled(ids["anna"], True)
+    assert db.get_user_by_id(ids["anna"])["disabled_by"] == "admin"
+    assert auth._row_get(db.get_user_by_id(ids["anna"]), "disabled_by") == "admin"
+
+
+def test_employees_from_directory(services, ldap_dir):
+    """Справочник сотрудников из каталога: адреса, отдел, отключённые — «не работает» (1.21.0)."""
+    from mailarchiver.models import JobType
+    from mailarchiver.queue.jobs import HANDLERS, JobContext
+    d, srv = ldap_dir
+    _configure(services, srv.port, employee_filter="(&(objectClass=user)(mail=*))")
+    d.entries["CN=Анна Админ,OU=U,DC=t"].update({"department": ["ИТ"], "title": ["Начальник"],
+                                                 "proxyaddresses": ["SMTP:anna@x.ru", "smtp:a.admin@x.ru"]})
+    d.add("CN=Пётр,OU=U,DC=t", "x", objectClass="user", sAMAccountName="petr", mail="petr@x.ru",
+          displayName="Пётр Уволенный", userAccountControl="514")
+    rows, problems = ldapauth.employee_rows(services)
+    by = {r["email"]: r for r in rows}
+    assert by["anna@x.ru"]["department"] == "ИТ" and by["anna@x.ru"]["extra_emails"] == ["a.admin@x.ru"]
+    assert by["petr@x.ru"]["inactive"] and not by["anna@x.ru"]["inactive"]
+    services.set_rt("employees", "source_type", "ldap")
+    job = services.db.enqueue_job(JobType.SYNC_EMPLOYEES, None, {}, 4, 1, "admin")
+    HANDLERS[JobType.SYNC_EMPLOYEES](JobContext(services, job, JobType.SYNC_EMPLOYEES, None, {}))
+    names = {e["full_name"] for e in services.db.query("SELECT full_name FROM employees")}
+    assert "Анна Админ" in names and "Пётр Уволенный" not in names

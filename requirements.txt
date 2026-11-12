@@ -59,6 +59,7 @@ openpyxl>=3.1,<4
 #      pip install Aspose.Email-for-Python-via-NET
 #  Требует установленного .NET Runtime на сервере.
 #
-#  pytest, httpx — только для запуска тестов (tests/), в проде не нужны:
+#  pytest, pytest-xdist, httpx — только для запуска тестов (tests/), в проде не нужны
+#  (параллельно: pytest -n auto --dist loadfile):
 #      pip install -e ".[test]"
 # ----------------------------------------------------------------------------

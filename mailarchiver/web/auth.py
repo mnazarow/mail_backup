@@ -763,8 +763,12 @@ def _try_ldap(services, request: Request, response: Response, username: str, pas
             services.db.execute("UPDATE users SET auth_source='ldap' WHERE id=?", (uid,))
             services.db.add_audit("system", "user_create", f"{username}: из каталога LDAP, роль {role}")
             existing = services.db.get_user_by_id(uid)
+        elif existing["disabled"] and _row_get(existing, "disabled_by", "") not in ("", "ldap"):
+            # отключён администратором вручную — каталог обратно не включает (1.21.0)
+            services.db.add_audit(username, "login_disabled", f"{ip} (LDAP): учётная запись отключена администратором")
+            return None
         elif existing["role"] != role or existing["disabled"]:
-            services.db.execute("UPDATE users SET role=?, disabled=0 WHERE id=?", (role, existing["id"]))
+            services.db.execute("UPDATE users SET role=?, disabled=0, disabled_by='' WHERE id=?", (role, existing["id"]))
             services.db.add_audit("system", "user_role", f"{username}: роль из каталога LDAP — {role}")
             existing = services.db.get_user_by_id(existing["id"])
         if _row_get(existing, "totp_enabled", 0):
@@ -779,7 +783,7 @@ def _try_ldap(services, request: Request, response: Response, username: str, pas
         return {"id": existing["id"], "username": existing["username"], "role": role, "totp_enabled": False}
     # в группах архива не состоит: учётную запись из каталога отключаем
     if existing is not None and _row_get(existing, "auth_source", "local") == "ldap" and not existing["disabled"]:
-        services.db.execute("UPDATE users SET disabled=1 WHERE id=?", (existing["id"],))
+        services.db.set_user_disabled(int(existing["id"]), True, by="ldap")
         services.db.add_audit("system", "user_disable", f"{username}: больше не в группах архива (LDAP)")
     if role == "mailbox":
         acc = ldapauth.mailbox_for(services, info.get("mail", ""))

@@ -763,6 +763,8 @@ def load_employee_source(
     :returns: ``(rows, problems, origin)`` — ``origin`` описывает источник
         человеческим текстом для журнала задания.
     """
+    if (source_type or "file").strip().lower() == "ldap":
+        raise ValidationError("Каталог LDAP читается заданием синхронизации (нужны настройки службы).")
     if (source_type or "file").strip().lower() == "url":
         data, name = fetch_employee_source(
             url, username=username, password=password, verify_ssl=verify_ssl,
@@ -1757,6 +1759,11 @@ def rehire_employee(svc, employee_id: int, *, by: str = "system") -> Dict[str, A
             continue
         if acc.hold_reason == "dismissed":
             svc.db.set_account_hold(acc.id, "", "")
+        elif acc.hold_reason == "case":
+            # ящик держит дело: снимаем удержание «уволен», которое вернулось бы после закрытия дела (1.21.0)
+            prev = svc.db.query_one("SELECT prev_reason FROM case_holds WHERE account_id=?", (acc.id,))
+            if prev is not None and prev["prev_reason"] == "dismissed":
+                svc.db.set_account_hold(acc.id, "", "")
         svc.db.mark_account_dismissed(acc.id, None)
         enabled = False
         if acc.auto_disabled:

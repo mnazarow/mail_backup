@@ -153,6 +153,11 @@ DEFAULTS: Dict[str, Any] = {
         "index_attachments": True,     # искать и по тексту вложений: PDF, Word, Excel, PowerPoint, OpenDocument, RTF (1.20.0)
         "attachment_max_kb": 10240,    # вложения крупнее (КБ) не разбираются
         "attachment_text_kb": 64,      # сколько текста вложений одного письма индексировать, КБ
+        "attachment_time_s": 10,       # предел времени на разбор одного вложения, секунд (1.21.0)
+        "ocr": False,                  # распознавать текст сканов и картинок (нужна программа tesseract), 1.21.0
+        "ocr_lang": "rus+eng",         # языки распознавания (пакеты tesseract-ocr-rus, -eng)
+        "ocr_max_pages": 5,            # страниц скана в PDF, не больше
+        "ocr_time_s": 60,              # предел времени на распознавание одного вложения, секунд
     },
     "replies": {
         # Раздел «Ответы на письма» (1.16.0): связи «письмо — ответ» по заголовкам In-Reply-To и References.
@@ -183,6 +188,29 @@ DEFAULTS: Dict[str, Any] = {
         "dlp_mode": "warn",            # конфиденциальные данные в письме: off | warn | block_external
         "warn_external": True,         # предупреждать, что письмо уходит за пределы организации
         "warn_recipients": 20,         # предупреждать, если в «Кому» и «Копии» больше адресатов (0 — нет)
+        "smime_ca_file": "",           # доверенные центры организации для подписей S/MIME (PEM), кроме системных
+        "send_limit_hour": 300,        # адресатов в час с одного ящика (0 — без предела), 1.21.0
+    },
+    "audit": {
+        # Аудит (1.21.0): срок хранения и копия на сервер журналов (syslog / SIEM)
+        "keep_days": 365,              # записи старше удаляются (0 — хранить всегда)
+        "message_views": True,         # записывать, кто из персонала открывал письма ящиков (раз в час на письмо)
+        "syslog_host": "",             # сервер журналов ('' — не пересылать)
+        "syslog_port": 514,
+        "syslog_proto": "udp",         # udp | tcp | tls
+        "syslog_tls_verify": True,     # для tls — проверять сертификат сервера
+        "syslog_hostname": "",         # имя узла в сообщениях ('' — имя сервера)
+    },
+    "drill": {
+        # Проверка восстановления (1.21.0): случайные письма каждого ящика читаются и сверяются
+        "enabled": True,
+        "cron": "15 5 1 * *",          # когда (по умолчанию — 1-го числа в 05:15)
+        "sample": 50,                  # писем на ящик
+    },
+    "cases": {
+        # Дела (1.21.0)
+        "export_keep_days": 0,         # выгрузки дел старше удаляются (0 — хранить, пока не удалено дело)
+        "sign_exports": True,          # подписывать опись выгрузки ключом Ed25519 сервера
     },
     "journal": {
         # Приём журналирования по SMTP (1.20.0): копия каждого письма организации — сразу в архив
@@ -196,6 +224,9 @@ DEFAULTS: Dict[str, Any] = {
         "tls_cert": "",                # сертификат и ключ для STARTTLS (PEM)
         "tls_key": "",
         "require_tls": False,          # не принимать письма без STARTTLS
+        "auth_user": "",               # SMTP AUTH: логин почтового сервера ('' — без входа), 1.21.0
+        "auth_password": "",           # и пароль (хранится зашифрованным); вход — только после STARTTLS
+        "client_ca": "",               # центр, выдавший сертификаты почтовым серверам (PEM): без сертификата — отказ
         "max_size_mb": 50,
     },
     "ldap": {
@@ -212,6 +243,9 @@ DEFAULTS: Dict[str, Any] = {
         "operator_group": "",         # DN группы операторов
         "nested_groups": True,        # учитывать вложенные группы (Active Directory)
         "employee_login": False,      # сотрудники входят доменным паролем в архив своих ящиков (по адресу mail)
+        "sync_users": True,           # раз в час сверять пользователей из каталога: исключённых — отключать (1.21.0)
+        "employee_base_dn": "",       # где искать сотрудников для справочника ('' — как base_dn), 1.21.0
+        "employee_filter": "(&(objectCategory=person)(objectClass=user)(mail=*))",  # кто — сотрудник
         "timeout_s": 10,
     },
     "mailadmin": {
@@ -295,7 +329,7 @@ DEFAULTS: Dict[str, Any] = {
     },
     "employees": {
         "sync_enabled": False,         # синхронизировать справочник сотрудников по расписанию
-        "source_type": "file",        # откуда берём список: file (файл на сервере) | url
+        "source_type": "file",        # откуда берём список: file (файл на сервере) | url | ldap (каталог, 1.21.0)
         "source_file": "",            # путь к файлу CSV/XLSX на сервере (выгрузка из кадровой системы)
         "source_url": "",             # адрес выгрузки http(s):// (когда source_type = url)
         "source_url_user": "",        # логин HTTP Basic, если адрес закрыт авторизацией
@@ -397,6 +431,14 @@ VALUE_RANGES: Dict[str, tuple] = {
     "ldap.timeout_s": (2, 120),
     "journal.port": (1, 65535),
     "journal.max_size_mb": (1, 500),
+    "webmail.send_limit_hour": (0, 100000),
+    "audit.keep_days": (0, 36500),
+    "audit.syslog_port": (1, 65535),
+    "cases.export_keep_days": (0, 36500),
+    "drill.sample": (1, 1000),
+    "search.attachment_time_s": (1, 600),
+    "search.ocr_max_pages": (1, 100),
+    "search.ocr_time_s": (5, 1800),
     "webmail.rules_interval_min": (0, 1440),
     "replica.db_snapshot_keep": (0, 365),
     "replica.max_delete_percent": (0, 100),
@@ -488,8 +530,9 @@ VALUE_CHOICES: Dict[str, tuple] = {
     "notifications.smtp_security": ("starttls", "ssl", "none"),
     "notifications.webhook_format": ("json", "slack"),
     "webmail.save_sent": ("auto", "always", "never"),
+    "audit.syslog_proto": ("udp", "tcp", "tls"),
     "webmail.dlp_mode": ("off", "warn", "block_external"),
-    "employees.source_type": ("file", "url"),
+    "employees.source_type": ("file", "url", "ldap"),
     "employees.source_url_format": ("auto", "csv", "xlsx"),
     "employees.account_security": ("ssl", "starttls", "plain"),
     "replica.target": ("dir", "rsync", "s3"),

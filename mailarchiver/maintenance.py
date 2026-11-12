@@ -163,7 +163,12 @@ def run_maintenance(svc) -> Dict[str, int]:
     keep_min = max(max(lockout_min, 15) * 4, LOGIN_ATTEMPTS_MIN_KEEP_MIN)
     out["login_attempts"] = db.purge_older_login(_iso(now - timedelta(minutes=keep_min)))
     db.purge_expired_otp_challenges()
-    out["audit"] = db.purge_older("audit", "ts", _iso(now - timedelta(days=AUDIT_DAYS)))
+    try:
+        audit_days = int(svc.rt("audit", "keep_days") if svc.rt("audit", "keep_days") is not None else AUDIT_DAYS)
+    except (TypeError, ValueError):
+        audit_days = AUDIT_DAYS
+    if audit_days > 0:                    # 0 — хранить аудит всегда (1.21.0)
+        out["audit"] = db.purge_older("audit", "ts", _iso(now - timedelta(days=audit_days)))
     out["stats"] = db.purge_older("stats_daily", "day", (now - timedelta(days=STATS_DAYS)).strftime("%Y-%m-%d"))
     out["restores"] = db.purge_older("restores", "created_at", _iso(now - timedelta(days=RESTORES_DAYS)))
     try:
@@ -190,6 +195,16 @@ def run_maintenance(svc) -> Dict[str, int]:
         out["server_progress"] = purge_server_progress(db)
     except Exception:  # noqa: BLE001
         log.exception("Не удалось удалить отметки хода заданий раздела «Ящики на сервере»")
+    try:
+        from .cases import purge_old_exports as purge_case_exports
+        out["case_exports"] = purge_case_exports(svc)
+    except Exception:  # noqa: BLE001
+        log.exception("Не удалось удалить старые выгрузки дел")
+    try:
+        from .ldapauth import sync_users as ldap_sync_users
+        out["ldap_disabled"] = int(ldap_sync_users(svc).get("disabled") or 0)
+    except Exception:  # noqa: BLE001
+        log.exception("Сверка пользователей с каталогом LDAP не удалась")
     if any(out.values()):
         log.info("Обслуживание: %s", ", ".join(f"{k}={v}" for k, v in out.items() if v))
     return out

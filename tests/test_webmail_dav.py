@@ -87,10 +87,11 @@ class Dav(BaseHTTPRequestHandler):
             self._xml(_ms.format("".join(_resp(f"/dav/book/contacts/{i}.vcf", f"<a:address-data>{c}</a:address-data>")
                                          for i, c in enumerate(cards))))
         elif self.path == "/dav/cal/work/":
-            evs = [_ics("e1", Dav.soon, "Планёрка"), _ics("e0", datetime.now(timezone.utc) - timedelta(days=40), "Старое")]
-            evs += list(Dav.puts.values())
-            self._xml(_ms.format("".join(_resp(f"/dav/cal/work/{i}.ics", f"<c:calendar-data>{e}</c:calendar-data>")
-                                         for i, e in enumerate(evs))))
+            evs = [(f"/dav/cal/work/{i}.ics", e) for i, e in enumerate(
+                [_ics("e1", Dav.soon, "Планёрка"), _ics("e0", datetime.now(timezone.utc) - timedelta(days=40), "Старое")])]
+            evs += [(k, v) for k, v in Dav.puts.items() if k.endswith(".ics")]
+            self._xml(_ms.format("".join(_resp(h, f'<d:getetag>"{hash(e)}"</d:getetag><c:calendar-data>{e}'
+                                                  f'</c:calendar-data>') for h, e in evs)))
         else:
             self._xml(_ms.format(""), 404)
 
@@ -98,8 +99,35 @@ class Dav(BaseHTTPRequestHandler):
         body = self.rfile.read(int(self.headers.get("Content-Length") or 0)).decode()
         if not self._auth():
             return
+        match = self.headers.get("If-Match")
+        if match and match != f'"{hash(Dav.puts.get(self.path, ""))}"':
+            self.send_response(412)
+            self.end_headers()
+            return
         Dav.puts[self.path] = body
         self.send_response(201)
+        self.end_headers()
+
+    def do_GET(self):  # noqa: N802
+        if not self._auth():
+            return
+        body = Dav.puts.get(self.path)
+        if body is None:
+            self.send_response(404)
+            self.end_headers()
+            return
+        data = body.encode()
+        self.send_response(200)
+        self.send_header("ETag", f'"{hash(body)}"')
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_DELETE(self):  # noqa: N802
+        if not self._auth():
+            return
+        Dav.puts.pop(self.path, None)
+        self.send_response(204)
         self.end_headers()
 
     def log_message(self, *a):
@@ -166,3 +194,31 @@ def test_api_dav(api, dav, monkeypatch):
     start = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
     assert mb.post("/api/webmail/calendar", json={"account_id": a, "summary": "Звонок", "start": start}).status_code == 200
     assert mb.get(f"/api/webmail/calendar?account_id={b}").status_code == 403
+
+
+def test_edit_delete_event_and_push_contact(box, dav, monkeypatch):
+    """Событие меняется и удаляется на сервере (ETag), контакт уходит в книгу сервера (1.21.0)."""
+    svc, world, acc = box
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1")
+    wdav.configure(svc, acc, dav, actor="adm")
+    start = (datetime.now(timezone.utc) + timedelta(days=3)).replace(microsecond=0)
+    wdav.add_event(svc, acc, summary="Встреча", start=start.isoformat(), actor="adm")
+    ev = [e for e in wdav.events(svc, acc) if e["summary"] == "Встреча"][0]
+    assert ev["href"].endswith(".ics") and ev["etag"]
+    wdav.update_event(svc, acc, ev["href"], ev["etag"], summary="Встреча перенесена",
+                      start=(start + timedelta(hours=2)).isoformat(), location="Зал", actor="adm")
+    stored = [v for k, v in Dav.puts.items() if k.endswith(".ics")][0]
+    assert "SUMMARY:Встреча перенесена" in stored and "SEQUENCE:1" in stored and "LOCATION:Зал" in stored
+    with pytest.raises(ValidationError):                          # старый ETag — правку не затираем
+        wdav.update_event(svc, acc, ev["href"], ev["etag"], summary="X", start=start.isoformat())
+    with pytest.raises(ValidationError):                          # не из календаря
+        wdav.delete_event(svc, acc, dav + "/dav/book/contacts/1.vcf")
+    ev = [e for e in wdav.events(svc, acc) if e["summary"] == "Встреча перенесена"][0]
+    wdav.delete_event(svc, acc, ev["href"], ev["etag"], actor="adm")
+    assert "Встреча перенесена" not in [e["summary"] for e in wdav.events(svc, acc)]
+    since = (datetime.now(timezone.utc) - timedelta(days=60)).date().isoformat()
+    until = datetime.now(timezone.utc).date().isoformat()
+    assert "Старое" in [e["summary"] for e in wdav.events(svc, acc, since=since, until=until)]
+    assert wdav.push_contact(svc, acc, name="Сидоров, Пётр", email="sidorov@x.ru", phone="+7 900")
+    card = [v for k, v in Dav.puts.items() if k.startswith("/dav/book/contacts/")][0]
+    assert "FN:Сидоров\\, Пётр" in card and "EMAIL;TYPE=INTERNET:sidorov@x.ru" in card

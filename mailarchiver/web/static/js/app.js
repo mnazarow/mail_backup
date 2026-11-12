@@ -3456,6 +3456,8 @@ async function viewSettings(c){
     if(sec.section==='search') searchCard(card);
     if(sec.section==='ldap') ldapCard(card, ()=>Object.keys(changed).some(k=>k.startsWith('ldap.')));
     if(sec.section==='journal') journalCard(card);
+    if(sec.section==='drill') drillCard(card);
+    if(sec.section==='audit') auditForwardCard(card, ()=>Object.keys(changed).some(k=>k.startsWith('audit.syslog')));
     if(sec.section==='axigen') axigenSettingsCard(card, ()=>Object.keys(changed).some(k=>k.startsWith('axigen.')));
   });
   applyDeps();
@@ -3594,9 +3596,16 @@ async function searchCard(card){
     <h4 style="margin:0 0 8px">🔎 Индекс поиска</h4>
     ${st.available?`<div class="small">Проиндексировано <b>${fmtNum(st.indexed)}</b> из ${fmtNum(st.total)} писем (${pct}%).${st.active_job?` Идёт индексация — задание #${st.active_job}.`:(st.pending?' Остальные проиндексируются в фоне (каждые 10 минут).':'')}</div>
       <div class="small muted" style="margin-top:4px">${st.bodies?('Ищется и по тексту писем'+(st.attachments?' и вложений (PDF, Word, Excel, PowerPoint, OpenDocument, RTF)':'')+'.'):'Текст писем не индексируется — поиск по теме, адресам и вложениям.'}${st.bodies_blocked_by_encryption?' Текст не индексируется, потому что включено шифрование копии.':''}</div>
-      <div class="btn-row" style="margin-top:10px"><button class="btn sm" data-re>Перестроить индекс</button></div>`
+      ${st.attachments&&st.attach_messages?`<div class="small muted" style="margin-top:4px">Писем с вложениями: ${fmtNum(st.attach_messages)}; текста вложений в индексе — до ${fmtNum(st.attach_text_kb)} КБ на письмо, то есть база может вырасти до ≈ ${fmtBytes(st.attach_messages*st.attach_text_kb*1024*1.3)} (обычно в разы меньше: у большинства вложений текста немного). Сейчас база занимает ${fmtBytes(st.db_size||0)}.</div>`:''}
+      ${st.ocr?`<div class="small muted" style="margin-top:4px">Распознавание сканов и картинок: ${st.ocr_tools&&st.ocr_tools.tesseract?('включено (tesseract'+(st.ocr_tools.pdftoppm?', pdftoppm':' — без pdftoppm сканы в PDF не читаются')+')'):'<b style="color:var(--warn-text)">включено, но на сервере нет программы tesseract</b> — установите пакеты tesseract-ocr и tesseract-ocr-rus'}.</div>`:''}
+      ${st.attachments&&st.attach_backfill?`<div class="hint" style="margin-top:8px">У ${fmtNum(st.attach_backfill)} писем, проиндексированных раньше, текст вложений ещё не прочитан. ${st.attach_job?`Читается — задание #${st.attach_job}.`:'Его можно дочитать без перестройки индекса.'}</div>`:''}
+      <div class="btn-row" style="margin-top:10px">${st.attachments&&st.attach_backfill&&!st.attach_job?'<button class="btn sm primary" data-att>📎 Дочитать вложения</button>':''}<button class="btn sm" data-re>Перестроить индекс</button></div>`
     :'<div class="hint" style="border-color:var(--warn)">SQLite на этом сервере собран без FTS5 — поиск работает только по теме и отправителю.</div>'}</div>`);
   card.appendChild(box);
+  const att=box.querySelector('[data-att]');
+  if(att) att.onclick=async()=>{
+    try{ const r=await api('/search/attachments',{method:'POST'}); toast('Запущено', `Задание #${r.job_id}: читаются вложения ${fmtNum(st.attach_backfill)} писем.`); box.remove(); searchCard(card); }catch(e){ toastErr(e); }
+  };
   const re=box.querySelector('[data-re]');
   if(re) re.onclick=async()=>{
     if(!await confirmDlg('Перестроить индекс поиска?', 'Индекс будет очищен и заполнен заново в фоне (для большого архива — часы). Нужно после смены настроек индексации текста.', {okText:'Перестроить', okClass:'primary'})) return;
@@ -3674,6 +3683,33 @@ function summaryCard(card, unsaved){
 }
 
 /** Блок «Приём журналирования»: работает ли SMTP-приёмник и сколько писем принято. */
+/** Блок «Проверка восстановления»: последний результат и запуск сейчас (1.21.0). */
+async function drillCard(card){
+  let st; try{ st=await api('/drill'); }catch(e){ return; }
+  const l=st.last;
+  const box=h(`<div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border)">
+    <h4 style="margin:0 0 8px">🧪 Последняя проверка</h4>
+    <div class="small">${l?`${l.finished_at?fmtDate(l.finished_at):'идёт'} · <span class="tag ${l.status==='success'?'ok':(l.status==='failed'?'err':'warn')}">${esc(STATUS_LBL[l.status]||l.status)}</span> ${esc(l.summary||'')} <a href="#/jobs">#${l.id}</a>`:'Ещё не проводилась.'}</div>
+    <div class="btn-row" style="margin-top:8px"><button class="btn sm" data-run ${st.active_job?'disabled':''}>${st.active_job?`Идёт — задание #${st.active_job}`:'Проверить сейчас'}</button></div></div>`);
+  box.querySelector('[data-run]').onclick=async()=>{ try{ const r=await api('/drill/run',{method:'POST'}); toast('Проверка запущена', `Задание #${r.job_id}.`); box.remove(); drillCard(card); }catch(e){ toastErr(e); } };
+  card.appendChild(box);
+}
+
+/** Блок «Пересылка в syslog / SIEM»: состояние и пробная запись (1.21.0). */
+async function auditForwardCard(card, unsaved){
+  let st; try{ st=await api('/audit/forward'); }catch(e){ return; }
+  const box=h(`<div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border)">
+    <h4 style="margin:0 0 8px">📤 Пересылка аудита</h4>
+    <div class="small">${st.enabled?`<span class="tag ok">включена</span> отправлено записей с запуска службы: ${fmtNum(st.sent)}${st.queued?`, в очереди ${fmtNum(st.queued)}`:''}${st.dropped?`, <b style="color:var(--danger)">отброшено ${fmtNum(st.dropped)}</b> (очередь переполнялась)`:''}`:'<span class="tag">выключена</span> — укажите сервер журналов'}</div>
+    ${st.last_error?`<div class="hint" style="margin-top:6px;border-color:var(--warn)">Последняя ошибка: ${esc(st.last_error)}</div>`:''}
+    <div class="btn-row" style="margin-top:8px"><button class="btn sm" data-t>Отправить пробную запись</button></div></div>`);
+  box.querySelector('[data-t]').onclick=async()=>{
+    if(unsaved()) return toast('Сначала сохраните настройки','Проверка идёт с сохранёнными значениями.','warn');
+    try{ const r=await api('/audit/forward/test',{method:'POST'}); r.ok?toast('Запись отправлена','Проверьте, что она пришла на сервер журналов (action=audit_syslog_test).'):toast('Не отправлено', r.error, 'err'); }catch(e){ toastErr(e); }
+  };
+  card.appendChild(box);
+}
+
 async function journalCard(card){
   let st; try{ st=await api('/journal/status'); }catch(e){ return; }
   card.appendChild(h(`<div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border)">
@@ -3766,7 +3802,7 @@ async function viewUsers(c){
       : `<select data-role aria-label="Роль пользователя ${esc(u.username)}" title="Сменить роль (сеансы пользователя будут завершены)">
           <option value="admin" ${u.role==='admin'?'selected':''}>администратор</option>
           <option value="operator" ${u.role==='operator'?'selected':''}>оператор</option></select>`;
-    const tr=h(`<tr><td><strong>${esc(u.username)}</strong>${u.auth_source==='ldap'?' <span class="tag" title="Входит доменным паролем; роль — по группе каталога LDAP">🏢 из каталога</span>':''}${u.disabled?' <span class="tag">выключен</span>':''}</td><td>${roleCell}</td>
+    const tr=h(`<tr><td><strong>${esc(u.username)}</strong>${u.auth_source==='ldap'?' <span class="tag" title="Входит доменным паролем; роль — по группе каталога LDAP">🏢 из каталога</span>':''}${u.disabled?(u.disabled_by==='ldap'?' <span class="tag" title="Отключён сверкой с каталогом: нет в каталоге, отключён в нём или вне групп архива. Включится сам при входе, если права вернут.">выключен каталогом</span>':' <span class="tag" title="Отключён администратором: вход через каталог его не включит">выключен</span>'):''}</td><td>${roleCell}</td>
       <td>${u.totp_enabled?'<span class="tag ok">🔐 вкл.</span>':'<span class="tag">нет</span>'}</td>
       <td class="small muted">${fmtDate(u.created_at)}</td><td class="small muted">${fmtDate(u.last_login)}</td>
       <td style="text-align:right;white-space:nowrap"><button class="btn sm" data-pw>Пароль</button><button class="btn sm" data-logout title="Завершить все открытые сеансы этого пользователя (его текущие cookie перестанут действовать)">Завершить сеансы</button>${u.totp_enabled && u.id!==State.user.id?'<button class="btn sm" data-reset2fa title="Отключить двухфакторный вход (например, пользователь потерял телефон)">Сбросить 2FA</button>':''}<button class="btn danger sm" data-del>✕</button></td></tr>`);
@@ -3860,7 +3896,7 @@ async function viewCases(c){
   const d=await api('/cases');
   c.innerHTML='';
   c.appendChild(h(`<div class="section-title"><h2 style="margin:0">⚖️ Дела</h2><div class="spacer"></div>
-    <a class="btn ghost sm" href="${docsHref('cases')}">📖 Как это работает</a> <button class="btn primary" id="csNew">＋ Новое дело</button></div>`));
+    <a class="btn ghost sm" href="${docsHref('cases')}">📖 Как это работает</a> <button class="btn ghost sm" id="csKey" title="Открытый ключ, которым подписывается опись выгрузок">🔏 Ключ подписи</button> <button class="btn primary" id="csNew">＋ Новое дело</button></div>`));
   c.appendChild(h(`<div class="hint" style="margin-bottom:12px">Дело собирает переписку для проверки, спора или запроса: ящики сотрудников, период и
     поисковый запрос. Пока дело открыто, архив его ящиков удерживается — письма не удаляются ни по сроку хранения, ни вручную.
     Найденные письма выгружаются в ZIP с описью и контрольными суммами SHA-256.</div>`));
@@ -3878,6 +3914,7 @@ async function viewCases(c){
   if(!tb.children.length) tb.innerHTML='<tr><td colspan="7" class="empty">Дел пока нет</td></tr>';
   c.appendChild(wrap);
   $('#csNew',c).onclick=()=>caseForm(null, (id)=>{ State.caseId=id; viewCases(c).catch(toastErr); });
+  $('#csKey',c).onclick=()=>caseKeyDlg();
 }
 
 /** Выбор ящиков: поиск по названию, логину и сотруднику, флажки. Возвращает выбранные id (или null). */
@@ -3922,6 +3959,10 @@ function caseForm(cs, onSaved){
     <div class="form-row" style="display:flex;gap:12px;flex-wrap:wrap"><label style="flex:1">С даты<input type="date" id="cfFrom" value="${esc(cs?cs.date_from:'')}"></label>
       <label style="flex:1">По дату<input type="date" id="cfTo" value="${esc(cs?cs.date_to:'')}"></label></div>
     <label class="check"><input type="checkbox" id="cfHold" ${!cs||cs.hold?'checked':''}> Удерживать архив ящиков, пока дело открыто</label>
+    <div class="form-row" style="margin:6px 0 0 24px"><label for="cfScope">Что удерживать</label><select id="cfScope">
+      <option value="all" ${!cs||cs.hold_scope!=='matching'?'selected':''}>Весь архив ящиков — сроки хранения не действуют</option>
+      <option value="matching" ${cs&&cs.hold_scope==='matching'?'selected':''}>Только письма по условиям дела — остальные чистятся по сроку</option></select>
+      <div class="small muted" style="margin-top:4px">В обоих случаях архив ящика нельзя удалить или пересоздать «с нуля», а копирование скачивает все письма.</div></div>
     ${isNew?`<div class="form-row" style="margin-top:10px"><label>Ящики</label><div style="display:flex;gap:8px;align-items:center"><button class="btn sm" type="button" id="cfPick">Выбрать ящики…</button><span class="small muted" id="cfPicked">не выбраны</span></div></div>`:''}`,
     {footer:'<button class="btn" data-c>Отмена</button><button class="btn primary" data-ok>'+(isNew?'Создать дело':'Сохранить')+'</button>'});
   m.foot.querySelector('[data-c]').onclick=()=>m.close();
@@ -3931,12 +3972,49 @@ function caseForm(cs, onSaved){
     const b=ev.currentTarget; b.disabled=true;
     const body={name:m.body.querySelector('#cfName').value.trim(), description:m.body.querySelector('#cfDesc').value,
       query:m.body.querySelector('#cfQuery').value.trim(), date_from:m.body.querySelector('#cfFrom').value, date_to:m.body.querySelector('#cfTo').value,
-      hold:m.body.querySelector('#cfHold').checked};
+      hold:m.body.querySelector('#cfHold').checked, hold_scope:m.body.querySelector('#cfScope').value};
     try{
       if(isNew){ body.account_ids=picked; const r=await api('/cases',{method:'POST',body}); toast('Дело создано'); m.close(); onSaved&&onSaved(r.id); }
       else{ await api('/cases/'+cs.id,{method:'PUT',body}); toast('Сохранено'); m.close(); onSaved&&onSaved(cs.id); }
     }catch(e){ toastErr(e); } finally{ b.disabled=false; }
   };
+}
+
+/** Выгрузка дела: формат (EML — письма без изменений, PST — для Outlook) и пароль архива (1.21.0). */
+function caseExportDlg(cs, id, reload){
+  const m=modal('📦 Выгрузить письма дела', `<p class="small" style="margin-top:0">${fmtNum(cs.count)} писем (${fmtBytes(cs.size)}). В архив попадут опись с SHA-256 каждого письма, подпись описи ключом сервера и отчёт. Выгрузка идёт заданием очереди; скачивание файла попадёт в аудит.</p>
+    <div class="form-row"><label>Формат</label>
+      <label class="check"><input type="radio" name="cxf" value="eml" checked> EML — письма ровно в том виде, в каком хранятся в архиве (для экспертизы)</label>
+      <label class="check"><input type="radio" name="cxf" value="pst"> PST — один файл для Outlook (письма преобразуются; суммы — по исходным письмам)</label></div>
+    <div class="form-row"><label class="check"><input type="checkbox" id="cxPw"> Зашифровать архив паролем (AES-256)</label>
+      <div id="cxPwBox" hidden><div class="grid2"><input type="password" id="cxP1" autocomplete="new-password" placeholder="Пароль, не короче 8 знаков"><input type="password" id="cxP2" autocomplete="new-password" placeholder="Ещё раз"></div>
+      <div class="small muted" style="margin-top:4px">Пароль нигде не сохраняется — передайте его получателю отдельно. Архив открывают 7-Zip, WinRAR, WinZip, Keka (встроенные средства Windows и macOS — нет).</div></div></div>
+    <div class="btn-row"><button class="btn primary" id="cxGo">Выгрузить</button><button class="btn ghost" id="cxCancel">Отмена</button></div>`);
+  const g=s=>m.body.querySelector(s);
+  g('#cxPw').onchange=()=>{ g('#cxPwBox').hidden=!g('#cxPw').checked; if(g('#cxPw').checked) g('#cxP1').focus(); };
+  g('#cxCancel').onclick=()=>m.close();
+  g('#cxGo').onclick=async()=>{
+    const body={format:(m.body.querySelector('input[name="cxf"]:checked')||{}).value||'eml'};
+    if(g('#cxPw').checked){
+      const p1=g('#cxP1').value, p2=g('#cxP2').value;
+      if(p1.length<8) return toast('Пароль — не короче 8 знаков','','warn');
+      if(p1!==p2) return toast('Пароли не совпадают','','warn');
+      body.password=p1;
+    }
+    const b=g('#cxGo'); b.disabled=true;
+    try{ const r=await api(`/cases/${id}/export`,{method:'POST',body}); m.close(); toast('Выгрузка запущена', `Задание #${r.job_id}. Когда оно закончится, нажмите «↻ Обновить».`); reload(); }catch(e){ toastErr(e); } finally{ b.disabled=false; }
+  };
+}
+
+/** Открытый ключ подписи выгрузок дел: отпечаток сообщают получателям (1.21.0). */
+async function caseKeyDlg(){
+  let k; try{ k=await api('/cases/signing-key'); }catch(e){ return toastErr(e); }
+  const m=modal('🔏 Ключ подписи выгрузок', `<p class="small" style="margin-top:0">Опись каждой выгрузки дела (manifest.csv) подписывается этим ключом (Ed25519). Сообщите отпечаток получателям выгрузок заранее, по другому каналу: совпадение отпечатка в отчёте выгрузки с этим доказывает, что опись сформировал ваш архив и её не меняли.</p>
+    <div class="kv"><span class="k">Отпечаток</span><span><code>${esc(k.fingerprint)}</code></span></div>
+    <pre class="small" style="white-space:pre-wrap;user-select:all">${esc(k.pem)}</pre>
+    <p class="small muted">Проверка (OpenSSL 3): <code>openssl pkeyutl -verify -pubin -inkey signing_key.pem -rawin -in manifest.csv -sigfile manifest.sig</code></p>
+    <div class="btn-row"><button class="btn" id="ckDl">⬇ Скачать signing_key.pem</button></div>`);
+  m.body.querySelector('#ckDl').onclick=()=>{ const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([k.pem],{type:'application/x-pem-file'})); a.download='signing_key.pem'; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href), 5000); };
 }
 
 async function caseDetail(c, id){
@@ -3952,7 +4030,7 @@ async function caseDetail(c, id){
   const info=h(`<div class="card"><div class="kv"><span class="k">Описание</span><span>${esc(cs.description||'—')}</span></div>
     <div class="kv"><span class="k">Запрос</span><span>${cs.query?'<code>'+esc(cs.query)+'</code>':'все письма ящиков'}</span></div>
     <div class="kv"><span class="k">Период</span><span>${cs.date_from?esc(cs.date_from):'с начала'} — ${cs.date_to?esc(cs.date_to):'по сегодня'}</span></div>
-    <div class="kv"><span class="k">Удержание архива</span><span>${cs.hold?(open?'<span class="tag ok">🔒 действует</span> письма ящиков не удаляются':'снято вместе с закрытием дела'):'не включено'}</span></div>
+    <div class="kv"><span class="k">Удержание архива</span><span>${cs.hold?(open?(cs.hold_scope==='matching'?'<span class="tag ok">🔒 действует</span> письма по условиям дела не удаляются, остальные чистятся по сроку хранения':'<span class="tag ok">🔒 действует</span> письма ящиков не удаляются'):'снято вместе с закрытием дела'):'не включено'}</span></div>
     <div class="kv"><span class="k">Писем по условиям</span><span><b>${fmtNum(cs.count)}</b> (${fmtBytes(cs.size)}) в ${cs.custodians} ящ.</span></div>
     <div class="kv"><span class="k">Создано</span><span>${fmtDate(cs.created_at)} · ${esc(cs.created_by)}${cs.closed_at?` · закрыто ${fmtDate(cs.closed_at)} · ${esc(cs.closed_by)}`:''}</span></div>
     ${cs.index_pending?`<div class="hint" style="margin-top:8px;border-color:var(--warn)">Индекс поиска ещё не охватывает ${fmtNum(cs.index_pending)} новейших писем архива — подходящие под запрос среди них появятся в деле после индексации.</div>`:''}
@@ -3980,7 +4058,7 @@ async function caseDetail(c, id){
   cs.export_list.forEach(x=>{
     etb.appendChild(h(`<tr><td class="small">${fmtDate(x.created_at)}</td><td class="small">${esc(x.created_by||'')}</td>
       <td><span class="tag ${x.status==='success'?'ok':(x.status==='partial'?'warn':(x.status==='failed'?'err':''))}">${esc(CASE_EXPORT_STATUS[x.status]||x.status)}</span>${x.job_id?` <a class="small" href="#/jobs">#${x.job_id}</a>`:''}${x.error?`<div class="small muted">${esc(x.error)}</div>`:''}</td>
-      <td>${x.count?fmtNum(x.count):'—'}</td><td>${x.size?fmtBytes(x.size):'—'}</td>
+      <td>${x.count?fmtNum(x.count):'—'}${x.format==='pst'?' <span class="tag">PST</span>':''}${x.protected?' <span class="tag" title="Архив зашифрован паролем (AES-256)">🔐 пароль</span>':''}</td><td>${x.size?fmtBytes(x.size):'—'}</td>
       <td style="text-align:right">${x.ready?`<a class="btn sm" href="/api/cases/${id}/exports/${x.id}/download" download>⬇ Скачать</a>`:''}</td></tr>`));
     if(x.sha256) etb.appendChild(h(`<tr class="case-sha"><td colspan="6" class="small muted">SHA-256 архива: <code style="word-break:break-all">${esc(x.sha256)}</code></td></tr>`));
   });
@@ -4015,9 +4093,7 @@ async function caseDetail(c, id){
   on('#cdEdit', ()=>caseForm(cs, reload));
   on('#cdAdd', async()=>{ const ids=await accountPickerDlg('Добавить ящики в дело', []); if(!ids||!ids.length) return;
     try{ const r=await api(`/cases/${id}/custodians`,{method:'POST',body:{add:ids}}); toast('Готово', `Добавлено ящиков: ${r.added}`); reload(); }catch(e){ toastErr(e); } });
-  on('#cdExport', async()=>{
-    if(!await confirmDlg('Выгрузить письма дела?', `В ZIP попадут ${fmtNum(cs.count)} писем (${fmtBytes(cs.size)}) с описью и контрольными суммами. Выгрузка идёт заданием очереди; скачивание файла попадёт в аудит.`, {okText:'Выгрузить', okClass:'primary'})) return;
-    try{ const r=await api(`/cases/${id}/export`,{method:'POST'}); toast('Выгрузка запущена', `Задание #${r.job_id}. Когда оно закончится, нажмите «↻ Обновить».`); reload(); }catch(e){ toastErr(e); } });
+  on('#cdExport', ()=>caseExportDlg(cs, id, reload));
   on('#cdClose', async()=>{
     if(!await confirmDlg('Закрыть дело?', 'Удержание архива по этому делу будет снято: ящикам вернётся удержание, которое было до дела (если их не держит другое открытое дело). Выгрузки и история сохранятся.', {okText:'Закрыть дело'})) return;
     try{ await api(`/cases/${id}/close`,{method:'POST'}); toast('Дело закрыто'); reload(); }catch(e){ toastErr(e); } });
@@ -5097,6 +5173,7 @@ async function loadMailMessage(accId, pk){
       <div class="rmeta"><b>Кому:</b> ${esc(hd.to||'—')}</div>
       ${hd.cc?`<div class="rmeta"><b>Копия:</b> ${esc(hd.cc)}</div>`:''}
       <div class="rmeta"><b>Дата:</b> <span title="${esc(hd.date||'')}">${esc(item.date?fmtDate(item.date):(hd.date||''))}</span> · <span class="muted">📁 ${esc(mailFolderLabel(mailFolderInfo(m.folder))||m.folder||'')}</span>${gone?' · <span class="rp-tag" title="Письма в этой папке на сервере больше нет — копия в архиве">нет на сервере</span>':''}</div>
+      ${m.journal?`<div class="rmeta small muted" title="Письмо принято по журналированию (SMTP)">📨 Из журнала: ${esc(fmtDate(m.journal.received_at))}, с ${esc(m.journal.ip)}${m.journal.helo?` (${esc(m.journal.helo)})`:''}${m.journal.auth_user?`, вход «${esc(m.journal.auth_user)}»`:''}${m.journal.client_cert?`, сертификат ${esc(m.journal.client_cert)}`:''}${m.journal.tls?', TLS':', без шифрования'}</div>`:''}
     </div>
     <div id="mthread"></div>
     ${(m.truncated||m.notice)?`<div class="hint" style="margin-bottom:12px;border-color:var(--warn)">📦 ${esc(m.notice||'Письмо слишком большое для показа в браузере.')}</div>`:''}
@@ -5270,6 +5347,7 @@ async function composeWindow(draft){
         <span class="spacer" style="flex:1"></span><button class="btn ghost sm" data-archived title="Приложить письма из архива (.eml)">🗄 Из архива</button><label class="btn ghost sm compose-attach" title="Прикрепить файлы">📎 Прикрепить<input type="file" multiple hidden></label></div>
       <div class="compose-body" contenteditable="true" role="textbox" aria-multiline="true" aria-label="Текст письма" spellcheck="true" lang="ru"></div>
       <div class="compose-atts"></div>
+      <div class="compose-smime small" hidden></div>
       <div class="compose-foot"><span class="compose-sendgrp"><button class="btn primary" data-send title="Отправить (Ctrl+Enter)">📨 Отправить</button><button class="btn primary" data-later title="Отправить позже — в назначенное время, даже если клиент закрыт" aria-label="Отправить позже">🕓</button></span>
         <button class="btn ghost sm" data-save>💾 Сохранить</button>
         <label class="compose-opt" title="Письмо придёт с пометкой «Важное»"><input type="checkbox" data-opt="priority" ${draft.priority?'checked':''}> ❗ Важное</label>
@@ -5296,6 +5374,21 @@ async function composeWindow(draft){
       try{ await api(`/webmail/drafts/${draft.id}/attachments/${b.dataset.n}`, {method:'DELETE'}); atts=atts.filter(x=>String(x.n)!==b.dataset.n); renderAtts(); }catch(e){ toastErr(e); } });
   };
   renderAtts();
+  // S/MIME: чьими сертификатами зашифруется письмо — с отпечатками; нет сертификата или он недавно сменился —
+  // видно до отправки (1.21.0)
+  const smimeHint=async()=>{
+    const box=g('.compose-smime'), on=g('[data-opt="smime_encrypt"]');
+    if(!on || !on.checked){ box.hidden=true; return; }
+    const emails=['to_addrs','cc_addrs','bcc_addrs'].map(f=>((g(`[data-f="${f}"]`)||{}).value||'').trim()).filter(Boolean).join(', ');
+    let r; try{ r=await api(`/webmail/smime/recipients?account_id=${draft.account_id}&emails=${encodeURIComponent(emails)}`, {bg:true}); }catch(e){ return; }
+    const certs=(r.certs||[]).map(c=>`<span class="attach-chip" title="${esc(c.name||'')} · до ${esc(fmtDateShort(c.valid_until))}">🔒 ${esc(c.email)} <span class="mono muted">${esc(c.fingerprint)}</span>${c.changed_at?` <b style="color:var(--warn-text)">⚠ сертификат сменился ${esc(fmtDateShort(c.changed_at))}</b>`:''}</span>`).join(' ');
+    const miss=(r.missing||[]).length?`<div style="color:var(--danger)">Нет сертификата: ${esc(r.missing.join(', '))} — такое письмо не отправится зашифрованным.</div>`:'';
+    const bcc=((g('[data-f="bcc_addrs"]')||{}).value||'').trim()?'<div class="muted">Скрытым адресатам уйдут отдельные зашифрованные копии — в основном письме их не видно.</div>':'';
+    box.innerHTML=(certs?`<div>Шифруется для: ${certs}</div>`:'')+miss+bcc; box.hidden=!(certs||miss||bcc);
+  };
+  g('[data-opt="smime_encrypt"]').addEventListener('change', smimeHint);
+  ['to_addrs','cc_addrs','bcc_addrs'].forEach(f=>{ const el=g(`[data-f="${f}"]`); if(el) el.addEventListener('change', smimeHint); });
+  smimeHint();
   // S/MIME: «Подписать» — только если у ящика есть сертификат с ключом
   api(`/webmail/smime?account_id=${draft.account_id}`, {bg:true}).then(r=>{ const k=r.key||{}; const lab=g('[data-smime]'); if(lab && k.present && !k.expired) lab.hidden=false; }).catch(()=>{});
   g('[data-archived]').onclick=async(e)=>{ e.preventDefault();
@@ -5495,7 +5588,7 @@ async function mailSmimeSection(pane, accId){
     <div class="grid2"><div class="form-row"><label for="sm-file">Файл .p12 / .pfx</label><input id="sm-file" type="file" accept=".p12,.pfx"></div>
       <div class="form-row"><label for="sm-pass">Пароль файла</label><input id="sm-pass" type="password" autocomplete="new-password"></div></div>
     <div class="btn-row"><button class="btn primary" data-up>${k.present?'Заменить сертификат':'Загрузить сертификат'}</button>${k.present?'<button class="btn danger" data-del>Удалить сертификат</button>':''}
-      <span class="spacer" style="flex:1"></span><button class="btn ghost" data-certs>Сертификаты получателей (${fmtNum(d.certs||0)})</button></div></div>`);
+      <span class="spacer" style="flex:1"></span><button class="btn ghost" data-certs>${d.personal?'Мои сертификаты получателей':'Сертификаты получателей'} (${fmtNum(d.certs||0)})</button></div></div>`);
   sec.querySelector('[data-up]').onclick=async()=>{
     const f=sec.querySelector('#sm-file').files[0]; if(!f) return toast('Выберите файл .p12 или .pfx','','warn');
     const fd=new FormData(); fd.append('account_id', accId); fd.append('password', sec.querySelector('#sm-pass').value); fd.append('file', f);
@@ -5504,25 +5597,30 @@ async function mailSmimeSection(pane, accId){
   const del=sec.querySelector('[data-del]');
   if(del) del.onclick=async()=>{ if(!await confirmDlg('Удалить сертификат ящика?', 'Подписывать письма и читать зашифрованные будет нельзя, пока не загрузите сертификат снова.', {okText:'Удалить'})) return;
     try{ await api(`/webmail/smime/key?account_id=${accId}`, {method:'DELETE'}); toast('Удалено'); sec.remove(); mailSmimeSection(pane, accId); }catch(e){ toastErr(e); } };
-  sec.querySelector('[data-certs]').onclick=()=>mailSmimeCerts();
+  sec.querySelector('[data-certs]').onclick=()=>mailSmimeCerts(d.personal?accId:null);
   pane.appendChild(sec);
 }
-async function mailSmimeCerts(){
-  const m=modal('Сертификаты получателей', `<div style="display:flex;gap:8px;align-items:center"><input type="search" id="sc-q" placeholder="Адрес или имя" style="flex:1">
-    <label class="btn sm">⬆ Загрузить .cer<input type="file" id="sc-file" accept=".cer,.crt,.pem,.der" hidden></label></div>
+async function mailSmimeCerts(accId){
+  // Сотрудник видит и пополняет только свой список (для своего ящика), общий справочник — у администратора (1.21.0)
+  const own=accId!=null, qs=own?`&account_id=${accId}`:'';
+  const m=modal(own?'Мои сертификаты получателей':'Сертификаты получателей', `<div style="display:flex;gap:8px;align-items:center"><input type="search" id="sc-q" placeholder="Адрес или имя" style="flex:1">
+    ${own||isAdmin()?'<label class="btn sm">⬆ Загрузить .cer<input type="file" id="sc-file" accept=".cer,.crt,.pem,.der" hidden></label>':''}</div>
+    <p class="small muted" style="margin:6px 0 0">${own?'Сертификаты, загруженные сюда, шифруют только письма из этого ящика. Общий справочник ведёт администратор; сертификаты из писем с доверенной подписью попадают в него сами.':'Сертификат из письма запоминается, только если подпись доверенная и адрес отправителя есть в сертификате; загруженный здесь сертификат письмом не заменяется. Сверяйте отпечаток с владельцем.'}</p>
     <div id="sc-list" style="margin-top:8px;max-height:55vh;overflow:auto"></div>`, {wide:true});
   const list=m.body.querySelector('#sc-list');
-  const SRC={signed:'из письма с подписью', upload:'загружен', own:'сертификат ящика'};
+  const SRC={signed:'из письма с подписью', upload:'загружен администратором', own:'сертификат ящика', personal:'загружен в ящик'};
+  const canDel=own||isAdmin();
   const load=async()=>{
     const q=m.body.querySelector('#sc-q').value.trim();
-    let r; try{ r=await api('/webmail/smime/certs?q='+encodeURIComponent(q)); }catch(e){ list.innerHTML=`<div class="empty small">${esc(e.message)}</div>`; return; }
-    list.innerHTML=r.items.length?`<table class="tbl"><thead><tr><th>Адрес</th><th>Владелец</th><th>До</th><th>Откуда</th>${isAdmin()?'<th></th>':''}</tr></thead><tbody>${r.items.map(c=>`<tr><td>${esc(c.email)}</td><td class="small">${esc(c.name)}<div class="muted">${esc(c.issuer)}</div></td><td class="small">${c.expired?'<span class="tag err">истёк</span>':esc(fmtDateShort(c.valid_until))}</td><td class="small">${esc(SRC[c.source]||c.source)}</td>${isAdmin()?`<td><button class="btn ghost sm" data-del="${esc(c.email)}">✕</button></td>`:''}</tr>`).join('')}</tbody></table>`
-      :'<div class="empty small">Сертификатов пока нет: они появятся, когда придут письма с подписью S/MIME.</div>';
+    let r; try{ r=await api('/webmail/smime/certs?q='+encodeURIComponent(q)+qs); }catch(e){ list.innerHTML=`<div class="empty small">${esc(e.message)}</div>`; return; }
+    list.innerHTML=r.items.length?`<table class="tbl"><thead><tr><th>Адрес</th><th>Владелец</th><th>Отпечаток SHA-256</th><th>До</th><th>Откуда</th>${canDel?'<th></th>':''}</tr></thead><tbody>${r.items.map(c=>`<tr><td>${esc(c.email)}${c.changed_at?`<div class="small" style="color:var(--warn-text)" title="Сертификат этого адреса сменился">⚠ сменился ${esc(fmtDateShort(c.changed_at))}</div>`:''}</td><td class="small">${esc(c.name)}<div class="muted">${esc(c.issuer)}</div></td><td class="small mono">${esc(c.fingerprint||'')}</td><td class="small">${c.expired?'<span class="tag err">истёк</span>':esc(fmtDateShort(c.valid_until))}</td><td class="small">${esc(SRC[c.source]||c.source)}</td>${canDel?`<td><button class="btn ghost sm" data-del="${esc(c.email)}" title="Удалить">✕</button></td>`:''}</tr>`).join('')}</tbody></table>`
+      :`<div class="empty small">${own?'Своих сертификатов пока нет.':'Сертификатов пока нет: они появятся, когда придут письма с доверенной подписью S/MIME.'}</div>`;
   };
-  list.onclick=async(e)=>{ const b=e.target.closest('[data-del]'); if(!b) return; try{ await api('/webmail/smime/certs?email='+encodeURIComponent(b.dataset.del), {method:'DELETE'}); load(); }catch(err){ toastErr(err); } };
+  list.onclick=async(e)=>{ const b=e.target.closest('[data-del]'); if(!b) return; try{ await api('/webmail/smime/certs?email='+encodeURIComponent(b.dataset.del)+qs, {method:'DELETE'}); load(); }catch(err){ toastErr(err); } };
   m.body.querySelector('#sc-q').oninput=()=>load();
-  m.body.querySelector('#sc-file').onchange=async(e)=>{ const f=e.target.files[0]; if(!f) return; const fd=new FormData(); fd.append('file', f);
-    try{ const r=await api('/webmail/smime/certs', {method:'POST', body:fd}); toast('Сертификат добавлен', r.emails.join(', ')); load(); }catch(err){ toastErr(err); } e.target.value=''; };
+  const file=m.body.querySelector('#sc-file');
+  if(file) file.onchange=async(e)=>{ const f=e.target.files[0]; if(!f) return; const fd=new FormData(); fd.append('file', f); if(own) fd.append('account_id', accId);
+    try{ const r=await api('/webmail/smime/certs', {method:'POST', body:fd}); toast('Сертификат добавлен', `${r.emails.join(', ')} · отпечаток ${r.fingerprint}`); load(); }catch(err){ toastErr(err); } e.target.value=''; };
   load();
 }
 
@@ -5670,30 +5768,81 @@ async function mailDavSection(pane, accId){
 
 /** Ближайшие события календаря сервера и новое событие. */
 async function mailCalendarDlg(accId){
-  const m=modal('📅 Календарь', `<div class="btn-row"><button class="btn sm primary" data-new>＋ Событие</button><span class="spacer" style="flex:1"></span><button class="btn sm ghost" data-reload>↻ Обновить</button></div>
+  // Список ближайших событий и вид «Месяц»; события можно изменить и удалить (1.21.0)
+  const m=modal('📅 Календарь', `<div class="btn-row"><button class="btn sm primary" data-new>＋ Событие</button>
+      <span class="seg" role="tablist"><button class="btn sm" data-view="list" aria-pressed="true">Список</button><button class="btn sm ghost" data-view="month" aria-pressed="false">Месяц</button></span>
+      <span class="spacer" style="flex:1"></span><span data-nav hidden><button class="btn sm ghost" data-prev title="Предыдущий месяц">‹</button> <b data-title></b> <button class="btn sm ghost" data-next title="Следующий месяц">›</button></span>
+      <button class="btn sm ghost" data-reload>↻ Обновить</button></div>
     <div data-form hidden class="card" style="margin:8px 0"><div class="form-row"><label>Название</label><input data-f="summary" maxlength="500"></div>
       <div class="grid2"><div class="form-row"><label>Начало</label><input type="datetime-local" data-f="start"></div><div class="form-row"><label>Конец</label><input type="datetime-local" data-f="end"></div></div>
       <div class="form-row"><label>Где</label><input data-f="location" maxlength="500"></div>
+      <div class="form-row"><label>Описание</label><textarea data-f="description" rows="2" maxlength="4000"></textarea></div>
       <label class="check"><input type="checkbox" data-f="all_day"> Весь день</label>
-      <div class="btn-row"><button class="btn primary sm" data-add>Добавить в календарь</button></div></div>
+      <div class="btn-row"><button class="btn primary sm" data-add>Добавить в календарь</button><button class="btn ghost sm" data-cancel>Отмена</button></div></div>
     <div data-list><div class="empty"><div class="spinner"></div></div></div>`, {wide:true});
-  const list=m.body.querySelector('[data-list]'), form=m.body.querySelector('[data-form]');
+  const g=s=>m.body.querySelector(s);
+  const list=g('[data-list]'), form=g('[data-form]');
+  let view='list', month=new Date(); month.setDate(1); month.setHours(0,0,0,0);
+  let editing=null, items=[];
+  const local=(x)=>new Date(x-x.getTimezoneOffset()*60e3).toISOString().slice(0,16);
   const fmtWhen=(e)=>{ const s=new Date(e.start); if(e.all_day) return s.toLocaleDateString('ru-RU',{weekday:'short', day:'2-digit', month:'long'})+' · весь день';
     const en=e.end?new Date(e.end):null; return s.toLocaleString('ru-RU',{weekday:'short', day:'2-digit', month:'long', hour:'2-digit', minute:'2-digit'})+(en?' – '+en.toLocaleTimeString('ru-RU',{hour:'2-digit', minute:'2-digit'}):''); };
-  const load=async()=>{
-    list.innerHTML='<div class="empty"><div class="spinner"></div></div>';
-    let r; try{ r=await api(`/webmail/calendar?account_id=${accId}&days=30`); }catch(e){ list.innerHTML=`<div class="empty small">${esc(e.message)}</div>`; return; }
-    list.innerHTML=r.items.length?r.items.map(e=>`<div class="mail-event"><div class="w">${esc(fmtWhen(e))}${e.rrule?' · 🔁':''}</div><div class="s"><b>${esc(e.summary||'(без названия)')}</b>${e.location?` <span class="muted">· ${esc(e.location)}</span>`:''}</div></div>`).join('')
+  const acts=(e,i)=>e.rrule?'<span class="small muted" title="Повторяющееся событие меняйте в программе календаря">🔁</span>':`<button class="btn ghost sm" data-edit="${i}" title="Изменить">✏️</button><button class="btn ghost sm" data-del="${i}" title="Удалить">🗑</button>`;
+  const renderList=()=>{
+    list.innerHTML=items.length?items.map((e,i)=>`<div class="mail-event"><div class="w">${esc(fmtWhen(e))}</div><div class="s"><b>${esc(e.summary||'(без названия)')}</b>${e.location?` <span class="muted">· ${esc(e.location)}</span>`:''}${e.description?`<div class="small muted">${esc(e.description.slice(0,200))}</div>`:''}</div><div class="a">${acts(e,i)}</div></div>`).join('')
       :'<div class="empty small">На ближайшие 30 дней событий нет.</div>';
   };
-  m.body.querySelector('[data-reload]').onclick=load;
-  m.body.querySelector('[data-new]').onclick=()=>{ form.hidden=!form.hidden; if(!form.hidden){ const d=new Date(Date.now()+3600e3); d.setMinutes(0,0,0); const iso=(x)=>new Date(x-x.getTimezoneOffset()*60e3).toISOString().slice(0,16);
-    form.querySelector('[data-f="start"]').value=iso(d); form.querySelector('[data-f="end"]').value=iso(new Date(d.getTime()+3600e3)); form.querySelector('[data-f="summary"]').focus(); } };
-  form.querySelector('[data-add]').onclick=async(ev)=>{
+  const renderMonth=()=>{
+    const first=new Date(month), start=new Date(first); start.setDate(1-((first.getDay()+6)%7));
+    const days=[]; for(let i=0;i<42;i++){ const d=new Date(start); d.setDate(start.getDate()+i); days.push(d); }
+    const key=d=>`${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+    const by={}; items.forEach((e,i)=>{ const d=new Date(e.start); (by[key(d)]=by[key(d)]||[]).push(i); });
+    const today=key(new Date());
+    list.innerHTML=`<div class="cal-grid">${['Пн','Вт','Ср','Чт','Пт','Сб','Вс'].map(x=>`<div class="cal-h">${x}</div>`).join('')}${days.map(d=>{
+      const evs=(by[key(d)]||[]).map(i=>{ const e=items[i]; const t=e.all_day?'':new Date(e.start).toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'})+' ';
+        return `<button class="cal-ev" ${e.rrule?'':`data-edit="${i}"`} title="${esc(fmtWhen(e))}${e.location?' · '+esc(e.location):''}">${esc(t)}${esc(e.summary||'(без названия)')}</button>`; }).join('');
+      return `<div class="cal-d ${d.getMonth()!==month.getMonth()?'out':''} ${key(d)===today?'today':''}"><div class="n">${d.getDate()}</div>${evs}</div>`; }).join('')}</div>`;
+    g('[data-title]').textContent=month.toLocaleDateString('ru-RU',{month:'long', year:'numeric'});
+  };
+  const load=async()=>{
+    list.innerHTML='<div class="empty"><div class="spinner"></div></div>';
+    let q=`/webmail/calendar?account_id=${accId}&days=30`;
+    if(view==='month'){ const a=new Date(month); a.setDate(a.getDate()-7); const b=new Date(month); b.setMonth(b.getMonth()+1); b.setDate(b.getDate()+14);
+      const d=x=>`${x.getFullYear()}-${String(x.getMonth()+1).padStart(2,'0')}-${String(x.getDate()).padStart(2,'0')}`; q+=`&since=${d(a)}&until=${d(b)}`; }
+    let r; try{ r=await api(q); }catch(e){ list.innerHTML=`<div class="empty small">${esc(e.message)}</div>`; return; }
+    items=r.items||[]; view==='month'?renderMonth():renderList();
+  };
+  const openForm=(e)=>{
+    editing=e||null; form.hidden=false; const v=s=>form.querySelector(`[data-f="${s}"]`);
+    if(e){ v('summary').value=e.summary||''; v('location').value=e.location||''; v('description').value=e.description||''; v('all_day').checked=!!e.all_day;
+      v('start').value=local(new Date(e.start)); v('end').value=e.end?local(new Date(e.end)):''; }
+    else{ const d=new Date(Date.now()+3600e3); d.setMinutes(0,0,0); ['summary','location','description'].forEach(k=>v(k).value=''); v('all_day').checked=false;
+      v('start').value=local(d); v('end').value=local(new Date(d.getTime()+3600e3)); }
+    g('[data-add]').textContent=e?'Сохранить':'Добавить в календарь'; v('summary').focus();
+  };
+  list.onclick=async(ev)=>{
+    const ed=ev.target.closest('[data-edit]'), del=ev.target.closest('[data-del]');
+    if(ed) return openForm(items[Number(ed.dataset.edit)]);
+    if(del){ const e=items[Number(del.dataset.del)];
+      if(!await confirmDlg('Удалить событие?', `«${esc(e.summary||'')}» — ${esc(fmtWhen(e))}. Событие удалится из календаря на сервере (и на телефоне).`, {okText:'Удалить', html:true})) return;
+      try{ await api(`/webmail/calendar?account_id=${accId}&href=${encodeURIComponent(e.href)}&etag=${encodeURIComponent(e.etag||'')}`, {method:'DELETE'}); toast('Событие удалено'); load(); }catch(err){ toastErr(err); } }
+  };
+  m.body.querySelectorAll('[data-view]').forEach(b=>b.onclick=()=>{ view=b.dataset.view;
+    m.body.querySelectorAll('[data-view]').forEach(x=>{ const on=x.dataset.view===view; x.classList.toggle('ghost',!on); x.setAttribute('aria-pressed', on); });
+    g('[data-nav]').hidden=view!=='month'; load(); });
+  g('[data-prev]').onclick=()=>{ month.setMonth(month.getMonth()-1); load(); };
+  g('[data-next]').onclick=()=>{ month.setMonth(month.getMonth()+1); load(); };
+  g('[data-reload]').onclick=load;
+  g('[data-new]').onclick=()=>openForm(null);
+  g('[data-cancel]').onclick=()=>{ form.hidden=true; editing=null; };
+  g('[data-add]').onclick=async(ev)=>{
     const b=ev.currentTarget; b.disabled=true; const v=s=>form.querySelector(`[data-f="${s}"]`);
     const toIso=(x)=>x?new Date(x).toISOString():'';
-    try{ await api('/webmail/calendar', {method:'POST', body:{account_id:accId, summary:v('summary').value, start:toIso(v('start').value), end:toIso(v('end').value), location:v('location').value, all_day:v('all_day').checked}});
-      toast('Событие добавлено'); form.hidden=true; load(); }catch(e){ toastErr(e); } finally{ b.disabled=false; }
+    const body={account_id:accId, summary:v('summary').value, start:toIso(v('start').value), end:toIso(v('end').value), location:v('location').value, description:v('description').value, all_day:v('all_day').checked};
+    try{
+      if(editing){ await api('/webmail/calendar', {method:'PUT', body:{...body, href:editing.href, etag:editing.etag||''}}); toast('Событие изменено'); }
+      else{ await api('/webmail/calendar', {method:'POST', body}); toast('Событие добавлено'); }
+      form.hidden=true; editing=null; load(); }catch(e){ toastErr(e); } finally{ b.disabled=false; }
   };
   load();
 }
@@ -6436,7 +6585,7 @@ function mailRenderTrust(el, accId, pk, x, act){
     box.prepend(b);
   }
   if(sm && sm.kind==='signed' && sm.signer && sm.signer.name){
-    box.appendChild(h(`<div class="small muted mail-smime">🔏 ${esc(sm.text||'')} Подписал: ${esc(sm.signer.name)}${(sm.signer.emails||[]).length?` &lt;${esc(sm.signer.emails.join(', '))}&gt;`:''}${sm.signer.issuer?`, выдан: ${esc(sm.signer.issuer)}`:''}${sm.signer.expired?' — сертификат истёк':''}.</div>`));
+    box.appendChild(h(`<div class="small muted mail-smime">🔏 ${esc(sm.text||'')} Подписал: ${esc(sm.signer.name)}${(sm.signer.emails||[]).length?` &lt;${esc(sm.signer.emails.join(', '))}&gt;`:''}${sm.signer.issuer?`, выдан: ${esc(sm.signer.issuer)}`:''}${sm.signer.expired?' — сертификат истёк':''}.${sm.signer.fingerprint?` <span class="mono" title="Отпечаток SHA-256 сертификата">${esc(sm.signer.fingerprint.slice(0,16).toUpperCase().replace(/(.{4})(?=.)/g,'$1 '))}</span>`:''}${sm.matches_sender===false?' <b style="color:var(--warn-text)">⚠ Адрес отправителя не совпадает с сертификатом.</b>':''}</div>`));
   }else if(sm && sm.text && sm.kind!=='signed'){
     const b=h(`<div class="small muted mail-smime">🔒 ${esc(sm.text)}${sm.can_decrypt?' <button class="btn sm" data-decrypt>🔓 Расшифровать</button>':''}</div>`);
     const dbtn=b.querySelector('[data-decrypt]'); if(dbtn) dbtn.onclick=()=>mailShowDecrypted(el, accId, pk, dbtn);
@@ -6545,7 +6694,7 @@ const STATUS_LBL = {queued:'в очереди',running:'выполняется',
 // Задания, которые меняли почтовый сервер: «Повторить» у них нет — повтор вслепую изменил бы ещё раз и
 // уже изменённые ящики. Их запускают заново из раздела, с проверкой.
 const NO_RETRY_JOBS = new Set(['axigen_action','server_action']);
-const JOBLBL = {backup:'Резервное копирование',restore:'Восстановление',export:'Экспорт',import_pst:'Импорт PST',test:'Проверка подключения',retention:'Очистка (ретеншн)',verify:'Проверка целостности',analyze:'Глубокий анализ писем',sync_employees:'Синхронизация сотрудников',storage_convert:'Шифрование копии',check_logins:'Проверка паролей',replicate:'Копия вне сервера',db_snapshot:'Снимок базы',search_index:'Индексация поиска',dedup_report:'Отчёт об одинаковых вложениях',cleanup:'Удаление архивов и прежних копий',backup_all:'Копирование всех ящиков по очереди',quarantine_check:'Сравнение прежней копии с новой',quarantine_rescue:'Возврат писем из прежней копии',folders_check:'Проверка папок на сервере',search_reindex:'Переиндексация поиска',axigen_sync:'Сверка с сервером Axigen',axigen_action:'Действия на сервере Axigen',server_action:'Действия с ящиками на сервере',server_sync:'Сверка с почтовым сервером',reply_index:'Индекс ответов на письма',case_export:'Выгрузка дела'};
+const JOBLBL = {backup:'Резервное копирование',restore:'Восстановление',export:'Экспорт',import_pst:'Импорт PST',test:'Проверка подключения',retention:'Очистка (ретеншн)',verify:'Проверка целостности',analyze:'Глубокий анализ писем',sync_employees:'Синхронизация сотрудников',storage_convert:'Шифрование копии',check_logins:'Проверка паролей',replicate:'Копия вне сервера',db_snapshot:'Снимок базы',search_index:'Индексация поиска',dedup_report:'Отчёт об одинаковых вложениях',cleanup:'Удаление архивов и прежних копий',backup_all:'Копирование всех ящиков по очереди',quarantine_check:'Сравнение прежней копии с новой',quarantine_rescue:'Возврат писем из прежней копии',folders_check:'Проверка папок на сервере',search_reindex:'Переиндексация поиска',axigen_sync:'Сверка с сервером Axigen',axigen_action:'Действия на сервере Axigen',server_action:'Действия с ящиками на сервере',server_sync:'Сверка с почтовым сервером',reply_index:'Индекс ответов на письма',case_export:'Выгрузка дела',search_attach:'Чтение текста вложений',restore_drill:'Проверка восстановления'};
 function cvar(n,f){ const v=getComputedStyle(document.documentElement).getPropertyValue(n).trim(); return v||f; }
 function fmtNum(n){ return Number(n||0).toLocaleString('ru-RU'); }
 function trunc(s,n){ s=String(s==null?'':s); return s.length>n? s.slice(0,n-1)+'…':s; }

@@ -41,6 +41,8 @@ class Services:
             min_free_mb=int(cfg.storage.get("min_free_space_mb", 500)),
             verify_after_write=bool(cfg.storage.get("verify_after_write", True)),
         )
+        from .auditlog import install as _audit_forward
+        _audit_forward(self)                   # копия аудита в syslog/SIEM (1.21.0), если задан сервер
         # «Сегодня» для дневной статистики — по часам пользователя, а не UTC
         self.db.day_provider = lambda: datetime.now(self.local_tz()).date().isoformat()
         self.notifier = Notifier(self)

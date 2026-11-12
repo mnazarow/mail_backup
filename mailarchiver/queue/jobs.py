@@ -11,7 +11,7 @@ import shutil
 import tempfile
 import time
 from datetime import datetime, timezone
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from ..accountops import hold_label
 from ..errors import ExportError, JobCancelled, MailArchiverError, ValidationError
@@ -74,6 +74,33 @@ def effective_retention_days(svc, acc) -> int:
         return max(0, int(svc.rt("retention", "keep_days") or 0))
     except (TypeError, ValueError):
         return 0
+
+
+def purge_retention_days(svc, acc) -> Tuple[int, list]:
+    """Срок для очистки по сроку хранения и дела, чьи письма очистка не трогает (1.21.0).
+
+    Ящик удерживается только делами «письма по условиям дела» (и до дела удержания не было) —
+    чистится по своему сроку, кроме писем, подходящих под условия этих дел. Копирование ящика
+    при этом скачивает всё (:func:`effective_retention_days` — 0): письмо, подходящее под дело,
+    не должно остаться только на сервере.
+    """
+    if acc.on_hold() and (acc.hold_reason or "") == "case":
+        from .. import cases as cases_mod
+        whole, rows = cases_mod.purge_protection(svc, acc.id)
+        if whole or not rows:
+            return 0, []
+        prev = svc.db.query_one("SELECT prev_until FROM case_holds WHERE account_id=?", (acc.id,))
+        if prev is not None and (prev["prev_until"] or "") >= datetime.now(timezone.utc).date().isoformat():
+            return 0, []                              # до дела действовало своё удержание
+        if acc.retention_days is not None and acc.retention_days >= 0:
+            return int(acc.retention_days), rows
+        if not bool(svc.rt("retention", "enabled")):
+            return 0, []
+        try:
+            return max(0, int(svc.rt("retention", "keep_days") or 0)), rows
+        except (TypeError, ValueError):
+            return 0, []
+    return effective_retention_days(svc, acc), []
 
 
 def retention_cutoff_iso(days: int) -> str:
@@ -1148,21 +1175,23 @@ def handle_retention(ctx: JobContext) -> Dict:
     # это даёт корректный прогресс и не требует держать выборку в памяти.
     plan = []
     for acc in accounts:
-        eff_days = effective_retention_days(svc, acc)
+        eff_days, case_rows = purge_retention_days(svc, acc)
         if eff_days <= 0:
             continue
         cutoff_iso = retention_cutoff_iso(eff_days)
-        plan.append((acc, eff_days, cutoff_iso, _count_older_than(svc.db, acc.id, cutoff_iso)))
+        plan.append((acc, eff_days, cutoff_iso, _count_older_than(svc.db, acc.id, cutoff_iso), case_rows))
     total = sum(p[3] for p in plan)
     ctx.progress(0, total, f"К удалению писем: {total}")
     if not plan:
         ctx.event("INFO", "Срок хранения не задан — удалять нечего.")
-    for acc, eff_days, cutoff_iso, planned in plan:
-        ctx.event("INFO", f"Ящик «{acc.name}»: хранение {eff_days} дн., к удалению писем {planned}.")
+    kept_by_case = 0
+    for acc, eff_days, cutoff_iso, planned, case_rows in plan:
+        ctx.event("INFO", f"Ящик «{acc.name}»: хранение {eff_days} дн., к удалению писем {planned}"
+                          + (f" (кроме писем по условиям дел: {len(case_rows)})" if case_rows else "") + ".")
         last_id = 0
         while True:
             fresh = svc.db.get_account(acc.id)
-            if fresh is None or effective_retention_days(svc, fresh) != eff_days:
+            if fresh is None or purge_retention_days(svc, fresh)[0] != eff_days:
                 # Поставили удержание архива или поменяли срок хранения — прежний план
                 # больше не годится: письма, которые теперь надо хранить, не трогаем.
                 ctx.event("WARNING", f"Ящик «{acc.name}»: срок хранения или удержание архива изменились во "
@@ -1171,10 +1200,17 @@ def handle_retention(ctx: JobContext) -> Dict:
             rows = _page_older_than(svc.db, acc.id, cutoff_iso, last_id, MESSAGE_PAGE_SIZE)
             if not rows:
                 break
+            keep: set = set()
+            if case_rows:
+                from .. import cases as cases_mod
+                keep = cases_mod.protected_ids(svc, case_rows, acc.id, [int(r["id"]) for r in rows])
             done_ids: List[int] = []
             try:
                 for row in rows:
                     last_id = row["id"]
+                    if int(row["id"]) in keep:
+                        kept_by_case += 1             # подходит под условия открытого дела — хранится
+                        continue
                     if ctx.is_cancelled():
                         ctx.event("WARNING", f"Очистка прервана: удалено {removed + len(done_ids)} "
                                              f"({human_size(freed)}).")
@@ -1201,6 +1237,8 @@ def handle_retention(ctx: JobContext) -> Dict:
         ctx.event("WARNING", f"Не удалось удалить файлов: {failed} — эти письма оставлены в копии "
                              f"(проверьте права на каталог с почтой и не смонтирован ли он только для чтения).")
     summary = f"Удалено {removed} писем, освобождено {human_size(freed)}."
+    if kept_by_case:
+        summary += f" Оставлено по условиям открытых дел: {kept_by_case}."
     if failed:
         summary += f" Не удалось удалить: {failed}."
     ctx.event("INFO", f"Ретеншн: {summary}")
@@ -1338,23 +1376,28 @@ def handle_sync_employees(ctx: JobContext) -> Dict:
     svc = ctx.services
     source_type = str(ctx.params.get("source_type")
                       or svc.rt("employees", "source_type") or "file").strip().lower()
-    if source_type not in ("file", "url"):
+    if source_type not in ("file", "url", "ldap"):
         source_type = "file"
 
     create_accounts = ctx.params.get("create_accounts")
     if create_accounts is None:
         create_accounts = bool(svc.rt("employees", "create_accounts"))
 
-    rows, problems, origin = load_employee_source(
-        source_type=source_type,
-        path=str(ctx.params.get("path") or svc.rt("employees", "source_file") or ""),
-        url=str(ctx.params.get("url") or svc.rt("employees", "source_url") or ""),
-        username=str(svc.rt("employees", "source_url_user") or ""),
-        password=str(svc.rt("employees", "source_url_password") or ""),
-        verify_ssl=bool(svc.rt("employees", "source_url_verify_ssl")),
-        timeout_s=int(svc.rt("employees", "source_url_timeout_s") or 60),
-        fmt=str(svc.rt("employees", "source_url_format") or "auto"),
-    )
+    if source_type == "ldap":                      # каталог LDAP / Active Directory (1.21.0)
+        from ..ldapauth import employee_rows
+        rows, problems = employee_rows(svc)
+        origin = f"каталог LDAP {svc.rt('ldap', 'url')}"
+    else:
+        rows, problems, origin = load_employee_source(
+            source_type=source_type,
+            path=str(ctx.params.get("path") or svc.rt("employees", "source_file") or ""),
+            url=str(ctx.params.get("url") or svc.rt("employees", "source_url") or ""),
+            username=str(svc.rt("employees", "source_url_user") or ""),
+            password=str(svc.rt("employees", "source_url_password") or ""),
+            verify_ssl=bool(svc.rt("employees", "source_url_verify_ssl")),
+            timeout_s=int(svc.rt("employees", "source_url_timeout_s") or 60),
+            fmt=str(svc.rt("employees", "source_url_format") or "auto"),
+        )
     ctx.event("INFO", f"Синхронизация сотрудников, источник: {origin}.")
     ctx.event("INFO", f"Разобрано строк: {len(rows)}; проблемных строк: {len(problems)}.")
     ctx.progress(0, len(rows) or 1, "Разбор списка завершён")
@@ -1667,6 +1710,38 @@ def handle_search_index(ctx: JobContext) -> Dict:
     if ctx.is_cancelled():
         raise JobCancelled(ctx.stop_reason() + ". " + summary)
     return {"final_status": JobStatus.SUCCESS, "summary": summary, **res}
+
+
+def handle_search_attach(ctx: JobContext) -> Dict:
+    """Дочитать текст вложений писем, проиндексированных без него (1.21.0)."""
+    from ..search import backfill_attachments
+    res = backfill_attachments(ctx.services, progress=ctx.progress, cancelled=ctx.is_cancelled, event=ctx.event,
+                               max_seconds=float(ctx.params.get("max_seconds") or SEARCH_INDEX_SLICE_S))
+    if not res.get("available"):
+        return {"final_status": JobStatus.SUCCESS,
+                "summary": "Полнотекстовый поиск недоступен: SQLite собран без FTS5."}
+    if res.get("disabled"):
+        return {"final_status": JobStatus.SUCCESS,
+                "summary": "Поиск по тексту вложений выключен (search.index_attachments) — читать нечего."}
+    summary = (f"Прочитаны вложения писем: {res['indexed']}"
+               + (f", осталось {res['pending']} — запустите ещё раз (продолжит с того же места)"
+                  if res["pending"] else "")
+               + (f"; файлы не прочитаны: {res['errors']}" if res["errors"] else "") + ".")
+    if ctx.is_cancelled():
+        raise JobCancelled(ctx.stop_reason() + ". " + summary)
+    return {"final_status": JobStatus.SUCCESS, "summary": summary, **res}
+
+
+def handle_restore_drill(ctx: JobContext) -> Dict:
+    """Проверка восстановления: случайные письма каждого ящика читаются, сверяются и разбираются (1.21.0)."""
+    from ..drill import run
+    res = run(ctx.services, progress=ctx.progress, cancelled=ctx.is_cancelled, event=ctx.event)
+    if ctx.is_cancelled():
+        raise JobCancelled(ctx.stop_reason() + ". " + res["summary"])
+    for note in res["notes"]:
+        ctx.event("WARNING", note)
+    status = JobStatus.SUCCESS if res["ok"] else (JobStatus.FAILED if res["bad"] else JobStatus.PARTIAL)
+    return {"final_status": status, "summary": res["summary"], "checked": res["checked"], "bad": res["bad"]}
 
 
 #: Сколько секунд один проход индекса ответов разбирает письма; остальное — следующим проходом.
@@ -2633,6 +2708,8 @@ HANDLERS: Dict[str, Callable[[JobContext], Dict]] = {
     JobType.QUARANTINE_RESCUE: handle_quarantine,
     JobType.FOLDERS_CHECK: handle_folders_check,
     JobType.SEARCH_REINDEX: handle_search_reindex,
+    JobType.SEARCH_ATTACH: handle_search_attach,
+    JobType.RESTORE_DRILL: handle_restore_drill,
     JobType.AXIGEN_SYNC: lambda ctx: _axigen_jobs().handle_sync(ctx),
     JobType.AXIGEN_ACTION: lambda ctx: _axigen_jobs().handle_action(ctx),
     JobType.SERVER_ACTION: lambda ctx: _server_jobs().handle_job(ctx),

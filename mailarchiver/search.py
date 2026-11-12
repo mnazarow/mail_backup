@@ -188,8 +188,25 @@ def status(svc) -> Dict:
     return {"enabled": bool(svc.rt("search", "enabled")), "available": available,
             "indexed": max(0, total - pending), "total": total, "pending": pending, "last_id": last,
             "bodies": bodies_enabled(svc), "attachments": attachments_enabled(svc),
+            "attach_backfill": attach_backfill_pending(db) if available else 0,
+            "ocr": bool(svc.rt("search", "ocr")), "ocr_tools": _ocr_tools(),
+            "attach_messages": int(db.scalar("SELECT COUNT(*) FROM messages WHERE has_attach=1") or 0),
+            "attach_text_kb": _attach_cap(svc) // 1024,
+            "db_size": _db_size(db),
             "bodies_blocked_by_encryption": bool(svc.rt("search", "index_bodies")) and svc.store.encrypt
             and not bool(svc.rt("search", "index_bodies_encrypted"))}
+
+
+def _ocr_tools() -> Dict[str, bool]:
+    from .attachtext import ocr_available
+    return ocr_available()
+
+
+def _db_size(db) -> int:
+    try:
+        return int(db.scalar("SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()") or 0)
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 def reset_index(db) -> None:
@@ -198,6 +215,10 @@ def reset_index(db) -> None:
         conn.execute(f"DELETE FROM {FTS_TABLE}")
         conn.execute("INSERT INTO meta(key, value) VALUES(?, '0') ON CONFLICT(key) DO UPDATE SET value='0'",
                      (_META_WATERMARK,))
+        # новый проход прочитает и вложения — дочитывать их отдельно не нужно
+        top = str(int(conn.execute("SELECT COALESCE(MAX(id), 0) FROM messages").fetchone()[0] or 0))
+        conn.execute("INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                     (_META_ATTACH, top))
         conn.execute("INSERT INTO meta(key, value) VALUES(?, '1') ON CONFLICT(key) DO UPDATE SET "
                      "value=CAST(COALESCE(value, '0') AS INTEGER) + 1", (_META_GEN,))
 
@@ -229,6 +250,21 @@ def _attach_cap(svc) -> int:
         return 64 * 1024
 
 
+def ocr_settings(svc) -> Optional[Dict]:
+    """Распознавание сканов и картинок (``search.ocr``, 1.21.0) — если включено и есть tesseract."""
+    if not bool(svc.rt("search", "ocr")):
+        return None
+    from .attachtext import ocr_available
+    if not ocr_available()["tesseract"]:
+        return None
+    try:
+        return {"lang": str(svc.rt("search", "ocr_lang") or "rus+eng"),
+                "max_pages": int(svc.rt("search", "ocr_max_pages") or 5),
+                "time_s": float(svc.rt("search", "ocr_time_s") or 60)}
+    except (TypeError, ValueError):
+        return {"lang": "rus+eng", "max_pages": 5, "time_s": 60.0}
+
+
 def attachments_text(svc, open_fn, cap_chars: int) -> str:
     """Текст поддерживаемых вложений письма (PDF, Word, Excel…), не больше ``cap_chars``."""
     from email import message_from_binary_file
@@ -239,6 +275,13 @@ def attachments_text(svc, open_fn, cap_chars: int) -> str:
         max_one = max(1, int(svc.rt("search", "attachment_max_kb") or 10240)) * 1024
     except (TypeError, ValueError):
         max_one = 10240 * 1024
+    try:
+        time_s = float(svc.rt("search", "attachment_time_s") or 10)
+    except (TypeError, ValueError):
+        time_s = 10.0
+    ocr = ocr_settings(svc)
+    if ocr:
+        time_s = max(time_s, float(ocr["time_s"]))
     with open_fn() as fh:
         msg = message_from_binary_file(fh, policy=compat32)
     out: List[str] = []
@@ -252,7 +295,7 @@ def attachments_text(svc, open_fn, cap_chars: int) -> str:
         except Exception:  # noqa: BLE001
             filename = ""
         disp = part.get_content_disposition()
-        if not _is_attachment(ctype, disp, filename) or not attachtext.kind_of(filename, ctype):
+        if not _is_attachment(ctype, disp, filename) or not attachtext.kind_of(filename, ctype, ocr=bool(ocr)):
             continue
         if ctype == "message/rfc822":
             payload = part.as_bytes() if not part.is_multipart() else b""
@@ -266,7 +309,7 @@ def attachments_text(svc, open_fn, cap_chars: int) -> str:
             payload = _decoded_payload(part) or b""
         if not payload or len(payload) > max_one:
             continue
-        text = attachtext.extract(filename, ctype, payload, left)
+        text = attachtext.extract(filename, ctype, payload, left, time_s, ocr=ocr)
         if text:
             out.append(text)
             left -= len(text)
@@ -331,6 +374,7 @@ def index_pending(svc, *, progress=None, cancelled=None, event=None, max_seconds
                         "ORDER BY id LIMIT ?", (last, BATCH))
         if not rows:
             break
+        batch_start = last
         batch: List[Tuple] = []
         for row in rows:
             fields, error = _row_fields(svc, row, with_body, body_cap, attach_cap)
@@ -348,6 +392,12 @@ def index_pending(svc, *, progress=None, cancelled=None, event=None, max_seconds
                              f"VALUES(?,?,?,?,?)", batch)
             conn.execute("INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET "
                          "value=excluded.value", (_META_WATERMARK, str(last)))
+            if attach_cap:
+                # вложения этой порции прочитаны: если до неё всё дочитано — отметка идёт следом
+                mark = conn.execute("SELECT value FROM meta WHERE key=?", (_META_ATTACH,)).fetchone()
+                if int(mark[0] if mark else 0) >= batch_start:
+                    conn.execute("INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET "
+                                 "value=excluded.value", (_META_ATTACH, str(last)))
         done += len(batch)
         if progress is not None:
             progress(done, max(total_pending, done), f"Проиндексировано писем: {done} из {total_pending}")
@@ -437,6 +487,76 @@ def reindex_accounts(svc, account_ids: Iterable[int], *, progress=None, cancelle
             on_account(account_id, dict(stat))
     return {"available": True, "indexed": done, "errors": errors, "total": total, "accounts": per,
             "stopped": stopped, "bodies": with_body}
+
+
+#: докуда дочитан текст вложений уже проиндексированных писем (1.21.0)
+_META_ATTACH = "search_attach_backfill"
+
+
+def attach_backfill_pending(db) -> int:
+    """Сколько проиндексированных писем с вложениями ждут чтения текста вложений."""
+    if not fts_available(db):
+        return 0
+    last = int(db.get_meta(_META_ATTACH) or 0)
+    watermark = int(db.get_meta(_META_WATERMARK) or 0)
+    return int(db.scalar("SELECT COUNT(*) FROM messages WHERE has_attach=1 AND id > ? AND id <= ?",
+                         (last, watermark)) or 0)
+
+
+def backfill_attachments(svc, *, progress=None, cancelled=None, event=None,
+                         max_seconds: Optional[float] = None) -> Dict:
+    """Дочитать текст вложений писем, проиндексированных без него (1.21.0).
+
+    Архив, проиндексированный до 1.20.0 (или с выключенным ``search.index_attachments``), не нужно
+    перестраивать целиком: перечитываются только письма с вложениями, по порядку, с отметкой — прерванное
+    задание продолжит с того же места. Новые письма общий проход индексирует сам, вместе с вложениями.
+    """
+    db = svc.db
+    if not fts_available(db):
+        return {"available": False, "indexed": 0, "errors": 0, "pending": 0}
+    if not attachments_enabled(svc):
+        return {"available": True, "indexed": 0, "errors": 0, "pending": attach_backfill_pending(db),
+                "disabled": True}
+    with_body = bodies_enabled(svc)
+    body_cap = _body_cap(svc)
+    attach_cap = _attach_cap(svc)
+    gen = db.get_meta(_META_GEN) or "0"
+    last = int(db.get_meta(_META_ATTACH) or 0)
+    total = attach_backfill_pending(db)
+    done = errors = 0
+    started = time.time()
+    while True:
+        if cancelled is not None and cancelled():
+            break
+        if max_seconds is not None and time.time() - started > max_seconds:
+            break
+        watermark = int(db.get_meta(_META_WATERMARK) or 0)
+        rows = db.query("SELECT id, account_id, stored_path, subject, from_addr, size, has_attach FROM messages "
+                        "WHERE has_attach=1 AND id > ? AND id <= ? ORDER BY id LIMIT ?", (last, watermark, BATCH))
+        if not rows:
+            break
+        batch: List[Tuple] = []
+        for row in rows:
+            fields, error = _row_fields(svc, row, with_body, body_cap, attach_cap)
+            last = int(row["id"])
+            if error:
+                errors += 1                       # файл не прочитан — прежнюю запись индекса не трогаем
+                if errors <= 20 and event is not None:
+                    event("WARNING", f"Письмо #{row['id']}: вложения не прочитаны: {error}")
+                continue
+            batch.append((row["id"], fields["subject"], fields["addrs"], fields["attach"], fields["body"]))
+        with db.transaction() as conn:
+            now_gen = conn.execute("SELECT value FROM meta WHERE key=?", (_META_GEN,)).fetchone()
+            if (now_gen[0] if now_gen else "0") != gen:
+                break                             # индекс перестроили — он и так прочитает вложения
+            conn.executemany(f"INSERT OR REPLACE INTO {FTS_TABLE}(rowid, subject, addrs, attach, body) "
+                             f"VALUES(?,?,?,?,?)", batch)
+            conn.execute("INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET "
+                         "value=excluded.value", (_META_ATTACH, str(last)))
+        done += len(batch)
+        if progress is not None:
+            progress(done + errors, max(total, done + errors), f"Прочитаны вложения писем: {done} из {total}")
+    return {"available": True, "indexed": done, "errors": errors, "pending": attach_backfill_pending(db)}
 
 
 # ---------------------------------------------------------------------------

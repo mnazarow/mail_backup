@@ -651,8 +651,8 @@ def webmail_draft_archived(request: Request, draft_id: int, body: ArchivedBody, 
 def webmail_smime(request: Request, account_id: int, user: dict = Depends(_user)):
     svc = _svc(request)
     acc = _account(svc, user, account_id)
-    return {"key": wsec.key_info(svc, acc),
-            "certs": int(svc.db.scalar("SELECT COUNT(*) FROM webmail_smime_certs") or 0)}
+    return {"key": wsec.key_info(svc, acc), "personal": _is_mailbox(user),
+            "certs": wsec.certs_count(svc, acc if _is_mailbox(user) else None)}
 
 
 @router.post("/smime/key")
@@ -676,20 +676,42 @@ def webmail_smime_key_delete(request: Request, account_id: int, user: dict = Dep
 
 
 @router.get("/smime/certs")
-def webmail_smime_certs(request: Request, q: str = "", user: dict = Depends(_user)):
-    return {"items": wsec.list_certs(_svc(request), q[:200])}
+def webmail_smime_certs(request: Request, q: str = "", account_id: Optional[int] = None, user: dict = Depends(_user)):
+    """Общий справочник сертификатов — персоналу; сотруднику — только личный список его ящика (1.21.0)."""
+    svc = _svc(request)
+    if _is_mailbox(user):
+        if account_id is None:
+            raise HTTPException(400, "Укажите ящик.")
+        return {"items": wsec.list_certs(svc, q[:200], _account(svc, user, account_id)), "personal": True}
+    return {"items": wsec.list_certs(svc, q[:200]), "personal": False}
 
 
 @router.post("/smime/certs")
-def webmail_smime_cert_upload(request: Request, file: UploadFile = File(...), user: dict = Depends(_user)):
-    return wsec.import_cert(_svc(request), file.file.read(64 * 1024), _actor(user))
+def webmail_smime_cert_upload(request: Request, file: UploadFile = File(...), account_id: Optional[int] = Form(None),
+                              user: dict = Depends(_user)):
+    svc = _svc(request)
+    data = file.file.read(64 * 1024)
+    if _is_mailbox(user):
+        if account_id is None:
+            raise HTTPException(400, "Укажите ящик.")
+        return wsec.import_cert(svc, data, _actor(user), _account(svc, user, account_id))
+    if user.get("role") != "admin":
+        raise HTTPException(403, "Пополнять общий справочник сертификатов может администратор.")
+    return wsec.import_cert(svc, data, _actor(user))
 
 
 @router.delete("/smime/certs")
-def webmail_smime_cert_delete(request: Request, email: str, user: dict = Depends(_user)):
+def webmail_smime_cert_delete(request: Request, email: str, account_id: Optional[int] = None,
+                              user: dict = Depends(_user)):
+    svc = _svc(request)
     if _is_mailbox(user):
-        raise HTTPException(403, "Удалять сертификаты получателей может администратор.")
-    wsec.delete_cert(_svc(request), email[:320], _actor(user))
+        if account_id is None:
+            raise HTTPException(403, "Удалять сертификаты общего справочника может администратор.")
+        wsec.delete_cert(svc, email[:320], _actor(user), _account(svc, user, account_id))
+        return {"ok": True}
+    if user.get("role") != "admin":
+        raise HTTPException(403, "Удалять сертификаты общего справочника может администратор.")
+    wsec.delete_cert(svc, email[:320], _actor(user))
     return {"ok": True}
 
 
@@ -698,7 +720,9 @@ def webmail_smime_recipients(request: Request, account_id: int, emails: str = ""
     from email.utils import getaddresses
     svc = _svc(request)
     acc = _account(svc, user, account_id)
-    addrs = [a for _n, a in getaddresses([emails[:20000]]) if a]
+    # пустые части («a@b, , ») строгий разбор Python 3.13 считает ошибкой и не возвращает ни одного адреса
+    emails = ",".join(x for x in emails[:20000].split(",") if x.strip())
+    addrs = [a for _n, a in getaddresses([emails]) if a]
     return wsec.recipients_state(svc, acc, addrs)
 
 
@@ -861,7 +885,14 @@ def webmail_book_add(request: Request, body: ContactBody, user: dict = Depends(_
     svc = _svc(request)
     acc = _account(svc, user, body.account_id)
     _require_act(svc, user, acc)
-    return wt.save_contact(svc, int(acc.id), body.model_dump())
+    out = wt.save_contact(svc, int(acc.id), body.model_dump())
+    try:                                          # и в адресную книгу сервера, если она подключена (1.21.0)
+        if wdav.push_contact(svc, acc, name=body.name, email=body.email, phone=body.phone, org=body.company,
+                             note=body.note):
+            out = {**out, "server": True}
+    except ValidationError as exc:
+        out = {**out, "server_error": exc.message}
+    return out
 
 
 @router.put("/book/{contact_id}")
@@ -1196,11 +1227,12 @@ def webmail_dav_contacts(request: Request, body: AccountOnly, user: dict = Depen
 
 
 @router.get("/calendar")
-def webmail_calendar(request: Request, account_id: int, days: int = 30, user: dict = Depends(_user)):
+def webmail_calendar(request: Request, account_id: int, days: int = 30, since: str = "", until: str = "",
+                     user: dict = Depends(_user)):
     svc = _svc(request)
     acc = _account(svc, user, account_id)
     _require_online(svc, user, acc)
-    return {"items": wdav.events(svc, acc, days)}
+    return {"items": wdav.events(svc, acc, days, since[:40], until[:40])}
 
 
 class EventBody(BaseModel):
@@ -1220,6 +1252,30 @@ def webmail_calendar_add(request: Request, body: EventBody, user: dict = Depends
     _require_act(svc, user, acc)
     return wdav.add_event(svc, acc, summary=body.summary, start=body.start, end=body.end, location=body.location,
                           description=body.description, all_day=body.all_day, actor=_actor(user))
+
+
+class EventUpdate(EventBody):
+    href: str = Field(max_length=2000)
+    etag: str = Field(default="", max_length=300)
+
+
+@router.put("/calendar")
+def webmail_calendar_update(request: Request, body: EventUpdate, user: dict = Depends(_user)):
+    svc = _svc(request)
+    acc = _account(svc, user, body.account_id)
+    _require_act(svc, user, acc)
+    return wdav.update_event(svc, acc, body.href, body.etag, summary=body.summary, start=body.start, end=body.end,
+                             location=body.location, description=body.description, all_day=body.all_day,
+                             actor=_actor(user))
+
+
+@router.delete("/calendar")
+def webmail_calendar_delete(request: Request, account_id: int, href: str, etag: str = "",
+                            user: dict = Depends(_user)):
+    svc = _svc(request)
+    acc = _account(svc, user, account_id)
+    _require_act(svc, user, acc)
+    return wdav.delete_event(svc, acc, href[:2000], etag[:300], actor=_actor(user))
 
 
 @router.get("/invite.ics")

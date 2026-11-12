@@ -9,6 +9,7 @@ import json
 import os
 import sqlite3
 import threading
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -63,7 +64,8 @@ MIN_SCHEDULE_INTERVAL_S = 60
 SECRET_SETTINGS = {"notifications.smtp_password", "notifications.telegram_bot_token", "ldap.bind_password",
                    "notifications.webhook_secret", "employees.source_url_password",
                    "replica.s3_secret_key", "monitoring.metrics_token", "mailadmin.password",
-                   "axigen.admin_password", "axigen.ftp_password"}
+                   "axigen.admin_password", "axigen.ftp_password",
+                   "journal.auth_password"}
 #: Секрет, который уходит на адрес из настроек: при смене адреса его нужно ввести заново
 #: (иначе администратор архива мог бы перенаправить пароль администратора почты на свой сервер).
 SECRET_BOUND_TO = {"axigen.admin_password": "axigen.host", "axigen.ftp_password": "axigen.host",
@@ -1873,6 +1875,34 @@ def _attachment_disposition(filename: str) -> str:
     return f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{quote(name)}'
 
 
+#: просмотры писем персоналом, уже записанные в аудит: (пользователь, ящик, письмо, что) → время
+_VIEWS_SEEN: Dict[tuple, float] = {}
+_VIEWS_LOCK = threading.Lock()
+VIEW_AUDIT_TTL_S = 3600
+
+
+def _audit_view(svc, user: dict, account_id: int, pk: int, what: str) -> None:
+    """Кто из персонала читал чужие письма (1.21.0): просмотр, вложение, исходный файл — в аудит.
+
+    Сотрудник в своём ящике не записывается; одно и то же действие с письмом — не чаще раза в час.
+    """
+    if user.get("role") == "mailbox" or not bool(svc.rt("audit", "message_views")
+                                                 if svc.rt("audit", "message_views") is not None else True):
+        return
+    key = (user.get("username") or "", int(account_id), int(pk), what)
+    now = time.monotonic()
+    with _VIEWS_LOCK:
+        if _VIEWS_SEEN.get(key, -1e18) > now - VIEW_AUDIT_TTL_S:
+            return
+        _VIEWS_SEEN[key] = now
+        if len(_VIEWS_SEEN) > 50000:
+            for k in [k for k, t in _VIEWS_SEEN.items() if t <= now - VIEW_AUDIT_TTL_S]:
+                _VIEWS_SEEN.pop(k, None)
+    acc = svc.db.get_account(int(account_id))
+    svc.db.add_audit(user.get("username") or "", "message_view",
+                     f"ящик «{acc.name if acc else account_id}»: письмо #{int(pk)} — {what}")
+
+
 @router.get("/accounts/{account_id}/messages/{pk}")
 def read_mailbox_message(request: Request, account_id: int, pk: int, user: dict = Depends(auth_mod.require_user)):
     svc = svc_dep(request)
@@ -1890,6 +1920,9 @@ def read_mailbox_message(request: Request, account_id: int, pk: int, user: dict 
     parsed["size_h"] = human_size(row["size"] or size)
     parsed["gone"] = bool(row["gone"])          # письма в этой папке на сервере больше нет (1.17.0)
     parsed["date"] = row["internaldate"]
+    from ..journal import receipt as _journal_receipt
+    parsed["journal"] = _journal_receipt(svc, pk) if user.get("role") != "mailbox" else None   # откуда (1.21.0)
+    _audit_view(svc, user, account_id, pk, "просмотр")
     return parsed
 
 
@@ -1911,6 +1944,7 @@ def download_attachment(request: Request, account_id: int, pk: int, idx: int,
     if att is None:
         raise HTTPException(404, "Вложение не найдено")
     filename, ctype, chunks, length = att
+    _audit_view(svc, user, account_id, pk, f"вложение «{(filename or '')[:120]}»")
     headers = {"Content-Disposition": _attachment_disposition(filename)}
     if length is not None:
         headers["Content-Length"] = str(length)
@@ -1927,6 +1961,7 @@ def download_message_raw(request: Request, account_id: int, pk: int, user: dict 
         raise HTTPException(404, "Письмо не найдено")
     stored = row["stored_path"]
     size = svc.store.message_size(account_id, stored)
+    _audit_view(svc, user, account_id, pk, "скачан исходный файл .eml")
     # Файл открывается до ответа: без ключа или при пропавшем файле клиент
     # получает понятную ошибку, а не «200 OK» с оборванным телом.
     chunks = open_source_stream(lambda: svc.store.open_message(account_id, stored))
@@ -2523,7 +2558,7 @@ def update_settings(request: Request, body: SettingsBody, user: dict = Depends(a
         # Расписания проверяем сразу: иначе кривое выражение обнаружилось бы
         # только в логах планировщика, а задание молча не запускалось бы.
         if full_key in ("employees.cron", "employees.account_schedule_cron", "retention.cron",
-                        "replica.cron", "notifications.summary_cron", "axigen.sync_cron"):
+                        "replica.cron", "notifications.summary_cron", "axigen.sync_cron", "drill.cron"):
             _validate_cron(str(coerced or ""))
         if coerced != svc.rt(*full_key.split(".", 1)) or full_key in SECRET_SETTINGS:
             new_values[full_key] = coerced
@@ -2802,7 +2837,24 @@ def search_status(request: Request, user: dict = Depends(auth_mod.require_user))
                 "pending": 0, "indexed": 0, "total": 0}
     job = next((j for j in svc.db.active_jobs() if j["type"] == JobType.SEARCH_INDEX), None)
     data["active_job"] = job["id"] if job else None
+    job = next((j for j in svc.db.active_jobs() if j["type"] == JobType.SEARCH_ATTACH), None)
+    data["attach_job"] = job["id"] if job else None
     return data
+
+
+@router.post("/search/attachments")
+def search_attachments(request: Request, user: dict = Depends(auth_mod.require_admin)):
+    """Дочитать текст вложений уже проиндексированных писем — без перестройки индекса (1.21.0)."""
+    from ..search import attach_backfill_pending, fts_available
+    svc = svc_dep(request)
+    if not fts_available(svc.db):
+        raise ValidationError("Полнотекстовый поиск недоступен: SQLite собран без FTS5.")
+    job = next((j for j in svc.db.active_jobs() if j["type"] == JobType.SEARCH_ATTACH), None)
+    if job is not None:
+        return {"ok": True, "job_id": job["id"], "already": True}
+    job_id = svc.queue.enqueue(JobType.SEARCH_ATTACH, None, {}, priority=8, created_by=user["username"])
+    svc.db.add_audit(user["username"], "search_attachments", f"писем с вложениями: {attach_backfill_pending(svc.db)}")
+    return {"ok": True, "job_id": job_id}
 
 
 @router.post("/search/reindex")
@@ -2936,6 +2988,45 @@ def journal_status(request: Request, user: dict = Depends(auth_mod.require_admin
     """Приём журналирования по SMTP: работает ли, сколько писем принято и сохранено."""
     from ..journal import status
     return status(svc_dep(request))
+
+
+@router.get("/drill")
+def drill_status(request: Request, user: dict = Depends(auth_mod.require_admin)):
+    """Проверка восстановления: последний результат и идёт ли сейчас (1.21.0)."""
+    svc = svc_dep(request)
+    row = svc.db.query_one("SELECT id, status, finished_at, summary FROM jobs WHERE type=? ORDER BY id DESC LIMIT 1",
+                           (JobType.RESTORE_DRILL,))
+    active = next((j["id"] for j in svc.db.active_jobs() if j["type"] == JobType.RESTORE_DRILL), None)
+    return {"last": dict(row) if row is not None else None, "active_job": active}
+
+
+@router.post("/drill/run")
+def drill_run(request: Request, user: dict = Depends(auth_mod.require_admin)):
+    svc = svc_dep(request)
+    active = next((j["id"] for j in svc.db.active_jobs() if j["type"] == JobType.RESTORE_DRILL), None)
+    if active:
+        return {"ok": True, "job_id": active, "already": True}
+    job_id = svc.queue.enqueue(JobType.RESTORE_DRILL, None, {}, priority=6, created_by=user["username"])
+    return {"ok": True, "job_id": job_id}
+
+
+@router.get("/audit/forward")
+def audit_forward_status(request: Request, user: dict = Depends(auth_mod.require_admin)):
+    """Пересылка аудита в syslog / SIEM: очередь, отправлено, последняя ошибка (1.21.0)."""
+    svc = svc_dep(request)
+    fwd = getattr(svc, "audit_forwarder", None)
+    return fwd.status() if fwd is not None else {"enabled": False, "queued": 0, "sent": 0, "dropped": 0,
+                                                 "last_error": ""}
+
+
+@router.post("/audit/forward/test")
+def audit_forward_test(request: Request, user: dict = Depends(auth_mod.require_admin)):
+    """Отправить на сервер журналов пробную запись — с сохранёнными настройками."""
+    from ..auditlog import test_send
+    svc = svc_dep(request)
+    res = test_send(svc)
+    svc.db.add_audit(user["username"], "audit_syslog_test", "успешно" if res["ok"] else res["error"][:300])
+    return res
 
 
 @router.post("/notifications/test")
@@ -3672,7 +3763,8 @@ def list_users(request: Request, user: dict = Depends(auth_mod.require_admin)):
     svc = svc_dep(request)
     return [{"id": r["id"], "username": r["username"], "role": r["role"], "created_at": r["created_at"],
              "last_login": r["last_login"], "disabled": bool(r["disabled"]),
-             "totp_enabled": bool(r["totp_enabled"]), "auth_source": _row_get(r, "auth_source") or "local"}
+             "totp_enabled": bool(r["totp_enabled"]), "auth_source": _row_get(r, "auth_source") or "local",
+             "disabled_by": _row_get(r, "disabled_by") or ""}
             for r in svc.db.list_users()]
 
 

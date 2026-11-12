@@ -37,6 +37,7 @@ class CaseBody(BaseModel):
     date_from: str = Field("", max_length=20)
     date_to: str = Field("", max_length=20)
     hold: bool = True
+    hold_scope: str = Field("all", max_length=16)
     account_ids: List[int] = Field(default_factory=list, max_length=20000)
 
 
@@ -47,6 +48,7 @@ class CaseUpdate(BaseModel):
     date_from: Optional[str] = Field(None, max_length=20)
     date_to: Optional[str] = Field(None, max_length=20)
     hold: Optional[bool] = None
+    hold_scope: Optional[str] = Field(None, max_length=16)
 
 
 class CustodiansBody(BaseModel):
@@ -63,8 +65,15 @@ def list_cases(request: Request, user: dict = Depends(auth_mod.require_admin)):
 def create_case(request: Request, body: CaseBody, user: dict = Depends(auth_mod.require_admin)):
     case_id = cs.create_case(_svc(request), user["username"], name=body.name, description=body.description,
                              query=body.query, date_from=body.date_from, date_to=body.date_to, hold=body.hold,
-                             account_ids=body.account_ids)
+                             account_ids=body.account_ids, hold_scope=body.hold_scope)
     return {"ok": True, "id": case_id}
+
+
+@router.get("/signing-key")
+def signing_key(request: Request, user: dict = Depends(auth_mod.require_admin)):
+    """Открытый ключ подписи выгрузок и его отпечаток — сообщить получателям выгрузок (1.21.0)."""
+    info = cs.public_key_info(_svc(request))
+    return {"pem": info["pem"], "fingerprint": info["fingerprint"]}
 
 
 @router.get("/{case_id}")
@@ -99,11 +108,18 @@ def messages(request: Request, case_id: int, offset: int = 0, limit: int = cs.PA
     return cs.list_messages(svc, case_id, offset, limit)
 
 
+class ExportBody(BaseModel):
+    format: str = Field("eml", max_length=8)
+    password: str = Field("", max_length=200)
+
+
 @router.post("/{case_id}/export")
-def export(request: Request, case_id: int, user: dict = Depends(auth_mod.require_admin)):
+def export(request: Request, case_id: int, body: Optional[ExportBody] = None,
+           user: dict = Depends(auth_mod.require_admin)):
     svc = _svc(request)
     _get(svc, case_id)
-    return {"ok": True, **cs.start_export(svc, user["username"], case_id)}
+    body = body or ExportBody()
+    return {"ok": True, **cs.start_export(svc, user["username"], case_id, fmt=body.format, password=body.password)}
 
 
 @router.get("/{case_id}/exports/{export_id}/download")

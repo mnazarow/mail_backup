@@ -155,3 +155,70 @@ def test_starttls_required(accs, tmp_path):
         assert len(_folder_ids(svc, a)) == 1
     finally:
         journal.stop()
+
+
+def test_auth_source_and_mapped_ipv4(accs, tmp_path):
+    """SMTP AUTH после STARTTLS, источник письма записан, ::ffff:IPv4 сверяется с IPv4-сетями (1.21.0)."""
+    svc, a, b, c, d = accs
+    port = _free_port()
+    cert, key = _cert_files(tmp_path)
+    for k, v in {"enabled": True, "port": port, "tls_cert": cert, "tls_key": key, "auth_user": "postfix",
+                 "auth_password": "Journal-Pass-1"}.items():
+        svc.set_rt("journal", k, v)
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        journal.ensure(svc)
+        with smtplib.SMTP("127.0.0.1", port, timeout=10) as s:
+            s.ehlo("mx1.x.ru")
+            assert not s.has_extn("auth")                      # без шифрования вход не предлагается
+            assert s.mail("client@ext.ru")[0] == 530
+            s.rset()
+            s.starttls(context=ctx)
+            s.ehlo("mx1.x.ru")
+            assert s.has_extn("auth")
+            assert s.mail("client@ext.ru")[0] == 530           # без входа — нельзя
+            s.rset()
+            with pytest.raises(smtplib.SMTPAuthenticationError):
+                s.login("postfix", "wrong")
+            s.login("postfix", "Journal-Pass-1")
+            s.sendmail("client@ext.ru", ["journal@x.ru"], _msg(mid="<auth1@ext>").as_bytes())
+        pk = _folder_ids(svc, a)[0]
+        rec = journal.receipt(svc, pk)
+        assert rec["ip"] == "127.0.0.1" and rec["helo"] == "mx1.x.ru" and rec["auth_user"] == "postfix"
+        assert rec["tls"] == 1 and rec["env_from"] == "client@ext.ru"
+    finally:
+        journal.stop()
+    svc.set_rt("journal", "allowed_ips", ["10.0.0.0/8"])
+    assert journal._allowed(svc, "::ffff:10.1.2.3") and not journal._allowed(svc, "::ffff:192.168.1.1")
+
+
+def test_long_line_with_dot_is_not_unstuffed(accs):
+    """Строка длиннее 1 МБ читается частями — точка в начале второй части остаётся (1.21.0)."""
+    svc, a, b, c, d = accs
+    port = _free_port()
+    svc.set_rt("journal", "enabled", True)
+    svc.set_rt("journal", "port", port)
+    body = "A" * (1024 * 1024 - 1) + ".B"                        # вторая часть начинается с точки
+    raw = (b"From: client@ext.ru\r\nTo: ivanov@x.ru\r\nSubject: Long\r\nMessage-ID: <long@ext>\r\n\r\n"
+           + body.encode() + b"\r\n")
+    try:
+        journal.ensure(svc)
+        with socket.create_connection(("127.0.0.1", port), timeout=10) as sock:
+            f = sock.makefile("rwb")
+            f.readline()
+            for cmd in (b"EHLO t\r\n", b"MAIL FROM:<client@ext.ru>\r\n", b"RCPT TO:<journal@x.ru>\r\n", b"DATA\r\n"):
+                f.write(cmd)
+                f.flush()
+                while True:
+                    line = f.readline()
+                    if line[3:4] != b"-":
+                        break
+            f.write(raw + b".\r\n")
+            f.flush()
+            assert f.readline().startswith(b"250")
+        row = svc.db.get_message(_folder_ids(svc, a)[0])
+        assert svc.store.read_message(a, row["stored_path"]).endswith(b"A.B\r\n")
+    finally:
+        journal.stop()

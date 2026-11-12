@@ -15,7 +15,10 @@ from __future__ import annotations
 
 import html as html_mod
 import io
+import os
 import re
+import threading
+import time
 import zipfile
 import zlib
 from typing import Dict, List, Optional, Tuple
@@ -23,6 +26,21 @@ from typing import Dict, List, Optional, Tuple
 from .logging_setup import get_logger
 
 log = get_logger("attachtext")
+
+#: предел времени на одно вложение (1.21.0): объём и число операций ограничены и раньше, но
+#: «тяжёлый» PDF мог занимать индексацию на секунды; по истечении — то, что успели прочитать
+DEFAULT_TIME_S = 10.0
+_deadline = threading.local()
+
+
+class _Timeout(Exception):
+    pass
+
+
+def _tick() -> None:
+    until = getattr(_deadline, "at", None)
+    if until is not None and time.monotonic() > until:
+        raise _Timeout()
 
 #: Сколько распакованных данных читать из одного файла (защита от «zip-бомб»).
 MAX_UNPACKED = 64 * 1024 * 1024
@@ -41,21 +59,108 @@ _CTYPE_EXT = {"application/pdf": ".pdf", "text/plain": ".txt", "text/csv": ".csv
               "application/vnd.oasis.opendocument.presentation": ".odp"}
 
 
-def kind_of(filename: str, ctype: str) -> str:
-    """Расширение, по которому разбирать вложение ('' — не поддерживается)."""
+#: картинки, которые читаются распознаванием текста (OCR, 1.21.0)
+IMAGE_EXT = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".webp"}
+_IMAGE_CTYPES = {"image/png": ".png", "image/jpeg": ".jpg", "image/tiff": ".tif", "image/bmp": ".bmp",
+                 "image/gif": ".gif", "image/webp": ".webp"}
+
+
+def kind_of(filename: str, ctype: str, ocr: bool = False) -> str:
+    """Расширение, по которому разбирать вложение ('' — не поддерживается). ``ocr`` — и картинки."""
     name = (filename or "").lower().strip()
     dot = name.rfind(".")
     ext = name[dot:] if dot >= 0 else ""
-    if ext in SUPPORTED:
+    if ext in SUPPORTED or (ocr and ext in IMAGE_EXT):
         return ext
-    return _CTYPE_EXT.get((ctype or "").lower().split(";")[0].strip(), "")
+    ct = (ctype or "").lower().split(";")[0].strip()
+    return _CTYPE_EXT.get(ct, "") or (_IMAGE_CTYPES.get(ct, "") if ocr else "")
 
 
-def extract(filename: str, ctype: str, data: bytes, cap_chars: int = 65536) -> str:
-    """Текст вложения (обрезанный до ``cap_chars``) или ''."""
-    kind = kind_of(filename, ctype)
+# ---------------------------------------------------------------------------
+#  Распознавание текста (OCR) — по желанию, программами tesseract и pdftoppm (1.21.0)
+# ---------------------------------------------------------------------------
+def ocr_available() -> Dict[str, bool]:
+    import shutil
+    return {"tesseract": bool(shutil.which("tesseract")), "pdftoppm": bool(shutil.which("pdftoppm"))}
+
+
+def _run(cmd: List[str], data: Optional[bytes], timeout: float) -> bytes:
+    import subprocess
+    r = subprocess.run(cmd, input=data, capture_output=True, timeout=max(1.0, timeout), check=False)
+    return r.stdout if r.returncode == 0 else b""
+
+
+def _left() -> float:
+    until = getattr(_deadline, "at", None)
+    return max(0.5, until - time.monotonic()) if until is not None else 30.0
+
+
+def ocr_image(data: bytes, lang: str = "rus+eng") -> str:
+    """Текст картинки: tesseract читает её со стандартного ввода."""
+    import shutil
+    exe = shutil.which("tesseract")
+    if not exe or not data:
+        return ""
+    lang = re.sub(r"[^a-z_+]", "", (lang or "rus+eng").lower()) or "eng"
+    return _decode(_run([exe, "stdin", "stdout", "-l", lang, "--psm", "3"], data, _left()))
+
+
+def ocr_pdf(data: bytes, lang: str = "rus+eng", max_pages: int = 5) -> str:
+    """Скан в PDF (страницы без текста): pdftoppm делает картинки страниц, tesseract их читает."""
+    import shutil
+    import tempfile
+    if not shutil.which("pdftoppm") or not shutil.which("tesseract"):
+        return ""
+    texts: List[str] = []
+    with tempfile.TemporaryDirectory(prefix="ma-ocr-") as tmp:
+        src = os.path.join(tmp, "in.pdf")
+        with open(src, "wb") as fh:
+            fh.write(data)
+        _run([shutil.which("pdftoppm") or "pdftoppm", "-r", "200", "-gray", "-png", "-f", "1", "-l",
+              str(max(1, int(max_pages))), src, os.path.join(tmp, "p")], None, _left())
+        for name in sorted(n for n in os.listdir(tmp) if n.endswith(".png")):
+            _tick()
+            with open(os.path.join(tmp, name), "rb") as fh:
+                texts.append(ocr_image(fh.read(), lang))
+    return "\n".join(t for t in texts if t.strip())
+
+
+def extract(filename: str, ctype: str, data: bytes, cap_chars: int = 65536, time_s: float = DEFAULT_TIME_S,
+            ocr: Optional[Dict] = None) -> str:
+    """Текст вложения (обрезанный до ``cap_chars``) или ''. Дольше ``time_s`` секунд — что успели прочитать.
+
+    ``ocr`` — ``{"lang": "rus+eng", "max_pages": 5}``: распознавать картинки и PDF без текста (сканы).
+    """
+    kind = kind_of(filename, ctype, ocr=bool(ocr))
     if not kind or not data:
         return ""
+    started = time.monotonic()
+    _deadline.at = started + max(0.1, float(time_s or DEFAULT_TIME_S))
+    try:
+        if ocr and kind in IMAGE_EXT:
+            try:
+                text = ocr_image(data, ocr.get("lang") or "rus+eng")
+            except Exception as exc:  # noqa: BLE001 - распознавание — дополнение
+                log.debug("OCR %s: %s", filename, exc)
+                text = ""
+            return _tidy(text, cap_chars)
+        text = _extract(filename, kind, data, cap_chars)
+        if ocr and kind == ".pdf" and len(text.strip()) < 20:
+            try:
+                text = _tidy(ocr_pdf(data, ocr.get("lang") or "rus+eng", int(ocr.get("max_pages") or 5)), cap_chars)
+            except _Timeout:
+                log.warning("Распознавание скана «%s» не уложилось в отведённое время", filename)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("OCR %s: %s", filename, exc)
+        return text
+    finally:
+        _deadline.at = None
+        spent = time.monotonic() - started
+        if spent > 2:
+            log.info("Текст вложения «%s» (%s КБ) читался %.1f с", filename, len(data) // 1024, spent)
+
+
+def _extract(filename: str, kind: str, data: bytes, cap_chars: int) -> str:
     try:
         if kind in TEXT_EXT:
             text = _decode(data[:cap_chars * 4])
@@ -75,9 +180,16 @@ def extract(filename: str, ctype: str, data: bytes, cap_chars: int = 65536) -> s
             text = pdf_text(data)
         else:
             text = ""
+    except _Timeout:
+        log.warning("Текст вложения «%s» не прочитан за отведённое время (search.attachment_time_s)", filename)
+        return ""
     except Exception as exc:  # noqa: BLE001 - битый файл не должен ломать индексацию
         log.debug("Текст вложения %s не извлечён: %s", filename, exc)
         return ""
+    return _tidy(text, cap_chars)
+
+
+def _tidy(text: str, cap_chars: int) -> str:
     text = re.sub(r"[ \t\r\f\v ]+", " ", text or "")
     text = re.sub(r" *\n[ \n]*", "\n", text).strip()
     return text[:cap_chars]
@@ -211,6 +323,8 @@ class _Pdf:
         data = self.data
         positions = [(int(m.group(1)), m.end()) for m in _OBJ_RE.finditer(data)]
         for i, (num, start) in enumerate(positions):
+            if not i & 0xFF:
+                _tick()
             end = data.find(b"endobj", start)
             if end < 0:
                 end = positions[i + 1][1] if i + 1 < len(positions) else len(data)
@@ -616,6 +730,8 @@ def _page_text(content: bytes, fonts: Dict[bytes, _Font], budget: List[int]) -> 
         cur += font.advance(raw) / 1000.0 * size
 
     while i < n and budget[0] > 0:
+        if not budget[0] & 0x7FF:
+            _tick()
         m = _TOKEN_RE.search(content, i)
         if not m:
             break
@@ -724,11 +840,15 @@ def pdf_text(data: bytes) -> str:
     pdf = _Pdf(data)
     budget = [MAX_PDF_OPS]
     texts: List[str] = []
-    for page in pdf.pages():
-        content = pdf.contents(page)
-        if not content:
-            continue
-        texts.append(_page_text(content, pdf.fonts(pdf.resources(page)), budget))
-        if budget[0] <= 0:
-            break
+    try:
+        for page in pdf.pages():
+            _tick()
+            content = pdf.contents(page)
+            if not content:
+                continue
+            texts.append(_page_text(content, pdf.fonts(pdf.resources(page)), budget))
+            if budget[0] <= 0:
+                break
+    except _Timeout:
+        log.warning("PDF читался дольше отведённого — в индекс попадёт начало (%s стр.)", len(texts))
     return "\n".join(texts)

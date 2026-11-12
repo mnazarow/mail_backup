@@ -478,6 +478,8 @@ table.rp-cmp tr.rp-group td { background:var(--bg-soft); font-weight:600; font-s
 .compose-body.sig { flex: none; min-height: 70px; max-height: 200px; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px; background: var(--bg-elev); }
 .compose-atts { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; padding: 4px 0; }
 .compose-atts:empty { display: none; }
+.compose-smime { display: flex; flex-direction: column; gap: 4px; padding: 4px 0; }
+.compose-smime .attach-chip { white-space: normal; }
 .compose-atts .x { border: 0; background: none; color: var(--text-dim); cursor: pointer; font-size: 1rem; padding: 0 2px; }
 .compose-foot { display: flex; align-items: center; gap: 8px; padding-top: 8px; border-top: 1px solid var(--border); }
 .compose-ac { position: absolute; z-index: 3; max-height: 240px; overflow-y: auto; background: var(--bg-elev); border: 1px solid var(--border); border-radius: var(--radius-sm); box-shadow: var(--shadow); }
@@ -767,3 +769,15 @@ table.tbl select[data-role]:focus { outline: none; border-color: var(--primary);
 @media (max-width: 640px) { .mail-event { flex-direction: column; gap: 2px; } .mail-event .w { flex: none; } }
 .case-exp td { white-space: nowrap; }
 .case-exp tr.case-sha td { white-space: normal; padding-top: 0; border-top: none; }
+
+/* Календарь: вид «Месяц» (1.21.0) */
+.mail-event .a { margin-left: auto; white-space: nowrap; }
+.cal-grid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 2px; margin-top: 8px; }
+.cal-h { font-size: .78rem; color: var(--text-dim); text-align: center; padding: 2px 0; }
+.cal-d { min-height: 84px; border: 1px solid var(--border); border-radius: 6px; padding: 2px 3px; overflow: hidden; background: var(--bg-elev); }
+.cal-d.out { opacity: .5; }
+.cal-d.today { border-color: var(--primary); box-shadow: inset 0 0 0 1px var(--primary); }
+.cal-d .n { font-size: .78rem; color: var(--text-dim); }
+.cal-ev { display: block; width: 100%; text-align: left; border: 0; border-radius: 4px; margin: 1px 0; padding: 1px 4px; font-size: .74rem;
+  background: var(--primary-soft); color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; }
+@media (max-width: 640px) { .cal-d { min-height: 56px; } .cal-ev { font-size: .66rem; } }

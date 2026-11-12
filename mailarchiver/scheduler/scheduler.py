@@ -131,6 +131,7 @@ class SchedulerService:
                 log.error("Не удалось добавить расписание #%s: %s", row["id"], exc)
         self._reload_employees_sync()
         self._reload_retention_sweep()
+        self._reload_restore_drill()
         self._reload_replica()
         self._reload_summary()
         self._reload_axigen_sync()
@@ -179,6 +180,26 @@ class SchedulerService:
         except Exception:  # noqa: BLE001
             log.exception("Ошибка при постановке синхронизации сотрудников")
 
+    # -- проверка восстановления (1.21.0) ------------------------------------
+    DRILL_JOB_ID = "restore_drill"
+
+    def _reload_restore_drill(self) -> None:
+        if not bool(self.services.rt("drill", "enabled")):
+            return
+        trigger = self._cron_trigger(self.services.rt("drill", "cron") or "15 5 1 * *", "проверки восстановления")
+        if trigger is None:
+            return
+        self._sched.add_job(self._fire_restore_drill, trigger, id=self.DRILL_JOB_ID, **self._job_kwargs())
+
+    def _fire_restore_drill(self) -> None:
+        try:
+            if any(job["type"] == JobType.RESTORE_DRILL for job in self.services.db.active_jobs()):
+                return
+            job_id = self.services.queue.enqueue(JobType.RESTORE_DRILL, None, {}, priority=9, created_by="scheduler")
+            log.info("Проверка восстановления по расписанию → задание #%s.", job_id)
+        except Exception:  # noqa: BLE001
+            log.exception("Ошибка при постановке проверки восстановления")
+
     # -- ежедневная очистка по срокам хранения -------------------------------
     def _reload_retention_sweep(self) -> None:
         trigger = self._cron_trigger(self.services.rt("retention", "cron") or "30 4 * * *",
@@ -194,13 +215,13 @@ class SchedulerService:
         По заданию на ящик (а не одно общее): так очистка ящика не пересекается
         с его же бэкапом или перешифровкой — очередь не пускает их одновременно.
         """
-        from ..queue.jobs import _count_older_than, effective_retention_days, retention_cutoff_iso
+        from ..queue.jobs import _count_older_than, purge_retention_days, retention_cutoff_iso
         svc = self.services
         created = []
         try:
             active = {(job["account_id"], job["type"]) for job in svc.db.active_jobs()}
             for acc in svc.db.list_accounts():
-                days = effective_retention_days(svc, acc)
+                days = purge_retention_days(svc, acc)[0]   # с учётом дел «письма по условиям» (1.21.0)
                 if days <= 0 or (acc.id, JobType.RETENTION) in active:
                     continue
                 if not _count_older_than(svc.db, acc.id, retention_cutoff_iso(days)):

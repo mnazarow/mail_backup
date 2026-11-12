@@ -37,11 +37,13 @@ class JobType:
     SERVER_SYNC = "server_sync"          # сверка учётных записей подключённого почтового сервера
     REPLY_INDEX = "reply_index"          # индекс ответов на письма (раздел «Ответы на письма»)
     CASE_EXPORT = "case_export"          # выгрузка писем дела (раздел «Дела», 1.20.0)
+    SEARCH_ATTACH = "search_attach"      # дочитать текст вложений уже проиндексированных писем (1.21.0)
+    RESTORE_DRILL = "restore_drill"      # проверка восстановления: письма из архива и копии вне сервера (1.21.0)
 
     ALL = [BACKUP, RESTORE, EXPORT, IMPORT_PST, TEST, RETENTION, VERIFY, ANALYZE, SYNC_EMPLOYEES,
            STORAGE_CONVERT, CHECK_LOGINS, REPLICATE, DB_SNAPSHOT, SEARCH_INDEX, DEDUP_REPORT, CLEANUP,
            BACKUP_ALL, QUARANTINE_CHECK, QUARANTINE_RESCUE, FOLDERS_CHECK, SEARCH_REINDEX, AXIGEN_SYNC,
-           AXIGEN_ACTION, SERVER_ACTION, SERVER_SYNC, REPLY_INDEX, CASE_EXPORT]
+           AXIGEN_ACTION, SERVER_ACTION, SERVER_SYNC, REPLY_INDEX, CASE_EXPORT, SEARCH_ATTACH, RESTORE_DRILL]
     LABELS = {
         BACKUP: "Резервное копирование",
         RESTORE: "Восстановление",
@@ -70,6 +72,8 @@ class JobType:
         SERVER_SYNC: "Сверка с почтовым сервером",
         REPLY_INDEX: "Индекс ответов на письма",
         CASE_EXPORT: "Выгрузка дела",
+        SEARCH_ATTACH: "Чтение текста вложений",
+        RESTORE_DRILL: "Проверка восстановления",
     }
     #: Задания, которые после перезапуска службы не продолжаются сами: они меняют
     #: почтовый сервер по кнопке администратора, а за время простоя состояние могли
