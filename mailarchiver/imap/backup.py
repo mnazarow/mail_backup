@@ -706,6 +706,15 @@ class BackupEngine:
         if new_uids and uidvalidity_changed:
             relinked = self._relink(conn, account, f, uidvalidity, new_uids, result, emit)
             new_uids = [u for u in new_uids if u not in relinked]
+        mark_gone = getattr(self.db, "mark_messages_gone", None)
+        if mark_gone is not None:
+            # Письма архива, которых в папке на сервере больше нет (удалены, перенесены): копии остаются,
+            # а почтовый клиент раздела «Почта» их не показывает (1.17.0).
+            server = set(all_uids)
+            try:
+                mark_gone(account.id, f.name, uidvalidity, [u for u in existing if u not in server])
+            except Exception as exc:  # noqa: BLE001
+                log.debug("Не удалось отметить удалённые на сервере письма «%s»: %s", f.name, exc)
         prune = getattr(self.db, "prune_retired_uids", None)
         if prune is not None:
             try:

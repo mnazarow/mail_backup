@@ -203,6 +203,11 @@ class Services:
         log.info("Сервис запущен.")
 
     def stop(self) -> None:
+        try:
+            from .webmail import shutdown as _webmail_shutdown
+            _webmail_shutdown(self)        # соединения почтового клиента с ящиками
+        except Exception:  # noqa: BLE001
+            log.debug("Соединения почтового клиента не закрыты", exc_info=True)
         if not self._started:
             return
         if self.worker is not None:
@@ -339,14 +344,15 @@ class Services:
                                    internaldate=epoch, message_id=row["message_id"] or "",
                                    size=row["size"] or len(raw),
                                    delimiter=self._folder_delimiter(row["folder"], row["stored_path"],
-                                                                    delimiters))
+                                                                    delimiters, account_id))
                     count += 1
                     if limit and count >= limit:
                         return
                 if len(rows) < page:
                     break
 
-    def _folder_delimiter(self, folder: str, stored_path: str, cache: Dict[str, str]) -> str:
+    def _folder_delimiter(self, folder: str, stored_path: str, cache: Dict[str, str],
+                          account_id: Optional[int] = None) -> str:
         """Разделитель уровней папки на сервере — по тому, как она разложена на диске.
 
         Письмо лежит в «<папка>/cur/<файл>», где путь папки собран разбиением
@@ -366,6 +372,15 @@ class Services:
                         break
                 except Exception:  # noqa: BLE001
                     continue
+        if not found and account_id is not None:
+            # папку переименовали в почтовом клиенте: файлы писем остались в каталоге прежнего имени, а
+            # разделитель сервера известен из списка папок клиента
+            try:
+                row = self.db.query_one("SELECT delimiter FROM webmail_folders WHERE account_id=? AND name=?",
+                                        (account_id, folder))
+                found = (row["delimiter"] or "") if row is not None else ""
+            except Exception:  # noqa: BLE001
+                found = ""
         cache[folder] = found
         return found
 

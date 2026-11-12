@@ -1879,6 +1879,8 @@ def read_mailbox_message(request: Request, account_id: int, pk: int, user: dict 
     parsed["folder"] = row["folder"]
     parsed["flags"] = [f for f in (row["flags"] or "").split(",") if f]
     parsed["size_h"] = human_size(row["size"] or size)
+    parsed["gone"] = bool(row["gone"])          # письма в этой папке на сервере больше нет (1.17.0)
+    parsed["date"] = row["internaldate"]
     return parsed
 
 

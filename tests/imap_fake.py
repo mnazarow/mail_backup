@@ -177,6 +177,10 @@ class FakeIMAPClient:
     def starttls(self, ctx=None):
         return None
 
+    def noop(self):
+        self._cmd("NOOP")
+        return None
+
     def logout(self):
         return None
 
@@ -292,6 +296,17 @@ class FakeIMAPClient:
             elif key == "DELETED":
                 uids = {u for u in uids if b"\\Deleted" in f.messages[u].flags}
             elif key == "HEADER":
+                # RFC 3501: письма, в заголовке которых есть подстрока (без учёта регистра)
+                name = str(crit[i + 1]).lower().encode()
+                want = str(crit[i + 2]).lower().encode()
+                keep = set()
+                for u in uids:
+                    head = f.messages[u].raw.split(b"\r\n\r\n", 1)[0]
+                    for line in head.split(b"\r\n"):
+                        k, _sep, v = line.partition(b":")
+                        if k.strip().lower() == name and want in v.lower():
+                            keep.add(u)
+                uids = keep
                 i += 2
             else:
                 raise IMAPClientError(f"SEARCH failed: unknown criterion {c}")
@@ -367,6 +382,7 @@ class FakeIMAPClient:
         if folder not in self.box:
             raise IMAPClientError("copy failed: [TRYCREATE] no such mailbox")
         src, dst = self._f(), self.box[folder]
+        old, new_uids = [], []
         for uid in uids:
             m = src.messages.get(int(uid))
             if m is None:
@@ -374,6 +390,13 @@ class FakeIMAPClient:
             new = dst.uidnext
             dst.uidnext += 1
             dst.messages[new] = Msg(raw=m.raw, date=m.date, flags=set(m.flags) - {b"\\Deleted"})
+            old.append(int(uid))
+            new_uids.append(new)
+        if old and "UIDPLUS" in self.world.capabilities:
+            # как imaplib: код ответа [COPYUID …] попадает в untagged_responses под своим именем
+            self._imap.untagged_responses.setdefault("COPYUID", []).append(
+                f"{dst.uidvalidity} {','.join(map(str, old))} {','.join(map(str, new_uids))}".encode())
+        return None
 
     def move(self, uids, folder):
         if "MOVE" not in self.world.capabilities:
@@ -389,4 +412,9 @@ class FakeIMAPClient:
         f = self.box[folder]
         uid = f.uidnext
         f.uidnext += 1
-        f.messages[uid] = Msg(raw=msg, date=msg_time or _dt.datetime.now(_dt.timezone.utc), flags=set(flags or ()))
+        raw = msg if isinstance(msg, bytes) else str(msg).encode()
+        f.messages[uid] = Msg(raw=raw, date=msg_time or _dt.datetime.now(_dt.timezone.utc),
+                              flags={x if isinstance(x, bytes) else str(x).encode() for x in (flags or ())})
+        if "UIDPLUS" in self.world.capabilities:
+            return f"[APPENDUID {f.uidvalidity} {uid}] Append completed".encode()
+        return b"Append completed"

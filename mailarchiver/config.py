@@ -155,6 +155,16 @@ DEFAULTS: Dict[str, Any] = {
         "exclude_senders": [],         # не ждать ответа на письма этих адресов: адрес, @домен, домен или маска *
         "match_subject": True,         # ответ без In-Reply-To связывать по теме и собеседнику (в течение 14 дней)
     },
+    "webmail": {
+        # Почтовый клиент раздела «Почта» (1.17.0): писать письма и менять ящик на почтовом сервере.
+        "enabled": True,               # выключено — «Почта» только показывает архив
+        "admin_actions": True,         # администратор может писать и менять ящики сотрудников (с записью в аудит)
+        "mark_read": True,             # открытое сотрудником письмо отмечать прочитанным (администратор — никогда)
+        "auto_refresh_s": 120,         # проверять новую почту открытой папки раз в столько секунд (0 — не проверять)
+        "max_attachments_mb": 25,      # вложения одного письма — не больше, МБ
+        "save_sent": "auto",           # копия отправленного в «Отправленные»: auto | always | never
+        "drafts_keep_days": 30,        # черновик, которого не касались столько дней, удаляется
+    },
     "mailadmin": {
         # Вход в ящики учётной записью администратора почты — без паролей сотрудников.
         # Работает, если почтовый сервер это умеет: Dovecot (master users), Cyrus и
@@ -328,6 +338,9 @@ VALUE_RANGES: Dict[str, tuple] = {
     # replica
     "search.body_max_kb": (1, 1024),
     "replies.sla_hours": (1, 8760),
+    "webmail.auto_refresh_s": (0, 3600),
+    "webmail.max_attachments_mb": (1, 30),
+    "webmail.drafts_keep_days": (1, 365),
     "replica.db_snapshot_keep": (0, 365),
     "replica.max_delete_percent": (0, 100),
     "replica.parallel": (1, 32),
@@ -416,6 +429,7 @@ VALUE_CHOICES: Dict[str, tuple] = {
     "export.default_engine": ("auto", "aspose", "native", "mbox", "eml"),
     "export.pst_format": ("unicode", "ansi"),
     "notifications.smtp_security": ("starttls", "ssl", "none"),
+    "webmail.save_sent": ("auto", "always", "never"),
     "employees.source_type": ("file", "url"),
     "employees.source_url_format": ("auto", "csv", "xlsx"),
     "employees.account_security": ("ssl", "starttls", "plain"),

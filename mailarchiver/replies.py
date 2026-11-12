@@ -143,6 +143,8 @@ def ensure_schema(conn) -> None:
     if added:
         conn.execute("DELETE FROM meta WHERE key IN (?, ?, ?)", (_META_HIGH, _META_LOW, _META_OWN))
     conn.execute(f"CREATE INDEX IF NOT EXISTS idx_reply_subj ON {TABLE}(account_id, subj, ts) WHERE subj IS NOT NULL")
+    # цепочка переписки в почтовом клиенте (1.17.0): письма с тем же началом цепочки
+    conn.execute(f"CREATE INDEX IF NOT EXISTS idx_reply_root ON {TABLE}(root, account_id) WHERE root IS NOT NULL")
     conn.commit()
 
 

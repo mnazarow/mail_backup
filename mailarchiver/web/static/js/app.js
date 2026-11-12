@@ -3925,13 +3925,48 @@ async function viewSecurity(c){
 }
 
 // ===================================================================
-//  Почта (просмотр писем)
+//  Почта: почтовый клиент поверх архива (1.17.0)
 // ===================================================================
-// picked — выбранные письма для «Восстановить выбранные»: ключ «ящик:id» → {acc, id, subject}
+// Письма показываются из архива (мгновенно, даже без связи с сервером), а действия — флаги, перенос,
+// удаление, папки, отправка — идут на почтовый сервер и тут же отражаются в архиве (/api/webmail/...).
+// picked — выбранные письма: ключ «ящик:id» → {acc, id, subject}
 const Mail = { acc:null, folder:null, offset:0, total:0, limit:50, msg:null, search:null, openAfter:null, picked:new Map(),
   // номера последних запросов: ответ на прежний запрос (щёлкнули письмо А, потом Б, а А ответило позже)
   // не перерисовывает то, что уже показано по новому
-  seqFolders:0, seqList:0, seqMsg:0 };
+  seqFolders:0, seqList:0, seqMsg:0,
+  st:null, folders:[], special:{}, sort:'date_desc', filter:'all', showGone:false, items:[], cur:null,
+  drafts:[], timer:null, view:'folder', goneCount:0, syncing:false };
+const MAIL_ICONS={inbox:'📥', drafts:'📝', sent:'📤', archive:'🗄️', junk:'🚫', trash:'🗑️', all:'🗂️'};
+const MAIL_NAMES={inbox:'Входящие', drafts:'Черновики', sent:'Отправленные', archive:'Архив', junk:'Спам', trash:'Корзина', all:'Вся почта'};
+
+function mailCanAct(){ return !!(Mail.st && Mail.st.can_act); }
+function mailCanSend(){ return !!(Mail.st && Mail.st.can_send); }
+function mailOnline(){ return !!(Mail.st && Mail.st.online); }
+function mailWhen(iso){
+  if(!iso) return '';
+  try{
+    const d=new Date(iso), now=new Date();
+    if(d.toDateString()===now.toDateString()) return d.toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'});
+    if(d.getFullYear()===now.getFullYear()) return d.toLocaleDateString('ru-RU',{day:'numeric',month:'short'});
+    return d.toLocaleDateString('ru-RU',{day:'2-digit',month:'2-digit',year:'2-digit'});
+  }catch(e){ return ''; }
+}
+function mailFolderInfo(name){ return Mail.folders.find(f=>f.name===name)||null; }
+function mailFolderLabel(f){
+  if(!f) return '';
+  if(f.special && MAIL_NAMES[f.special]) return MAIL_NAMES[f.special];
+  const d=f.delimiter||'';
+  return d && f.name.includes(d) ? f.name.slice(f.name.lastIndexOf(d)+d.length) : f.name;
+}
+function mailFolderDepth(f){
+  if(f.special || !f.delimiter) return 0;
+  let name=f.name;
+  const inboxPrefix='INBOX'+f.delimiter;
+  if(name.toUpperCase().startsWith(inboxPrefix.toUpperCase())) name=name.slice(inboxPrefix.length);   // Courier: «INBOX.Проекты»
+  return Math.min(6, name.split(f.delimiter).length-1);
+}
+/** Папка «Отправленные» или «Черновики»: в списке вместо отправителя — получатель. */
+function mailIsOutFolder(name){ const f=mailFolderInfo(name); return !!(f && (f.special==='sent' || f.special==='drafts')); }
 
 async function viewMail(c){
   c.innerHTML='';
@@ -3940,7 +3975,8 @@ async function viewMail(c){
     ? ((State.mailAccount && mine.find(a=>a.id===State.mailAccount)) ? State.mailAccount : mine[0].id)
     : (State.mailAccount||null);
   let accounts = [];
-  const head=h(`<div class="section-title"><h2 style="margin:0">📧 Почта</h2><div class="spacer"></div><span id="mailAccWrap" class="btn-row"></span></div>`);
+  const head=h(`<div class="section-title mail-head"><h2 style="margin:0">📧 Почта</h2>
+    <span class="btn-row" id="mailTools"></span><div class="spacer"></div><span id="mailAccWrap" class="btn-row"></span></div>`);
   c.appendChild(head);
   if(isMailbox() && accId){
     State.mailAccount=accId;
@@ -3953,7 +3989,7 @@ async function viewMail(c){
     // Сотруднику — выгрузка и восстановление своего ящика прямо отсюда: меню
     // ящика в разделе «Почтовые ящики» ему недоступно.
     const cur=mine.find(a=>a.id===accId)||{id:accId, name:'мой ящик'};
-    const acts=h(`<span class="btn-row"><button class="btn sm" id="mbExport">📤 Выгрузить</button><button class="btn sm" id="mbRestore">♻️ Восстановить в ящик</button></span>`);
+    const acts=h(`<span class="btn-row"><button class="btn sm ghost" id="mbExport" title="Выгрузить ящик в PST или EML">📤 Выгрузить</button><button class="btn sm ghost" id="mbRestore" title="Вернуть письма из архива в ящик на сервере">♻️ Восстановить в ящик</button></span>`);
     acts.querySelector('#mbExport').onclick=()=>exportModal(cur);
     acts.querySelector('#mbRestore').onclick=()=>restoreModal(cur);
     head.querySelector('#mailAccWrap').appendChild(acts);
@@ -3963,14 +3999,30 @@ async function viewMail(c){
     if(!accounts.length){ c.appendChild(h('<div class="card"><div class="empty"><div class="big">📭</div>Нет ящиков. Добавьте ящик и сделайте бэкап.</div></div>')); return; }
     if(!accId || !accounts.find(a=>a.id===accId)) accId=accounts[0].id;
     State.mailAccount=accId;
-    const sel=h(`<select id="mailAcc" style="width:auto;padding:7px 12px">${accounts.map(a=>`<option value="${a.id}" ${a.id===accId?'selected':''}>${esc(a.name)}</option>`).join('')}</select>`);
+    const sel=h(`<select id="mailAcc" aria-label="Ящик" style="width:auto;padding:7px 12px">${accounts.map(a=>`<option value="${a.id}" ${a.id===accId?'selected':''}>${esc(a.name)}</option>`).join('')}</select>`);
     sel.onchange=()=>{ State.mailAccount=parseInt(sel.value); Mail.folder=null; Mail.offset=0; Mail.picked.clear(); viewMail(c); };
     head.querySelector('#mailAccWrap').appendChild(sel);
   }
   if(Mail.acc!==accId && !(Mail.search && Mail.search.scope==='all')) Mail.picked.clear();
+  if(Mail.acc!==accId){ Mail.view='folder'; Mail.cur=null; }
   Mail.acc=accId;
+  const seq=State.routeSeq;
+  try{ Mail.st=await api(`/webmail/status?account_id=${accId}`); }
+  catch(e){ Mail.st={enabled:false, online:false, can_act:false, can_send:false, act_problem:e.message, mark_read:false, auto_refresh_s:0}; }
+  if(seq!==State.routeSeq) return;
+  const tools=head.querySelector('#mailTools');
+  if(Mail.st.enabled){
+    tools.appendChild(h(`<button class="btn sm primary" id="mailCompose" ${mailCanSend()?'':'disabled'} title="${esc(mailCanSend()?'Новое письмо (c)':(Mail.st.send_problem||''))}">✏️ Написать</button>`));
+    tools.appendChild(h(`<button class="btn sm" id="mailSync" ${mailOnline()?'':'disabled'} title="Проверить почту на сервере">🔄 Проверить почту</button>`));
+    tools.appendChild(h(`<button class="btn sm ghost" id="mailIdent" title="Отправитель, подпись${isAdmin()?' и сервер отправки':''}">⚙️</button>`));
+    $('#mailCompose',tools).onclick=()=>mailCompose('new');
+    $('#mailSync',tools).onclick=()=>mailSync(true);
+    $('#mailIdent',tools).onclick=()=>mailIdentityDialog(accId);
+  }
+  const why = !Mail.st.enabled ? '' : (!Mail.st.online ? Mail.st.online_problem : (!Mail.st.can_act ? Mail.st.act_problem : ''));
+  if(why) c.appendChild(h(`<div class="hint mail-ro">🔒 ${esc(why)} Письма показываются из архива.</div>`));
   const sbar=h(`<div class="mail-search">
-    <input type="search" id="msq" placeholder="Поиск по письмам: слова, «фраза в кавычках», тема:, от:, вложение:" value="${esc(Mail.search?Mail.search.q:'')}">
+    <input type="search" id="msq" placeholder="Поиск по письмам: слова, «фраза в кавычках», тема:, от:, вложение:  (клавиша /)" value="${esc(Mail.search?Mail.search.q:'')}">
     ${isMailbox()&&mine.length<2?'':`<select id="msScope" aria-label="Где искать"><option value="account">в этом ящике</option><option value="all" ${Mail.search&&Mail.search.scope==='all'?'selected':''}>${isMailbox()?'во всех моих ящиках':'во всех ящиках'}</option></select>`}
     <label class="small" style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="msAttach" ${Mail.search&&Mail.search.attach?'checked':''}> с вложениями</label>
     <button class="btn sm primary" id="msGo">🔎 Найти</button>
@@ -3985,7 +4037,7 @@ async function viewMail(c){
     loadSearchResults(accId);
   };
   $('#msGo',sbar).onclick=runSearch;
-  $('#msq',sbar).onkeydown=(e)=>{ if(e.key==='Enter'){ e.preventDefault(); runSearch(); } };
+  $('#msq',sbar).onkeydown=(e)=>{ if(e.key==='Enter'){ e.preventDefault(); runSearch(); } if(e.key==='Escape'){ e.target.blur(); } };
   $('#msClear',sbar).onclick=()=>{ $('#msq',sbar).value=''; Mail.search=null; $('#msClear',sbar).style.display='none'; loadMailMessages(accId); };
   api('/search/status',{bg:true}).then(st=>{
     const info=$('#msInfo',sbar); if(!info) return;
@@ -3993,7 +4045,7 @@ async function viewMail(c){
     else if(st.pending>0) info.textContent=`Проиндексировано ${fmtNum(st.indexed)} из ${fmtNum(st.total)} писем — остальные индексируются в фоне.`;
     else if(!st.bodies) info.textContent='Поиск по теме, адресам и вложениям (текст писем не индексируется).';
   }).catch(()=>{});
-  // Выбранные письма: «Восстановить выбранные» — вернуть их на почтовый сервер.
+  // Выбранные письма: действия над ними (прочитано, перенос, удаление…) и «Восстановить выбранные».
   c.appendChild(h('<div id="mpick" class="mail-pick" role="status" aria-live="polite" hidden></div>'));
   renderPickBar();
   const layout=h(`<div class="mail-layout">
@@ -4003,12 +4055,57 @@ async function viewMail(c){
   </div>`);
   c.appendChild(layout);
   await loadMailFolders(accId);
+  mailStartTimer();
+}
+
+/** Проверка почты по таймеру, пока раздел открыт и вкладка видна. */
+function mailStartTimer(){
+  if(Mail.timer){ clearInterval(Mail.timer); Mail.timer=null; }
+  const every=(Mail.st&&Mail.st.auto_refresh_s)||0;
+  if(!every || !mailOnline()) return;
+  const seq=State.routeSeq;
+  Mail.timer=setInterval(()=>{
+    if(seq!==State.routeSeq || State.view!=='mail'){ clearInterval(Mail.timer); Mail.timer=null; return; }
+    if(document.hidden || Mail.search || Mail.view!=='folder') return;
+    mailSync(false);
+  }, Math.max(30, every)*1000);
+}
+
+/** Проверить открытую папку на сервере: новые письма — в архив и в список, удалённые — убрать. */
+async function mailSync(manual){
+  if(!mailOnline() || !Mail.folder || Mail.syncing) return;
+  const fi=mailFolderInfo(Mail.folder);
+  if(fi && fi.on_server===false){ if(manual) toast('Папки нет на сервере','Её письма есть только в архиве.','warn'); return; }
+  Mail.syncing=true;
+  const btn=$('#mailSync'); if(btn && manual){ btn.disabled=true; btn.innerHTML='<span class="spinner"></span> Проверяю…'; }
+  const acc=Mail.acc, folder=Mail.folder;
+  try{
+    const r=await api('/webmail/sync',{method:'POST', body:{account_id:acc, folder, folders:!!manual, manual:!!manual}, bg:!manual});
+    if(Mail.acc!==acc) return;
+    if(r.skipped) return;
+    if(r.uidvalidity_changed && manual) toast('Папка на сервере пересоздана','Запущено копирование ящика — письма сверятся с архивом.','warn',7000);
+    if(manual){
+      const parts=[];
+      if(r.new) parts.push(`новых писем: ${fmtNum(r.new)}`);
+      if(r.gone) parts.push(`удалено на сервере: ${fmtNum(r.gone)}`);
+      if(r.pending) parts.push(`ещё ${fmtNum(r.pending)} скачает копирование`);
+      if(r.backup_running) parts.push('идёт копирование ящика — новые письма появятся после него');
+      toast('Почта проверена', parts.join(', ')||'Нового нет.');
+    }
+    if(r.new || r.gone || r.flags || manual){
+      await loadMailFolders(acc, {quiet:true});
+      if(folder===Mail.folder && !Mail.search && Mail.view==='folder') await loadMailMessages(acc, {keep:true});
+    }else{
+      const f=mailFolderInfo(folder); if(f && (f.unseen!==r.unseen || f.total!==r.total)){ f.unseen=r.unseen; f.total=r.total; renderMailFolders(acc); }
+    }
+  }catch(e){ if(manual) toastErr(e); }
+  finally{ Mail.syncing=false; if(btn && manual){ btn.disabled=false; btn.innerHTML='🔄 Проверить почту'; } }
 }
 
 /** Возвращать письма на сервер может администратор и сам сотрудник (оператор писем не видит). */
 function canRestoreMessages(){ return isAdmin() || isMailbox(); }
 
-/** Флажок выбора письма в списке (для «Восстановить выбранные»). */
+/** Флажок выбора письма в списке. */
 function pickBox(acc, id, subject){
   if(!canRestoreMessages()) return '';
   return `<input type="checkbox" class="msg-pick" data-pick ${Mail.picked.has(acc+':'+id)?'checked':''} aria-label="Выбрать письмо «${esc(trunc(subject||'без темы',60))}»">`;
@@ -4021,28 +4118,109 @@ function wirePick(el, acc, id, subject){
   cb.onchange=()=>{
     const k=acc+':'+id;
     if(cb.checked) Mail.picked.set(k,{acc, id, subject}); else Mail.picked.delete(k);
+    el.classList.toggle('picked', cb.checked);
     renderPickBar();
     const list=el.parentElement; if(list) list.dispatchEvent(new Event('pickchange'));
   };
 }
-/** Полоса «Выбрано: N · Восстановить · Снять выбор». */
+function mailPickedIds(){ return [...Mail.picked.values()].filter(p=>p.acc===Mail.acc).map(p=>p.id); }
+function mailClearPicked(){
+  Mail.picked.clear(); renderPickBar();
+  document.querySelectorAll('#mlist input[data-pick], #mlist input[data-pickall]').forEach(x=>{ x.checked=false; x.indeterminate=false; });
+  document.querySelectorAll('#mlist .msg-item.picked').forEach(x=>x.classList.remove('picked'));
+}
+/** Полоса «Выбрано: N» с действиями над выбранными письмами. */
 function renderPickBar(){
   const bar=$('#mpick'); if(!bar) return;
   const n=Mail.picked.size;
   bar.hidden=!n;
   if(!n){ bar.innerHTML=''; return; }
   const accs=new Set([...Mail.picked.values()].map(p=>p.acc));
+  const here=accs.size===1 && accs.has(Mail.acc) && mailCanAct();
   bar.innerHTML=`<span>Выбрано: <b>${fmtNum(n)}</b> ${plural(n,'письмо','письма','писем')}${accs.size>1?` из ${accs.size} ${plural(accs.size,'ящика','ящиков','ящиков')}`:''}</span>
-    <button class="btn sm primary" data-go>♻️ Восстановить выбранные</button>
+    ${here?`<button class="btn sm" data-a="read" title="Отметить прочитанными">✉️ Прочитано</button>
+      <button class="btn sm" data-a="unread" title="Отметить непрочитанными">📩 Не прочитано</button>
+      <button class="btn sm" data-a="star" title="Пометить">⭐</button>
+      <button class="btn sm" data-a="move" title="Переместить в папку">📁 Переместить</button>
+      <button class="btn sm" data-a="junk" title="В спам">🚫 Спам</button>
+      <button class="btn sm danger" data-a="delete" title="Удалить (Delete)">🗑 Удалить</button>`:''}
+    <button class="btn sm ${here?'ghost':'primary'}" data-go>♻️ Восстановить</button>
     <button class="btn sm ghost" data-clear>✕ Снять выбор</button>`;
-  bar.querySelector('[data-go]').onclick=()=>messagesRestoreModal([...Mail.picked.values()], ()=>{
-    Mail.picked.clear(); renderPickBar();
-    document.querySelectorAll('#mlist input[data-pick], #mlist input[data-pickall]').forEach(x=>{ x.checked=false; x.indeterminate=false; });
+  bar.querySelector('[data-go]').onclick=()=>messagesRestoreModal([...Mail.picked.values()], mailClearPicked);
+  bar.querySelector('[data-clear]').onclick=mailClearPicked;
+  bar.querySelectorAll('[data-a]').forEach(b=>b.onclick=(e)=>{
+    const ids=mailPickedIds(); const a=b.dataset.a;
+    if(a==='read') mailAct('flags', ids, {add:['\\Seen']});
+    else if(a==='unread') mailAct('flags', ids, {remove:['\\Seen']});
+    else if(a==='star') mailAct('flags', ids, {add:['\\Flagged']});
+    else if(a==='junk') mailAct('junk', ids, {spam:(mailFolderInfo(Mail.folder)||{}).special!=='junk'});
+    else if(a==='delete') mailDelete(ids);
+    else if(a==='move') mailMovePicker(e.currentTarget, ids);
   });
-  bar.querySelector('[data-clear]').onclick=()=>{
-    Mail.picked.clear(); renderPickBar();
-    document.querySelectorAll('#mlist input[data-pick], #mlist input[data-pickall]').forEach(x=>{ x.checked=false; x.indeterminate=false; });
+}
+
+/** Действие над письмами на сервере; после него — список и счётчики папок заново. */
+async function mailAct(kind, ids, extra={}, {quiet=false}={}){
+  if(!ids.length) return null;
+  const acc=Mail.acc;
+  let r;
+  try{ r=await api('/webmail/'+kind, {method:'POST', body:Object.assign({account_id:acc, ids}, extra)}); }
+  catch(e){ toastErr(e); return null; }
+  if(r && r.missing && !quiet) toast('Часть писем уже удалена на сервере', `Писем: ${fmtNum(r.missing)} — в архиве они остались.`, 'warn');
+  if(kind!=='flags') ids.forEach(id=>Mail.picked.delete(acc+':'+id));
+  renderPickBar();
+  if(kind==='flags'){
+    const add=extra.add||[], rem=extra.remove||[];
+    Mail.items.forEach(m=>{ if(!ids.includes(m.id)) return;
+      if(add.includes('\\Seen')) m.seen=true; if(rem.includes('\\Seen')) m.seen=false;
+      if(add.includes('\\Flagged')) m.flagged=true; if(rem.includes('\\Flagged')) m.flagged=false; });
+    renderMailList(acc);
+    if(add.includes('\\Seen')||rem.includes('\\Seen')) loadMailFolders(acc, {quiet:true});
+    if(Mail.cur && ids.includes(Mail.cur)) mailReaderFlags();
+  }else{
+    if(Mail.cur && ids.includes(Mail.cur)){ Mail.cur=null; const rd=$('#mreader'); if(rd) rd.innerHTML='<div class="empty" style="padding:40px 20px"><div class="big">✉️</div>Выберите письмо для просмотра</div>'; }
+    await loadMailFolders(acc, {quiet:true});
+    if(!Mail.search) await loadMailMessages(acc, {keep:true}); else loadSearchResults(acc);
+  }
+  return r;
+}
+
+async function mailDelete(ids, {permanent=false}={}){
+  if(!ids.length) return;
+  const f=mailFolderInfo(Mail.folder);
+  const inTrash=f && f.special==='trash';
+  const noTrash=!Mail.special.trash;
+  if(permanent || inTrash || noTrash){
+    const ok=await confirmDlg('Удалить с сервера насовсем?', `${fmtNum(ids.length)} ${plural(ids.length,'письмо','письма','писем')} будут удалены из ящика на сервере без корзины. Копии в архиве останутся — их можно будет вернуть «Восстановить».`, {okText:'Удалить'});
+    if(!ok) return;
+    const r=await mailAct('delete', ids, {permanent:true});
+    if(r) toast('Удалено с сервера', `Писем: ${fmtNum(r.deleted)}. Копии остались в архиве.`);
+    return;
+  }
+  const r=await mailAct('delete', ids, {permanent:false});
+  if(r) toast('Перенесено в корзину', `Писем: ${fmtNum(r.trashed)}`);
+}
+
+/** Выбор папки для переноса — всплывающий список у кнопки. */
+function mailMovePicker(anchor, ids){
+  document.querySelectorAll('.mail-pop').forEach(x=>x.remove());
+  const targets=Mail.folders.filter(f=>f.on_server!==false && f.selectable && f.name!==Mail.folder);
+  const pop=h(`<div class="mail-pop" role="menu"><input type="text" placeholder="Найти папку" aria-label="Найти папку"><div class="mail-pop-list"></div></div>`);
+  const list=pop.querySelector('.mail-pop-list'), q=pop.querySelector('input');
+  const fill=()=>{ const s=q.value.trim().toLowerCase();
+    list.innerHTML=targets.filter(f=>!s || f.name.toLowerCase().includes(s) || mailFolderLabel(f).toLowerCase().includes(s)).slice(0,200)
+      .map(f=>`<button class="mail-pop-item" data-f="${esc(f.name)}" style="padding-left:${10+mailFolderDepth(f)*14}px">${MAIL_ICONS[f.special]||'📁'} ${esc(mailFolderLabel(f))}</button>`).join('')||'<div class="muted small" style="padding:8px">Папок нет</div>';
+    list.querySelectorAll('[data-f]').forEach(b=>b.onclick=async()=>{ pop.remove(); const r=await mailAct('move', ids, {folder:b.dataset.f}); if(r) toast('Перенесено', `Писем: ${fmtNum(r.moved)} → «${b.dataset.f}»`); });
   };
+  fill(); q.oninput=fill;
+  document.body.appendChild(pop);
+  const r=anchor.getBoundingClientRect();
+  pop.style.top=Math.min(window.innerHeight-320, r.bottom+4+window.scrollY)+'px';
+  pop.style.left=Math.max(8, Math.min(window.innerWidth-280, r.left+window.scrollX))+'px';
+  q.focus();
+  const off=(e)=>{ if(!pop.contains(e.target) && e.target!==anchor){ pop.remove(); document.removeEventListener('mousedown', off); } };
+  setTimeout(()=>document.addEventListener('mousedown', off), 0);
+  q.onkeydown=(e)=>{ if(e.key==='Escape'){ pop.remove(); } };
 }
 
 /** Восстановить отдельные письма: в тот же ящик или (администратору) в другой.
@@ -4137,24 +4315,127 @@ async function messagesRestoreModal(items, onDone){
   };
 }
 
-async function loadMailFolders(accId){
+// ---------- Папки ----------
+async function loadMailFolders(accId, {refresh=false, quiet=false}={}){
   const box=$('#mfolders'); if(!box) return;
   const seq=++Mail.seqFolders;
   let data;
-  try{ data=await api(`/accounts/${accId}/mailfolders`); }catch(e){ if(seq===Mail.seqFolders) box.innerHTML=`<div class="empty small">${esc(e.message)}</div>`; return; }
+  try{ data=await api(`/webmail/folders?account_id=${accId}${refresh?'&refresh=true':''}`, {bg:quiet}); }
+  catch(e){ if(seq===Mail.seqFolders && !quiet) box.innerHTML=`<div class="empty small">${esc(e.message)}</div>`; return; }
+  if(seq!==Mail.seqFolders || Mail.acc!==accId) return;
+  Mail.folders=data.folders||[]; Mail.special=data.special||{};
+  if(data.error && !quiet && mailOnline()) toast('Список папок с сервера не получен', data.error.message+(data.error.hint?' '+data.error.hint:''), 'warn', 7000);
+  try{ const d=await api(`/webmail/drafts?account_id=${accId}`, {bg:true}); Mail.drafts=d.items||[]; }catch(e){ Mail.drafts=[]; }
   if(seq!==Mail.seqFolders) return;
-  if(!data.folders.length){ box.innerHTML='<div class="empty small" style="padding:16px">Нет локальных копий.<br>Сделайте бэкап ящика.</div>'; return; }
-  box.innerHTML='';
-  if(!Mail.folder || !data.folders.find(f=>f.folder===Mail.folder)) Mail.folder=data.folders[0].folder;
-  data.folders.forEach(f=>{
-    const el=h(`<div class="mail-folder ${f.folder===Mail.folder?'active':''}" tabindex="0" role="button"><span>📁</span><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(f.folder)}</span><span class="cnt">${f.count}</span></div>`);
-    el.onclick=()=>{ Mail.folder=f.folder; Mail.offset=0; Mail.search=null; const q=$('#msq'); if(q) q.value=''; const cl=$('#msClear'); if(cl) cl.style.display='none'; box.querySelectorAll('.mail-folder').forEach(x=>x.classList.remove('active')); el.classList.add('active'); loadMailMessages(accId); };
-    el.onkeydown=(e)=>{ if(e.key==='Enter'||e.key===' '){ e.preventDefault(); el.click(); } };
-    box.appendChild(el);
-  });
-  if(Mail.search) loadSearchResults(accId); else loadMailMessages(accId);
+  if(!Mail.folders.length){ box.innerHTML='<div class="empty small" style="padding:16px">Нет папок.<br>Сделайте бэкап ящика.</div>'; return; }
+  const first=Mail.folders.find(f=>f.special==='inbox') || Mail.folders.find(f=>f.selectable) || Mail.folders[0];
+  if(!Mail.folder || !Mail.folders.find(f=>f.name===Mail.folder)) Mail.folder=first.name;
+  renderMailFolders(accId);
+  if(!quiet){
+    if(Mail.view==='drafts') mailShowDrafts(accId);
+    else if(Mail.search) loadSearchResults(accId); else loadMailMessages(accId);
+  }
   // письмо, открытое из отчёта аналитики
   if(Mail.openAfter && Mail.openAfter.acc===accId){ const id=Mail.openAfter.id; Mail.openAfter=null; loadMailMessage(accId, id); }
+}
+
+function renderMailFolders(accId){
+  const box=$('#mfolders'); if(!box) return;
+  box.innerHTML='';
+  const head=h(`<div class="mail-folders-head"><span class="muted small">Папки</span>
+    ${mailCanAct()?'<button class="btn ghost sm" data-new title="Новая папка">＋</button>':''}
+    ${mailOnline()?'<button class="btn ghost sm" data-ref title="Обновить список папок с сервера">↻</button>':''}</div>`);
+  const nb=head.querySelector('[data-new]'); if(nb) nb.onclick=()=>mailFolderDialog('create', '');
+  const rb=head.querySelector('[data-ref]'); if(rb) rb.onclick=()=>loadMailFolders(accId, {refresh:true});
+  box.appendChild(head);
+  if(Mail.drafts.length || Mail.view==='drafts'){
+    const el=h(`<div class="mail-folder ${Mail.view==='drafts'?'active':''}" tabindex="0" role="button" title="Письма, начатые здесь и ещё не отправленные"><span>✏️</span><span class="fname">Неотправленные</span><span class="cnt">${Mail.drafts.length}</span></div>`);
+    el.onclick=()=>{ Mail.view='drafts'; Mail.search=null; renderMailFolders(accId); mailShowDrafts(accId); };
+    el.onkeydown=(e)=>{ if(e.key==='Enter'||e.key===' '){ e.preventDefault(); el.click(); } };
+    box.appendChild(el);
+  }
+  let archHead=false;
+  Mail.folders.forEach(f=>{
+    if(f.on_server===false && !archHead){
+      archHead=true;
+      box.appendChild(h(`<div class="mail-folders-sep" title="Этих папок на сервере больше нет (удалены или переименованы) — письма остались в архиве">🗄 Только в архиве</div>`));
+    }
+    const label=mailFolderLabel(f), depth=mailFolderDepth(f);
+    const unseen=(f.unseen!=null && f.on_server!==false && f.special!=='drafts' && f.special!=='sent')?f.unseen:0;
+    const total=(f.total!=null && f.on_server!==false)?f.total:f.archived;
+    const icon=MAIL_ICONS[f.special]||(f.on_server===false?'🗄':'📁');
+    const active=Mail.view==='folder' && f.name===Mail.folder;
+    const el=h(`<div class="mail-folder ${active?'active':''} ${f.on_server===false?'gone':''} ${f.selectable?'':'noselect'}" tabindex="0" role="button" title="${esc(f.name)}" style="padding-left:${9+depth*14}px" data-fname="${esc(f.name)}">
+      <span>${icon}</span><span class="fname">${esc(label)}</span>
+      ${unseen?`<span class="cnt unseen" title="Непрочитанных">${fmtNum(unseen)}</span>`:`<span class="cnt" title="${f.on_server===false?'Писем в архиве':'Писем'}">${fmtNum(total||0)}</span>`}
+      ${mailCanAct()&&f.on_server!==false&&!f.special&&f.name.toUpperCase()!=='INBOX'?'<button class="fmenu" title="Папка: создать вложенную, переименовать, удалить" aria-label="Действия с папкой">⋯</button>':''}</div>`);
+    if(f.selectable){
+      el.onclick=(e)=>{ if(e.target.classList.contains('fmenu')) return;
+        Mail.view='folder'; Mail.folder=f.name; Mail.offset=0; Mail.search=null; Mail.showGone=false;
+        const q=$('#msq'); if(q) q.value=''; const cl=$('#msClear'); if(cl) cl.style.display='none';
+        renderMailFolders(accId); loadMailMessages(accId);
+        if(mailOnline() && f.on_server!==false) setTimeout(()=>mailSync(false), 300); };
+      el.onkeydown=(e)=>{ if(e.key==='Enter'||e.key===' '){ e.preventDefault(); el.click(); } };
+    }
+    const fm=el.querySelector('.fmenu');
+    if(fm) fm.onclick=(e)=>{ e.stopPropagation(); mailFolderMenu(fm, f); };
+    // перенос писем перетаскиванием на папку
+    if(mailCanAct() && f.on_server!==false && f.selectable){
+      el.addEventListener('dragover', (e)=>{ if(e.dataTransfer.types.includes('text/x-mail-ids')){ e.preventDefault(); el.classList.add('drop'); } });
+      el.addEventListener('dragleave', ()=>el.classList.remove('drop'));
+      el.addEventListener('drop', async(e)=>{ e.preventDefault(); el.classList.remove('drop');
+        let ids=[]; try{ ids=JSON.parse(e.dataTransfer.getData('text/x-mail-ids')||'[]'); }catch(_){ ids=[]; }
+        if(ids.length && f.name!==Mail.folder){ const r=await mailAct('move', ids, {folder:f.name}); if(r) toast('Перенесено', `Писем: ${fmtNum(r.moved)} → «${label}»`); } });
+    }
+    box.appendChild(el);
+  });
+}
+
+function mailFolderMenu(anchor, f){
+  document.querySelectorAll('.mail-pop').forEach(x=>x.remove());
+  const pop=h(`<div class="mail-pop" role="menu"><div class="mail-pop-list">
+    <button class="mail-pop-item" data-a="create">＋ Создать вложенную папку</button>
+    <button class="mail-pop-item" data-a="rename">✏️ Переименовать</button>
+    <button class="mail-pop-item danger" data-a="delete">🗑 Удалить папку</button></div></div>`);
+  document.body.appendChild(pop);
+  const r=anchor.getBoundingClientRect();
+  pop.style.top=(r.bottom+4+window.scrollY)+'px'; pop.style.left=Math.max(8, Math.min(window.innerWidth-280, r.left+window.scrollX-200))+'px';
+  pop.querySelectorAll('[data-a]').forEach(b=>b.onclick=()=>{ pop.remove(); mailFolderDialog(b.dataset.a, f.name); });
+  const off=(e)=>{ if(!pop.contains(e.target)){ pop.remove(); document.removeEventListener('mousedown', off); } };
+  setTimeout(()=>document.addEventListener('mousedown', off), 0);
+}
+
+async function mailFolderDialog(kind, name){
+  const acc=Mail.acc;
+  const f=mailFolderInfo(name);
+  if(kind==='delete'){
+    const n=f&&f.total!=null?f.total:0;
+    const ok=await confirmDlg('Удалить папку на сервере?', `Папка «${name}»${n?` и ${fmtNum(n)} ${plural(n,'письмо','письма','писем')} в ней`:''} будут удалены из ящика на сервере. Копии писем в архиве останутся (папка — в «Только в архиве»).`, {okText:'Удалить папку'});
+    if(!ok) return;
+    try{ await api('/webmail/folders/delete',{method:'POST', body:{account_id:acc, folder:name}}); toast('Папка удалена', name);
+      if(Mail.folder===name) Mail.folder=null; loadMailFolders(acc); }catch(e){ toastErr(e); }
+    return;
+  }
+  const title=kind==='rename'?'Переименовать папку':(name?`Новая папка в «${mailFolderLabel(f)}»`:'Новая папка');
+  const m=modal(title, `<div class="form-row"><label for="mf-name">Имя папки</label><input id="mf-name" type="text" maxlength="200" value="${kind==='rename'?esc(mailFolderLabel(f)):''}"></div>
+    ${kind==='create'&&!name?`<div class="form-row"><label for="mf-parent">Внутри папки</label><select id="mf-parent"><option value="">— в корне ящика —</option>${Mail.folders.filter(x=>x.on_server!==false&&x.special!=='trash'&&x.special!=='junk').map(x=>`<option value="${esc(x.name)}">${esc(x.name)}</option>`).join('')}</select></div>`:''}`,
+    {footer:'<button class="btn ghost" data-c>Отмена</button><button class="btn primary" data-ok>Сохранить</button>'});
+  const inp=m.body.querySelector('#mf-name'); inp.focus(); inp.select();
+  m.foot.querySelector('[data-c]').onclick=m.close;
+  const go=async()=>{
+    const v=inp.value.trim(); if(!v) return toastErr({message:'Укажите имя папки.'});
+    const btn=m.foot.querySelector('[data-ok]'); btn.disabled=true;
+    try{
+      let r;
+      if(kind==='rename') r=await api('/webmail/folders/rename',{method:'POST', body:{account_id:acc, folder:name, name:v}});
+      else r=await api('/webmail/folders/create',{method:'POST', body:{account_id:acc, name:v, parent:name||((m.body.querySelector('#mf-parent')||{}).value||'')}});
+      m.close(); toast(kind==='rename'?'Папка переименована':'Папка создана', r.folder);
+      if(kind==='rename' && Mail.folder===name) Mail.folder=r.folder;
+      loadMailFolders(acc);
+    }catch(e){ btn.disabled=false; toastErr(e); }
+  };
+  m.foot.querySelector('[data-ok]').onclick=go;
+  inp.onkeydown=(e)=>{ if(e.key==='Enter'){ e.preventDefault(); go(); } };
 }
 
 /** Выделение найденного: сервер помечает его символами \x02…\x03. */
@@ -4172,7 +4453,7 @@ async function loadSearchResults(accId, append){
   catch(e){ box.innerHTML=`<div class="empty small">${esc(e.message)}</div>`; return; }
   if(!append){
     box.innerHTML='';
-    box.appendChild(h(`<div style="padding:8px 12px;border-bottom:1px solid var(--border);font-size:.82rem" class="muted">
+    box.appendChild(h(`<div class="mail-list-bar muted">
       Найдено: ${data.results.length}${data.more?'+':''} · ${S.scope==='all'?'во всех ящиках':'в этом ящике'}</div>`));
   }
   const old=box.querySelector('#msMore'); if(old) old.remove();
@@ -4180,7 +4461,7 @@ async function loadSearchResults(accId, append){
   data.results.forEach(r=>{
     const el=h(`<div class="msg-item" tabindex="0" role="button">
       ${S.scope==='all'?`<div class="msg-acc">${esc(r.account_name||'')} · ${esc(r.folder)}</div>`:`<div class="msg-acc">${esc(r.folder)}</div>`}
-      <div class="msg-top">${pickBox(r.account_id, r.id, r.subject)}<span class="msg-from">${esc(r.from||'—')}</span><span>${r.has_attach?'📎':''}</span><span>${esc(fmtDateShort(r.date))}</span></div>
+      <div class="msg-top">${pickBox(r.account_id, r.id, r.subject)}<span class="msg-from">${esc(r.from||'—')}</span><span>${r.has_attach?'📎':''}</span><span class="msg-date">${esc(mailWhen(r.date))}</span></div>
       <div class="msg-subj">${esc(r.subject||'(без темы)')}</div>
       ${r.snippet?`<div class="msg-snip">${markSnippet(r.snippet)}</div>`:''}</div>`);
     wirePick(el, r.account_id, r.id, r.subject);
@@ -4195,55 +4476,120 @@ async function loadSearchResults(accId, append){
   }
 }
 
-async function loadMailMessages(accId){
+// ---------- Список писем ----------
+async function loadMailMessages(accId, {keep=false}={}){
   const box=$('#mlist'); if(!box) return;
-  box.innerHTML='<div class="empty" style="padding:20px"><div class="spinner"></div></div>';
+  Mail.view='folder';
+  const scroll=keep?box.scrollTop:0;
+  if(!keep) box.innerHTML='<div class="empty" style="padding:20px"><div class="spinner"></div></div>';
   const seq=++Mail.seqList;
+  const fi=mailFolderInfo(Mail.folder);
+  const showGone=Mail.showGone || !mailOnline() || (fi && fi.on_server===false);
   let data;
-  try{ data=await api(`/accounts/${accId}/messages?folder=${encodeURIComponent(Mail.folder)}&limit=${Mail.limit}&offset=${Mail.offset}`); }
+  const qs=new URLSearchParams({account_id:String(accId), folder:Mail.folder||'', offset:String(Mail.offset), limit:String(Mail.limit),
+    sort:Mail.sort, filter:Mail.filter, show_gone:showGone?'true':'false'});
+  try{ data=await api('/webmail/messages?'+qs.toString(), {bg:keep}); }
   catch(e){ if(seq===Mail.seqList) box.innerHTML=`<div class="empty small">${esc(e.message)}</div>`; return; }
-  if(seq!==Mail.seqList) return;
-  Mail.total=data.total;
+  if(seq!==Mail.seqList || Mail.acc!==accId) return;
+  if(data.offset>0 && !data.messages.length && data.total){ Mail.offset=Math.max(0, Math.floor((data.total-1)/Mail.limit)*Mail.limit); return loadMailMessages(accId, {keep}); }
+  Mail.total=data.total; Mail.goneCount=data.gone||0; Mail.items=data.messages;
+  renderMailList(accId);
+  box.scrollTop=scroll;
+}
+
+function renderMailList(accId){
+  const box=$('#mlist'); if(!box) return;
+  const items=Mail.items;
+  const fi=mailFolderInfo(Mail.folder);
+  const archiveOnly=fi && fi.on_server===false;
+  const out=mailIsOutFolder(Mail.folder);
   box.innerHTML='';
-  const bar=h(`<div style="padding:8px 12px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px;font-size:.82rem" class="muted">
-    ${canRestoreMessages()&&data.messages.length?'<input type="checkbox" class="msg-pick" data-pickall aria-label="Выбрать все письма на странице" title="Выбрать все на странице">':''}
-    <span>${fmtNum(data.total)} ${plural(data.total||0,'письмо','письма','писем')}</span><span class="spacer" style="flex:1"></span>
-    <button class="btn ghost sm" ${Mail.offset<=0?'disabled':''} data-prev>←</button>
-    <span>${Math.floor(Mail.offset/Mail.limit)+1}/${Math.max(1,Math.ceil(data.total/Mail.limit))}</span>
-    <button class="btn ghost sm" ${Mail.offset+Mail.limit>=data.total?'disabled':''} data-next>→</button></div>`);
+  const bar=h(`<div class="mail-list-bar">
+    <div class="row1">${canRestoreMessages()&&items.length?'<input type="checkbox" class="msg-pick" data-pickall aria-label="Выбрать все письма на странице" title="Выбрать все на странице">':''}
+    <span class="muted">${fmtNum(Mail.total)} ${plural(Mail.total||0,'письмо','письма','писем')}</span><span class="spacer" style="flex:1"></span>
+    <button class="btn ghost sm" ${Mail.offset<=0?'disabled':''} data-prev aria-label="Предыдущая страница">←</button>
+    <span class="muted">${Math.floor(Mail.offset/Mail.limit)+1}/${Math.max(1,Math.ceil(Mail.total/Mail.limit))}</span>
+    <button class="btn ghost sm" ${Mail.offset+Mail.limit>=Mail.total?'disabled':''} data-next aria-label="Следующая страница">→</button></div>
+    <div class="row2">
+      <select data-sort aria-label="Порядок"><option value="date_desc">Сначала новые</option><option value="date_asc">Сначала старые</option><option value="from">По ${out?'получателю':'отправителю'}</option><option value="subject">По теме</option><option value="size">Крупные сначала</option></select>
+      <select data-filter aria-label="Отбор"><option value="all">Все</option><option value="unread">Непрочитанные</option><option value="flagged">Помеченные</option><option value="attach">С вложениями</option><option value="answered">Отвеченные</option></select>
+      ${mailOnline()&&!archiveOnly&&(Mail.goneCount||Mail.showGone)?`<label class="small muted" title="Письма, которых в этой папке на сервере больше нет (удалены, перенесены) — их копии в архиве"><input type="checkbox" data-gone ${Mail.showGone?'checked':''}> удалённые с сервера (${fmtNum(Mail.goneCount)})</label>`:''}
+    </div></div>`);
   box.appendChild(bar);
+  bar.querySelector('[data-sort]').value=Mail.sort; bar.querySelector('[data-filter]').value=Mail.filter;
+  bar.querySelector('[data-sort]').onchange=(e)=>{ Mail.sort=e.target.value; Mail.offset=0; loadMailMessages(accId); };
+  bar.querySelector('[data-filter]').onchange=(e)=>{ Mail.filter=e.target.value; Mail.offset=0; loadMailMessages(accId); };
+  const gcb=bar.querySelector('[data-gone]'); if(gcb) gcb.onchange=()=>{ Mail.showGone=gcb.checked; Mail.offset=0; loadMailMessages(accId); };
   bar.querySelector('[data-prev]').onclick=()=>{ Mail.offset=Math.max(0,Mail.offset-Mail.limit); loadMailMessages(accId); };
   bar.querySelector('[data-next]').onclick=()=>{ Mail.offset+=Mail.limit; loadMailMessages(accId); };
-  if(!data.messages.length){ box.appendChild(h('<div class="empty">Папка пуста</div>')); return; }
+  if(archiveOnly) box.appendChild(h('<div class="hint" style="margin:8px">🗄 Этой папки на сервере нет — письма только в архиве. Вернуть их в ящик — «♻️ Восстановить».</div>'));
+  if(!items.length){ box.appendChild(h(`<div class="empty">${Mail.filter!=='all'?'Писем по этому отбору нет':'Папка пуста'}</div>`)); return; }
   const all=bar.querySelector('[data-pickall]');
   // список (#mlist) живёт между страницами: прежний обработчик снимаем, иначе они копились бы
   if(box._pickSync){ box.removeEventListener('pickchange', box._pickSync); box._pickSync=null; }
   if(all){
-    const sync=()=>{ const n=data.messages.filter(m=>Mail.picked.has(accId+':'+m.id)).length;
-      all.checked=n===data.messages.length; all.indeterminate=n>0&&n<data.messages.length; };
+    const sync=()=>{ const n=items.filter(m=>Mail.picked.has(accId+':'+m.id)).length;
+      all.checked=n===items.length; all.indeterminate=n>0&&n<items.length; };
     sync();
     all.onchange=()=>{
-      data.messages.forEach(m=>{ const k=accId+':'+m.id; if(all.checked) Mail.picked.set(k,{acc:accId,id:m.id,subject:m.subject}); else Mail.picked.delete(k); });
-      box.querySelectorAll('input[data-pick]').forEach(x=>{ x.checked=all.checked; });
+      items.forEach(m=>{ const k=accId+':'+m.id; if(all.checked) Mail.picked.set(k,{acc:accId,id:m.id,subject:m.subject}); else Mail.picked.delete(k); });
+      box.querySelectorAll('input[data-pick]').forEach(x=>{ x.checked=all.checked; const it=x.closest('.msg-item'); if(it) it.classList.toggle('picked', all.checked); });
       renderPickBar();
     };
     box._pickSync=sync;
     box.addEventListener('pickchange', sync);
   }
-  data.messages.forEach(m=>{
-    const el=h(`<div class="msg-item ${m.seen?'':'unread'}" data-id="${m.id}" tabindex="0" role="button">
-      <div class="msg-top">${pickBox(accId, m.id, m.subject)}<span class="msg-from">${m.flagged?'⭐ ':''}${m.answered?'↩ ':''}${esc(m.from||'—')}</span><span>${m.has_attach?'📎':''}</span><span>${esc(fmtDateShort(m.date))}</span></div>
-      <div class="msg-subj">${esc(m.subject)}</div>
-      <div class="muted small">${esc(m.size_h)}</div></div>`);
+  const act=mailCanAct();
+  items.forEach(m=>{
+    const who=out?(m.to?'Кому: '+m.to:(m.from||'—')):(m.from||'—');
+    const picked=Mail.picked.has(accId+':'+m.id);
+    const el=h(`<div class="msg-item ${m.seen?'':'unread'} ${m.gone?'gone':''} ${m.id===Mail.cur?'active':''} ${picked?'picked':''}" data-id="${m.id}" tabindex="0" role="button" title="${esc(m.size_h)}" ${act&&!m.gone?'draggable="true"':''}>
+      <div class="msg-top">${pickBox(accId, m.id, m.subject)}
+        <button class="msg-star ${m.flagged?'on':''}" ${act&&!m.gone?'':'disabled'} title="${m.flagged?'Снять пометку':'Пометить'} (s)" aria-label="Пометка">${m.flagged?'★':'☆'}</button>
+        <span class="msg-from">${esc(who)}</span><span>${m.has_attach?'📎':''}</span><span class="msg-date" title="${esc(fmtDate(m.date))}">${esc(mailWhen(m.date))}</span></div>
+      <div class="msg-subj">${m.answered?'<span class="msg-ic" title="Отвечено">↩</span>':''}${m.forwarded?'<span class="msg-ic" title="Переслано">↪</span>':''}${esc(m.subject)}</div>
+      ${m.gone?'<div class="msg-meta"><span class="rp-tag" title="Письма в этой папке на сервере больше нет — копия в архиве">нет на сервере</span></div>':''}</div>`);
     wirePick(el, accId, m.id, m.subject);
-    el.onclick=()=>{ box.querySelectorAll('.msg-item').forEach(x=>x.classList.remove('active')); el.classList.add('active'); el.classList.remove('unread'); loadMailMessage(accId, m.id); };
+    const star=el.querySelector('.msg-star');
+    star.onclick=(e)=>{ e.stopPropagation(); if(star.disabled) return; mailAct('flags', [m.id], m.flagged?{remove:['\\Flagged']}:{add:['\\Flagged']}); };
+    el.onclick=()=>{ box.querySelectorAll('.msg-item').forEach(x=>x.classList.remove('active')); el.classList.add('active'); loadMailMessage(accId, m.id); };
     el.onkeydown=(e)=>{
-      if(e.key==='Enter'||e.key===' '){ e.preventDefault(); el.click(); }
+      if(e.key==='Enter'){ e.preventDefault(); el.click(); }
+      else if(e.key===' ' && !e.target.closest('input')){ e.preventDefault(); const cb=el.querySelector('input[data-pick]'); if(cb){ cb.checked=!cb.checked; cb.onchange(); } }
       else if(e.key==='ArrowDown' && el.nextElementSibling){ e.preventDefault(); el.nextElementSibling.focus(); }
       else if(e.key==='ArrowUp' && el.previousElementSibling && el.previousElementSibling.classList.contains('msg-item')){ e.preventDefault(); el.previousElementSibling.focus(); }
     };
+    el.addEventListener('dragstart', (e)=>{
+      const ids=Mail.picked.has(accId+':'+m.id)?mailPickedIds():[m.id];
+      e.dataTransfer.setData('text/x-mail-ids', JSON.stringify(ids)); e.dataTransfer.effectAllowed='move';
+    });
     box.appendChild(el);
   });
+}
+
+// ---------- Неотправленные (черновики клиента) ----------
+async function mailShowDrafts(accId){
+  const box=$('#mlist'); if(!box) return;
+  Mail.view='drafts';
+  try{ const d=await api(`/webmail/drafts?account_id=${accId}`); Mail.drafts=d.items||[]; }catch(e){ toastErr(e); return; }
+  box.innerHTML='';
+  box.appendChild(h(`<div class="mail-list-bar muted">Неотправленные письма: ${fmtNum(Mail.drafts.length)}. Хранятся в архиве, пока их не отправят или не удалят.</div>`));
+  if(!Mail.drafts.length){ box.appendChild(h('<div class="empty">Неотправленных писем нет</div>')); return; }
+  Mail.drafts.forEach(d=>{
+    const el=h(`<div class="msg-item" tabindex="0" role="button">
+      <div class="msg-top"><span class="msg-from">${esc(d.to_addrs?'Кому: '+d.to_addrs:'(без получателя)')}</span><span>${d.attachments.length?'📎':''}</span><span class="msg-date">${esc(mailWhen(d.updated_at))}</span></div>
+      <div class="msg-subj">${esc(d.subject||'(без темы)')}</div>
+      ${d.error?`<div class="small rp-red">Не отправлено: ${esc(trunc(d.error,140))}</div>`:''}
+      <div class="btn-row" style="margin-top:6px"><button class="btn sm" data-open>✏️ Продолжить</button><button class="btn sm ghost" data-del>🗑 Удалить</button></div></div>`);
+    el.querySelector('[data-open]').onclick=(e)=>{ e.stopPropagation(); composeWindow(d); };
+    el.querySelector('[data-del]').onclick=async(e)=>{ e.stopPropagation();
+      if(!await confirmDlg('Удалить черновик?', `«${d.subject||'без темы'}» и его вложения будут удалены.`, {okText:'Удалить'})) return;
+      try{ await api(`/webmail/drafts/${d.id}`,{method:'DELETE'}); mailShowDrafts(accId); renderMailFolders(accId); }catch(err){ toastErr(err); } };
+    el.onclick=()=>composeWindow(d);
+    el.onkeydown=(e)=>{ if(e.key==='Enter'){ e.preventDefault(); composeWindow(d); } };
+    box.appendChild(el);
+  });
+  renderMailFolders(accId);
 }
 // Политика безопасности для HTML письма. Внешние ресурсы блокирует сам
 // браузер, а не регулярные выражения: прежний фильтр пропускал дюжину вариантов
@@ -4282,6 +4628,7 @@ function mailSrcdoc(html, allowImages){
 
 function fmtDateShort(iso){ if(!iso) return ''; try{ const d=new Date(iso); return d.toLocaleDateString('ru-RU',{day:'2-digit',month:'2-digit',year:'2-digit'}); }catch(e){ return ''; } }
 
+// ---------- Письмо ----------
 async function loadMailMessage(accId, pk){
   const box=$('#mreader'); if(!box) return;
   box.innerHTML='<div class="empty" style="padding:40px"><div class="spinner"></div></div>';
@@ -4291,32 +4638,65 @@ async function loadMailMessage(accId, pk){
   let m;
   try{ m=await api(`/accounts/${accId}/messages/${pk}`); }catch(e){ if(seq===Mail.seqMsg) box.innerHTML=`<div class="empty">${esc(e.message)}</div>`; return; }
   if(seq!==Mail.seqMsg) return;
+  Mail.cur=pk; Mail.msg=m; Mail.msgAcc=accId;
+  const item=Mail.items.find(x=>x.id===pk) || {id:pk, seen:(m.flags||[]).includes('\\Seen'), flagged:(m.flags||[]).includes('\\Flagged'), gone:!!m.gone, date:m.date};
+  const gone=!!(item.gone || m.gone);
+  const here=accId===Mail.acc;
+  const act=here && mailCanAct() && !gone;
+  const send=here && mailCanSend() && !gone;
+  const inDrafts=(mailFolderInfo(m.folder)||{}).special==='drafts';
   const hd=m.headers||{};
   // Картинки, уже показанные в тексте письма (cid:), в списке вложений не дублируем.
   const visibleAtts=(m.attachments||[]).filter(a=>!a.inline);
-  const atts=visibleAtts.map(a=>`<a class="attach-chip" href="/api/accounts/${accId}/messages/${pk}/attachment/${a.index}" download>📎 ${esc(a.filename)} <span class="muted">(${fmtBytes(a.size)})</span></a>`).join('');
+  const attUrl=a=>`/api/accounts/${accId}/messages/${pk}/attachment/${a.index}`;
+  const atts=visibleAtts.map(a=>{
+    const img=/^image\/(png|jpe?g|gif|webp)$/i.test(a.content_type||'') && (a.size||0)<5*1024*1024;
+    return `<a class="attach-chip ${img?'img':''}" href="${attUrl(a)}" download title="Скачать «${esc(a.filename)}»">${img?`<img src="${attUrl(a)}" alt="" loading="lazy">`:'📎'} ${esc(a.filename)} <span class="muted">(${fmtBytes(a.size)})</span></a>`; }).join('');
   const hasText=!!(m.text&&m.text.trim()), hasHtml=!!(m.html&&m.html.trim());
+  const sendTip=send?'':esc((Mail.st&&Mail.st.send_problem)||(gone?'Письма на сервере больше нет':'Отправка недоступна'));
   box.innerHTML='';
   const el=h(`<div>
+    <div class="mail-tb">
+      ${inDrafts&&act?`<button class="btn sm primary" data-c="edit" ${send?'':'disabled'} title="${sendTip||'Продолжить черновик'}">✏️ Продолжить</button>`:''}
+      <button class="btn sm ${inDrafts?'':'primary'}" data-c="reply" ${send?'':'disabled'} title="${sendTip||'Ответить (r)'}">Ответить</button>
+      <button class="btn sm" data-c="reply_all" ${send?'':'disabled'} title="${sendTip||'Ответить всем (a)'}">Всем</button>
+      <button class="btn sm" data-c="forward" ${send?'':'disabled'} title="${sendTip||'Переслать (f)'}">Переслать</button>
+      <button class="btn sm ghost" data-c="star" ${act?'':'disabled'} title="Пометить (s)">☆</button>
+      <button class="btn sm ghost" data-c="unread" ${act?'':'disabled'} title="Отметить непрочитанным (u)">📩</button>
+      <button class="btn sm ghost" data-c="move" ${act?'':'disabled'} title="Переместить в папку (v)">📁</button>
+      <button class="btn sm ghost" data-c="junk" ${act&&Mail.special.junk?'':'disabled'} title="${(mailFolderInfo(m.folder)||{}).special==='junk'?'Не спам — во «Входящие»':'В спам'}">🚫</button>
+      <button class="btn sm ghost danger" data-c="delete" ${act?'':'disabled'} title="Удалить (Delete)">🗑</button>
+      <span class="spacer" style="flex:1"></span>
+      <button class="btn sm ghost" data-c="more" title="Ещё: скачать, заголовки, печать, восстановить" aria-label="Ещё">⋯</button>
+    </div>
     <div class="rhead">
       <div class="rsubj">${esc(hd.subject||'(без темы)')}</div>
       <div class="rmeta"><b>От:</b> ${esc(hd.from||'—')}</div>
       <div class="rmeta"><b>Кому:</b> ${esc(hd.to||'—')}</div>
       ${hd.cc?`<div class="rmeta"><b>Копия:</b> ${esc(hd.cc)}</div>`:''}
-      <div class="rmeta"><b>Дата:</b> ${esc(hd.date||'')}</div>
-      <div style="margin-top:10px" class="btn-row">
-        <a class="btn sm" href="/api/accounts/${accId}/messages/${pk}/raw" download>⬇ Скачать .eml</a>
-        ${canRestoreMessages()?'<button class="btn sm" data-restore-one>♻️ Восстановить письмо</button>':''}
-      </div>
+      <div class="rmeta"><b>Дата:</b> <span title="${esc(hd.date||'')}">${esc(item.date?fmtDate(item.date):(hd.date||''))}</span> · <span class="muted">📁 ${esc(mailFolderLabel(mailFolderInfo(m.folder))||m.folder||'')}</span>${gone?' · <span class="rp-tag" title="Письма в этой папке на сервере больше нет — копия в архиве">нет на сервере</span>':''}</div>
     </div>
+    <div id="mthread"></div>
     ${(m.truncated||m.notice)?`<div class="hint" style="margin-bottom:12px;border-color:var(--warn)">📦 ${esc(m.notice||'Письмо слишком большое для показа в браузере.')}</div>`:''}
-    ${atts?`<div style="margin-bottom:14px"><div class="muted small" style="margin-bottom:4px">Вложения (${visibleAtts.length}):</div>${atts}</div>`:''}
+    ${atts?`<div class="mail-atts"><div class="muted small" style="margin-bottom:4px">Вложения (${visibleAtts.length}):</div>${atts}</div>`:''}
     ${(hasText&&hasHtml)?`<div class="body-tabs"><button class="btn sm primary" data-tab="text">Текст</button><button class="btn sm" data-tab="html">HTML</button></div>`:''}
     <div id="mbody"></div>
   </div>`);
   box.appendChild(el);
-  const one=el.querySelector('[data-restore-one]');
-  if(one) one.onclick=()=>messagesRestoreModal([{acc:accId, id:pk, subject:hd.subject||''}]);
+  const tb=el.querySelector('.mail-tb');
+  const go=(c, e)=>{
+    if(c==='reply'||c==='reply_all'||c==='forward') return mailCompose(c, pk);
+    if(c==='edit') return mailCompose('edit', pk);
+    if(c==='star') return mailAct('flags', [pk], item.flagged?{remove:['\\Flagged']}:{add:['\\Flagged']});
+    if(c==='unread') return mailAct('flags', [pk], item.seen?{remove:['\\Seen']}:{add:['\\Seen']});
+    if(c==='move') return mailMovePicker(e.currentTarget, [pk]);
+    if(c==='junk') return mailAct('junk', [pk], {spam:(mailFolderInfo(m.folder)||{}).special!=='junk'});
+    if(c==='delete') return mailDelete([pk]);
+    if(c==='more') return mailMoreMenu(e.currentTarget, accId, pk, hd, gone);
+  };
+  tb.querySelectorAll('[data-c]').forEach(b=>b.onclick=(e)=>go(b.dataset.c, e));
+  Mail.readerGo=go;
+  mailReaderFlags();
   const bodyBox=el.querySelector('#mbody');
   const showText=()=>{ bodyBox.innerHTML=''; bodyBox.appendChild(h(`<div class="mail-body-text">${esc(m.text||'(пустое тело)')}</div>`)); };
   // Внешние картинки в письме по умолчанию НЕ грузим: это трекинг-пиксели,
@@ -4335,16 +4715,363 @@ async function loadMailMessage(accId, pk){
     }
     const f=document.createElement('iframe'); f.className='mail-body-frame';
     // Без allow-scripts и allow-same-origin: письмо не может выполнить код и
-    // обратиться к API. allow-popups — чтобы ссылки открывались в новой вкладке
-    // (раньше щелчок по ссылке ничего не делал).
+    // обратиться к API. allow-popups — чтобы ссылки открывались в новой вкладке.
     f.setAttribute('sandbox','allow-popups allow-popups-to-escape-sandbox');
     f.setAttribute('referrerpolicy','no-referrer');
     f.srcdoc=doc.srcdoc; bodyBox.appendChild(f);
   };
+  // HTML-письмо показываем как HTML: у многих писем текстовая часть — пустая заглушка
   if(m.truncated){ /* тело не разбиралось — показываем только шапку и подсказку */ }
-  else if(hasText) showText(); else if(hasHtml) showHtml(); else showText();
+  else if(hasHtml){ showHtml(); const t=el.querySelectorAll('[data-tab]'); t.forEach(x=>x.className='btn sm'+(x.dataset.tab==='html'?' primary':'')); }
+  else showText();
   el.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{ el.querySelectorAll('[data-tab]').forEach(x=>x.className='btn sm'); b.className='btn sm primary'; b.dataset.tab==='html'?showHtml():showText(); });
+  // переписка
+  api(`/webmail/thread?account_id=${accId}&id=${pk}`, {bg:true}).then(t=>{
+    if(seq!==Mail.seqMsg || !t.items || t.items.length<2) return;
+    const th=el.querySelector('#mthread');
+    th.appendChild(h(`<details class="mail-thread" ${t.items.length<=6?'open':''}><summary>🧵 Переписка: ${t.items.length} ${plural(t.items.length,'письмо','письма','писем')}</summary>
+      ${t.items.map(x=>`<div class="mail-thread-item ${x.current?'cur':''} ${x.seen?'':'unread'} ${x.gone?'gone':''}" data-id="${x.id}" tabindex="0" role="button"><span class="d">${esc(mailWhen(x.date))}</span><span class="f">${esc(trunc(x.from,40))}</span><span class="s">${esc(trunc(x.subject||'(без темы)',80))}</span><span class="muted small">${esc(x.folder)}</span></div>`).join('')}</details>`));
+    th.querySelectorAll('[data-id]').forEach(r=>{ const id=parseInt(r.dataset.id); if(id===pk) return;
+      r.onclick=()=>loadMailMessage(accId, id); r.onkeydown=(e)=>{ if(e.key==='Enter') loadMailMessage(accId, id); }; });
+  }).catch(()=>{});
+  // прочитано: сотрудник в своём ящике — как в любом почтовом клиенте (администратор отметок не меняет)
+  if(Mail.st && Mail.st.mark_read && here && !item.seen && !gone){
+    setTimeout(()=>{ if(Mail.cur===pk && seq===Mail.seqMsg) mailAct('flags', [pk], {add:['\\Seen']}, {quiet:true}); }, 1200);
+  }
 }
+
+/** Пометка и «прочитано» в панели письма — по текущему состоянию письма в списке. */
+function mailReaderFlags(){
+  const rd=$('#mreader'); if(!rd || !Mail.cur) return;
+  const item=Mail.items.find(x=>x.id===Mail.cur); if(!item) return;
+  const star=rd.querySelector('[data-c="star"]'); if(star){ star.textContent=item.flagged?'★':'☆'; star.classList.toggle('on', !!item.flagged); star.title=item.flagged?'Снять пометку (s)':'Пометить (s)'; }
+  const un=rd.querySelector('[data-c="unread"]'); if(un){ un.textContent=item.seen?'📩':'✉️'; un.title=item.seen?'Отметить непрочитанным (u)':'Отметить прочитанным (u)'; }
+}
+
+function mailMoreMenu(anchor, accId, pk, hd, gone){
+  document.querySelectorAll('.mail-pop').forEach(x=>x.remove());
+  const pop=h(`<div class="mail-pop" role="menu"><div class="mail-pop-list">
+    <a class="mail-pop-item" href="/api/accounts/${accId}/messages/${pk}/raw" download>⬇ Скачать .eml</a>
+    <button class="mail-pop-item" data-a="headers">📋 Заголовки письма</button>
+    <button class="mail-pop-item" data-a="print">🖨 Печать</button>
+    ${canRestoreMessages()?'<button class="mail-pop-item" data-a="restore">♻️ Восстановить письмо</button>':''}
+    ${mailCanAct()&&!gone&&accId===Mail.acc?'<button class="mail-pop-item danger" data-a="erase">🗑 Удалить с сервера насовсем</button>':''}</div></div>`);
+  document.body.appendChild(pop);
+  const r=anchor.getBoundingClientRect();
+  pop.style.top=(r.bottom+4+window.scrollY)+'px'; pop.style.left=Math.max(8, Math.min(window.innerWidth-290, r.right+window.scrollX-280))+'px';
+  const close=()=>pop.remove();
+  pop.querySelectorAll('a').forEach(a=>a.addEventListener('click', ()=>setTimeout(close, 0)));
+  pop.querySelectorAll('[data-a]').forEach(b=>b.onclick=async()=>{
+    close();
+    const a=b.dataset.a;
+    if(a==='restore') messagesRestoreModal([{acc:accId, id:pk, subject:hd.subject||''}]);
+    else if(a==='erase') mailDelete([pk], {permanent:true});
+    else if(a==='print') window.print();
+    else if(a==='headers'){
+      try{ const d=await api(`/webmail/headers?account_id=${accId}&id=${pk}`);
+        modal('Заголовки письма', `<div class="muted small" style="margin-bottom:6px">Папка «${esc(d.folder)}», UID ${esc(String(d.uid))}${d.gone?' · на сервере письма больше нет':''}</div><pre class="mail-headers">${esc(d.headers)}</pre>`, {wide:true});
+      }catch(e){ toastErr(e); }
+    }
+  });
+  const off=(e)=>{ if(!pop.contains(e.target)){ close(); document.removeEventListener('mousedown', off); } };
+  setTimeout(()=>document.addEventListener('mousedown', off), 0);
+}
+
+// ---------- Новое письмо, ответ, пересылка ----------
+async function mailCompose(mode, refId){
+  if(!mailCanSend()) return toast('Отправка недоступна', (Mail.st&&Mail.st.send_problem)||'', 'warn', 7000);
+  let d;
+  try{ d=await api('/webmail/drafts', {method:'POST', body:{account_id:Mail.acc, mode, ref_id:refId||null}}); }
+  catch(e){ return toastErr(e); }
+  Mail.drafts.unshift(d);
+  composeWindow(d);
+}
+
+/** Окно письма: адреса с подсказкой, тема, редактор, вложения, автосохранение, отправка. */
+function composeWindow(draft){
+  const existing=document.querySelector(`.compose[data-draft="${draft.id}"]`);
+  if(existing){ existing.classList.remove('min'); const b=existing.querySelector('.compose-body'); if(b) b.focus(); return; }
+  document.querySelectorAll('.compose').forEach(x=>x.classList.add('min'));   // одно окно открыто, остальные свёрнуты
+  const accs=isMailbox()?myAccounts():(State.accounts||[]);
+  const fromAcc=accs.find(a=>a.id===draft.account_id)||{id:draft.account_id, name:''};
+  const fromOpts=isMailbox()&&accs.length>1
+    ? `<select data-f="account_id" aria-label="От">${accs.map(a=>`<option value="${a.id}" ${a.id===draft.account_id?'selected':''}>${esc(a.name)}</option>`).join('')}</select>`
+    : `<span class="compose-from">${esc(fromAcc.name||'')}</span>`;
+  const titles={new:'Новое письмо', reply:'Ответ', reply_all:'Ответ всем', forward:'Пересылка', edit:'Черновик'};
+  const w=h(`<div class="compose" data-draft="${draft.id}" role="dialog" aria-label="Письмо">
+    <div class="compose-head"><span class="t">${esc(titles[draft.mode]||'Письмо')}${draft.subject?': '+esc(trunc(draft.subject,50)):''}</span>
+      <span class="compose-state muted small" aria-live="polite"></span>
+      <button class="x" data-min title="Свернуть" aria-label="Свернуть">▁</button><button class="x" data-max title="Развернуть" aria-label="Развернуть">⤢</button><button class="x" data-close title="Закрыть (черновик сохранится)" aria-label="Закрыть">×</button></div>
+    <div class="compose-inner">
+      <div class="compose-row"><label>От</label>${fromOpts}</div>
+      <div class="compose-row"><label for="cw-to-${draft.id}">Кому</label><input id="cw-to-${draft.id}" data-f="to_addrs" type="text" autocomplete="off" placeholder="адрес или имя" value="${esc(draft.to_addrs||'')}">
+        <span class="compose-links"><a href="#" data-show="cc">Копия</a> <a href="#" data-show="bcc">Скрытая</a></span></div>
+      <div class="compose-row" data-row="cc" ${draft.cc_addrs?'':'hidden'}><label for="cw-cc-${draft.id}">Копия</label><input id="cw-cc-${draft.id}" data-f="cc_addrs" type="text" autocomplete="off" value="${esc(draft.cc_addrs||'')}"></div>
+      <div class="compose-row" data-row="bcc" ${draft.bcc_addrs?'':'hidden'}><label for="cw-bcc-${draft.id}">Скрытая</label><input id="cw-bcc-${draft.id}" data-f="bcc_addrs" type="text" autocomplete="off" value="${esc(draft.bcc_addrs||'')}"></div>
+      <div class="compose-row"><label for="cw-subj-${draft.id}">Тема</label><input id="cw-subj-${draft.id}" data-f="subject" type="text" maxlength="998" value="${esc(draft.subject||'')}"></div>
+      <div class="compose-toolbar" role="toolbar" aria-label="Оформление">
+        <button data-cmd="bold" title="Жирный (Ctrl+B)"><b>Ж</b></button><button data-cmd="italic" title="Курсив (Ctrl+I)"><i>К</i></button><button data-cmd="underline" title="Подчёркнутый (Ctrl+U)"><u>Ч</u></button><button data-cmd="strikeThrough" title="Зачёркнутый"><s>З</s></button>
+        <span class="sep"></span><button data-cmd="insertUnorderedList" title="Список">• ≡</button><button data-cmd="insertOrderedList" title="Нумерованный список">1. ≡</button><button data-cmd="quote" title="Цитата">❝</button>
+        <span class="sep"></span><button data-cmd="link" title="Ссылка">🔗</button><button data-cmd="removeFormat" title="Убрать оформление">⌫</button>
+        <span class="spacer" style="flex:1"></span><label class="btn ghost sm compose-attach" title="Прикрепить файлы">📎 Прикрепить<input type="file" multiple hidden></label></div>
+      <div class="compose-body" contenteditable="true" role="textbox" aria-multiline="true" aria-label="Текст письма"></div>
+      <div class="compose-atts"></div>
+      <div class="compose-foot"><button class="btn primary" data-send title="Отправить (Ctrl+Enter)">📨 Отправить</button>
+        <button class="btn ghost sm" data-save>💾 Сохранить</button><span class="spacer" style="flex:1"></span>
+        <button class="btn ghost sm danger" data-discard title="Удалить черновик">🗑</button></div>
+    </div>
+    <div class="compose-ac" hidden></div></div>`);
+  document.body.appendChild(w);
+  const g=s=>w.querySelector(s);
+  const body=g('.compose-body');
+  body.innerHTML=draft.body||'';               // сервер уже очистил HTML (sanitize_html), CSP не даст выполнить код
+  const state=g('.compose-state');
+  let atts=(draft.attachments||[]).slice();
+  let dirty=false, saving=null, timer=null, closed=false, sending=false;
+  const maxMb=(Mail.st&&Mail.st.max_attachments_mb)||25;
+  const renderAtts=()=>{
+    const used=atts.reduce((s,a)=>s+(a.size||0),0);
+    g('.compose-atts').innerHTML=atts.map(a=>`<span class="attach-chip">📎 ${esc(a.name)} <span class="muted">(${fmtBytes(a.size)})</span>${a.uploading?' <span class="spinner"></span>':`<button class="x" data-n="${a.n}" title="Убрать вложение" aria-label="Убрать вложение «${esc(a.name)}»">×</button>`}</span>`).join('')
+      + (atts.length?`<span class="muted small">всего ${fmtBytes(used)} из ${maxMb} МБ</span>`:'');
+    g('.compose-atts').querySelectorAll('[data-n]').forEach(b=>b.onclick=async()=>{
+      try{ await api(`/webmail/drafts/${draft.id}/attachments/${b.dataset.n}`, {method:'DELETE'}); atts=atts.filter(x=>String(x.n)!==b.dataset.n); renderAtts(); }catch(e){ toastErr(e); } });
+  };
+  renderAtts();
+  const fields=()=>{ const o={body:body.innerHTML}; w.querySelectorAll('[data-f]').forEach(x=>{ o[x.dataset.f]=x.dataset.f==='account_id'?parseInt(x.value):x.value; }); return o; };
+  const save=async(manual)=>{
+    if(closed && !manual) return;
+    if(saving) await saving;
+    if(!dirty && !manual) return;
+    dirty=false;
+    state.textContent='Сохраняю…';
+    saving=api(`/webmail/drafts/${draft.id}`, {method:'PUT', body:fields(), bg:!manual})
+      .then(d=>{ Object.assign(draft, d); state.textContent='Сохранено '+new Date().toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'}); })
+      .catch(e=>{ dirty=true; state.textContent='Не сохранено'; if(manual) toastErr(e); });
+    await saving; saving=null;
+  };
+  const touch=()=>{ dirty=true; state.textContent='Изменено'; clearTimeout(timer); timer=setTimeout(()=>save(false), 3000); };
+  w.querySelectorAll('[data-f]').forEach(x=>{ x.addEventListener('input', touch); x.addEventListener('change', touch); });
+  body.addEventListener('input', touch);
+  // вставка: только безопасная разметка; картинки из буфера — внутрь письма
+  body.addEventListener('paste', (e)=>{
+    const cd=e.clipboardData; if(!cd) return;
+    const files=[...cd.files||[]].filter(f=>/^image\/(png|jpe?g|gif|webp)$/.test(f.type));
+    if(files.length){ e.preventDefault(); files.forEach(f=>composeInsertImage(f)); return; }
+    const html=cd.getData('text/html');
+    if(html){ e.preventDefault(); document.execCommand('insertHTML', false, composeClean(html)); }
+  });
+  const composeInsertImage=(f)=>{
+    if(f.size>3*1024*1024) return toast('Картинка слишком большая', 'Вставлять в текст можно картинки до 3 МБ — крупные прикрепите файлом.', 'warn');
+    const rd=new FileReader(); rd.onload=()=>{ body.focus(); document.execCommand('insertHTML', false, `<img src="${rd.result}" alt="" style="max-width: 100%">`); touch(); }; rd.readAsDataURL(f);
+  };
+  g('.compose-toolbar').querySelectorAll('[data-cmd]').forEach(b=>b.onclick=(e)=>{
+    e.preventDefault(); body.focus();
+    const c=b.dataset.cmd;
+    if(c==='link'){ const url=window.prompt('Адрес ссылки (https://…)', 'https://'); if(url && /^(https?:|mailto:)/i.test(url.trim())) document.execCommand('createLink', false, url.trim()); }
+    else if(c==='quote') document.execCommand('formatBlock', false, 'blockquote');
+    else document.execCommand(c, false, null);
+    touch();
+  });
+  // адреса: Копия, Скрытая, подсказка
+  w.querySelectorAll('[data-show]').forEach(a=>a.onclick=(e)=>{ e.preventDefault(); const row=g(`[data-row="${a.dataset.show}"]`); row.hidden=false; row.querySelector('input').focus(); a.hidden=true; });
+  if(draft.cc_addrs){ const a=g('[data-show="cc"]'); if(a) a.hidden=true; }
+  if(draft.bcc_addrs){ const a=g('[data-show="bcc"]'); if(a) a.hidden=true; }
+  composeAutocomplete(w, draft);
+  // вложения: кнопка и перетаскивание файлов на окно
+  const upload=async(files)=>{
+    for(const f of files){
+      const used=atts.reduce((s,a)=>s+(a.size||0),0);
+      if(used+f.size>maxMb*1024*1024){ toast('Вложения слишком большие', `Вместе — не больше ${maxMb} МБ.`, 'warn'); break; }
+      const tmp={n:'u'+Math.random(), name:f.name, size:f.size, uploading:true}; atts.push(tmp); renderAtts();
+      const fd=new FormData(); fd.append('file', f);
+      try{ const r=await api(`/webmail/drafts/${draft.id}/attachments`, {method:'POST', body:fd}); Object.assign(tmp, r); tmp.uploading=false; }
+      catch(e){ atts=atts.filter(x=>x!==tmp); toastErr(e); }
+      renderAtts();
+    }
+  };
+  const fileInp=g('.compose-attach input');
+  fileInp.onchange=()=>{ upload([...fileInp.files]); fileInp.value=''; };
+  w.addEventListener('dragover', (e)=>{ if(e.dataTransfer.types.includes('Files')){ e.preventDefault(); w.classList.add('drop'); } });
+  w.addEventListener('dragleave', (e)=>{ if(!w.contains(e.relatedTarget)) w.classList.remove('drop'); });
+  w.addEventListener('drop', (e)=>{ if(!e.dataTransfer.files.length) return; e.preventDefault(); w.classList.remove('drop');
+    const imgs=[...e.dataTransfer.files]; if(e.target.closest('.compose-body') && imgs.every(f=>/^image\//.test(f.type) && f.size<3*1024*1024)) imgs.forEach(composeInsertImage); else upload(imgs); });
+  const close=async()=>{ if(closed) return; clearTimeout(timer); await save(false); closed=true; w.remove(); if(Mail.view==='drafts' && Mail.acc) mailShowDrafts(Mail.acc); else if(Mail.acc) loadMailFolders(Mail.acc, {quiet:true}); };
+  g('[data-close]').onclick=close;
+  g('[data-min]').onclick=()=>w.classList.toggle('min');
+  g('[data-max]').onclick=()=>w.classList.toggle('max');
+  g('.compose-head').ondblclick=()=>w.classList.toggle('min');
+  g('[data-save]').onclick=()=>save(true);
+  g('[data-discard]').onclick=async()=>{
+    if(!await confirmDlg('Удалить черновик?', 'Письмо и его вложения будут удалены.', {okText:'Удалить'})) return;
+    clearTimeout(timer); closed=true;
+    try{ await api(`/webmail/drafts/${draft.id}`, {method:'DELETE'}); }catch(e){ toastErr(e); }
+    w.remove(); Mail.drafts=Mail.drafts.filter(x=>x.id!==draft.id); if(Mail.view==='drafts' && Mail.acc) mailShowDrafts(Mail.acc); else if(Mail.acc) renderMailFolders(Mail.acc);
+  };
+  const doSend=async()=>{
+    if(sending) return;
+    if(atts.some(a=>a.uploading)) return toast('Вложения ещё загружаются', 'Дождитесь окончания загрузки.', 'warn');
+    const f=fields();
+    if(!(f.to_addrs||'').trim() && !(f.cc_addrs||'').trim() && !(f.bcc_addrs||'').trim()) return toastErr({message:'Укажите хотя бы одного получателя.'});
+    if(!(f.subject||'').trim() && !await confirmDlg('Отправить без темы?', 'У письма нет темы.', {okText:'Отправить', okClass:'primary'})) return;
+    sending=true; const btn=g('[data-send]'); btn.disabled=true; btn.innerHTML='<span class="spinner"></span> Отправляю…';
+    clearTimeout(timer); dirty=true;
+    try{
+      await save(true);
+      const r=await api(`/webmail/drafts/${draft.id}/send`, {method:'POST'});
+      closed=true; w.remove();
+      Mail.drafts=Mail.drafts.filter(x=>x.id!==draft.id);
+      toast('Письмо отправлено', `Получателей: ${fmtNum(r.recipients)}${r.saved_to?` · копия в «${r.saved_to}»`:''}`);
+      (r.warnings||[]).forEach(t=>toast('Обратите внимание', t, 'warn', 8000));
+      if(Mail.acc){ await loadMailFolders(Mail.acc, {quiet:true}); if(Mail.view==='drafts') mailShowDrafts(Mail.acc); else if(!Mail.search) loadMailMessages(Mail.acc, {keep:true}); }
+    }catch(e){ sending=false; btn.disabled=false; btn.innerHTML='📨 Отправить'; toastErr(e); }
+  };
+  g('[data-send]').onclick=doSend;
+  w.addEventListener('keydown', (e)=>{
+    if((e.ctrlKey||e.metaKey) && e.key==='Enter'){ e.preventDefault(); doSend(); }
+    else if((e.ctrlKey||e.metaKey) && (e.key==='s'||e.key==='ы')){ e.preventDefault(); save(true); }
+    else if(e.key==='Escape' && !g('.compose-ac').hidden){ g('.compose-ac').hidden=true; }
+    e.stopPropagation();
+  });
+  if(draft.error) toast('Письмо не было отправлено', draft.error, 'warn', 8000);
+  // курсор — в «Кому», если пусто, иначе в начало текста
+  const to=g('[data-f="to_addrs"]');
+  if(!to.value.trim()) to.focus();
+  else{ body.focus(); try{ const r=document.createRange(); r.setStart(body, 0); r.collapse(true); const s=window.getSelection(); s.removeAllRanges(); s.addRange(r); }catch(e){ /* пустое тело */ } }
+}
+
+/** Вставленный HTML — без скриптов, обработчиков, стилей страницы и внешних картинок. */
+function composeClean(html){
+  const ok=new Set(['A','B','STRONG','I','EM','U','S','STRIKE','DEL','BR','P','DIV','SPAN','UL','OL','LI','BLOCKQUOTE','H1','H2','H3','H4','PRE','CODE','TABLE','THEAD','TBODY','TR','TD','TH','HR','SUB','SUP','IMG']);
+  let doc;
+  try{ doc=new DOMParser().parseFromString(String(html||''), 'text/html'); }catch(e){ return esc(String(html||'')); }
+  const walk=(node)=>{
+    [...node.childNodes].forEach(ch=>{
+      if(ch.nodeType===1){
+        if(['SCRIPT','STYLE','IFRAME','OBJECT','EMBED','NOSCRIPT','TEMPLATE','HEAD','TITLE','META','LINK','SVG','MATH','FORM','INPUT','BUTTON','SELECT','TEXTAREA'].includes(ch.tagName)){ ch.remove(); return; }
+        walk(ch);
+        if(!ok.has(ch.tagName)){ ch.replaceWith(...ch.childNodes); return; }
+        [...ch.attributes].forEach(a=>{
+          const n=a.name.toLowerCase(), v=a.value||'';
+          const keep=(n==='href' && ch.tagName==='A' && /^(https?:|mailto:)/i.test(v.trim()))
+            || (n==='src' && ch.tagName==='IMG' && /^data:image\/(png|jpe?g|gif|webp);base64,/i.test(v.trim()))
+            || ['colspan','rowspan','alt'].includes(n);
+          if(!keep) ch.removeAttribute(a.name);
+        });
+        if(ch.tagName==='IMG' && !ch.getAttribute('src')) ch.remove();
+      }else if(ch.nodeType!==3){ ch.remove(); }
+    });
+  };
+  walk(doc.body);
+  return doc.body.innerHTML;
+}
+
+/** Подсказка адресов в полях «Кому», «Копия», «Скрытая»: последний адрес после запятой. */
+function composeAutocomplete(w, draft){
+  const ac=w.querySelector('.compose-ac');
+  let target=null, items=[], idx=-1, t=null;
+  const hide=()=>{ ac.hidden=true; items=[]; idx=-1; };
+  const pick=(i)=>{
+    const it=items[i]; if(!it || !target) return;
+    const parts=target.value.split(/[,;]/); parts.pop();
+    target.value=(parts.map(s=>s.trim()).filter(Boolean).concat([it.label]).join(', '))+', ';
+    target.dispatchEvent(new Event('input')); hide(); target.focus();
+  };
+  const show=()=>{
+    if(!items.length || !target){ hide(); return; }
+    const r=target.getBoundingClientRect(), wr=w.getBoundingClientRect();
+    ac.style.left=(r.left-wr.left)+'px'; ac.style.top=(r.bottom-wr.top+2)+'px'; ac.style.width=r.width+'px';
+    ac.innerHTML=items.map((it,i)=>`<div class="compose-ac-item ${i===idx?'on':''}" data-i="${i}">${esc(it.label)}</div>`).join('');
+    ac.querySelectorAll('[data-i]').forEach(d=>d.onmousedown=(e)=>{ e.preventDefault(); pick(parseInt(d.dataset.i)); });
+    ac.hidden=false;
+  };
+  w.querySelectorAll('[data-f="to_addrs"],[data-f="cc_addrs"],[data-f="bcc_addrs"]').forEach(inp=>{
+    inp.addEventListener('input', ()=>{
+      target=inp; clearTimeout(t);
+      const q=(inp.value.split(/[,;]/).pop()||'').trim();
+      if(q.length<2){ hide(); return; }
+      t=setTimeout(async()=>{
+        try{ const r=await api(`/webmail/contacts?account_id=${draft.account_id}&q=${encodeURIComponent(q)}`, {bg:true}); items=(r.items||[]).slice(0,8); idx=items.length?0:-1; show(); }catch(e){ hide(); }
+      }, 200);
+    });
+    inp.addEventListener('keydown', (e)=>{
+      if(ac.hidden) return;
+      if(e.key==='ArrowDown'){ e.preventDefault(); idx=Math.min(items.length-1, idx+1); show(); }
+      else if(e.key==='ArrowUp'){ e.preventDefault(); idx=Math.max(0, idx-1); show(); }
+      else if((e.key==='Enter'||e.key==='Tab') && idx>=0){ e.preventDefault(); pick(idx); }
+      else if(e.key==='Escape'){ e.preventDefault(); hide(); }
+    });
+    inp.addEventListener('blur', ()=>setTimeout(hide, 150));
+  });
+}
+
+// ---------- Отправитель, подпись, сервер отправки ----------
+async function mailIdentityDialog(accId){
+  let d; try{ d=await api(`/webmail/identity?account_id=${accId}`); }catch(e){ return toastErr(e); }
+  const adm=d.can_edit_smtp;
+  const auto=d.auto||{};
+  const st=d.stored||{};
+  const m=modal('Отправитель и подпись', `
+    <div class="form-row"><label for="mi-name">Имя отправителя</label><input id="mi-name" type="text" maxlength="200" value="${esc(d.display_name||'')}"><div class="hint">Так получатели увидят отправителя: «${esc(d.display_name||'')} &lt;${esc(d.address||'адрес')}&gt;».</div></div>
+    <div class="form-row"><label for="mi-reply">Ответы — на адрес <span class="muted small">(необязательно)</span></label><input id="mi-reply" type="text" maxlength="300" value="${esc(d.reply_to||'')}" placeholder="например, sales@company.ru"></div>
+    <div class="form-row"><label>Подпись</label><div class="compose-body sig" id="mi-sig" contenteditable="true" role="textbox" aria-multiline="true" aria-label="Подпись"></div><div class="hint">Добавляется в каждое новое письмо, ответ и пересылку.</div></div>
+    ${adm?`<details class="mail-smtp" ${d.send_problem?'open':''}><summary><b>Отправка (SMTP)</b> — ${esc(d.smtp_host)}:${esc(String(d.smtp_port))}, ${esc(d.smtp_security)}</summary>
+      <div class="form-row"><label for="mi-addr">Адрес отправителя</label><input id="mi-addr" type="text" inputmode="email" autocomplete="off" value="${esc(st.address||'')}" placeholder="${esc(d.address||'')}"><div class="hint">Пусто — логин ящика (если это адрес) или адрес сотрудника.</div></div>
+      <div class="grid2"><div class="form-row"><label for="mi-host">Сервер отправки</label><input id="mi-host" type="text" value="${esc(st.smtp_host||'')}" placeholder="${esc(auto.host||'')}"></div>
+        <div class="form-row"><label for="mi-port">Порт</label><input id="mi-port" type="number" min="1" max="65535" value="${st.smtp_port||''}" placeholder="${esc(String(auto.port||''))}"></div></div>
+      <div class="grid2"><div class="form-row"><label for="mi-sec">Защита</label><select id="mi-sec"><option value="">как подобрано (${esc(auto.security||'')})</option><option value="ssl">SSL (порт 465)</option><option value="starttls">STARTTLS (порт 587)</option><option value="none">без шифрования</option></select></div>
+        <div class="form-row"><label for="mi-auth">Вход</label><select id="mi-auth"><option value="account">как в ящик (пароль, OAuth)</option><option value="custom">отдельный логин и пароль</option><option value="none">без входа (ретранслятор)</option></select></div></div>
+      <div class="grid2" id="mi-custom"><div class="form-row"><label for="mi-user">Логин SMTP</label><input id="mi-user" type="text" value="${esc(d.smtp_username||'')}" autocomplete="off"></div>
+        <div class="form-row"><label for="mi-pass">Пароль SMTP</label><input id="mi-pass" type="password" autocomplete="new-password" placeholder="${d.smtp_password_set?'задан — пусто, чтобы не менять':''}"></div></div>
+      <div class="form-row"><label for="mi-save">Копия в «Отправленные»</label><select id="mi-save"><option value="">как в настройках</option><option value="auto">auto — кроме Gmail и Microsoft 365</option><option value="always">всегда</option><option value="never">никогда (сервер кладёт сам)</option></select></div>
+      ${d.send_problem?`<div class="hint" style="border-color:var(--warn)">⚠️ ${esc(d.send_problem)}</div>`:'<div class="hint">Пустые поля подбираются по серверу IMAP ящика.</div>'}
+    </details>`:(d.send_problem?`<div class="hint" style="border-color:var(--warn)">⚠️ ${esc(d.send_problem)}</div>`:'')}`,
+    {wide:true, footer:'<button class="btn ghost" data-c>Отмена</button><button class="btn primary" data-ok>Сохранить</button>'});
+  const g=s=>m.body.querySelector(s);
+  g('#mi-sig').innerHTML=d.signature||'';
+  g('#mi-sig').addEventListener('paste', (e)=>{ const html=e.clipboardData&&e.clipboardData.getData('text/html'); if(html){ e.preventDefault(); document.execCommand('insertHTML', false, composeClean(html)); } });
+  if(adm){
+    g('#mi-sec').value=st.smtp_security||''; g('#mi-auth').value=d.smtp_auth||'account'; g('#mi-save').value=st.save_sent||'';
+    const sync=()=>{ g('#mi-custom').style.display=g('#mi-auth').value==='custom'?'':'none'; }; sync(); g('#mi-auth').onchange=sync;
+  }
+  m.foot.querySelector('[data-c]').onclick=m.close;
+  m.foot.querySelector('[data-ok]').onclick=async()=>{
+    const body={account_id:accId, display_name:g('#mi-name').value, reply_to:g('#mi-reply').value, signature:g('#mi-sig').innerHTML};
+    if(adm){
+      Object.assign(body, {address:g('#mi-addr').value.trim(), smtp_host:g('#mi-host').value.trim(), smtp_port:parseInt(g('#mi-port').value||'0')||0,
+        smtp_security:g('#mi-sec').value, smtp_auth:g('#mi-auth').value, smtp_username:g('#mi-user').value.trim(), save_sent:g('#mi-save').value});
+      if(g('#mi-pass').value) body.smtp_password=g('#mi-pass').value;
+    }
+    try{ await api('/webmail/identity', {method:'PUT', body}); m.close(); toast('Сохранено', 'Отправитель и подпись ящика');
+      try{ Mail.st=await api(`/webmail/status?account_id=${accId}`); }catch(e){ /* обновится при следующем входе */ }
+      const cb=$('#mailCompose'); if(cb){ cb.disabled=!mailCanSend(); cb.title=mailCanSend()?'Новое письмо (c)':(Mail.st.send_problem||''); }
+    }catch(e){ toastErr(e); }
+  };
+}
+
+// ---------- Горячие клавиши «Почты» ----------
+document.addEventListener('keydown', (e)=>{
+  if(State.view!=='mail' || e.ctrlKey || e.metaKey || e.altKey) return;
+  const t=e.target;
+  if(t && (t.closest('input,textarea,select,[contenteditable="true"],.compose,.modal-back'))) return;
+  if(document.querySelector('.modal-back')) return;
+  const k=e.key;
+  const list=$('#mlist');
+  if(k==='/'){ const q=$('#msq'); if(q){ e.preventDefault(); q.focus(); } return; }
+  if(k==='c' || k==='с'){ if(mailCanSend()){ e.preventDefault(); mailCompose('new'); } return; }
+  if((k==='j'||k==='о'||k==='k'||k==='л') && list){
+    const items=[...list.querySelectorAll('.msg-item')]; if(!items.length) return;
+    const cur=items.findIndex(x=>x.classList.contains('active'));
+    const next=(k==='j'||k==='о')?Math.min(items.length-1, cur+1):Math.max(0, cur<0?0:cur-1);
+    e.preventDefault(); items[next].focus(); items[next].click(); return;
+  }
+  if(!Mail.cur || !Mail.readerGo) return;
+  const map={r:'reply', 'к':'reply', a:'reply_all', 'ф':'reply_all', f:'forward', 'а':'forward', s:'star', 'ы':'star', u:'unread', 'г':'unread', '#':'delete', Delete:'delete', v:'move', 'м':'move'};
+  const c=map[k]; if(!c) return;
+  const rd=$('#mreader'); const btn=rd && rd.querySelector(`[data-c="${c}"]`);
+  if(!btn || btn.disabled) return;
+  e.preventDefault();
+  Mail.readerGo(c, {currentTarget:btn});
+});
 
 // ===================================================================
 //  Аналитика — набор графиков на canvas (без внешних библиотек)

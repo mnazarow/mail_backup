@@ -257,6 +257,9 @@ class Database:
             # индекс ответов на письма — раздел «Ответы на письма» (1.16.0)
             from .replies import ensure_schema as _ensure_replies
             _ensure_replies(conn)
+            # почтовый клиент раздела «Почта»: папки сервера, отправители, черновики (1.17.0)
+            from .webmail import ensure_schema as _ensure_webmail
+            _ensure_webmail(conn)
         self._encrypt_plain_settings()
 
     def _encrypt_plain_settings(self) -> None:
@@ -337,6 +340,9 @@ class Database:
             # логины ящиков, которые у сотрудника уже были: удалённый или отвязанный ящик синхронизация
             # не заводит снова (1.15.0; раньше — один флаг had_account на весь справочник сотрудника)
             ("employees", "known_logins", "TEXT DEFAULT ''"),
+            # письма, которых в папке на сервере больше нет (удалены, перенесены) — почтовый клиент их
+            # не показывает, архив хранит (1.17.0)
+            ("messages", "gone", "INTEGER NOT NULL DEFAULT 0"),
         ]
         changed = False
         # Индекс (account_id, folder) полностью покрыт уникальным ключом
@@ -1775,6 +1781,35 @@ class Database:
                 (account_id, *part)))
         return sorted(out)
 
+    def mark_messages_gone(self, account_id: int, folder: str, uidvalidity: int, uids: Sequence[int],
+                           *, other_uidvalidity: bool = True) -> int:
+        """Отметить письма папки, которых на сервере больше нет (``gone = 1``): удалены или перенесены.
+
+        Копия в архиве остаётся — архив хранит историю. Записи папки с другим UIDVALIDITY (пересозданная
+        папка, переезд почты) — тоже на сервере не существуют: письма, которые узнаны заново, перед этим
+        получили новый UIDVALIDITY (см. BackupEngine._relink). Возвращает, сколько записей отмечено.
+        """
+        changed = 0
+        uids = sorted({int(u) for u in uids})
+        conn = self.connect()
+        with self._write_lock:
+            try:
+                for start in range(0, len(uids), 500):
+                    part = uids[start:start + 500]
+                    cur = conn.execute(
+                        f"UPDATE messages SET gone=1 WHERE account_id=? AND folder=? AND uidvalidity=? AND gone=0 "
+                        f"AND uid IN ({','.join('?' * len(part))})", (account_id, folder, uidvalidity, *part))
+                    changed += int(cur.rowcount or 0)
+                if other_uidvalidity and uidvalidity:
+                    cur = conn.execute("UPDATE messages SET gone=1 WHERE account_id=? AND folder=? AND uidvalidity<>? "
+                                       "AND gone=0", (account_id, folder, uidvalidity))
+                    changed += int(cur.rowcount or 0)
+                conn.commit()
+            except BaseException:
+                self._safe_rollback(conn)
+                raise
+        return changed
+
     def messages_by_ids(self, account_id: int, ids: Sequence[int]):
         """Строки индекса по id — только писем этого ящика, по возрастанию id, порциями (генератор)."""
         ids = sorted({int(i) for i in ids})
@@ -2999,6 +3034,8 @@ CREATE TABLE IF NOT EXISTS messages (
     from_addr    TEXT,
     has_attach   INTEGER DEFAULT 0,
     backed_up_at TEXT,
+    -- письма в этой папке на сервере уже нет (удалено, перенесено): копия в архиве остаётся (1.17.0)
+    gone         INTEGER NOT NULL DEFAULT 0,
     UNIQUE(account_id, folder, uidvalidity, uid),
     FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
 );
