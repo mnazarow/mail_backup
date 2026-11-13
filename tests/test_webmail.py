@@ -47,6 +47,22 @@ class FakeSMTP:
     def auth(self, mech, authobject, initial_response_ok=True):
         FakeSMTP.logins.append((mech, authobject()))
 
+    # пароль с русскими буквами smtplib в ASCII не закодирует — util.smtp_login шлёт AUTH PLAIN сам (1.24.1)
+    esmtp_features = {"auth": "PLAIN LOGIN"}
+
+    def ehlo_or_helo_if_needed(self):
+        return None
+
+    def has_extn(self, name):
+        return name.lower() in self.esmtp_features
+
+    def docmd(self, cmd, args=""):
+        import base64
+        assert cmd == "AUTH" and args.startswith("PLAIN ")
+        _authz, user, password = base64.b64decode(args.split()[1]).decode("utf-8").split("\0")
+        self.login(user, password)
+        return 235, b"Authentication successful"
+
     def sendmail(self, sender, rcpts, data):
         if FakeSMTP.fail is not None and not isinstance(FakeSMTP.fail, smtplib.SMTPAuthenticationError):
             raise FakeSMTP.fail

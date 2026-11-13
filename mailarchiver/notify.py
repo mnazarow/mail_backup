@@ -21,6 +21,7 @@ from email.message import EmailMessage
 from typing import Dict, List, Optional
 
 from .logging_setup import get_logger
+from .util import smtp_login
 
 log = get_logger("notify")
 
@@ -215,14 +216,14 @@ class Notifier:
         if security == "ssl":
             with smtplib.SMTP_SSL(host, port, context=ctx, timeout=30) as s:
                 if user:
-                    s.login(user, password)
+                    smtp_login(s, user, password)
                 s.send_message(msg)
         else:
             with smtplib.SMTP(host, port, timeout=30) as s:
                 if security == "starttls":
                     s.starttls(context=ctx)
                 if user:
-                    s.login(user, password)
+                    smtp_login(s, user, password)
                 s.send_message(msg)
         log.info("Уведомление отправлено: %s", subject)
 

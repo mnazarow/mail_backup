@@ -338,3 +338,36 @@ def parse_day(value) -> date:
             continue
     raise ValidationError(f"Не удалось разобрать дату «{text}».",
                           hint="Укажите дату в виде ГГГГ-ММ-ДД (например 2026-09-15) или ДД.ММ.ГГГГ.")
+
+
+def smtp_login(server, user: str, password: str) -> None:
+    """SMTP AUTH — и когда в логине или пароле русские буквы.
+
+    smtplib кодирует ответы AUTH в ASCII: пароль с русскими буквами давал
+    «'ascii' codec can't encode characters» ещё до обращения к серверу. Такие
+    логин и пароль уходят в UTF-8 (AUTH PLAIN по RFC 4616, иначе AUTH LOGIN).
+    """
+    import base64
+    import smtplib
+    user, password = str(user or ""), str(password or "")
+    if user.isascii() and password.isascii():
+        server.login(user, password)
+        return
+    server.ehlo_or_helo_if_needed()
+    if not server.has_extn("auth"):
+        raise smtplib.SMTPNotSupportedError("SMTP AUTH extension not supported by server.")
+    mechs = server.esmtp_features.get("auth", "").upper().split()
+
+    def b64(data: bytes) -> str:
+        return base64.b64encode(data).decode("ascii")
+    if "PLAIN" in mechs:
+        code, resp = server.docmd("AUTH", "PLAIN " + b64(b"\0" + user.encode("utf-8") + b"\0" + password.encode("utf-8")))
+    elif "LOGIN" in mechs:
+        code, resp = server.docmd("AUTH", "LOGIN " + b64(user.encode("utf-8")))
+        if code == 334:
+            code, resp = server.docmd(b64(password.encode("utf-8")))
+    else:
+        raise smtplib.SMTPException("Сервер отправки не предлагает AUTH PLAIN или LOGIN — логин или пароль с "
+                                    "русскими буквами передать нельзя.")
+    if code not in (235, 503):
+        raise smtplib.SMTPAuthenticationError(code, resp)

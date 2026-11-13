@@ -143,7 +143,79 @@ def _map_exception(exc: BaseException) -> Exception:
         if "auth" in text or "login" in text or "credential" in text:
             return ImapAuthError(f"IMAP-сервер отклонил аутентификацию: {exc}", cause=exc)
         return ImapProtocolError(f"Ошибка протокола IMAP: {exc}", cause=exc)
+    if isinstance(exc, UnicodeEncodeError):
+        # imaplib передаёт команды в ASCII: строка с русскими буквами не уходит на сервер вовсе
+        return ImapProtocolError(
+            f"В команде для IMAP-сервера есть не латинские символы, которые нельзя передать: «{exc.object}»"
+            if len(str(exc.object)) <= 80 else
+            "В команде для IMAP-сервера есть не латинские символы, которые нельзя передать.",
+            hint="Сообщите разработчикам, в каком действии это случилось (журнал службы).", cause=exc)
     return ImapProtocolError(f"Неожиданная ошибка IMAP: {exc}", cause=exc)
+
+
+def _non_ascii(*values) -> bool:
+    """Есть ли в строках символы вне ASCII (русские буквы в пароле и т.п.)."""
+    return any(v is not None and not str(v).isascii() for v in values)
+
+
+#: Подсказка, когда сервер не принял логин или пароль с русскими буквами.
+_LAYOUT_HINT = ("В логине или пароле ящика есть русские (не латинские) буквы. Если на почтовом сервере пароль "
+                "латиницей, его, скорее всего, набрали в русской раскладке — введите пароль ящика заново. ")
+
+
+#: Сколько «пропавших» писем одной порции перепроверять поодиночке.
+MISSING_PROBE_LIMIT = 50
+
+
+def _message_from(uid: int, raw: bytes, item: dict) -> dict:
+    """Запись письма из ответа FETCH: {uid, raw, flags, internaldate, size}."""
+    internaldate = item.get(b"INTERNALDATE")
+    try:
+        epoch = internaldate.timestamp() if internaldate else None
+    except (OverflowError, OSError, ValueError, AttributeError):
+        epoch = None
+    # Флаги — атомы ASCII, но серверы присылают и ключевые слова в
+    # cp1251: строгое .decode() роняло весь прогон (UnicodeDecodeError).
+    flags = [f.decode("latin-1") if isinstance(f, bytes) else str(f) for f in (item.get(b"FLAGS") or ())]
+    return {
+        "uid": uid,
+        "raw": raw,
+        "flags": flags,
+        "internaldate": epoch,
+        "size": int(item.get(b"RFC822.SIZE", len(raw)) or len(raw)),
+    }
+
+
+def _describe(meta: dict) -> str:
+    """«12.03.2024, 15 КБ, «Тема», от a@b» — чтобы письмо можно было найти на сервере."""
+    import email.header
+    parts: List[str] = []
+    when = meta.get(b"INTERNALDATE")
+    try:
+        if when:
+            parts.append(when.strftime("%d.%m.%Y %H:%M"))
+    except (AttributeError, ValueError):
+        pass
+    size = meta.get(b"RFC822.SIZE")
+    if size is not None:
+        parts.append(f"{int(size)} Б")
+    env = meta.get(b"ENVELOPE")
+    if env is not None:
+        try:
+            subj = env.subject or b""
+            subj = subj.decode("utf-8", "replace") if isinstance(subj, bytes) else str(subj)
+            subj = str(email.header.make_header(email.header.decode_header(subj)))
+            if subj:
+                parts.append(f"«{subj[:80]}»")
+        except Exception:  # noqa: BLE001 — тема с ошибками кодировки: без неё
+            pass
+        try:
+            sender = (env.from_ or [None])[0]
+            if sender is not None and sender.mailbox and sender.host:
+                parts.append("от " + f"{sender.mailbox.decode(errors='replace')}@{sender.host.decode(errors='replace')}")
+        except Exception:  # noqa: BLE001
+            pass
+    return ", ".join(parts)
 
 
 def _is_already_exists_error(exc: BaseException) -> bool:
@@ -505,7 +577,7 @@ class ImapConnection:
                     hint="Для восстановления на сервер и проверки папок по IMAP задайте ящику пароль (карточка ящика); "
                          "копирование через FTP Backup пароля не требует.")
             else:
-                self.client.login(acc.username, acc.password)
+                self._password_login(acc.username, acc.password)
         except LoginError as exc:
             if acc.auth_type == AuthType.SERVER:
                 reply = _server_reply(exc)
@@ -547,11 +619,54 @@ class ImapConnection:
                 text += f" Ответ сервера: «{reply}»."
             raise ImapAuthError(
                 text,
-                hint="Проверьте логин/пароль. Возможно, нужен «пароль приложения» или включение IMAP в настройках почты. "
-                     "Если в ответе сервера сказано, что учётная запись отключена или пароль устарел, — это "
-                     "решается на почтовом сервере.",
+                hint=(_LAYOUT_HINT if acc.auth_type == AuthType.PASSWORD and _non_ascii(acc.username, acc.password)
+                      else "")
+                + "Проверьте логин/пароль. Возможно, нужен «пароль приложения» или включение IMAP в настройках почты. "
+                  "Если в ответе сервера сказано, что учётная запись отключена или пароль устарел, — это "
+                  "решается на почтовом сервере.",
                 cause=exc,
             ) from exc
+
+    def _password_login(self, user: str, password: str) -> None:
+        """Вход по логину и паролю — и с русскими буквами в них.
+
+        imaplib передаёт аргументы LOGIN в ASCII: пароль с русскими буквами давал
+        «'ascii' codec can't encode characters» ещё до обращения к серверу, и ящик
+        не копировался вовсе. Такие логин и пароль уходят в UTF-8: командой
+        AUTHENTICATE PLAIN (RFC 4616 — UTF-8 по определению), а если сервер её не
+        объявляет — LOGIN с паролем литералом (байты UTF-8 как есть).
+        """
+        if not _non_ascii(user, password):
+            self.client.login(user, password)
+            return
+        if self.has_capability("AUTH=PLAIN"):
+            self.client.plain_login(user, password)
+            return
+        if not _non_ascii(user):
+            self._literal_login(user, password)
+            return
+        raise ImapAuthError(
+            "В логине ящика есть не латинские символы, а сервер не поддерживает вход AUTHENTICATE PLAIN — "
+            "передать такой логин нельзя.",
+            hint="Укажите логин латиницей (обычно это адрес почты) или включите на почтовом сервере "
+                 "механизм входа PLAIN.")
+
+    def _literal_login(self, user: str, password: str) -> None:
+        """LOGIN "логин" {N}<пароль в UTF-8> — для серверов без AUTH=PLAIN."""
+        imap = self.client._imap
+        quoted = '"' + user.replace("\\", "\\\\").replace('"', '\\"') + '"'
+        imap.literal = password.encode("utf-8")
+        try:
+            typ, dat = imap._simple_command("LOGIN", quoted)
+        except imaplib.IMAP4.abort:
+            raise
+        except imaplib.IMAP4.error as exc:
+            raise LoginError(str(exc)) from exc
+        finally:
+            imap.literal = None
+        if typ != "OK":
+            raise LoginError(_as_text(dat[-1] if dat else b"") or "LOGIN failed")
+        imap.state = "AUTH"
 
     def _master_login(self) -> None:
         """Войти в ящик учётной записью администратора почты."""
@@ -571,7 +686,7 @@ class ImapConnection:
                 hint="Исправьте сервер ящика или адрес сервера в настройках входа администратора.")
         if str(master.get("mode") or "sasl_plain") == "separator":
             sep = str(master.get("separator") or "*")
-            self.client.login(f"{acc.username}{sep}{master['user']}", master["password"])
+            self._password_login(f"{acc.username}{sep}{master['user']}", master["password"])
         else:
             self.client.plain_login(master["user"], master["password"],
                                     authorization_identity=acc.username)
@@ -588,7 +703,7 @@ class ImapConnection:
         elif auth.mech == "plain_authzid":
             self.client.plain_login(auth.user, auth.secret, authorization_identity=auth.authzid or acc.username)
         elif auth.mech == "separator":
-            self.client.login(f"{auth.authzid or acc.username}{auth.separator or '*'}{auth.user}", auth.secret)
+            self._password_login(f"{auth.authzid or acc.username}{auth.separator or '*'}{auth.user}", auth.secret)
         elif auth.mech == "kerio_master":
             # учебный IMAP-сервер тестов умеет это сам; настоящий IMAPClient — нет
             custom = getattr(self.client, "kerio_master_login", None)
@@ -597,7 +712,7 @@ class ImapConnection:
             else:
                 kerio_master_login(self.client, auth.authzid or acc.username, auth.secret)
         else:
-            self.client.login(auth.user or acc.username, auth.secret)
+            self._password_login(auth.user or acc.username, auth.secret)
 
     _CLOSE_TIMEOUT_S = 5
 
@@ -1219,21 +1334,7 @@ class ImapConnection:
             if not raw:
                 missing.append(uid)
                 continue
-            internaldate = item.get(b"INTERNALDATE")
-            try:
-                epoch = internaldate.timestamp() if internaldate else None
-            except (OverflowError, OSError, ValueError):
-                epoch = None
-            # Флаги — атомы ASCII, но серверы присылают и ключевые слова в
-            # cp1251: строгое .decode() роняло весь прогон (UnicodeDecodeError).
-            flags = [f.decode("latin-1") if isinstance(f, bytes) else str(f) for f in (item.get(b"FLAGS") or ())]
-            yield {
-                "uid": uid,
-                "raw": raw,
-                "flags": flags,
-                "internaldate": epoch,
-                "size": int(item.get(b"RFC822.SIZE", len(raw)) or len(raw)),
-            }
+            yield _message_from(uid, raw, item)
         if missing:
             # Молча терять письма нельзя: сервер мог их удалить между SEARCH и
             # FETCH, но так же выглядит и сбой выдачи. Раньше это попадало
@@ -1243,8 +1344,53 @@ class ImapConnection:
             tail = f" и ещё {len(missing) - 20}" if len(missing) > 20 else ""
             log.warning("FETCH не вернул %d из %d писем (пропущены): UID %s%s",
                         len(missing), len(chunk), shown, tail)
-            for uid in missing:
-                yield {"uid": uid, "missing": True}
+            for n, uid in enumerate(missing):
+                # Каждое такое письмо — ещё раз отдельно и по частям: часть серверов не отдаёт в общей
+                # порции (или целиком) письмо, которое отдаёт поодиночке или заголовок и текст по
+                # отдельности. Заодно — размер, дата и тема: по ним письмо можно найти на сервере.
+                # Много «пропавших» сразу — обычно удаление во время копирования: столько не перепроверяем.
+                yield self._probe_missing(uid) if n < MISSING_PROBE_LIMIT else {"uid": uid, "missing": True}
+
+    def _probe_missing(self, uid: int) -> dict:
+        """Письмо, которого не было в ответе FETCH: достать его иначе или хотя бы описать.
+
+        Возвращает обычную запись письма (с ``recovered``), запись ``empty`` (на сервере письмо
+        длиной 0 байт — сохранять нечего) или ``missing`` со сведениями ``detail`` для журнала.
+        """
+        out: dict = {"uid": uid, "missing": True}
+        meta: dict = {}
+        try:
+            meta = self.client.fetch([uid], [b"RFC822.SIZE", b"INTERNALDATE", b"FLAGS", b"ENVELOPE"]).get(uid) or {}
+        except Exception as exc:  # noqa: BLE001
+            mapped = _map_exception(exc)
+            if isinstance(mapped, (ImapConnectionError, ImapTimeoutError)):
+                raise mapped from exc
+            out["reply"] = _server_reply(exc) or mapped.message
+        if meta:
+            out["detail"] = _describe(meta)
+            if meta.get(b"RFC822.SIZE") == 0:
+                out.update(empty=True)
+                out.pop("missing", None)
+                return out
+        for items in ([b"BODY.PEEK[]"], [b"BODY.PEEK[HEADER]", b"BODY.PEEK[TEXT]"]):
+            try:
+                item = self.client.fetch([uid], items + [b"FLAGS", b"INTERNALDATE", b"RFC822.SIZE"]).get(uid) or {}
+            except Exception as exc:  # noqa: BLE001
+                mapped = _map_exception(exc)
+                if isinstance(mapped, (ImapConnectionError, ImapTimeoutError)):
+                    raise mapped from exc
+                out["reply"] = _server_reply(exc) or mapped.message
+                continue
+            raw = item.get(b"BODY[]") or b""
+            if not raw and (item.get(b"BODY[HEADER]") or item.get(b"BODY[TEXT]")):
+                raw = (item.get(b"BODY[HEADER]") or b"") + (item.get(b"BODY[TEXT]") or b"")
+            if raw:
+                log.info("Письмо UID %s отдано сервером при повторном запросе (%s).", uid,
+                         " + ".join(i.decode() for i in items))
+                msg = _message_from(uid, raw, item or meta)
+                msg["recovered"] = True
+                return msg
+        return out
 
     # -- запись (для восстановления) ----------------------------------------
     def ensure_folder(self, folder: str) -> None:

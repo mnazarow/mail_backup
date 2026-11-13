@@ -895,6 +895,7 @@ class BackupEngine:
 
         max_uid = 0
         missing: List[int] = []
+        missing_info: Dict[int, dict] = {}
         store_errors_in_row = 0
         # Лимит размера передаём в клиент: слишком крупные письма
         # отсеиваются по ответу (RFC822.SIZE) и вообще не качаются.
@@ -912,10 +913,20 @@ class BackupEngine:
                                   f"{msg['error']}")
                 state["done"] += 1
                 continue
+            if msg.get("empty"):
+                # На сервере письмо длиной 0 байт: не потеря, но и сохранять нечего.
+                result.messages_skipped += 1
+                state["done"] += 1
+                emit_msg("WARNING", f"Письмо UID {uid} в «{f.name}» пустое на сервере (0 байт) — сохранять нечего"
+                                    + (f" ({msg['detail']})." if msg.get("detail") else "."))
+                continue
             if msg.get("missing"):
                 missing.append(uid)
+                missing_info[uid] = msg
                 state["done"] += 1
                 continue
+            if msg.get("recovered"):
+                emit_msg("INFO", f"Письмо UID {uid} в «{f.name}» сервер отдал только при повторном запросе — сохранено.")
             raw = msg["raw"]
             if self.skip_larger_than and len(raw) > self.skip_larger_than:
                 # Подстраховка: сервер мог не сообщить RFC822.SIZE
@@ -970,7 +981,7 @@ class BackupEngine:
                 report_progress(f"«{f.name}»: {state['done']}/{total_new}")
 
         if missing:
-            self._report_missing(conn, f.name, missing, result, emit_msg)
+            self._report_missing(conn, f.name, missing, result, emit_msg, missing_info)
         # Индекс папки фиксируем ДО обновления её состояния: иначе при обрыве
         # last_uid ушёл бы вперёд, а писем в индексе не было бы.
         flush_index()
@@ -982,7 +993,7 @@ class BackupEngine:
 
     @staticmethod
     def _report_missing(conn: ImapConnection, folder: str, missing: List[int],
-                        result: BackupResult, emit_msg: EventCB) -> None:
+                        result: BackupResult, emit_msg: EventCB, info: Optional[Dict[int, dict]] = None) -> None:
         """Письма, которые FETCH не вернул: удалены во время копирования или потеряны?
 
         Раньше это попадало только в журнал службы, и письмо, повреждённое на
@@ -1009,8 +1020,19 @@ class BackupEngine:
             shown_lost = ", ".join(str(u) for u in lost[:20]) + (f" и ещё {len(lost) - 20}"
                                                                   if len(lost) > 20 else "")
             result.add_error(f"«{folder}»: сервер не отдаёт писем {len(lost)} (UID {shown_lost})")
+            details = []
+            for u in lost[:5]:
+                item = (info or {}).get(u) or {}
+                bits = [b for b in (item.get("detail"), f"ответ сервера: {item['reply']}" if item.get("reply") else "")
+                        if b]
+                if bits:
+                    details.append(f"UID {u}: {'; '.join(bits)}")
             emit_msg("ERROR", f"Папка «{folder}»: сервер не отдаёт писем {len(lost)} (UID {shown_lost}), "
-                              f"хотя они в папке есть — возможно, повреждены на сервере.")
+                              f"хотя они в папке есть — ни целиком, ни по частям; возможно, повреждены на сервере."
+                              + (" " + " · ".join(details) + "." if details else "")
+                              + " Откройте письмо в почтовой программе или веб-почте сервера: если оно не "
+                                "открывается и там, его нужно восстановить или удалить на сервере; копирование "
+                                "будет пробовать его каждую ночь.")
 
     @staticmethod
     def _header_block(raw: bytes) -> bytes:

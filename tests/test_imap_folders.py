@@ -117,6 +117,13 @@ class FakeIMAP:
                 continue
             if b"BODY.PEEK[]" in fields and uid in getattr(self, "not_returned", set()):
                 continue
+            if b"BODY.PEEK[HEADER]" in fields:
+                # по частям сервер отдаёт и то письмо, которое не отдаёт целиком (split_ok)
+                if uid in getattr(self, "split_ok", set()):
+                    head, _, text = raw.partition(b"\r\n\r\n")
+                    out[uid] = {b"BODY[HEADER]": head + b"\r\n\r\n", b"BODY[TEXT]": text, b"FLAGS": (),
+                                b"INTERNALDATE": None, b"RFC822.SIZE": len(raw)}
+                continue
             if b"BODY.PEEK[]" in fields:
                 out[uid] = {b"BODY[]": raw, b"FLAGS": (b"\\Seen",),
                             b"INTERNALDATE": None, b"RFC822.SIZE": len(raw)}
@@ -823,6 +830,38 @@ def test_message_not_returned_by_fetch_is_classified(monkeypatch):
     assert res.messages_vanished == 1 and res.messages_failed == 1
     assert res.errors == 1
     assert any("UID 4" in m for _lvl, m in events)
+
+
+def test_message_returned_only_in_parts_is_saved(monkeypatch):
+    """Журнал 12.11.2026: письмо не отдаётся целиком — пробуем заголовок и текст отдельно и сохраняем."""
+    fake = FakeIMAP(folders=[((b"\\HasNoChildren",), b"/", "INBOX")],
+                    messages={"INBOX": {i: RAW for i in range(1, 4)}})
+    fake.not_returned = {2}
+    fake.split_ok = {2}
+    res, db, store, events = _run_backup(monkeypatch, fake)
+    assert res.messages_new == 3 and res.messages_failed == 0 and res.errors == 0
+    assert any("повторном запросе" in m for _lvl, m in events)
+    assert ("INBOX", 2) in store.stored
+
+
+def test_empty_message_is_a_warning_not_a_loss(monkeypatch):
+    """Письмо длиной 0 байт: сервер «не отдаёт» его тело, но это не повреждение — предупреждение, не ошибка."""
+    fake = FakeIMAP(folders=[((b"\\HasNoChildren",), b"/", "INBOX")],
+                    messages={"INBOX": {1: RAW, 2: b"", 3: RAW}})
+    res, db, store, events = _run_backup(monkeypatch, fake)
+    assert res.messages_new == 2 and res.messages_failed == 0 and res.errors == 0
+    assert res.messages_skipped == 1
+    assert any(lvl == "WARNING" and "0 байт" in m for lvl, m in events)
+
+
+def test_lost_message_report_says_how_to_find_it(monkeypatch):
+    fake = FakeIMAP(folders=[((b"\\HasNoChildren",), b"/", "Мегатрон")],
+                    messages={"Мегатрон": {52780: RAW, 52781: RAW}})
+    fake.not_returned = {52781}
+    res, db, store, events = _run_backup(monkeypatch, fake)
+    assert res.messages_failed == 1
+    err = [m for lvl, m in events if lvl == "ERROR"]
+    assert err and "UID 52781" in err[0] and f"{len(RAW)} Б" in err[0] and "ни целиком, ни по частям" in err[0]
 
 
 def test_disk_full_aborts_the_run_and_keeps_the_index(monkeypatch):

@@ -48,7 +48,7 @@ from .errors import (ImapAuthError, ImapConnectionError, ImapTimeoutError, MailA
 from .imap.client import ConnectOptions, FolderInfo, ImapConnection
 from .logging_setup import get_logger
 from .models import Account, AuthType, JobStatus, JobType
-from .util import decode_mime_header, ensure_dir, utcnow_iso
+from .util import decode_mime_header, ensure_dir, smtp_login, utcnow_iso
 
 log = get_logger("webmail")
 
@@ -1791,7 +1791,7 @@ def _smtp_send(svc, account: Account, ident: Dict, sender: str, rcpts: List[str]
     try:
         server = _smtp_connect(host, port, security, 30, context)
         if mech == "login":
-            server.login(user, secret)
+            smtp_login(server, user, secret)
         elif mech == "xoauth2":
             token = f"user={user}\x01auth=Bearer {secret}\x01\x01"
             server.auth("XOAUTH2", lambda challenge=None: token if challenge is None else "", initial_response_ok=True)
