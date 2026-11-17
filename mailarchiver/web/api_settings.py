@@ -6,9 +6,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, File, Form, Request, Response, UploadFile
 from pydantic import BaseModel, Field
 
 from ..errors import MailArchiverError, ValidationError
@@ -115,6 +115,23 @@ def update_settings(request: Request, body: SettingsBody, user: dict = Depends(a
                     hint="Сохранённый пароль не отправляется на новый адрес без подтверждения. Ничего не сохранено.")
     _require_axigen_password(svc, new_values)
 
+    saved = save_settings_values(svc, new_values)
+    changed, enc_state = saved["changed"], saved["enc_state"]
+    shown = [k + ("=***" if k in SECRET_SETTINGS else "") for k in changed]
+    svc.db.add_audit(user["username"], "settings_update", ", ".join(shown[:30]))
+    result = {"ok": True, "changed": changed}
+    if enc_state.get("generated"):
+        result["notice"] = (f"Создан ключ шифрования: {enc_state['key_path']}. Сохраните его копию "
+                            f"ОТДЕЛЬНО от каталога данных — без него зашифрованные письма не прочитать.")
+    return result
+
+
+def save_settings_values(svc, new_values: Dict[str, Any]) -> Dict[str, Any]:
+    """Записать проверенные значения одной транзакцией и применить их к работающей службе.
+
+    Общая часть «Сохранить» и восстановления из копии настроек (1.26.0). Не применилось (ключ шифрования
+    и т. п.) — всё записанное откатывается, ``ValidationError``. → ``{"changed", "enc_state", "snapshot"}``
+    (``snapshot`` — прежние значения в базе, чтобы вернуть их, если восстановление дальше не удалось)."""
     snapshot = svc.db.raw_settings(new_values.keys())
     before_retention = _retention_policy(svc)
     svc.db.set_settings_many(new_values)
@@ -141,13 +158,7 @@ def update_settings(request: Request, body: SettingsBody, user: dict = Depends(a
     if any(k.startswith("journal.") for k in changed):
         from ..journal import ensure as journal_ensure
         journal_ensure(svc)
-    shown = [k + ("=***" if k in SECRET_SETTINGS else "") for k in changed]
-    svc.db.add_audit(user["username"], "settings_update", ", ".join(shown[:30]))
-    result = {"ok": True, "changed": changed}
-    if enc_state.get("generated"):
-        result["notice"] = (f"Создан ключ шифрования: {enc_state['key_path']}. Сохраните его копию "
-                            f"ОТДЕЛЬНО от каталога данных — без него зашифрованные письма не прочитать.")
-    return result
+    return {"changed": changed, "enc_state": enc_state or {}, "snapshot": snapshot}
 
 
 def _retention_policy(svc) -> Dict[str, Any]:
@@ -170,6 +181,64 @@ def _after_retention_change(svc, before: Dict[str, Any]) -> None:
     for acc in svc.db.list_accounts():
         if acc.retention_days is None or acc.retention_days < 0:
             svc.db.clear_retired(acc.id)
+
+
+# =====================================================================
+#  Резервная копия настроек (1.26.0)
+# =====================================================================
+class SettingsBackupBody(BaseModel):
+    password: str = Field("", max_length=1024)
+    sections: Optional[List[str]] = None
+
+
+@router.get("/settings-backup")
+def settings_backup_info(request: Request, user: dict = Depends(auth_mod.require_admin)):
+    """Разделы копии и копии, которые служба сделала перед восстановлением."""
+    from .. import settings_backup as sb
+    svc = svc_dep(request)
+    return {"sections": [{"name": k, "title": v, "protected_only": k in sb.PROTECTED_ONLY}
+                         for k, v in sb.SECTIONS.items()],
+            "auto": [{k: a[k] for k in ("name", "created_at", "size")} for a in sb.list_auto(svc.cfg)],
+            "min_password": sb.MIN_PASSWORD}
+
+
+@router.post("/settings-backup/export")
+def settings_backup_export(request: Request, body: SettingsBackupBody, user: dict = Depends(auth_mod.require_admin)):
+    """Скачать копию настроек: без пароля — без секретов и учётных записей, с паролем — всё (зашифровано)."""
+    from .. import settings_backup as sb
+    svc = svc_dep(request)
+    data, summary = sb.build(svc, password=body.password or "", sections=body.sections)
+    parts = ", ".join(f"{k} {v}" for k, v in summary["counts"].items() if v)
+    svc.db.add_audit(user["username"], "settings_backup",
+                     f"{'с паролем' if summary['encrypted'] else 'без пароля (без секретов)'}: {parts}"[:1000])
+    return Response(content=data, media_type="application/json",
+                    headers={"Content-Disposition": f'attachment; filename="{summary["filename"]}"',
+                             "Cache-Control": "no-store"})
+
+
+@router.post("/settings-backup/restore")
+def settings_backup_restore(request: Request, file: Optional[UploadFile] = File(None), auto: str = Form(""),
+                            password: str = Form(""), mode: str = Form("add"), sections: str = Form(""),
+                            dry_run: str = Form("true"), user: dict = Depends(auth_mod.require_admin)):
+    """Проверить (``dry_run``, по умолчанию) или выполнить восстановление из файла копии или из копии,
+    сделанной службой перед прошлым восстановлением (``auto`` — её имя)."""
+    from .. import settings_backup as sb
+    svc = svc_dep(request)
+    if auto:
+        data = sb.read_auto(svc.cfg, auto)
+    elif file is not None:
+        data = file.file.read(sb.MAX_FILE_BYTES + 1)
+    else:
+        raise ValidationError("Выберите файл копии настроек.")
+    info = sb.describe(data)
+    opened = sb.open_backup(data, password=password or "", box=svc.db.secret)
+    chosen = [p.strip() for p in str(sections or "").split(",") if p.strip()] or None
+    dry = str(dry_run).strip().lower() not in ("false", "0", "no", "")
+    report = sb.restore(svc, opened, mode=(mode or "add").strip(), sections=chosen, dry_run=dry,
+                        actor=user["username"])
+    report["file"] = info
+    report["available"] = [s for s in sb.SECTIONS if s in (opened.get("sections") or {})]
+    return report
 
 
 # =====================================================================

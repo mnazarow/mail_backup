@@ -10,6 +10,8 @@
     mailarchiver reset-password -u имя # сбросить пароль пользователя
     mailarchiver replica-pull          # скачать копию вне сервера (после аварии)
     mailarchiver restore-snapshot F    # восстановить базу из снимка
+    mailarchiver settings-backup       # резервная копия настроек в файл
+    mailarchiver settings-restore F    # восстановить настройки из копии (--dry-run — только проверить)
     mailarchiver replica-ssh-key       # SSH-ключ службы для копии на сервер по rsync
     mailarchiver check-config          # проверить конфигурацию
     mailarchiver version
@@ -320,8 +322,9 @@ def cmd_replica_pull(args) -> int:
     marker = res.get("marker") or {}
     if marker.get("host"):
         print(f"Копия сделана на сервере {marker.get('host')}.")
-    print("Дальше: sudo mailarchiver restore-snapshot <самый свежий файл из snapshots/>, затем верните "
-          "secret.key (и ключ шифрования писем) и запустите службу.")
+    print("Дальше: верните в каталог данных secret.key (им подписаны снимки и зашифрованы пароли ящиков) и ключ "
+          "шифрования писем, затем sudo mailarchiver restore-snapshot <самый свежий файл из snapshots/> и запустите "
+          "службу.")
     return 0
 
 
@@ -338,6 +341,7 @@ def cmd_restore_snapshot(args) -> int:
         if os.path.exists(candidate):
             path = candidate
     path = os.path.abspath(path)
+    _check_snapshot_signature(cfg, args, path)
     cipher = None
     if path.endswith(".enc"):
         key_path = args.key
@@ -366,6 +370,44 @@ def cmd_restore_snapshot(args) -> int:
     print(f"База восстановлена из {os.path.basename(path)}: {dest} ({human_size(size)}).")
     print("Проверьте, что на месте secret.key (пароли ящиков) и ключ шифрования писем, затем запустите службу.")
     return 0
+
+
+def _check_snapshot_signature(cfg, args, path: str) -> None:
+    """Подпись снимка (1.26.0) — до разворачивания. Ключ — secret.key (не создаётся, если его нет)."""
+    from .replica import snapshots
+    from .security import SecretBox
+    if not os.path.isfile(path):
+        raise MailArchiverError(f"Файл снимка не найден: {path}")
+    key_path = os.path.abspath(args.secret_key) if args.secret_key else cfg.secret_key_path
+    box = None
+    if os.path.isfile(key_path):
+        with open(key_path, "rb") as fh:
+            raw = fh.read().strip()
+        if len(raw) >= 32:
+            box = SecretBox(raw)
+    elif args.secret_key:
+        raise MailArchiverError(f"Файл ключа не найден: {key_path}")
+    res = snapshots.verify_signature(box, path)
+    status = res["status"]
+    if status == "ok":
+        print(f"Подпись снимка верна (ключ {key_path}).")
+        return
+    if status == "missing" and path.endswith(".enc"):
+        print("Подписи у снимка нет, но он зашифрован: подмену без ключа шифрования выдаст расшифровка.")
+        return
+    if args.allow_unsigned:
+        print(f"ВНИМАНИЕ: {res['message']} Продолжаю без проверки (--allow-unsigned).", file=sys.stderr)
+        return
+    hints = {
+        "missing": "Снимки до 1.26.0 не подписаны. Если файл точно ваш (снят этим сервером, лежал в надёжном "
+                   "месте) — повторите с --allow-unsigned.",
+        "no_key": f"Верните secret.key в каталог данных ({cfg.secret_key_path}) — он нужен и для паролей ящиков — "
+                  f"или укажите его: --secret-key ФАЙЛ. Без проверки — --allow-unsigned.",
+        "other_key": "Укажите ключ того сервера, где снят снимок: --secret-key ФАЙЛ. Без проверки — --allow-unsigned.",
+        "bad": "Не восстанавливайте этот файл: возьмите другой снимок. Если подпись повреждена, а снимок точно ваш "
+               "— --allow-unsigned.",
+    }
+    raise MailArchiverError(res["message"] + " База не изменена.", hint=hints.get(status))
 
 
 def _restore_pg(cfg, args, path: str, cipher, is_sql: bool) -> int:
@@ -404,6 +446,102 @@ def _restore_pg(cfg, args, path: str, cipher, is_sql: bool) -> int:
         print(f"Прежняя схема сохранена как {backup} (удалить: DROP SCHEMA {backup} CASCADE).")
     print(f"База восстановлена из {os.path.basename(path)} в схему «{schema}» ({human_size(size)} выгрузки).")
     print("Проверьте, что на месте secret.key (пароли ящиков) и ключ шифрования писем, затем запустите службу.")
+    return 0
+
+
+def _backup_password(args, *, confirm: bool) -> str:
+    """Пароль копии настроек: из файла (--password-file) или с клавиатуры."""
+    if getattr(args, "password_file", None):
+        with open(args.password_file, "r", encoding="utf-8") as fh:
+            return fh.readline().rstrip("\r\n")
+    if not sys.stdin.isatty():
+        raise MailArchiverError("Нужен пароль копии.", hint="Укажите --password-file ФАЙЛ (первая строка — пароль)"
+                                + (" или --no-password." if confirm else "."))
+    first = getpass.getpass("Пароль копии: ")
+    if confirm and getpass.getpass("Ещё раз: ") != first:
+        raise MailArchiverError("Пароли не совпадают.")
+    return first
+
+
+def _cli_services(cfg):
+    from types import SimpleNamespace
+    return SimpleNamespace(db=_build_db(cfg), cfg=cfg)
+
+
+def cmd_settings_backup(args) -> int:
+    """Резервная копия настроек в файл (1.26.0)."""
+    from . import settings_backup as sb
+    from .util import atomic_write_bytes, human_size
+    cfg = load_config(args.config)
+    svc = _cli_services(cfg)
+    password = "" if args.no_password else _backup_password(args, confirm=True)
+    sections = [p for p in (args.sections or "").split(",") if p.strip()] or None
+    data, summary = sb.build(svc, password=password, sections=sections)
+    out = os.path.abspath(args.output or summary["filename"])
+    if os.path.isdir(out):
+        out = os.path.join(out, summary["filename"])
+    if os.path.exists(out) and not args.force:
+        raise MailArchiverError(f"Файл уже есть: {out}", hint="Укажите другое имя (-o) или --force.")
+    atomic_write_bytes(out, data, mode=0o600)
+    parts = ", ".join(f"{k} {v}" for k, v in summary["counts"].items() if v)
+    svc.db.add_audit("cli", "settings_backup",
+                     f"{'с паролем' if summary['encrypted'] else 'без пароля (без секретов)'}: {parts}"[:1000])
+    print(f"Копия настроек: {out} ({human_size(len(data))}, {'с паролем' if password else 'без пароля'}).")
+    print(f"В копии: {parts or 'пусто'}.")
+    for note in summary["notes"]:
+        print(f"  ! {note}")
+    if password:
+        print("Запишите пароль отдельно от копии: без него её не прочитать.")
+    return 0
+
+
+def cmd_settings_restore(args) -> int:
+    """Восстановить настройки из копии (1.26.0)."""
+    from . import settings_backup as sb
+    cfg = load_config(args.config)
+    with open(args.file, "rb") as fh:
+        data = fh.read(sb.MAX_FILE_BYTES + 1)
+    info = sb.describe(data)
+    password = _backup_password(args, confirm=False) if info["needs_password"] else ""
+    svc = _cli_services(cfg)
+    opened = sb.open_backup(data, password=password, box=svc.db.secret)
+    source = opened.get("source") or {}
+    print(f"Копия от {info['created_at'][:19].replace('T', ' ')} UTC, версия {info['app_version']}"
+          + (f", сервер {source.get('host')}" if source.get("host") else "")
+          + (", с паролем (с секретами)" if opened.get("secrets") else ", без пароля (без секретов)") + ".")
+    if args.extract_config:
+        conf = (opened.get("sections") or {}).get("config")
+        if not isinstance(conf, dict) or not conf.get("text"):
+            raise MailArchiverError("В копии нет файла config.yaml.",
+                                    hint="Он сохраняется только в копии с паролем.")
+        out = os.path.abspath(args.extract_config)
+        if os.path.exists(out):
+            raise MailArchiverError(f"Файл уже есть: {out}", hint="Укажите другое имя: файл не перезаписывается.")
+        from .util import atomic_write_text
+        atomic_write_text(out, str(conf["text"]), mode=0o600)
+        print(f"config.yaml из копии записан в {out} (был {conf.get('path') or 'config.yaml'}). Сравните с "
+              f"действующим и перенесите нужное вручную.")
+        return 0
+    sections = [p for p in (args.sections or "").split(",") if p.strip()] or None
+    report = sb.restore(svc, opened, mode="update" if args.update else "add", sections=sections,
+                        dry_run=args.dry_run, actor="cli")
+    print(("Проверка (ничего не изменено):" if args.dry_run else "Восстановлено:")
+          + f" режим «{'добавить и обновить' if args.update else 'только недостающее'}».")
+    print(sb.report_text(report))
+    totals = report["totals"]
+    print(f"Итого: добавить {totals['added']}, изменить {totals['updated']}, без изменений {totals['same']}"
+          + (f", оставлено как есть {totals['kept']}" if totals["kept"] else "")
+          + (f", пропущено {totals['skipped']}" if totals["skipped"] else "") + ".")
+    if args.dry_run:
+        print("Чтобы выполнить, повторите без --dry-run.")
+    else:
+        if report.get("auto_backup"):
+            print(f"Прежние настройки сохранены: {os.path.join(sb.auto_dir(cfg), report['auto_backup'])} "
+                  f"(вернуть: mailarchiver settings-restore этот_файл --update).")
+        print("Перезапустите службу (sudo systemctl restart mailarchiver), чтобы применились расписания и "
+              "параметры хранилища.")
+    if report.get("has_config"):
+        print("В копии есть config.yaml — он не применяется; извлечь: --extract-config ФАЙЛ.")
     return 0
 
 
@@ -576,7 +714,32 @@ def main(argv=None) -> int:
     p.add_argument("snapshot", metavar="СНИМОК", help="файл снимка (mailarchiver-….db.gz[.enc] или ….sql.gz[.enc])")
     p.add_argument("--key", metavar="ФАЙЛ", help="ключ шифрования (для зашифрованного снимка)")
     p.add_argument("--force", action="store_true", help="заменить существующую базу (она сохранится рядом)")
+    p.add_argument("--secret-key", metavar="ФАЙЛ", help="ключ secret.key для проверки подписи снимка "
+                                                        "(по умолчанию — из каталога данных)")
+    p.add_argument("--allow-unsigned", action="store_true",
+                   help="развернуть снимок без подписи или с неверной подписью (снимки до 1.26.0)")
     p.set_defaults(func=cmd_restore_snapshot)
+
+    p = sub.add_parser("settings-backup", help="резервная копия настроек в файл")
+    p.add_argument("-o", "--output", metavar="ФАЙЛ", help="куда записать (по умолчанию — "
+                                                          "mailarchiver-settings-ДАТА.json в текущем каталоге)")
+    p.add_argument("--password-file", metavar="ФАЙЛ", help="пароль копии — первая строка файла")
+    p.add_argument("--no-password", action="store_true",
+                   help="без пароля: без секретов, пользователей и config.yaml")
+    p.add_argument("--sections", metavar="РАЗДЕЛЫ", help="через запятую: settings, mail_servers, employees, "
+                                                         "accounts, users, webmail, config (по умолчанию — все)")
+    p.add_argument("--force", action="store_true", help="перезаписать файл, если он есть")
+    p.set_defaults(func=cmd_settings_backup)
+
+    p = sub.add_parser("settings-restore", help="восстановить настройки из копии")
+    p.add_argument("file", metavar="ФАЙЛ", help="файл копии (mailarchiver-settings-….json)")
+    p.add_argument("--password-file", metavar="ФАЙЛ", help="пароль копии — первая строка файла")
+    p.add_argument("--update", action="store_true",
+                   help="обновить и существующее значениями из копии (по умолчанию — только добавить недостающее)")
+    p.add_argument("--sections", metavar="РАЗДЕЛЫ", help="через запятую (по умолчанию — все, что есть в копии)")
+    p.add_argument("--dry-run", action="store_true", help="только показать, что изменится")
+    p.add_argument("--extract-config", metavar="ФАЙЛ", help="записать config.yaml из копии в файл и выйти")
+    p.set_defaults(func=cmd_settings_restore)
 
     p = sub.add_parser("db-migrate", help="перенести базу службы из SQLite в PostgreSQL")
     p.add_argument("--to", metavar="АДРЕС", help="адрес PostgreSQL (по умолчанию — database.url)")

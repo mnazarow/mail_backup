@@ -471,7 +471,10 @@ def test_cli_restore_broken_snapshot_keeps_base(services, tmp_path, capsys):
         data = src.read()
         dst.write(data[:-300] if svc.db.is_pg else data[: len(data) // 2])
     before = sorted(os.listdir(svc.cfg.data_dir))
-    assert main(["restore-snapshot", str(broken), "--force"]) == 1
+    assert main(["restore-snapshot", str(broken), "--force"]) == 1          # без подписи — отказ (1.26.0)
+    err = capsys.readouterr().err
+    assert "Подписи снимка" in err and "--allow-unsigned" in err
+    assert main(["restore-snapshot", str(broken), "--force", "--allow-unsigned"]) == 1
     err = capsys.readouterr().err
     assert "База не изменена" in err
     assert [a.name for a in svc.db.list_accounts()] == ["Живой ящик"]

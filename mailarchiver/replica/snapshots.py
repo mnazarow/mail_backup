@@ -16,11 +16,19 @@ gzip; если включено шифрование копии, снимок д
 (SQL, ``mailarchiver-….sql.gz[.enc]``), тоже согласованная на момент начала;
 восстанавливается командой ``mailarchiver restore-snapshot`` (нужен ``psql``). Перед ``psql`` выгрузка
 проверяется (:class:`_DumpGuard`, 1.25.0): команды psql и операторы, которых pg_dump не пишет, — отказ.
+
+Подпись (1.26.0): рядом со снимком — ``….sig``: SHA-256 файла и HMAC от неё ключом, производным от
+secret.key (:func:`write_signature`). ``restore-snapshot`` проверяет подпись до разворачивания: подложенный в
+копию вне сервера файл (база SQLite с триггерами, выгрузка с лишними операторами) не пройдёт, даже если
+снимки не шифруются. Файлы ``.sig`` удаляются и копируются вне сервера вместе со снимками.
 """
 from __future__ import annotations
 
 import gzip
+import hashlib
+import hmac
 import itertools
+import json
 import os
 import re
 import shutil
@@ -44,6 +52,9 @@ _NAME_RE = re.compile(r"^mailarchiver-(\d{8}T\d{6}Z)(?:-(\d{1,4}))?\.(db|sql)\.g
 _PG_DUMP_END = b"PostgreSQL database dump complete"
 _LOCK = threading.Lock()
 _COPY_CHUNK = 1024 * 1024
+SIG_SUFFIX = ".sig"
+_SIG_FORMAT = "mailarchiver-snapshot-signature"
+_SIG_LABEL = "snapshot-signature-v1"
 
 
 def snapshot_dir(cfg) -> str:
@@ -69,7 +80,7 @@ def list_snapshots(cfg) -> List[Dict]:
             continue
         created = datetime.strptime(match.group(1), "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
         out.append({"name": name, "path": path, "size": size, "created_at": created.isoformat(),
-                    "encrypted": bool(match.group(4)),
+                    "encrypted": bool(match.group(4)), "signed": os.path.exists(path + SIG_SUFFIX),
                     "kind": "postgresql" if match.group(3) == "sql" else "sqlite", "_order": (match.group(1), int(match.group(2) or 0))})
     out.sort(key=lambda item: item["_order"], reverse=True)
     for item in out:
@@ -86,7 +97,7 @@ def newest_age_s(cfg) -> Optional[float]:
 
 
 def prune(cfg, keep: int) -> int:
-    """Оставить ``keep`` самых свежих снимков (не меньше одного)."""
+    """Оставить ``keep`` самых свежих снимков (не меньше одного); подписи — вместе со снимками."""
     keep = max(1, int(keep))
     removed = 0
     for item in list_snapshots(cfg)[keep:]:
@@ -95,7 +106,93 @@ def prune(cfg, keep: int) -> int:
             removed += 1
         except OSError as exc:
             log.warning("Не удалось удалить старый снимок базы %s: %s", item["path"], exc)
+            continue
+        try:
+            os.unlink(item["path"] + SIG_SUFFIX)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            log.warning("Не удалось удалить подпись снимка %s: %s", item["path"] + SIG_SUFFIX, exc)
+    folder = snapshot_dir(cfg)
+    try:
+        names = os.listdir(folder)
+    except FileNotFoundError:
+        return removed
+    for name in names:                       # подпись без снимка (снимок удалили руками)
+        if name.endswith(SIG_SUFFIX) and _NAME_RE.match(name[:-len(SIG_SUFFIX)]) \
+                and not os.path.exists(os.path.join(folder, name[:-len(SIG_SUFFIX)])):
+            try:
+                os.unlink(os.path.join(folder, name))
+            except OSError:
+                pass
     return removed
+
+
+# ---------------------------------------------------------------------------
+#  Подпись снимка (1.26.0)
+# ---------------------------------------------------------------------------
+def _sig_key(box) -> bytes:
+    return box.derive(_SIG_LABEL)
+
+
+def _sig_kid(key: bytes) -> str:
+    return hashlib.sha256(b"mailarchiver-snapshot-kid:" + key).hexdigest()[:16]
+
+
+def file_sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while True:
+            chunk = fh.read(_COPY_CHUNK)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _sig_mac(key: bytes, digest: str) -> str:
+    return hmac.new(key, f"{_SIG_FORMAT}\n1\n{digest}".encode("ascii"), hashlib.sha256).hexdigest()
+
+
+def signature_text(box, path: str) -> str:
+    """Содержимое файла подписи для снимка ``path``."""
+    key = _sig_key(box)
+    digest = file_sha256(path)
+    return json.dumps({"format": _SIG_FORMAT, "version": 1, "sha256": digest, "hmac": _sig_mac(key, digest),
+                       "kid": _sig_kid(key)}, indent=1) + "\n"
+
+
+def write_signature(box, path: str, sig_path: Optional[str] = None) -> str:
+    sig_path = sig_path or path + SIG_SUFFIX
+    from ..util import atomic_write_text
+    atomic_write_text(sig_path, signature_text(box, path), mode=0o600)
+    return sig_path
+
+
+def verify_signature(box, path: str) -> Dict:
+    """Проверить подпись снимка: ``{"status": ok | missing | no_key | other_key | bad, "message": …}``."""
+    sig_path = path + SIG_SUFFIX
+    if not os.path.exists(sig_path):
+        return {"status": "missing", "message": "Подписи снимка (.sig) нет — снимок сделан до 1.26.0 или подпись "
+                                                "не скопирована."}
+    if box is None:
+        return {"status": "no_key", "message": "Нет файла secret.key — подпись нечем проверить."}
+    try:
+        with open(sig_path, "r", encoding="utf-8") as fh:
+            sig = json.loads(fh.read(64 * 1024))
+        if not isinstance(sig, dict) or sig.get("format") != _SIG_FORMAT:
+            raise ValueError("не та подпись")
+    except (OSError, ValueError) as exc:
+        return {"status": "bad", "message": f"Файл подписи не читается: {exc}"}
+    key = _sig_key(box)
+    if sig.get("kid") != _sig_kid(key):
+        return {"status": "other_key", "message": "Снимок подписан другим ключом secret.key (другой сервер или ключ "
+                                                  "сменился)."}
+    digest = file_sha256(path)
+    if not hmac.compare_digest(str(sig.get("hmac") or ""), _sig_mac(key, digest)) \
+            or str(sig.get("sha256") or "") != digest:
+        return {"status": "bad", "message": "Подпись не совпадает: снимок изменён или повреждён после снятия."}
+    return {"status": "ok", "message": "Подпись снимка верна."}
 
 
 def _clean_leftovers(folder: str) -> None:
@@ -181,6 +278,7 @@ def make_snapshot(svc, *, keep: Optional[int] = None) -> Dict:
         raw_tmp = os.path.join(folder, f".tmp-{stamp}.{ext}")
         gz_tmp = raw_tmp + ".gz"
         enc_tmp = gz_tmp + ".enc"
+        sig_tmp = raw_tmp + SIG_SUFFIX
         started = time.time()
         try:
             if pg:
@@ -208,17 +306,23 @@ def make_snapshot(svc, *, keep: Optional[int] = None) -> Dict:
                 final_name = final_name.replace(stamp, f"{stamp}-{counter}", 1) if counter == 2 \
                     else final_name.replace(f"{stamp}-{counter - 1}", f"{stamp}-{counter}", 1)
                 final = os.path.join(folder, final_name)
+            box = getattr(svc.db, "secret", None)
+            if box is not None and hasattr(box, "derive"):
+                # подпись — раньше снимка: снимка без подписи в каталоге не бывает
+                write_signature(box, final_tmp, sig_tmp)
+                os.replace(sig_tmp, final + SIG_SUFFIX)
             os.replace(final_tmp, final)
             os.chmod(final, 0o600)
         finally:
-            for leftover in (raw_tmp, gz_tmp, enc_tmp):
+            for leftover in (raw_tmp, gz_tmp, enc_tmp, sig_tmp):
                 if os.path.exists(leftover):
                     try:
                         os.unlink(leftover)
                     except OSError:
                         pass
         info = {"name": final_name, "path": final, "size": os.path.getsize(final),
-                "encrypted": cipher is not None, "seconds": round(time.time() - started, 1),
+                "encrypted": cipher is not None, "signed": os.path.exists(final + SIG_SUFFIX),
+                "seconds": round(time.time() - started, 1),
                 "db_size": db_size}
         if keep is None:
             try:
@@ -353,6 +457,8 @@ class _DumpGuard:
 
     def __init__(self):
         self.copy = False
+        self.copy_table = ""
+        self.rows: Dict[str, int] = {}   # строк данных COPY по таблицам (для учебной проверки, 1.26.0)
         self.quote = None          # None | "'" | "e'" | '"' | "$тег$"
         self.block = 0             # вложенность /* */
         self.raw: List[str] = []   # текст оператора целиком (для проверки SET и setval)
@@ -371,6 +477,8 @@ class _DumpGuard:
         if self.copy:
             if line.rstrip(b"\r\n") == b"\\.":
                 self.copy = False
+            else:
+                self.rows[self.copy_table] = self.rows.get(self.copy_table, 0) + 1
             return line
         if (self._RESTRICT.match(line) and self.quote is None and not self.block
                 and not "".join(self.code).strip()):
@@ -405,6 +513,8 @@ class _DumpGuard:
         if head == "COPY":
             if not self._COPY.match(code):
                 self._fail(f"COPY не из выгрузки («{code[:80]}»)")
+            name = re.match(r'^COPY\s+((?:"[^"]+"|\w+)(?:\.(?:"[^"]+"|\w+))?)', code).group(1)
+            self.copy_table = name.split(".")[-1].strip('"')
             self.copy = True
             return
         if not self._STMT_OK.match(code):
@@ -488,6 +598,36 @@ class _DumpGuard:
                 continue
             self._add(c)
             i += 1
+
+
+def check_pg_snapshot(snapshot_path: str, cipher=None) -> Dict[str, int]:
+    """Прочитать выгрузку PostgreSQL целиком, как перед ``psql``, но никуда не разворачивая (учебная проверка,
+    1.26.0): расшифровка, распаковка, проверка :class:`_DumpGuard`, последняя строка pg_dump. → строк данных по
+    таблицам. Ошибка — :class:`StorageError`."""
+    guard = _DumpGuard()
+    tail = b""
+    with open(snapshot_path, "rb") as raw:
+        stream = raw
+        reader = None
+        if snapshot_path.endswith(".enc"):
+            if cipher is None:
+                raise StorageError("Снимок зашифрован, а ключ шифрования не загружен.")
+            reader = cipher.open_reader(raw)
+            stream = reader
+        try:
+            with gzip.GzipFile(fileobj=stream, mode="rb") as gz:
+                for line in gz:
+                    tail = (tail + line)[-4096:]
+                    guard.feed(line)
+        except (OSError, EOFError, gzip.BadGzipFile) as exc:
+            raise StorageError(f"Снимок не читается: {exc}") from exc
+        finally:
+            if reader is not None:
+                reader.close()
+    guard.finish()
+    if _PG_DUMP_END not in tail:
+        raise StorageError("Снимок оборван (нет последней строки pg_dump).")
+    return dict(guard.rows)
 
 
 def restore_pg_snapshot(snapshot_path: str, url: str, cipher=None, *, keep_as: Optional[str] = None) -> int:

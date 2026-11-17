@@ -67,6 +67,12 @@ class SecretBox:
         #: ключ подписи цепочки записей аудита (1.20.0): файл секретного ключа лежит вне базы, поэтому
         #: правка аудита прямо в базе не может пересчитать подписи
         self.audit_key = hashlib.sha256(b"mailarchiver-audit-chain-v1:" + app_secret).digest()
+        self._derive_base = hashlib.sha256(b"mailarchiver-derive-v1:" + app_secret).digest()
+
+    def derive(self, label: str) -> bytes:
+        """Отдельный ключ для своей цели (подпись снимков, копия настроек перед восстановлением, 1.26.0):
+        HMAC-SHA256 от метки ключом, производным от secret.key. Разные цели — разные ключи."""
+        return hmac.new(self._derive_base, label.encode("utf-8"), hashlib.sha256).digest()
 
     def encrypt(self, plaintext: Optional[str]) -> str:
         if plaintext is None:

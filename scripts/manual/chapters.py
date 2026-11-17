@@ -62,7 +62,7 @@ def local_numbers(fname, text, chapters=None):
 
 
 #: абзац или блок кода внутри пункта нумерованного списка нумерацию не обрывает
-CONTINUE_LISTS = {"20-server-bulk.md", "21-mailservers.md"}
+CONTINUE_LISTS = {"13-replica.md", "14-monitoring.md", "20-server-bulk.md", "21-mailservers.md"}
 
 #: Ссылки на главы словами в записи CHANGELOG.md (в «Что нового» руководства к ним добавляется номер главы):
 #: «глава «Почтовые серверы»» (название — начало названия главы) номер получает сама — «глава 16 «Почтовые

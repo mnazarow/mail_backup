@@ -262,6 +262,7 @@ drill:                       # проверка восстановления (do
   enabled: true
   cron: "15 5 1 * *"         # 1-го числа в 05:15
   sample: 50                 # писем на ящик
+  snapshot: true             # развернуть свежий снимок базы на пробу (1.26.0)
 
 ldap:                        # вход через LDAP / Active Directory (docs/ru/08-security.md)
   enabled: false

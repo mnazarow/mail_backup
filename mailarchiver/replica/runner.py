@@ -142,7 +142,8 @@ def readme_text(svc) -> str:
         "                Письма *.enc зашифрованы ключом шифрования копии." if enc else
         "  mailboxes/  — файлы писем всех ящиков (account_N — номер ящика в MailArchiver).",
         "  db/         — снимки базы MailArchiver (индекс писем, ящики, настройки).",
-        "                Снимки *.enc зашифрованы тем же ключом, что и письма.",
+        "                Снимки *.enc зашифрованы тем же ключом, что и письма; *.sig —",
+        "                подписи снимков (проверяются ключом secret.key при восстановлении).",
         "",
         "Ключей здесь НЕТ — и это правильно. Для восстановления понадобятся:",
         "  * secret.key из каталога данных (им зашифрованы пароли ящиков);",
@@ -157,10 +158,11 @@ def readme_text(svc) -> str:
         "     (она же восстанавливает исходные имена файлов — в сетевой папке «:» в",
         "     именах писем записан как %3A). Копию по SSH верните rsync-ом в",
         "     /var/lib/mailarchiver/mailboxes/.",
-        "  3. Верните базу из самого свежего снимка:",
-        "       sudo mailarchiver restore-snapshot /var/lib/mailarchiver/snapshots/<снимок>",
-        "  4. Положите secret.key в каталог данных (и ключ шифрования — по пути из",
+        "  3. Положите secret.key в каталог данных (и ключ шифрования — по пути из",
         "     настроек), проверьте: sudo mailarchiver storage-key",
+        "  4. Верните базу из самого свежего снимка (подпись снимка проверяется",
+        "     ключом secret.key — поэтому сначала шаг 3):",
+        "       sudo mailarchiver restore-snapshot /var/lib/mailarchiver/snapshots/<снимок>",
         "  5. Запустите службу: sudo systemctl start mailarchiver",
         "",
         "Подробно — в документации: docs/ru/13-replica.md.",
@@ -297,7 +299,7 @@ def status(svc) -> Dict:
             "last_run": last, "last_ok": svc.db.get_meta(_META_OK) or "",
             "last_verify": svc.db.get_meta(_META_VERIFY) or "",
             "files_known": svc.db.replica_count(),
-            "snapshots": [{k: s[k] for k in ("name", "size", "created_at", "encrypted")} for s in snaps],
+            "snapshots": [{k: s[k] for k in ("name", "size", "created_at", "encrypted", "signed")} for s in snaps],
             "ssh_public_key": _read_public_key(svc)}
 
 
@@ -723,11 +725,13 @@ class ReplicaRunner:
     def _sync_snapshots(self, target: ReplicaTarget, verify: bool) -> None:
         local = {}
         for snap in snapshots.list_snapshots(self.svc.cfg):
-            try:
-                st = os.stat(snap["path"])
-            except OSError:
-                continue
-            local[f"{DB_GROUP}/{snap['name']}"] = (st.st_size, st.st_mtime_ns, snap["path"])
+            # снимок и его подпись (1.26.0): без подписи restore-snapshot снимок из копии не примет
+            for suffix in ("", snapshots.SIG_SUFFIX):
+                try:
+                    st = os.stat(snap["path"] + suffix)
+                except OSError:
+                    continue
+                local[f"{DB_GROUP}/{snap['name']}{suffix}"] = (st.st_size, st.st_mtime_ns, snap["path"] + suffix)
         if verify:
             remote = dict(target.list(DB_GROUP + "/"))
             self.db.replica_replace_group(DB_GROUP, [(rel, DB_GROUP, v[0], v[1]) for rel, v in local.items()

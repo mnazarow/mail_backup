@@ -124,7 +124,8 @@ const SETTING_DEPS = {
 };
 async function viewSettings(c){
   const data=await api('/settings');
-  c.innerHTML=''; c.appendChild(h('<div class="section-title"><h2 style="margin:0">Настройки</h2><div class="spacer"></div><button class="btn primary" id="saveAll">💾 Сохранить всё</button></div>'));
+  c.innerHTML=''; c.appendChild(h('<div class="section-title"><h2 style="margin:0">Настройки</h2><div class="spacer"></div><button class="btn" id="sbOpen" title="Скачать все настройки файлом или восстановить их из такого файла">🗄 Копия настроек</button><button class="btn primary" id="saveAll">💾 Сохранить всё</button></div>'));
+  $('#sbOpen').onclick=()=>settingsBackupDlg(()=>Object.keys(changed).length);
   const help=data.help.params||{};
   const changed={};
   // Текущие значения всех параметров — по ним решается, какие поля показывать.
@@ -211,6 +212,133 @@ async function viewSettings(c){
   };
 }
 
+// ===================================================================
+//  Резервная копия настроек (1.26.0)
+// ===================================================================
+const SB_COLS=[['added','Добавить'],['updated','Изменить'],['same','Без изменений'],['kept','Оставить как есть'],['skipped','Пропустить']];
+
+/** Окно «Копия настроек»: скачать копию, проверить и выполнить восстановление, вернуться к прежним. */
+async function settingsBackupDlg(unsaved){
+  let info; try{ info=await api('/settings-backup'); }catch(e){ return toastErr(e); }
+  const minPw=info.min_password||10;
+  const secChecks=(prefix, list, on)=>list.map(s=>`<label class="small" style="display:inline-flex;gap:6px;align-items:center;margin:2px 14px 2px 0"><input type="checkbox" data-${prefix}="${esc(s.name)}" ${on(s)?'checked':''}> ${esc(s.title)}${s.protected_only?' <span class="muted">(только с паролем)</span>':''}</label>`).join('');
+  const autoRows=()=> (info.auto||[]).length
+    ? `<table class="tbl"><tbody>${info.auto.map(a=>`<tr><td>${fmtDate(a.created_at)}</td><td class="muted small">${fmtBytes(a.size)}</td><td style="text-align:right"><button class="btn sm" data-auto="${esc(a.name)}">Проверить возврат</button></td></tr>`).join('')}</tbody></table>`
+    : '<div class="small muted">Пока нет: служба сохраняет нынешние настройки перед каждым восстановлением.</div>';
+  let restoredSomething=false;
+  const m=modal('Копия настроек', `
+    <h3 style="margin-top:0">⬇ Скачать копию</h3>
+    <p class="small muted">Все настройки одним файлом: параметры раздела «Настройки», подключения к почтовым серверам, сотрудники, ящики с расписаниями и доступом к чужим ящикам, личные настройки почтового клиента (подписи, правила, автоответ, метки, шаблоны, адресная книга, сертификаты). Писем и истории в копии нет — для них снимки базы и копия вне сервера.</p>
+    <div class="form-row check" style="margin-bottom:2px"><span class="switch"><input type="checkbox" id="sb-prot" checked><span class="track"></span></span><label for="sb-prot">Защитить паролем</label></div>
+    <div class="small muted" style="margin:0 0 8px">С паролем в копии всё: и пароли ящиков, подключений и уведомлений, пользователи интерфейса с API-токенами, ключи S/MIME, файл config.yaml.</div>
+    <div id="sb-pw" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:0 12px">
+      <div class="form-row"><label for="sb-p1">Пароль копии (не короче ${minPw} символов)</label><input type="password" id="sb-p1" autocomplete="new-password"></div>
+      <div class="form-row"><label for="sb-p2">Ещё раз</label><input type="password" id="sb-p2" autocomplete="new-password"></div></div>
+    <div class="hint small" id="sb-plainhint" style="display:none">Без пароля в файл не попадут секреты и учётные записи: после восстановления пароли ящиков и подключений придётся ввести заново.</div>
+    <details style="margin:6px 0"><summary class="small">Разделы</summary><div style="margin-top:6px">${secChecks('exp', info.sections, ()=>true)}</div></details>
+    <div class="btn-row"><button class="btn primary" id="sb-dl">⬇ Скачать копию</button></div>
+    <hr style="margin:18px 0;border:0;border-top:1px solid var(--border)">
+    <h3>⬆ Восстановить из копии</h3>
+    <p class="small muted">Ничего не удаляется. Сначала покажем, что изменится; перед восстановлением служба сама сохранит нынешние настройки — к ним можно вернуться ниже.</p>
+    <div class="form-row"><label for="sb-file">Файл копии (mailarchiver-settings-….json)</label><input type="file" id="sb-file" accept=".json,application/json"></div>
+    <div class="form-row" id="sb-rpw-row" style="display:none"><label for="sb-rpw">Пароль копии</label><input type="password" id="sb-rpw" autocomplete="off"></div>
+    <div class="form-row"><label for="sb-mode">Что делать с тем, что уже есть</label><select id="sb-mode">
+      <option value="add">Только добавить недостающее — существующее не трогать</option>
+      <option value="update">Добавить и обновить существующее значениями из копии</option></select></div>
+    <div class="btn-row"><button class="btn" id="sb-check">Проверить</button></div>
+    <div id="sb-result" style="margin-top:10px"></div>
+    <hr style="margin:18px 0;border:0;border-top:1px solid var(--border)">
+    <h3>↩ Настройки перед прошлыми восстановлениями</h3>
+    <div id="sb-auto">${autoRows()}</div>`, {wide:true, onClose:()=>{ if(restoredSomething) route(); }});
+  const B=m.body, q=(sel)=>B.querySelector(sel);
+  const prot=q('#sb-prot');
+  const syncProt=()=>{ q('#sb-pw').style.display=prot.checked?'grid':'none'; q('#sb-plainhint').style.display=prot.checked?'none':'';
+    B.querySelectorAll('[data-exp]').forEach(cb=>{ const s=info.sections.find(x=>x.name===cb.dataset.exp); if(s&&s.protected_only){ cb.disabled=!prot.checked; if(!prot.checked) cb.checked=false; else cb.checked=true; } }); };
+  prot.onchange=syncProt; syncProt();
+  q('#sb-dl').onclick=async(ev)=>{
+    const pw=q('#sb-p1').value;
+    if(prot.checked){
+      if(pw.length<minPw) return toast('Слишком короткий пароль', `Не короче ${minPw} символов.`, 'warn');
+      if(pw!==q('#sb-p2').value) return toast('Пароли не совпадают','','warn');
+    }
+    if(unsaved && unsaved()) toast('Есть несохранённые изменения', 'В копию попадут сохранённые настройки.', 'warn');
+    const sections=[...B.querySelectorAll('[data-exp]')].filter(cb=>cb.checked).map(cb=>cb.dataset.exp);
+    if(!sections.length) return toast('Выберите разделы','','warn');
+    const b=ev.currentTarget; b.disabled=true;
+    try{
+      await apiDownload('/settings-backup/export', {password: prot.checked?pw:'', sections}, 'mailarchiver-settings.json');
+      toast('Копия скачана', prot.checked?'Запишите пароль отдельно от файла: без него копию не прочитать.':'Без пароля: секретов и учётных записей в ней нет.', 'success', 7000);
+    }catch(e){ toastErr(e); } finally{ b.disabled=false; }
+  };
+  let source=null, available=null;
+  const fileInp=q('#sb-file');
+  fileInp.onchange=async()=>{
+    source=null; available=null; q('#sb-result').innerHTML='';
+    const f=fileInp.files[0]; if(!f) return;
+    source={file:f};
+    try{ const doc=JSON.parse(await f.text()); const kdf=doc&&doc.kdf; q('#sb-rpw-row').style.display=(doc&&doc.encrypted&&kdf&&kdf.name!=='local')?'':'none'; }
+    catch(e){ q('#sb-rpw-row').style.display='none'; }
+  };
+  q('#sb-mode').onchange=()=>{ if(source) run(true); };
+  const form=(dry)=>{
+    const fd=new FormData();
+    if(source.auto) fd.append('auto', source.auto); else fd.append('file', source.file);
+    fd.append('password', q('#sb-rpw').value||'');
+    fd.append('mode', source.auto?'update':q('#sb-mode').value);
+    const picked=[...B.querySelectorAll('[data-res]')].filter(cb=>cb.checked).map(cb=>cb.dataset.res);
+    if(available && picked.length) fd.append('sections', picked.join(','));
+    fd.append('dry_run', dry?'true':'false');
+    return fd;
+  };
+  const render=(r, done)=>{
+    const out=q('#sb-result');
+    const rows=Object.values(r.tables||{}).filter(t=>t.added||t.updated||t.kept||t.skipped||t.same);
+    const src=r.source||{};
+    const head=`<div class="small">Копия от <b>${fmtDate(r.created_at)}</b>, версия ${esc(r.app_version||'?')}${src.host?`, сервер <span class="mono">${esc(src.host)}</span>`:''} · ${r.secrets?'с паролем (с секретами)':'без пароля (без секретов)'} · режим «${r.mode==='update'?'добавить и обновить':'только недостающее'}»</div>`;
+    const secs=(r.available||[]).filter(n=>n!=='config');
+    const pick=!done && secs.length>1 ? `<div style="margin:8px 0">${secChecks('res', info.sections.filter(s=>secs.includes(s.name)), s=>(r.sections||[]).includes(s.name))}</div>` : '';
+    const table=rows.length?`<div class="table-wrap" style="margin-top:8px"><table class="tbl"><thead><tr><th>Что</th>${SB_COLS.map(c=>`<th style="text-align:right">${c[1]}</th>`).join('')}</tr></thead><tbody>
+      ${rows.map(t=>`<tr><td>${esc(t.title)}${(t.names||[]).length||(t.notes||[]).length?`<details class="small"><summary class="muted">подробнее</summary>${(t.names||[]).map(n=>`<div>${esc(n)}</div>`).join('')}${(t.notes||[]).map(n=>`<div style="color:var(--warn)">⚠️ ${esc(n)}</div>`).join('')}</details>`:''}</td>${SB_COLS.map(c=>`<td style="text-align:right">${t[c[0]]?`<b>${fmtNum(t[c[0]])}</b>`:'<span class="muted">0</span>'}</td>`).join('')}</tr>`).join('')}
+      </tbody></table></div>`:'<div class="small muted" style="margin-top:8px">В копии нет того, что можно восстановить.</div>';
+    const tot=r.totals||{};
+    const foot = done
+      ? `<div class="hint" style="margin-top:10px">✅ Восстановлено: добавлено ${fmtNum(tot.added||0)}, изменено ${fmtNum(tot.updated||0)}.${r.notice?' '+esc(r.notice):''} Прежние настройки сохранены — их можно вернуть ниже.</div>`
+      : `<div class="btn-row" style="margin-top:10px"><button class="btn primary" data-apply ${(tot.added||tot.updated)?'':'disabled'}>Восстановить: добавить ${fmtNum(tot.added||0)}, изменить ${fmtNum(tot.updated||0)}</button></div>`;
+    out.innerHTML=head+pick+table+(r.has_config?'<div class="small muted" style="margin-top:6px">В копии есть config.yaml — он не применяется (извлечь: mailarchiver settings-restore файл --extract-config новый.yaml).</div>':'')+foot;
+    out.querySelectorAll('[data-res]').forEach(cb=>cb.onchange=()=>run(true));
+    const ab=out.querySelector('[data-apply]');
+    if(ab) ab.onclick=async()=>{
+      if(!await confirmDlg('Восстановить настройки?', `Будет добавлено ${tot.added||0} и изменено ${tot.updated||0}. Ничего не удаляется; нынешние настройки служба сохранит перед восстановлением.`, {okText:'Восстановить', okClass:'primary'})) return;
+      run(false);
+    };
+  };
+  const run=async(dry)=>{
+    if(!source) return toast('Выберите файл копии','','warn');
+    const out=q('#sb-result');
+    out.innerHTML='<div class="small muted"><span class="spinner"></span> Проверяю…</div>';
+    try{
+      const r=await api('/settings-backup/restore',{method:'POST', body:form(dry)});
+      available=r.available;
+      render(r, !dry);
+      if(!dry){
+        toast('Настройки восстановлены', `Добавлено ${(r.totals||{}).added||0}, изменено ${(r.totals||{}).updated||0}.`);
+        if(r.notice) toast('Важно', r.notice, 'warn', 15000);
+        try{ info=await api('/settings-backup'); q('#sb-auto').innerHTML=autoRows(); bindAuto(); }catch(e){}
+        State.bulkActions=null;
+        restoredSomething=true;
+      }
+    }catch(e){
+      out.innerHTML='';
+      const code=e.data&&e.data.code;
+      if(code==='password_required'||code==='password_wrong'){ q('#sb-rpw-row').style.display=''; q('#sb-rpw').focus(); }
+      toastErr(e);
+    }
+  };
+  q('#sb-check').onclick=()=>{ if(source&&source.auto){ source=null; } if(!source && fileInp.files[0]) source={file:fileInp.files[0]}; run(true); };
+  const bindAuto=()=>B.querySelectorAll('[data-auto]').forEach(b=>b.onclick=()=>{ source={auto:b.dataset.auto}; available=null; run(true); q('#sb-result').scrollIntoView({block:'nearest'}); });
+  bindAuto();
+}
+
 /** Блок «Шифрование копии» в карточке хранилища: состояние ключа и перешифровка. */
 async function storageEncryptionCard(card){
   let st;
@@ -257,7 +385,7 @@ async function replicaCard(card, unsaved){
         ${st.last_ok?` · последняя удачная: ${fmtDate(st.last_ok)}`:''}${st.last_verify?` · полная сверка: ${fmtDate(st.last_verify)}`:''}</div>
       ${last?`<div class="small muted" style="margin-top:4px">${esc(last.message||'')}</div>`:''}
       <div class="small muted" style="margin-top:4px">${st.enabled?(st.next_run?`Следующий прогон: ${fmtDate(st.next_run)}.`:'Расписание не работает (выключен планировщик?).'):'Копирование по расписанию выключено.'}
-        Снимков базы на сервере: ${snaps.length}${lastSnap?` (последний ${fmtDate(lastSnap.created_at)}, ${fmtBytes(lastSnap.size)}${lastSnap.encrypted?', зашифрован':''})`:''}.</div>
+        Снимков базы на сервере: ${snaps.length}${lastSnap?` (последний ${fmtDate(lastSnap.created_at)}, ${fmtBytes(lastSnap.size)}${lastSnap.encrypted?', зашифрован':''}${lastSnap.signed?', подписан':', без подписи'})`:''}.</div>
       ${st.active_job?`<div class="hint" style="margin-top:8px">⏳ Идёт копирование — задание #${st.active_job}. Ход — в разделе «Очередь и задания».</div>`:''}
       ${last&&last.deletions_blocked?`<div class="hint" style="margin-top:8px;border-color:var(--warn)">⚠️ Удаление в копии приостановлено: прогон собирался удалить ${fmtNum(last.deletions_blocked)} файлов. Так выглядит отключившийся диск с почтой. Если удаление ожидаемо (очистка по сроку, удалённые ящики) — разрешите его.
         <div class="btn-row" style="margin-top:6px"><button class="btn sm" data-allow>Разрешить удаление и запустить</button></div></div>`:''}

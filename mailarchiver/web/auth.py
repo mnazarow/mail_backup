@@ -268,8 +268,9 @@ def _authenticated(request: Request) -> dict:
     return user
 
 
-#: Чего нельзя делать с API-токеном: свой пароль и двухфакторный вход, выпуск и отзыв токенов, пользователи.
-TOKEN_FORBIDDEN_PREFIXES = ("/api/me", "/api/tokens", "/api/users", "/api/logout")
+#: Чего нельзя делать с API-токеном: свой пароль и двухфакторный вход, выпуск и отзыв токенов, пользователи,
+#: копия настроек (в ней хеши паролей и токенов; восстановление меняет пользователей, 1.26.0).
+TOKEN_FORBIDDEN_PREFIXES = ("/api/me", "/api/tokens", "/api/users", "/api/logout", "/api/settings-backup")
 
 
 def _token_forbidden(path: str) -> bool:
