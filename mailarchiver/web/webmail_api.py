@@ -1119,15 +1119,28 @@ def _file_response(fh, filename: str, ctype: str = "application/zip"):
                                       "Content-Length": str(size)})
 
 
+def _zip_call(fn, *a, **k):
+    try:
+        return fn(*a, **k)
+    except wt.ZipBusy as exc:
+        raise HTTPException(429, exc.message) from None
+
+
 @router.post("/zip")
 def webmail_zip(request: Request, body: IdsBody, user: dict = Depends(_user)):
     """Выбранные письма — файлами .eml в одном архиве .zip."""
     svc = _svc(request)
     acc = _account(svc, user, body.account_id)
-    fh = wt.zip_messages(svc, acc, body.ids)
-    if user.get("role") == "admin":
-        # администратор выгружает чужую переписку — как поиск и выгрузка ящика, это в аудит
-        svc.db.add_audit(_actor(user), "webmail_zip", f"ящик «{acc.name}»: писем {len(body.ids)} архивом .zip")
+    rights = auth_mod.mailbox_rights(user, int(acc.id)) if _is_mailbox(user) else "staff"
+    if rights == "read":
+        # «только чтение»: выгружать письма нельзя (1.25.0; раньше .zip обходил запрет выгрузки)
+        raise HTTPException(403, f"Ящик «{acc.name}» открыт вам только для чтения: скачивать его письма архивом "
+                                 f"нельзя (доступ даёт администратор).")
+    fh = _zip_call(wt.zip_messages, svc, acc, body.ids, who=_actor(user))
+    if rights != "own":
+        # чужая переписка (администратор или сотрудник с доступом к чужому ящику) — в аудит
+        svc.db.add_audit(_actor(user), "webmail_zip", f"ящик «{acc.name}»: писем {len(body.ids)} архивом .zip"
+                         + (" (доступ к чужому ящику)" if rights == "full" else ""))
     return _file_response(fh, f"Письма ({len(body.ids)}).zip")
 
 
@@ -1135,7 +1148,7 @@ def webmail_zip(request: Request, body: IdsBody, user: dict = Depends(_user)):
 def webmail_attachments_zip(request: Request, account_id: int, id: int, user: dict = Depends(_user)):  # noqa: A002
     svc = _svc(request)
     acc = _account(svc, user, account_id)
-    fh, name = wt.zip_attachments(svc, acc, _message_row(svc, acc, id))
+    fh, name = _zip_call(wt.zip_attachments, svc, acc, _message_row(svc, acc, id), who=_actor(user))
     return _file_response(fh, name)
 
 

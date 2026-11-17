@@ -1727,6 +1727,10 @@ def dismiss_employee(svc, employee_id: int, *, by: str = "system", reason: str =
         out["action"] = actions.pop() if len(actions) == 1 else "mixed"
         if len(out["accounts"]) == 1 and "job_id" in out["accounts"][0]:
             out["job_id"] = out["accounts"][0]["job_id"]
+    # доступ к архиву уволенного закрывается сразу (1.25.0): открытые сеансы, уведомления на устройствах,
+    # запланированные им письма
+    revoked = revoke_employee_access(svc, employee_id, reason="сотрудник уволен")
+    out.update(revoked)
     detail = emp["full_name"]
     if out["accounts"]:
         what = {"final_backup": "последняя копия, затем копирование выключится",
@@ -1737,7 +1741,34 @@ def dismiss_employee(svc, employee_id: int, *, by: str = "system", reason: str =
         detail += f": архив удерживается {until_text}; " + ("ящик " if len(out["accounts"]) == 1 else "ящики: ") + boxes
     if reason:
         detail += f" ({reason})"
+    closed = [f"{label}: {revoked[key]}" for key, label in (("sessions_closed", "сеансов завершено"),
+                                                             ("devices_off", "уведомления выключены на устройствах"),
+                                                             ("scheduled_off", "запланированных писем отменено"))
+              if revoked.get(key)]
+    if closed:
+        detail += "; " + ", ".join(closed)
     svc.db.add_audit(by, "employee_dismissed", detail[:900])
+    return out
+
+
+def revoke_employee_access(svc, employee_id: int, *, reason: str) -> Dict[str, int]:
+    """Закрыть то, что сотрудник оставил «включённым» в архиве (1.25.0): сеансы, открытые паролем его ящиков,
+    уведомления на его устройствах, письма, запланированные им к отправке (возвращаются в черновики с
+    причиной). Делегирования не трогаются: они и так действуют, только пока сотрудник работает."""
+    ids = [int(r["id"]) for r in svc.db.employee_accounts(employee_id)]
+    out = {"sessions_closed": 0, "devices_off": 0, "scheduled_off": 0}
+    for aid in ids:
+        out["sessions_closed"] += int(svc.db.delete_mailbox_sessions(aid) or 0)
+    from .webpush import forget_logins
+    out["devices_off"] = forget_logins(svc.db, ids, reason=reason)
+    try:
+        cur = svc.db.execute("UPDATE webmail_drafts SET status='draft', send_at=NULL, error=?, updated_at=? "
+                             "WHERE status='scheduled' AND owner=?",
+                             (f"Запланированная отправка отменена: {reason}.", utcnow_iso(),
+                              f"mailbox:emp:{int(employee_id)}"))
+        out["scheduled_off"] = int(cur.rowcount or 0)
+    except Exception:  # noqa: BLE001 - нет таблицы черновиков (очень старая база)
+        pass
     return out
 
 

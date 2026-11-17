@@ -88,3 +88,17 @@ def test_runtime_translation(tmp_path):
     assert out["server"] == "The folder “Проекты” is not on the server."
     assert out["unknown"] is None
     assert out["plural"] == "письмо/писем"
+
+
+def test_user_content_is_not_translated():
+    """Темы, отправители, свои папки и метки, имена — под translate="no" (1.25.0): иначе тема «Важно»
+    в английском интерфейсе показывалась как «Important»."""
+    from mailarchiver.web.assets import bundle_text
+    js = bundle_text()
+    assert "function uesc(" in js and '<span translate="no">' in js
+    mail = open(os.path.join(ROOT, "mailarchiver", "web", "static", "js", "mail.js"), encoding="utf-8").read()
+    for bad in ("${esc(r.subject", "${esc(m.subject", "${esc(hd.subject", "${esc(hd.from", "${esc(r.from",
+                "${esc(m.from", "${esc(label)}"):
+        assert bad not in mail, bad
+    for good in ("uesc(r.subject,'(без темы)')", "uesc(hd.from,'—')", "mailFolderHtml(", "mailTagHtml("):
+        assert good in mail, good

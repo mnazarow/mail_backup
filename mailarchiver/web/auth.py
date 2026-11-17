@@ -330,6 +330,9 @@ def create_session(services, response: Response, user_id: int, request: Request,
     ip = client_ip(request)
     ua = request.headers.get("user-agent", "")
     services.db.create_session(token, user_id, expires, ip, ua, role=role, account_id=account_id)
+    if role == "mailbox" and account_id:
+        from ..webpush import touch
+        touch(services, int(account_id))          # подписки на уведомления этого сотрудника — «на связи»
     signed = sign_value(token, services.cfg.secret_key())
     secure = bool(services.rt("security", "secure_cookie"))
     if not secure:
@@ -453,6 +456,11 @@ def do_login(services, request: Request, response: Response, username: str, pass
                                           "учётной записью это не касается.")
         try:
             acc = _try_mailbox_login(services, candidate, password)
+        except MailServerUnavailable:
+            # почтовый сервер пароль не проверил — это не неудача пароля
+            services.db.delete_login_attempt(attempt_id)
+            services.db.add_audit(username, "login_mailbox_unavailable", ip)
+            raise
         except AuthError:
             # проверка не выполнялась (нет свободных слотов) — это не неудача пароля
             services.db.delete_login_attempt(attempt_id)
@@ -845,6 +853,10 @@ def _mailbox_limit_reached(services, username: str) -> Optional[str]:
     return None
 
 
+class MailServerUnavailable(AuthError):
+    """Почтовый сервер не ответил на проверку пароля ящика (пароль не проверялся)."""
+
+
 def _try_mailbox_login(services, acc, password: str):
     """Проверить пароль почтового ящика через IMAP. Вернуть Account или None.
 
@@ -852,6 +864,7 @@ def _try_mailbox_login(services, acc, password: str):
     блокирующее и долгое, а свободных слотов нет — сразу отказ (AuthError), а не
     ожидание. Иначе поток запросов на /api/login выводит из строя весь REST API.
     """
+    from ..errors import ImapAuthError
     from ..models import Account, AuthType
     from ..imap.client import ImapConnection
     if not _mailbox_login_sem.acquire(blocking=False):
@@ -864,8 +877,17 @@ def _try_mailbox_login(services, acc, password: str):
             with ImapConnection(trial, services.connect_options()):
                 pass
             return acc
-        except Exception:  # noqa: BLE001
-            return None
+        except ImapAuthError:
+            return None                                     # пароль не подошёл
+        except Exception as exc:  # noqa: BLE001
+            # сервер не ответил, оборвал соединение, TLS — пароль не проверялся (1.25.0: раньше это считалось
+            # неверным паролем, и во время сбоя почты сотрудники упирались в общий предел неудач)
+            log.warning("Вход по ящику «%s»: почтовый сервер не проверил пароль — %s", acc.name,
+                        getattr(exc, "message", exc))
+            raise MailServerUnavailable(
+                "Почтовый сервер сейчас не отвечает — проверить пароль ящика нельзя. Повторите через несколько "
+                "минут.", hint="Если это повторяется, сообщите администратору: архив не может подключиться к "
+                               "почтовому серверу.") from None
     finally:
         _mailbox_login_sem.release()
 

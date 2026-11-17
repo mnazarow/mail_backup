@@ -151,6 +151,15 @@ PARAM_HELP: Dict[str, dict] = {
         "recommend": "Держите включённым. Отключайте только для внутренних серверов с самоподписанным сертификатом — это снижает защиту от подмены.",
         "example": "true", "default": "true",
     },
+    "security.sso_inactive_days": {
+        "title": "Единый вход: отключать не входивших, дней",
+        "help": ("Учётная запись единого входа (OIDC, SAML), которая столько дней не входила через поставщика, "
+                 "отключается вместе с сеансами и API-токенами: сотрудник, отключённый у поставщика, иначе "
+                 "сохранял бы доступ по токену. Вошёл снова через поставщика — учётная запись включается сама. "
+                 "Токены для скриптов выпускайте на локального пользователя, если их владелец не входит в архив "
+                 "регулярно. 0 — не отключать."),
+        "recommend": "30.", "example": "30", "default": "30",
+    },
     # ---- storage ----
     "storage.compress": {
         "title": "Сжимать письма (gzip)",
@@ -832,6 +841,14 @@ PARAM_HELP: Dict[str, dict] = {
                  "включено «Новая почта сразу» и сервер это умеет) — письмо объявляется за секунды. Без IDLE "
                  "«Входящие» проверяются раз в столько минут."),
         "recommend": "5.", "example": "5", "default": "5",
+    },
+    "webmail.web_push_idle_days": {
+        "title": "Уведомления без входа в архив, дней",
+        "help": ("Подписка устройства удаляется, если сотрудник столько дней не входил в архив (паролем ящика или "
+                 "через единый вход) — уведомления не идут бесконечно на забытый или чужой телефон. Увольнение, "
+                 "передача ящика другому сотруднику, выключение ящика и «Завершить сеансы» выключают уведомления "
+                 "сразу, независимо от этого срока. 0 — не удалять по сроку."),
+        "recommend": "90.", "example": "90", "default": "90",
     },
     "webmail.web_push_hosts": {
         "title": "Службы уведомлений браузеров",
@@ -1860,6 +1877,15 @@ PARAM_HELP: Dict[str, dict] = {
                  "адресу email (логин ящика или адрес сотрудника в справочнике)."),
         "recommend": "Включите, если сотрудникам нужен архив своей почты.", "example": "false", "default": "false",
     },
+    "oidc.trust_unverified_email": {
+        "title": "Доверять адресу без email_verified",
+        "help": ("Сотрудник входит в архив ящика по адресу email из данных поставщика — только если поставщик "
+                 "подтвердил адрес (email_verified). Entra ID и ADFS этого утверждения не присылают; включите, "
+                 "только если адреса у поставщика задаёт администратор, а пользователь (или гость) изменить свой "
+                 "адрес не может — иначе он войдёт в архив чужого ящика."),
+        "recommend": "Выключено; для Entra ID и ADFS — включите, проверив, что адрес задаёт только администратор.",
+        "example": "false", "default": "false",
+    },
     "oidc.use_userinfo": {
         "title": "Дополнять данные из userinfo",
         "help": "Если групп или почты нет в id_token, архив спросит их у userinfo поставщика.",
@@ -1992,7 +2018,7 @@ SETTINGS_SECTIONS: List[dict] = [
     {"section": "security", "title": "Безопасность", "icon": "🔒",
      "keys": ["auth_enabled", "session_ttl_hours", "session_idle_minutes", "min_password_length",
               "max_login_attempts", "lockout_minutes", "secure_cookie", "require_2fa", "mailbox_login",
-              "imap_ssl_verify"]},
+              "imap_ssl_verify", "sso_inactive_days"]},
     {"section": "storage", "title": "Хранилище", "icon": "💾",
      "keys": ["compress", "fsync", "min_free_space_mb", "verify_after_write", "encrypt",
               "encryption_key_file"]},
@@ -2044,7 +2070,7 @@ SETTINGS_SECTIONS: List[dict] = [
      "keys": ["enabled", "admin_actions", "mark_read", "auto_refresh_s", "max_attachments_mb", "save_sent",
               "drafts_keep_days", "undo_send_s", "rules_interval_min", "push", "drafts_on_server",
               "phishing_report_to", "dlp_mode", "warn_external", "warn_recipients", "smime_ca_file",
-              "send_limit_hour", "web_push", "web_push_preview", "web_push_poll_min", "web_push_hosts",
+              "send_limit_hour", "web_push", "web_push_preview", "web_push_poll_min", "web_push_idle_days", "web_push_hosts",
               "web_push_contact"]},
     {"section": "journal", "title": "Приём журналирования (SMTP)", "icon": "📨",
      "keys": ["enabled", "listen", "port", "allowed_ips", "address", "folder", "unwrap_exchange", "tls_cert",
@@ -2062,7 +2088,8 @@ SETTINGS_SECTIONS: List[dict] = [
               "employee_filter", "timeout_s"]},
     {"section": "oidc", "title": "Единый вход (OpenID Connect)", "icon": "🔑",
      "keys": ["enabled", "issuer", "client_id", "client_secret", "scopes", "username_claim", "role_claim",
-              "admin_values", "operator_values", "employee_login", "use_userinfo", "button_text", "redirect_uri",
+              "admin_values", "operator_values", "employee_login", "trust_unverified_email", "use_userinfo", "button_text",
+              "redirect_uri",
               "verify_ssl"]},
     {"section": "saml", "title": "Единый вход (SAML 2.0)", "icon": "🪪",
      "keys": ["enabled", "idp_metadata_url", "idp_entity_id", "idp_sso_url", "idp_cert", "sp_entity_id", "acs_url",

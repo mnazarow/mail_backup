@@ -134,6 +134,20 @@ def cmd_reset_password(args) -> int:
     return 0
 
 
+def cmd_push_reset_key(args) -> int:
+    """Создать ключ уведомлений (VAPID) заново: старый не расшифровывается — сменился ключ базы (1.25.0)."""
+    import types
+
+    from . import webpush
+    cfg = load_config(args.config)
+    db = _build_db(cfg)
+    removed = webpush.reset_key(types.SimpleNamespace(db=db))
+    db.add_audit("cli", "webpush_reset_key", f"ключ уведомлений создан заново; подписок удалено: {removed}")
+    print(f"Ключ уведомлений создан заново. Подписок удалено: {removed} — сотрудникам нужно снова включить "
+          f"уведомления в «Почта → ⚙ → 🔔 Уведомления».")
+    return 0
+
+
 def cmd_reset_2fa(args) -> int:
     """Отключить двухфакторный вход пользователя (потерян телефон)."""
     cfg = load_config(args.config)
@@ -336,19 +350,19 @@ def cmd_restore_snapshot(args) -> int:
     if cfg.db_url or is_sql:
         return _restore_pg(cfg, args, path, cipher, is_sql)
     dest = cfg.db_path
+    keep_as = None
     if os.path.exists(dest):
         if not args.force:
             print(f"База уже есть: {dest}. Остановите службу (sudo systemctl stop mailarchiver) и повторите "
                   f"с --force — текущая база будет сохранена рядом.", file=sys.stderr)
             return 1
-        stamp = _time.strftime("%Y%m%d-%H%M%S")
-        for suffix in ("", "-wal", "-shm"):
-            if os.path.exists(dest + suffix):
-                os.replace(dest + suffix, f"{dest}.before-restore-{stamp}{suffix}")
-        print(f"Текущая база сохранена как {dest}.before-restore-{stamp}")
+        keep_as = f"{dest}.before-restore-{_time.strftime('%Y%m%d-%H%M%S')}"
     os.makedirs(os.path.dirname(dest), exist_ok=True)
-    size = snapshots.restore_snapshot(path, dest, cipher)
+    # прежняя база откладывается только после того, как снимок распакован и проверен (1.25.0)
+    size = snapshots.restore_snapshot(path, dest, cipher, keep_as=keep_as)
     from .util import human_size
+    if keep_as:
+        print(f"Прежняя база сохранена как {keep_as}")
     print(f"База восстановлена из {os.path.basename(path)}: {dest} ({human_size(size)}).")
     print("Проверьте, что на месте secret.key (пароли ящиков) и ключ шифрования писем, затем запустите службу.")
     return 0
@@ -373,19 +387,21 @@ def _restore_pg(cfg, args, path: str, cipher, is_sql: bool) -> int:
         session = pgcompat.Session(engine)
         tables = int(session.execute("SELECT COUNT(*) FROM pg_tables WHERE schemaname = ?", (schema,))
                      .fetchone()[0] or 0)
-        if tables:
-            if not args.force:
-                print(f"В схеме «{schema}» уже есть база службы. Остановите службу (sudo systemctl stop "
-                      f"mailarchiver) и повторите с --force — текущая схема будет сохранена под другим именем.",
-                      file=sys.stderr)
-                return 1
-            backup = f"{schema}_before_{_time.strftime('%Y%m%d_%H%M%S')}"[:63]
-            session.execute_raw(f'ALTER SCHEMA "{schema}" RENAME TO "{backup}"')
-            print(f"Текущая схема сохранена как {backup} (удалить: DROP SCHEMA {backup} CASCADE).")
     finally:
         engine.close()
-    size = snapshots.restore_pg_snapshot(path, cfg.db_url, cipher)
+    backup = None
+    if tables:
+        if not args.force:
+            print(f"В схеме «{schema}» уже есть база службы. Остановите службу (sudo systemctl stop "
+                  f"mailarchiver) и повторите с --force — текущая схема будет сохранена под другим именем.",
+                  file=sys.stderr)
+            return 1
+        backup = f"{schema}_before_{_time.strftime('%Y%m%d_%H%M%S')}"[:63]
+    # переименование прежней схемы и разворачивание снимка — одна транзакция: при ошибке всё как было (1.25.0)
+    size = snapshots.restore_pg_snapshot(path, cfg.db_url, cipher, keep_as=backup)
     from .util import human_size
+    if backup:
+        print(f"Прежняя схема сохранена как {backup} (удалить: DROP SCHEMA {backup} CASCADE).")
     print(f"База восстановлена из {os.path.basename(path)} в схему «{schema}» ({human_size(size)} выгрузки).")
     print("Проверьте, что на месте secret.key (пароли ящиков) и ключ шифрования писем, затем запустите службу.")
     return 0
@@ -537,6 +553,9 @@ def main(argv=None) -> int:
     p = sub.add_parser("reset-2fa", help="отключить двухфакторный вход пользователя (потерян телефон)")
     p.add_argument("-u", "--username", required=True)
     p.set_defaults(func=cmd_reset_2fa)
+
+    p = sub.add_parser("push-reset-key", help="создать ключ уведомлений Web Push заново (старый не расшифровывается)")
+    p.set_defaults(func=cmd_push_reset_key)
 
     p = sub.add_parser("storage-key", help="ключ шифрования локальной копии: состояние или создание")
     p.add_argument("--generate", metavar="ПУТЬ", help="создать новый ключ в указанном файле (не перезаписывает)")

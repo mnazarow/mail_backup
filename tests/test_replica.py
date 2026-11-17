@@ -457,6 +457,32 @@ def test_cli_restore_snapshot(services, tmp_path, capsys):
         assert any(n.startswith("mailarchiver.db.before-restore-") for n in os.listdir(svc.cfg.data_dir))
 
 
+def test_cli_restore_broken_snapshot_keeps_base(services, tmp_path, capsys):
+    """Битый снимок с --force: прежняя база на месте под своим именем, рядом ничего не появилось (1.25.0)."""
+    import gzip
+
+    from mailarchiver import models
+    from mailarchiver.__main__ import main
+    svc = services
+    svc.db.create_account(models.Account(name="Живой ящик", host="h", username="a@b", password="p"))
+    info = snapshots.make_snapshot(svc)
+    broken = tmp_path / ("mailarchiver-20990101T000000Z" + (".sql.gz" if svc.db.is_pg else ".db.gz"))
+    with gzip.open(info["path"], "rb") as src, gzip.open(broken, "wb") as dst:
+        data = src.read()
+        dst.write(data[:-300] if svc.db.is_pg else data[: len(data) // 2])
+    before = sorted(os.listdir(svc.cfg.data_dir))
+    assert main(["restore-snapshot", str(broken), "--force"]) == 1
+    err = capsys.readouterr().err
+    assert "База не изменена" in err
+    assert [a.name for a in svc.db.list_accounts()] == ["Живой ящик"]
+    if svc.db.is_pg:
+        from mailarchiver.pgcompat import split_url
+        schema = split_url(svc.cfg.db_url)[1]
+        assert not svc.db.scalar("SELECT 1 FROM pg_namespace WHERE nspname LIKE ?", (schema + "_before_%",))
+    else:
+        assert sorted(os.listdir(svc.cfg.data_dir)) == before
+
+
 # ---------------------------------------------------------------------------
 #  Веб-интерфейс
 # ---------------------------------------------------------------------------

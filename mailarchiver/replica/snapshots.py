@@ -14,11 +14,13 @@ gzip; если включено шифрование копии, снимок д
 
 База на PostgreSQL (1.24.0): снимок — выгрузка схемы службы программой ``pg_dump``
 (SQL, ``mailarchiver-….sql.gz[.enc]``), тоже согласованная на момент начала;
-восстанавливается командой ``mailarchiver restore-snapshot`` (нужен ``psql``).
+восстанавливается командой ``mailarchiver restore-snapshot`` (нужен ``psql``). Перед ``psql`` выгрузка
+проверяется (:class:`_DumpGuard`, 1.25.0): команды psql и операторы, которых pg_dump не пишет, — отказ.
 """
 from __future__ import annotations
 
 import gzip
+import itertools
 import os
 import re
 import shutil
@@ -269,10 +271,12 @@ def maybe_daily_snapshot(svc) -> Optional[Dict]:
     return ensure_fresh(svc, 23 * 3600)
 
 
-def restore_snapshot(snapshot_path: str, dest_db: str, cipher=None) -> int:
+def restore_snapshot(snapshot_path: str, dest_db: str, cipher=None, *, keep_as: Optional[str] = None) -> int:
     """Развернуть снимок в файл базы ``dest_db`` (через временный файл).
 
-    Зашифрованный снимок (``.enc``) требует ключ шифрования копии.
+    Зашифрованный снимок (``.enc``) требует ключ шифрования копии. Существующая база (с ``-wal``/``-shm``)
+    переименовывается в ``keep_as`` (без него — заменяется) **только после** того, как новый файл
+    распакован и проверен: битый снимок или неверный ключ оставляют прежнюю базу на месте (1.25.0).
     Возвращает размер получившейся базы.
     """
     if not os.path.isfile(snapshot_path):
@@ -301,14 +305,17 @@ def restore_snapshot(snapshot_path: str, dest_db: str, cipher=None) -> int:
             conn.close()
         if str(verdict).lower() != "ok":
             raise StorageError(f"Снимок повреждён: {verdict}")
-        for suffix in ("-wal", "-shm"):
+        for suffix in ("", "-wal", "-shm"):
             if os.path.exists(dest_db + suffix):
-                os.unlink(dest_db + suffix)
+                if keep_as:
+                    os.replace(dest_db + suffix, keep_as + suffix)
+                elif suffix:
+                    os.unlink(dest_db + suffix)
         os.replace(tmp, dest_db)
         os.chmod(dest_db, 0o600)
         return os.path.getsize(dest_db)
-    except (OSError, EOFError, gzip.BadGzipFile) as exc:
-        raise StorageError(f"Снимок не читается: {exc}") from exc
+    except (OSError, EOFError, gzip.BadGzipFile, sqlite3.DatabaseError) as exc:
+        raise StorageError(f"Снимок не читается: {exc}", hint="База не изменена.") from exc
     finally:
         if os.path.exists(tmp):
             try:
@@ -317,11 +324,180 @@ def restore_snapshot(snapshot_path: str, dest_db: str, cipher=None) -> int:
                 pass
 
 
-def restore_pg_snapshot(snapshot_path: str, url: str, cipher=None) -> int:
+class _DumpGuard:
+    r"""Проверка выгрузки перед ``psql`` (1.25.0): ``psql`` выполняет не только SQL, но и свои команды
+    (``\! команда`` — команда оболочки), а снимок мог подменить тот, кто может писать в копию вне сервера.
+
+    Пропускается только то, что пишет ``pg_dump`` для схемы службы: команды SET, создание и изменение таблиц,
+    индексов, функций на sql/plpgsql, триггеров, ``COPY … FROM stdin`` с данными, ``setval``. Обратная косая черта
+    вне строк и данных COPY — отказ (строки ``\restrict``/``\unrestrict`` новых pg_dump убираются: старый psql
+    их не знает). Строки и идентификаторы в кавычках, строки в долларах и комментарии разбираются как в psql.
+    """
+
+    _SET_OK = {"statement_timeout", "lock_timeout", "idle_in_transaction_session_timeout", "transaction_timeout",
+               "client_encoding", "standard_conforming_strings", "check_function_bodies", "xmloption",
+               "client_min_messages", "row_security", "default_tablespace", "default_table_access_method",
+               "search_path", "default_with_oids"}
+    _STMT_OK = re.compile(
+        r"^(?:CREATE\s+(?:SCHEMA|TABLE|UNLOGGED\s+TABLE|SEQUENCE|INDEX|UNIQUE\s+INDEX|FUNCTION|OR\s+REPLACE\s+"
+        r"FUNCTION|TRIGGER|OR\s+REPLACE\s+TRIGGER|CONSTRAINT\s+TRIGGER|VIEW|OR\s+REPLACE\s+VIEW|TYPE|DOMAIN)\b"
+        r"|ALTER\s+(?:TABLE|SEQUENCE|SCHEMA|FUNCTION|INDEX|VIEW|TYPE|DOMAIN|TRIGGER)\b|COMMENT\s+ON\b)", re.I)
+    _COPY = re.compile(r'^COPY\s+(?:"[^"]+"|\w+)(?:\.(?:"[^"]+"|\w+))?\s*(?:\([^()]*\))?\s+FROM\s+stdin$', re.I)
+    _SETVAL = re.compile(r"^SELECT\s+pg_catalog\.setval\('[^']*',\s*\d+,\s*(?:true|false)\)$", re.I)
+    _SET_CONFIG = re.compile(r"^SELECT\s+pg_catalog\.set_config\('search_path',\s*'[^']*',\s*false\)$", re.I)
+    _SET = re.compile(r"^SET\s+(\w+)\s*(?:=|TO)\s*(.+)$", re.I | re.S)
+    _LANG = re.compile(r'\bLANGUAGE\s+"?(\w+)"?', re.I)
+    _RESTRICT = re.compile(rb"^\\(?:un)?restrict [A-Za-z0-9]{1,128}\r?\n?$")
+    _DOLLAR = re.compile(r"\$(?:[A-Za-z_][A-Za-z_0-9]*)?\$")
+    MAX_STMT = 1 << 20
+
+    def __init__(self):
+        self.copy = False
+        self.quote = None          # None | "'" | "e'" | '"' | "$тег$"
+        self.block = 0             # вложенность /* */
+        self.raw: List[str] = []   # текст оператора целиком (для проверки SET и setval)
+        self.code: List[str] = []  # текст оператора без строк и комментариев
+        self.size = 0
+        self.line_no = 0
+
+    def _fail(self, what: str):
+        raise StorageError(f"Снимок отклонён: {what} (строка {self.line_no}). Так pg_dump не пишет — файл мог "
+                           f"быть изменён.", hint="База не изменена. Восстанавливайте снимки только из своей "
+                                                  "копии; зашифрованные снимки (.enc) подделать без ключа нельзя.")
+
+    def feed(self, line: bytes) -> bytes:
+        """Строка выгрузки → что передать psql (b'' — убрать строку)."""
+        self.line_no += 1
+        if self.copy:
+            if line.rstrip(b"\r\n") == b"\\.":
+                self.copy = False
+            return line
+        if (self._RESTRICT.match(line) and self.quote is None and not self.block
+                and not "".join(self.code).strip()):
+            return b""
+        self._lex(line.decode("utf-8", "replace"))
+        return line
+
+    def finish(self) -> None:
+        if self.copy or self.quote or self.block or "".join(self.code).strip():
+            raise StorageError("Снимок оборван: выгрузка закончилась посреди оператора или данных.",
+                               hint="База не изменена.")
+
+    def _end(self) -> None:
+        code = re.sub(r"\s+", " ", "".join(self.code)).strip()
+        raw = re.sub(r"\s+", " ", "".join(self.raw)).strip()
+        self.code, self.raw, self.size = [], [], 0
+        if not code:
+            return
+        head = code.split(" ", 1)[0].upper()
+        if head == "SET":
+            m = self._SET.match(raw)
+            name = (m.group(1).lower() if m else "")
+            if not m or name not in self._SET_OK:
+                self._fail(f"команда «{raw[:80]}»")
+            if name == "standard_conforming_strings" and m.group(2).strip().strip("'").lower() != "on":
+                self._fail("standard_conforming_strings — только on")
+            return
+        if head == "SELECT":
+            if not (self._SETVAL.match(raw) or self._SET_CONFIG.match(raw)):
+                self._fail(f"запрос «{raw[:80]}»")
+            return
+        if head == "COPY":
+            if not self._COPY.match(code):
+                self._fail(f"COPY не из выгрузки («{code[:80]}»)")
+            self.copy = True
+            return
+        if not self._STMT_OK.match(code):
+            self._fail(f"оператор «{code[:80]}»")
+        if re.match(r"^CREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\b", code, re.I):
+            lang = self._LANG.search(code)
+            if not lang or lang.group(1).lower() not in ("sql", "plpgsql"):
+                self._fail("функция не на sql/plpgsql")
+
+    def _add(self, raw: str, code: Optional[str] = None) -> None:
+        """В текст оператора: ``raw`` — как есть, ``code`` — в текст без строк (по умолчанию то же)."""
+        self.size += len(raw)
+        if self.size > self.MAX_STMT:
+            self._fail("слишком длинный оператор")
+        self.raw.append(raw)
+        self.code.append(raw if code is None else code)
+
+    def _lex(self, text: str) -> None:
+        i, n = 0, len(text)
+        while i < n:
+            c = text[i]
+            q = self.quote
+            if self.block:                              # /* … */, могут быть вложенными
+                if text.startswith("*/", i):
+                    self.block -= 1
+                    i += 2
+                elif text.startswith("/*", i):
+                    self.block += 1
+                    i += 2
+                else:
+                    i += 1
+                continue
+            if q is not None:
+                if q == "e'" and c == "\\":             # E'…': \' и \\ — внутри строки
+                    self._add(text[i:i + 2], "")
+                    i += 2
+                    continue
+                close = "'" if q == "e'" else q
+                if text.startswith(close, i):
+                    self.quote = None
+                    self._add(close, close if q == '"' else "")
+                    i += len(close)
+                    continue
+                self._add(c, c if q == '"' else "")
+                i += 1
+                continue
+            if text.startswith("--", i):
+                break                                   # комментарий до конца строки
+            if text.startswith("/*", i):
+                self.block = 1
+                i += 2
+                continue
+            if c == "'":
+                tail = "".join(self.code[-3:])[-2:]
+                e_string = tail[-1:] in ("E", "e") and not (tail[:-1].isalnum() or tail[:-1] == "_")
+                self.quote = "e'" if e_string else "'"
+                self._add(c, "''")
+                i += 1
+                continue
+            if c == '"':
+                self.quote = '"'
+                self._add(c)
+                i += 1
+                continue
+            if c == "$":
+                m = self._DOLLAR.match(text, i)
+                prev = text[i - 1] if i else " "
+                if m and not (prev.isalnum() or prev == "_"):
+                    self.quote = m.group(0)
+                    self._add(m.group(0), " $$ ")
+                    i = m.end()
+                    continue
+            if c == "\\":
+                self._fail("команда psql (обратная косая черта вне строки)")
+            if c == ";":
+                rest = text[i + 1:]
+                self._end()
+                if self.copy and rest.strip():
+                    self._fail("после COPY … FROM stdin на той же строке что-то есть")
+                i += 1
+                continue
+            self._add(c)
+            i += 1
+
+
+def restore_pg_snapshot(snapshot_path: str, url: str, cipher=None, *, keep_as: Optional[str] = None) -> int:
     """Развернуть выгрузку PostgreSQL (``….sql.gz[.enc]``) в схему службы из адреса ``url``.
 
-    Выполняется программой ``psql`` одной транзакцией: ошибка или оборванная выгрузка — ничего не меняется.
-    Снимок другой схемы разворачивается под именем схемы службы. Возвращает размер выгрузки (байт)."""
+    Всё — одной транзакцией ``psql``, вместе с тем, что делается с прежней схемой службы: она
+    переименовывается в ``keep_as`` (если в ней есть таблицы — без ``keep_as`` отказ) или удаляется (пустая).
+    Ошибка, оборванная или подозрительная выгрузка (см. :class:`_DumpGuard`) — ничего не меняется, прежняя
+    схема на месте под своим именем (1.25.0). Снимок другой схемы разворачивается под именем схемы службы.
+    Возвращает размер выгрузки (байт)."""
     from .. import pgcompat
     if not os.path.isfile(snapshot_path):
         raise StorageError(f"Файл снимка не найден: {snapshot_path}")
@@ -330,10 +506,19 @@ def restore_pg_snapshot(snapshot_path: str, url: str, cipher=None) -> int:
     engine = pgcompat.Engine(url, 2)
     try:
         engine.pool()                       # функции и правило сравнения, которые нужны таблицам службы
+        session = pgcompat.Session(engine)
+        tables = int(session.execute("SELECT COUNT(*) FROM pg_tables WHERE schemaname = ?", (schema,))
+                     .fetchone()[0] or 0)
     finally:
         engine.close()
+    if tables and not keep_as:
+        raise StorageError(f"В схеме «{schema}» уже есть база службы.", hint="База не изменена.")
+    if keep_as and not re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", keep_as):
+        raise StorageError(f"Недопустимое имя схемы: {keep_as}")
     dbname, env = pgcompat.libpq_env(conninfo)
     total = 0
+    guard = _DumpGuard()
+    refused: Optional[StorageError] = None
     with open(snapshot_path, "rb") as raw:
         stream = raw
         reader = None
@@ -345,28 +530,51 @@ def restore_pg_snapshot(snapshot_path: str, url: str, cipher=None) -> int:
             stream = reader
         try:
             with gzip.GzipFile(fileobj=stream, mode="rb") as gz, tempfile.TemporaryFile() as err:
-                head = gz.read(256 * 1024)
-                found = re.search(rb'CREATE SCHEMA "([a-z_][a-z0-9_]{0,62})";', head)
-                if not found:
-                    raise StorageError("Это не снимок базы службы: в выгрузке нет схемы.")
-                source = found.group(1).decode()
+                head: List[bytes] = []
+                source, seen = "", 0
+                for line in gz:                         # схема выгрузки — в первых строках
+                    head.append(line)
+                    seen += len(line)
+                    found = re.match(rb'CREATE SCHEMA "([a-z_][a-z0-9_]{0,62})";', line)
+                    if found:
+                        source = found.group(1).decode()
+                        break
+                    if seen > 256 * 1024:
+                        break
+                if not source:
+                    raise StorageError("Это не снимок базы службы: в выгрузке нет схемы.", hint="База не изменена.")
                 proc = subprocess.Popen([psql, "--quiet", "--no-psqlrc", "--single-transaction", "-v", "ON_ERROR_STOP=1",
                                          f"--dbname={dbname}"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                                         stderr=err, env=env)
                 tail = b""
                 try:
-                    proc.stdin.write(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE;\n'.encode())
-                    chunk = head
-                    while chunk:
-                        proc.stdin.write(chunk)
-                        total += len(chunk)
-                        tail = (tail + chunk)[-4096:]
-                        chunk = gz.read(_COPY_CHUNK)
-                    if _PG_DUMP_END not in tail:
-                        proc.stdin.write(b"\nSELECT 'dump is truncated'::int;\n")   # ошибка → откат
-                    elif source != schema:
-                        proc.stdin.write(f'\nALTER SCHEMA "{source}" RENAME TO "{schema}";\n'.encode())
-                    proc.stdin.close()
+                    prelude = "SET standard_conforming_strings = on;\n"
+                    if tables:
+                        prelude += f'ALTER SCHEMA "{schema}" RENAME TO "{keep_as}";\n'
+                    else:
+                        prelude += f'DROP SCHEMA IF EXISTS "{schema}" CASCADE;\n'
+                    proc.stdin.write(prelude.encode())
+                    try:
+                        for line in itertools.chain(head, gz):
+                            total += len(line)
+                            tail = (tail + line)[-4096:]
+                            out = guard.feed(line)
+                            if out:
+                                proc.stdin.write(out)
+                        guard.finish()
+                    except StorageError as exc:
+                        refused = exc
+                        proc.kill()                     # транзакция не завершена — откат
+                        try:
+                            proc.stdin.close()
+                        except OSError:
+                            pass
+                    if refused is None:
+                        if _PG_DUMP_END not in tail:
+                            proc.stdin.write(b"\nSELECT 'dump is truncated'::int;\n")   # ошибка → откат
+                        elif source != schema:
+                            proc.stdin.write(f'\nALTER SCHEMA "{source}" RENAME TO "{schema}";\n'.encode())
+                        proc.stdin.close()
                 except BrokenPipeError:
                     pass
                 code = proc.wait()
@@ -375,8 +583,10 @@ def restore_pg_snapshot(snapshot_path: str, url: str, cipher=None) -> int:
         finally:
             if reader is not None:
                 reader.close()
+    if refused is not None:
+        raise refused
     if _PG_DUMP_END not in tail and (code == 0 or "dump is truncated" in message):
-        raise StorageError("Снимок оборван (нет последней строки pg_dump) — база не изменена.")
+        raise StorageError("Снимок оборван (нет последней строки pg_dump).", hint="База не изменена.")
     if code != 0:
         raise StorageError(f"psql завершился с ошибкой ({code}): {message[-500:]}",
                            hint="База не изменена (всё в одной транзакции). Если схема с именем из снимка уже "

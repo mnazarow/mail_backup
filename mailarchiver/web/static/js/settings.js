@@ -440,7 +440,7 @@ function samlCard(card, unsaved){
     if(unsaved()) return toast('Сначала сохраните настройки','Проверка идёт с сохранёнными значениями.','warn');
     const out=box.querySelector('[data-r]'); out.innerHTML='<div class="spinner"></div>';
     try{ const r=await api('/saml/check',{method:'POST'});
-      const certs=(r.certs||[]).map(c=>`<div>🔏 ${esc(c.subject)} · до ${esc(fmtDate(c.until))} · SHA-256 <code style="font-size:.75rem;word-break:break-all">${esc(c.sha256)}</code></div>`).join('');
+      const certs=(r.certs||[]).map(c=>`<div>🔏 ${uesc(c.subject)} · до ${esc(fmtDate(c.until))} · SHA-256 <code style="font-size:.75rem;word-break:break-all">${esc(c.sha256)}</code></div>`).join('');
       out.innerHTML=(r.ok?`<span class="tag ok">поставщик найден</span> ${esc(r.entity_id)} · вход: ${esc(r.sso_url)}${certs}${r.cert_warning?`<div style="color:var(--warn-text)">⚠️ ${esc(r.cert_warning)}</div>`:''}`:`<span class="tag err">ошибка</span> ${esc(r.error)}`)
         +`<table class="tbl small" style="margin-top:8px"><tbody>
           <tr><td>Идентификатор архива (entityID)</td><td><code style="user-select:all">${esc(r.sp_entity_id)}</code></td></tr>
@@ -808,7 +808,7 @@ async function caseDetail(c, id){
   const accCard=h(`<div class="card" style="margin-top:12px"><h3 style="margin-top:0">Ящики дела (${cs.accounts.length})</h3><div class="table-wrap"><table class="tbl"><thead><tr><th>Ящик</th><th>Сотрудник</th><th>Писем</th><th>Удержание</th>${open?'<th></th>':''}</tr></thead><tbody></tbody></table></div></div>`);
   const atb=accCard.querySelector('tbody');
   cs.accounts.forEach(a=>{
-    const tr=h(`<tr><td><b>${esc(a.name)}</b> <span class="small muted">${esc(a.username)}</span>${a.dismissed?' <span class="tag">уволен</span>':''}</td><td>${esc(a.employee||'—')}</td><td>${fmtNum(a.messages)}</td>
+    const tr=h(`<tr><td><b>${esc(a.name)}</b> <span class="small muted">${esc(a.username)}</span>${a.dismissed?' <span class="tag">уволен</span>':''}</td><td>${uesc(a.employee,'—')}</td><td>${fmtNum(a.messages)}</td>
       <td>${a.hold_reason==='case'?'<span class="tag ok">🔒 по делу</span>':esc(a.hold)}</td>${open?'<td><button class="btn ghost sm" data-rm="'+a.id+'" title="Убрать из дела">✕</button></td>':''}</tr>`);
     atb.appendChild(tr);
   });
@@ -841,8 +841,8 @@ async function caseDetail(c, id){
   const loadMsgs=async()=>{
     const r=await api(`/cases/${id}/messages?offset=${offset}`);
     r.results.forEach(x=>{
-      const tr=h(`<tr class="clickable"><td class="small">${fmtDate(x.date)}</td><td class="small">${esc(x.account_name)}<div class="muted">${esc(x.folder)}</div></td>
-        <td class="small">${esc(x.from)}</td><td>${x.has_attach?'📎 ':''}${esc(x.subject||'(без темы)')}${x.gone?' <span class="tag" title="Письма уже нет на почтовом сервере — копия в архиве">нет на сервере</span>':''}${x.snippet?`<div class="small muted">${snip(x.snippet)}</div>`:''}</td></tr>`);
+      const tr=h(`<tr class="clickable"><td class="small">${fmtDate(x.date)}</td><td class="small">${uesc(x.account_name)}<div class="muted">${uesc(x.folder)}</div></td>
+        <td class="small">${uesc(x.from)}</td><td>${x.has_attach?'📎 ':''}${uesc(x.subject,'(без темы)')}${x.gone?' <span class="tag" title="Письма уже нет на почтовом сервере — копия в архиве">нет на сервере</span>':''}${x.snippet?`<div class="small muted">${snip(x.snippet)}</div>`:''}</td></tr>`);
       tr.onclick=()=>openMailMessage(x.account_id, x.id, x.folder);
       mtb.appendChild(tr);
     });

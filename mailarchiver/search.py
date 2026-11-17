@@ -631,9 +631,13 @@ def _fold(word: str) -> str:
     return unicodedata.normalize("NFC", "".join(out))
 
 
+#: Слова запроса: «поле:"фраза"» (1.25.0 — раньше делилось по пробелу внутри кавычек), «"фраза"», слово.
+_TOKEN_RE = re.compile(r'[^\W\d_]+:"[^"]*"|"[^"]*"|\S+', re.UNICODE)
+
+
 def build_tsquery(query: str) -> str:
     """Запрос пользователя → tsquery PostgreSQL с тем же смыслом, что и ``build_match``."""
-    tokens = re.findall(r'"[^"]*"|\S+', query or "")
+    tokens = _TOKEN_RE.findall(query or "")
     parts: List[str] = []
     for tok in tokens:
         weight = ""
@@ -655,7 +659,7 @@ def build_tsquery(query: str) -> str:
 def _query_terms(query: str) -> List[Tuple[str, bool, str]]:
     """Слова запроса для выделения в отрывке: (слово, по началу ли, поле или '')."""
     out: List[Tuple[str, bool, str]] = []
-    for tok in re.findall(r'"[^"]*"|\S+', query or ""):
+    for tok in _TOKEN_RE.findall(query or ""):
         field = ""
         m = re.match(r"^([^\W\d_]+):(.*)$", tok, re.UNICODE)
         if m and m.group(1).lower() in _FIELD_ALIASES:
@@ -714,7 +718,7 @@ def build_match(query: str) -> str:
     «Фраза в кавычках» — слова подряд. Поля: тема:, от:/кому:, вложение:, текст:.
     Составное слово (адрес, номер через дефис) ищется фразой.
     """
-    tokens = re.findall(r'"[^"]*"|\S+', query or "")
+    tokens = _TOKEN_RE.findall(query or "")
     parts: List[str] = []
     for tok in tokens:
         field = None

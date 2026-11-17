@@ -38,6 +38,7 @@ security:
   require_2fa: false     # true — администраторы обязаны включить вход с кодом из приложения
   mailbox_login: true    # вход сотрудников по email и паролю своего ящика
   imap_ssl_verify: true  # проверять TLS-сертификат IMAP-сервера
+  sso_inactive_days: 30  # единый вход: не входил через поставщика столько дней — отключить с API-токенами (0 — нет)
 
 # База службы. По умолчанию — файл SQLite в каталоге данных. PostgreSQL 16+ (1.24.0) — адрес ниже
 # или переменная MAILARCHIVER_DATABASE_URL; перенос действующей базы — mailarchiver db-migrate.
@@ -224,6 +225,7 @@ webmail:                     # почтовый клиент раздела «П
   web_push: false            # разрешить сотрудникам включать уведомления на своих устройствах
   web_push_preview: true     # отправитель и тема в уведомлении (иначе — «Новое письмо»)
   web_push_poll_min: 5       # ящик без IMAP IDLE: проверять «Входящие» раз в столько минут
+  web_push_idle_days: 90     # подписка устройства, с которого столько дней не входили в архив, удаляется (0 — нет)
   web_push_hosts: [fcm.googleapis.com, push.services.mozilla.com, push.apple.com, notify.windows.com]
   web_push_contact: ""       # mailto:адрес администратора для служб доставки ('' — адрес сервера)
 
@@ -291,6 +293,7 @@ oidc:                        # единый вход OpenID Connect (docs/ru/08-
   operator_values: []        # группы/роли операторов
   employee_login: false      # остальные — сотрудники: архив своих ящиков по адресу email
   use_userinfo: false        # дополнять данными userinfo (если групп нет в id_token)
+  trust_unverified_email: false  # вход сотрудника по адресу без email_verified (Entra ID, ADFS) — только если адреса задаёт администратор
   button_text: "Войти через единый вход"
   redirect_uri: ""           # '' — <адрес интерфейса>/api/auth/oidc/callback
   verify_ssl: true

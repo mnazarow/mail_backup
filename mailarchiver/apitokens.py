@@ -120,6 +120,10 @@ def user_for(svc, token: str, ip: str = "") -> Optional[Dict]:
     owner = svc.db.get_user_by_id(row["user_id"])
     if owner is None or owner["disabled"]:
         return None
+    from .sso import is_idle
+    if is_idle(svc, owner):
+        # владелец из единого входа давно не входил через поставщика — возможно, там он уже отключён (1.25.0)
+        return None
     role = row["role"]
     if owner["role"] == ROLE_OPERATOR:
         role = ROLE_OPERATOR                    # владельца понизили — токен не выше его роли

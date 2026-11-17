@@ -16,6 +16,13 @@ const root = () => document.getElementById('root');
 
 function h(html){ const t=document.createElement('template'); t.innerHTML=html.trim(); return t.content.firstElementChild; }
 function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+/** Текст пользователя или письма (тема, отправитель, имя, папка): экранируется и не переводится
+ *  английским интерфейсом (translate="no" — 1.25.0: тема «Важно» иначе показывалась как «Important»).
+ *  Пусто — ``fallback`` (подпись интерфейса, она переводится). */
+function uesc(s, fallback){
+  const v=String(s==null?'':s);
+  return v ? `<span translate="no">${esc(v)}</span>` : esc(fallback==null?'':fallback);
+}
 function fmtDate(iso){ if(!iso) return '—'; try{ const d=new Date(iso); return d.toLocaleString(UI_LOCALE,{day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'}); }catch(e){ return iso; } }
 function fmtBytes(n){ n=Number(n||0); const u=['Б','КБ','МБ','ГБ','ТБ'].map(x=>t(x)); let i=0; while(n>=1024&&i<u.length-1){n/=1024;i++;} return (i===0?n:n.toFixed(1))+' '+u[i]; }
 

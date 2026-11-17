@@ -106,6 +106,12 @@ def _enable(svc):
     svc.db.set_setting("webmail.web_push_hosts", ["127.0.0.1"])
     svc.db.set_setting("webmail.push", False)           # без IDLE: «Входящие» проверяются по таймеру
     webpush._LAST_POLL.clear()  # noqa: SLF001
+    # копирование, поставленное в очередь подготовкой, должно закончиться: пока оно идёт, tick «Входящие» не
+    # проверяет (иначе тест зависит от того, успела ли очередь)
+    import time
+    deadline = time.monotonic() + 30
+    while svc.db.scalar("SELECT COUNT(*) FROM jobs WHERE status IN ('queued', 'running')") and time.monotonic() < deadline:
+        time.sleep(0.05)
 
 
 def test_subscribe_notify_and_cleanup(api, push, world):
@@ -180,3 +186,133 @@ def test_service_worker_served(client):
     r = client.get("/sw.js")
     assert r.status_code == 200 and "javascript" in r.headers["content-type"]
     assert "showNotification" in r.text and "notificationclick" in r.text
+
+
+# ---------------------------------------------------------------------------
+#  Разбор 16.11 (1.25.0): уведомления прекращаются вместе с доступом
+# ---------------------------------------------------------------------------
+def _subscribe(mb, push, n=1):
+    sub = {"endpoint": push.base + f"/sub/{n}", "keys": {"p256dh": push.p256dh, "auth": push.auth}}
+    r = mb.post("/api/push/subscribe", json=sub)
+    assert r.status_code == 200, r.text
+    return sub
+
+
+def _new_mail(svc, world, subject, mid):
+    world.add("ivanov@x.ru", "INBOX", base._mail(subject, mid=mid))  # noqa: SLF001
+    webpush._LAST_POLL.clear()  # noqa: SLF001
+    return webpush.tick(svc)
+
+
+def test_dismissed_employee_gets_no_push(api, push, world):
+    """Уволенному — ни уведомлений, ни сеансов; подписаться снова нельзя."""
+    from mailarchiver.employees import dismiss_employee
+    admin, mb, svc, a, b = api
+    _enable(svc)
+    svc.db.set_setting("employees.dismissed_action", "keep")          # копирование продолжается
+    sub = _subscribe(mb, push)
+    emp = int(svc.db.get_account(a).employee_id)
+    res = dismiss_employee(svc, emp, by="admin", reason="тест")
+    assert res["devices_off"] == 1 and res["sessions_closed"] >= 1
+    assert mb.get(f"/api/webmail/status?account_id={a}").status_code == 401
+    _new_mail(svc, world, "После увольнения", "<d1@ext>")
+    assert push.got == []
+    detail = svc.db.query_one("SELECT detail FROM audit WHERE action='employee_dismissed'")["detail"]
+    assert "уведомления выключены на устройствах: 1" in detail
+    # подписка уволенного, оставшаяся в базе (например, прежней версии), тоже не срабатывает
+    svc.db.execute("INSERT INTO push_subscriptions(endpoint, p256dh, auth, login_account_id, account_ids, created_at, "
+                   "employee_id, seen_at) VALUES(?,?,?,?,?,?,?,?)",
+                   (sub["endpoint"], push.p256dh, push.auth, a, json.dumps([a]), "2026-11-16T00:00:00+00:00", emp,
+                    "2026-11-16T00:00:00+00:00"))
+    _new_mail(svc, world, "Ещё одно", "<d2@ext>")
+    assert push.got == [] and svc.db.scalar("SELECT COUNT(*) FROM push_subscriptions") == 0
+
+
+def _mb_client(admin, svc, account_id, token):
+    from fastapi.testclient import TestClient
+
+    from mailarchiver.security import sign_value
+    from mailarchiver.web.auth import COOKIE_NAME
+    svc.db.create_session(token, 0, "2099-01-01T00:00:00+00:00", "", "", role="mailbox", account_id=account_id)
+    c = TestClient(admin.app, headers=base.HDR)
+    c.cookies.set(COOKIE_NAME, sign_value(token, svc.cfg.secret_key()))
+    return c
+
+
+def test_relinked_mailbox_and_logout_sessions_stop_push(api, push, world):
+    admin, mb, svc, a, b = api
+    _enable(svc)
+    _subscribe(mb, push)
+    r = admin.post(f"/api/accounts/{a}/logout-sessions").json()
+    assert r["closed"] >= 1 and r["devices"] == 1
+    assert svc.db.scalar("SELECT COUNT(*) FROM push_subscriptions") == 0
+    assert "уведомления выключены на устройствах: 1" in svc.db.query_one(
+        "SELECT detail FROM audit WHERE action='account_logout_sessions'")["detail"]
+    # снова вошёл и подписался — ящик передан другому сотруднику
+    mb2 = _mb_client(admin, svc, a, "mbtok2")
+    _subscribe(mb2, push, 2)
+    other = svc.db.create_employee(full_name="Сидоров Сидор", email="sidorov@x.ru")
+    svc.db.link_employee_account(other, a)
+    assert svc.db.scalar("SELECT COUNT(*) FROM push_subscriptions") == 0
+    _new_mail(svc, world, "Уже для Сидорова", "<r1@ext>")
+    assert push.got == []
+    # отвязка ящика — то же
+    mb3 = _mb_client(admin, svc, a, "mbtok3")
+    _subscribe(mb3, push, 3)
+    svc.db.unlink_employee_account(a)
+    assert svc.db.scalar("SELECT COUNT(*) FROM push_subscriptions") == 0
+
+
+def test_push_owner_checked_on_every_send(api, push, world):
+    """Ящик передан в обход ``link_employee_account`` (прямо в базе) — подписка всё равно не срабатывает."""
+    admin, mb, svc, a, b = api
+    _enable(svc)
+    _subscribe(mb, push)
+    other = svc.db.create_employee(full_name="Сидоров Сидор", email="sidorov@x.ru")
+    svc.db.execute("UPDATE accounts SET employee_id=? WHERE id=?", (other, a))
+    _new_mail(svc, world, "Чужое", "<o1@ext>")
+    assert push.got == [] and svc.db.scalar("SELECT COUNT(*) FROM push_subscriptions") == 0
+
+
+def test_push_idle_device_expires_and_login_refreshes(api, push, world):
+    admin, mb, svc, a, b = api
+    _enable(svc)
+    _subscribe(mb, push)
+    svc.db.execute("UPDATE push_subscriptions SET seen_at='2026-01-01T00:00:00+00:00'")
+    # вход сотрудника паролем ящика обновляет отметку — подписка жива
+    from mailarchiver.web.auth import create_session
+    from starlette.requests import Request
+    from starlette.responses import Response
+    req = Request({"type": "http", "method": "POST", "path": "/", "headers": [], "client": ("127.0.0.1", 1),
+                   "scheme": "http", "query_string": b"", "server": ("t", 80)})
+    create_session(svc, Response(), 0, req, role="mailbox", account_id=a)
+    assert svc.db.scalar("SELECT seen_at FROM push_subscriptions") > "2026-11-01"
+    assert _new_mail(svc, world, "Свежее", "<i1@ext>")["messages"] == 1 and len(push.got) == 1
+    # давно не входил — удалена
+    svc.db.execute("UPDATE push_subscriptions SET seen_at='2026-01-01T00:00:00+00:00'")
+    _new_mail(svc, world, "Позже", "<i2@ext>")
+    assert len(push.got) == 1 and svc.db.scalar("SELECT COUNT(*) FROM push_subscriptions") == 0
+    # 0 — по сроку не удаляется
+    svc.db.set_setting("webmail.web_push_idle_days", 0)
+    _subscribe(mb, push, 4)
+    svc.db.execute("UPDATE push_subscriptions SET seen_at='2020-01-01T00:00:00+00:00'")
+    _new_mail(svc, world, "Совсем позже", "<i3@ext>")
+    assert len(push.got) > 1 and push.decode(push.got[-1])["body"].startswith("Совсем позже")
+
+
+def test_disabled_mailbox_and_broken_key_keep_data(api, push, world):
+    admin, mb, svc, a, b = api
+    _enable(svc)
+    _subscribe(mb, push)
+    # ключ VAPID не расшифровывается — подписки и ключ остаются, ошибка понятная
+    stored = svc.db.get_meta("webpush_vapid")
+    svc.db.set_meta("webpush_vapid", "gAAAAAbroken")
+    st = mb.post("/api/push/state", json={"endpoint": ""})
+    assert st.status_code == 400 and "не расшифровывается" in st.json()["message"]
+    assert svc.db.scalar("SELECT COUNT(*) FROM push_subscriptions") == 1
+    assert svc.db.get_meta("webpush_vapid") == "gAAAAAbroken"
+    svc.db.set_meta("webpush_vapid", stored)
+    # создание ключа заново — подписки удаляются, ключ новый
+    import types
+    assert webpush.reset_key(types.SimpleNamespace(db=svc.db)) == 1
+    assert svc.db.get_meta("webpush_vapid") not in (stored, "gAAAAAbroken")

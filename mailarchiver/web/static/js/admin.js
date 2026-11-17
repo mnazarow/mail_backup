@@ -278,7 +278,7 @@ async function viewEmployees(c){
         + (boxes.length>2?`<div class="muted small">и ещё ${boxes.length-2}</div>`:'')
       : '<span class="muted small">—</span>';
     const tr=h(`<tr>
-      <td><strong>${esc(e.full_name)}</strong>${e.external_id?`<div class="muted small">таб. № ${esc(e.external_id)}</div>`:''}</td>
+      <td><strong>${uesc(e.full_name)}</strong>${e.external_id?`<div class="muted small">таб. № ${esc(e.external_id)}</div>`:''}</td>
       <td class="small">${esc(e.email||'—')}</td>
       <td class="small">${esc(e.position||'—')}</td>
       <td class="small">${esc(e.department||'—')}</td>
@@ -1066,7 +1066,7 @@ async function quarantineModal(a, changed=false){
     const when=qWhen(q.name);
     return `<details class="q-samples"><summary>Письма только в прежней копии ${when?`от ${esc(when)}`:`«${esc(q.name)}»`} — ${fmtNum(c.unique)}${c.unique>sm.length?` (показаны первые ${sm.length})`:''}</summary>
       <div class="table-wrap"><table class="tbl"><thead><tr><th>Дата</th><th>Папка</th><th>От кого</th><th>Тема</th></tr></thead><tbody>
-      ${sm.map(x=>`<tr><td class="small nowrap">${esc(fmtDate(x.date))}</td><td class="small">${esc(x.folder)}</td><td class="small">${esc(x.from)}</td><td class="small">${esc(x.subject||'(без темы)')}</td></tr>`).join('')}
+      ${sm.map(x=>`<tr><td class="small nowrap">${esc(fmtDate(x.date))}</td><td class="small">${uesc(x.folder)}</td><td class="small">${uesc(x.from)}</td><td class="small">${uesc(x.subject,'(без темы)')}</td></tr>`).join('')}
       </tbody></table></div></details>`;
   }).join('');
   let reopening=false;
@@ -1290,7 +1290,7 @@ async function delegatesModal(a){
       <div class="grid2"><div class="form-row"><label>До (необязательно)</label><input type="date" data-u></div><div class="form-row"><label>Примечание</label><input data-n maxlength="300" placeholder="например, на время отпуска"></div></div>
       <div class="btn-row"><button class="btn primary sm" data-add disabled>Открыть доступ</button></div></div>`, {wide:true});
   const g=s=>m.body.querySelector(s); let pick=null;
-  const render=(items)=>{ g('[data-list]').innerHTML=items.length?`<table class="tbl"><thead><tr><th>Сотрудник</th><th>Права</th><th>До</th><th>Кто открыл</th><th></th></tr></thead><tbody>${items.map(d=>`<tr><td>${esc(d.employee)}<div class="small muted">${esc(d.email)}${d.note?' · '+esc(d.note):''}</div></td><td>${esc(d.rights_label)}${d.active?'':' <span class="tag">не действует</span>'}</td><td class="small">${d.until?esc(d.until):'бессрочно'}</td><td class="small">${esc(d.granted_by)}<div class="muted">${esc(fmtDate(d.granted_at))}</div></td><td><button class="btn ghost sm" data-del="${d.employee_id}" title="Снять доступ">✕</button></td></tr>`).join('')}</tbody></table>`:'<div class="empty small">Ящик открыт только его владельцу.</div>'; };
+  const render=(items)=>{ g('[data-list]').innerHTML=items.length?`<table class="tbl"><thead><tr><th>Сотрудник</th><th>Права</th><th>До</th><th>Кто открыл</th><th></th></tr></thead><tbody>${items.map(d=>`<tr><td>${uesc(d.employee)}<div class="small muted">${esc(d.email)}${d.note?' · '+esc(d.note):''}</div></td><td>${esc(d.rights_label)}${d.active?'':' <span class="tag">не действует</span>'}</td><td class="small">${d.until?esc(d.until):'бессрочно'}</td><td class="small">${esc(d.granted_by)}<div class="muted">${esc(fmtDate(d.granted_at))}</div></td><td><button class="btn ghost sm" data-del="${d.employee_id}" title="Снять доступ">✕</button></td></tr>`).join('')}</tbody></table>`:'<div class="empty small">Ящик открыт только его владельцу.</div>'; };
   const load=async()=>{ try{ render((await api(`/accounts/${a.id}/delegates`)).items); }catch(e){ g('[data-list]').innerHTML=`<div class="empty small">${esc(e.message)}</div>`; } };
   g('[data-list]').onclick=async(e)=>{ const b=e.target.closest('[data-del]'); if(!b) return;
     try{ render((await api(`/accounts/${a.id}/delegates/${b.dataset.del}`,{method:'DELETE'})).items); toast('Доступ снят'); }catch(err){ toastErr(err); } };
@@ -1299,7 +1299,7 @@ async function delegatesModal(a){
     const q=g('[data-q]').value.trim(); if(q.length<2){ g('[data-found]').innerHTML=''; return; }
     let r; try{ r=await api(`/employees?query=${encodeURIComponent(q)}&status=active&limit=8`); }catch(e){ return; }
     const items=r.items||r.employees||[];
-    g('[data-found]').innerHTML=items.map(e=>`<a href="#" data-e="${e.id}" data-name="${esc(e.full_name)}">${esc(e.full_name)}</a> <span class="muted">${esc(e.email||'')}</span>`).join('<br>')||'<span class="muted">не найдено</span>'; }, 250); };
+    g('[data-found]').innerHTML=items.map(e=>`<a href="#" data-e="${e.id}" data-name="${esc(e.full_name)}">${uesc(e.full_name)}</a> <span class="muted">${esc(e.email||'')}</span>`).join('<br>')||'<span class="muted">не найдено</span>'; }, 250); };
   g('[data-found]').onclick=(e)=>{ const x=e.target.closest('[data-e]'); if(!x) return; e.preventDefault(); pick=Number(x.dataset.e); g('[data-q]').value=x.dataset.name; g('[data-found]').innerHTML=''; g('[data-add]').disabled=false; };
   g('[data-add]').onclick=async()=>{ if(!pick) return;
     try{ render((await api(`/accounts/${a.id}/delegates`,{method:'POST',body:{employee_id:pick, rights:g('[data-r]').value, until:g('[data-u]').value, note:g('[data-n]').value}})).items); toast('Доступ открыт'); g('[data-q]').value=''; pick=null; g('[data-add]').disabled=true; }catch(e){ toastErr(e); } };

@@ -161,15 +161,33 @@ def test_pg_snapshot_and_restore(services, tmp_path):
     with gzip.open(info["path"], "rb") as src, gzip.open(broken, "wb") as dst:
         dst.write(src.read()[:-300])
     from mailarchiver.errors import StorageError
+    schema = pgcompat.split_url(url)[1]
+    keep = f"{schema}_keep"
+    # в схеме есть база — без имени для неё отказ
+    with pytest.raises(StorageError, match="уже есть база"):
+        snapshots.restore_pg_snapshot(info["path"], url, None)
     with pytest.raises(StorageError, match="оборван"):
-        snapshots.restore_pg_snapshot(str(broken), url, None)
+        snapshots.restore_pg_snapshot(str(broken), url, None, keep_as=keep)
+    # подложенная выгрузка с командой psql — отказ до выполнения
+    marker = tmp_path / "pwned"
+    evil = tmp_path / "evil.sql.gz"
+    with gzip.open(info["path"], "rb") as src, gzip.open(evil, "wb") as dst:
+        text = src.read()
+        dst.write(text.replace(b"SET client_encoding", b"\\! touch " + str(marker).encode() + b"\nSET client_encoding", 1))
+    with pytest.raises(StorageError, match="команда psql"):
+        snapshots.restore_pg_snapshot(str(evil), url, None, keep_as=keep)
+    assert not marker.exists()
     from mailarchiver.database import Database
     db = Database(url, None)
     try:
-        assert len(db.list_accounts()) == 2                 # оборванная выгрузка ничего не изменила
+        # оборванная и отклонённая выгрузки ничего не изменили: прежняя схема на месте под своим именем
+        assert len(db.list_accounts()) == 2
+        assert not db.scalar("SELECT 1 FROM pg_namespace WHERE nspname = ?", (keep,))
         db.close_all()
-        assert snapshots.restore_pg_snapshot(info["path"], url, None) > 0
+        assert snapshots.restore_pg_snapshot(info["path"], url, None, keep_as=keep) > 0
         assert [a.name for a in db.list_accounts()] == ["До снимка"]
+        assert db.scalar(f"SELECT COUNT(*) FROM {keep}.accounts") == 2       # прежняя — под другим именем
+        db.execute(f"DROP SCHEMA {keep} CASCADE")
         # снимок другой схемы разворачивается под именем схемы службы (если той схемы в базе нет)
         target = url.replace("schema=", "schema=r_")
         db.execute(f"ALTER SCHEMA {pgcompat.split_url(url)[1]} RENAME TO {pgcompat.split_url(target)[1]}x")

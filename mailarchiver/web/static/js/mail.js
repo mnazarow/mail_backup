@@ -44,6 +44,15 @@ function mailFolderLabel(f){
   const d=f.delimiter||'';
   return d && f.name.includes(d) ? f.name.slice(f.name.lastIndexOf(d)+d.length) : f.name;
 }
+//: Метки, которые «Почта» заводит сама (как $label1…5 в Thunderbird): их названия — подписи интерфейса.
+const MAIL_DEFAULT_TAGS = new Set(['Важно', 'Работа', 'Личное', 'Сделать', 'Позже']);
+/** Название метки для разметки: стандартные переводятся, свои — как есть. */
+function mailTagHtml(name){ return MAIL_DEFAULT_TAGS.has(name) ? esc(name) : uesc(name); }
+/** Название папки для разметки: особые папки — подписи интерфейса (переводятся), свои — как на сервере. */
+function mailFolderHtml(f, fallback){
+  if(!f) return uesc(fallback||'');
+  return (f.special && MAIL_NAMES[f.special]) ? esc(mailFolderLabel(f)) : uesc(mailFolderLabel(f));
+}
 function mailFolderDepth(f){
   if(f.special || !f.delimiter) return 0;
   let name=f.name;
@@ -333,7 +342,7 @@ function mailMovePicker(anchor, ids){
   const list=pop.querySelector('.mail-pop-list'), q=pop.querySelector('input');
   const fill=()=>{ const s=q.value.trim().toLowerCase();
     list.innerHTML=targets.filter(f=>!s || f.name.toLowerCase().includes(s) || mailFolderLabel(f).toLowerCase().includes(s)).slice(0,200)
-      .map(f=>`<button class="mail-pop-item" data-f="${esc(f.name)}" style="padding-left:${10+mailFolderDepth(f)*14}px">${MAIL_ICONS[f.special]||'📁'} ${esc(mailFolderLabel(f))}</button>`).join('')||'<div class="muted small" style="padding:8px">Папок нет</div>';
+      .map(f=>`<button class="mail-pop-item" data-f="${esc(f.name)}" style="padding-left:${10+mailFolderDepth(f)*14}px">${MAIL_ICONS[f.special]||'📁'} ${mailFolderHtml(f)}</button>`).join('')||'<div class="muted small" style="padding:8px">Папок нет</div>';
     list.querySelectorAll('[data-f]').forEach(b=>b.onclick=async()=>{ pop.remove(); await mailAct('move', ids, {folder:b.dataset.f}); });
   };
   fill(); q.oninput=fill;
@@ -515,7 +524,7 @@ function renderMailFolders(accId){
     const icon=MAIL_ICONS[f.special]||(f.on_server===false?'🗄':'📁');
     const active=Mail.view==='folder' && f.name===Mail.folder;
     const el=h(`<div class="mail-folder ${active?'active':''} ${f.on_server===false?'gone':''} ${f.selectable?'':'noselect'}" tabindex="0" role="button" title="${esc(f.name)}" style="padding-left:${9+depth*14}px" data-fname="${esc(f.name)}">
-      <span>${icon}</span><span class="fname">${esc(label)}</span>
+      <span>${icon}</span><span class="fname">${f.special&&MAIL_NAMES[f.special]?esc(label):uesc(label)}</span>
       ${unseen?`<span class="cnt unseen" title="Непрочитанных">${fmtNum(unseen)}</span>`:`<span class="cnt" title="${f.on_server===false?'Писем в архиве':'Писем'}">${fmtNum(total||0)}</span>`}
       ${mailCanAct()&&f.on_server!==false&&f.selectable?'<button class="fmenu" title="Папка: прочитать всё, очистить, создать вложенную, переименовать, переместить, удалить" aria-label="Действия с папкой">⋯</button>':''}</div>`);
     if(f.selectable){
@@ -622,9 +631,9 @@ async function loadSearchResults(accId, append){
   if(!data.results.length && !append){ box.appendChild(h('<div class="empty">Ничего не найдено</div>')); return; }
   data.results.forEach(r=>{
     const el=h(`<div class="msg-item" tabindex="0" role="button">
-      ${S.scope==='all'?`<div class="msg-acc">${esc(r.account_name||'')} · ${esc(r.folder)}</div>`:`<div class="msg-acc">${esc(r.folder)}</div>`}
-      <div class="msg-top">${pickBox(r.account_id, r.id, r.subject)}<span class="msg-from">${esc(r.from||'—')}</span><span>${r.has_attach?'📎':''}</span><span class="msg-date">${esc(mailWhen(r.date))}</span></div>
-      <div class="msg-subj">${esc(r.subject||'(без темы)')}</div>
+      ${S.scope==='all'?`<div class="msg-acc">${uesc(r.account_name)} · ${uesc(r.folder)}</div>`:`<div class="msg-acc">${uesc(r.folder)}</div>`}
+      <div class="msg-top">${pickBox(r.account_id, r.id, r.subject)}<span class="msg-from">${uesc(r.from,'—')}</span><span>${r.has_attach?'📎':''}</span><span class="msg-date">${esc(mailWhen(r.date))}</span></div>
+      <div class="msg-subj">${uesc(r.subject,'(без темы)')}</div>
       ${r.snippet?`<div class="msg-snip">${markSnippet(r.snippet)}</div>`:''}</div>`);
     wirePick(el, r.account_id, r.id, r.subject);
     el.onclick=()=>{ box.querySelectorAll('.msg-item').forEach(x=>x.classList.remove('active')); el.classList.add('active'); loadMailMessage(r.account_id, r.id); };
@@ -712,7 +721,7 @@ function renderMailList(accId){
       <div class="msg-top">${pickBox(accId, m.id, m.subject)}
         <button class="msg-star ${m.flagged?'on':''}" ${act&&!m.gone?'':'disabled'} title="${m.flagged?'Снять пометку':'Пометить'} (s)" aria-label="Пометка">${m.flagged?'★':'☆'}</button>
         <span class="msg-from">${esc(who)}</span>${m.thread_count>1?`<span class="msg-cnt" title="Писем в беседе: ${m.thread_count}${m.thread_unread?`, непрочитанных: ${m.thread_unread}`:''}">${m.thread_count}</span>`:''}<span>${m.has_attach?'📎':''}</span><span class="msg-date" title="${esc(fmtDate(m.date))}">${esc(mailWhen(m.date))}</span></div>
-      <div class="msg-subj">${m.answered?'<span class="msg-ic" title="Отвечено">↩</span>':''}${m.forwarded?'<span class="msg-ic" title="Переслано">↪</span>':''}${esc(m.subject)}</div>
+      <div class="msg-subj">${m.answered?'<span class="msg-ic" title="Отвечено">↩</span>':''}${m.forwarded?'<span class="msg-ic" title="Переслано">↪</span>':''}${uesc(m.subject)}</div>
       ${mailTagChips(m.keywords)}
       ${m.gone?'<div class="msg-meta"><span class="rp-tag" title="Письма в этой папке на сервере больше нет — копия в архиве">нет на сервере</span></div>':''}</div>`);
     wirePick(el, accId, m.id, m.subject, m.thread_ids);
@@ -745,9 +754,9 @@ async function mailShowUnified(offset){
   if(!r.items.length && !offset){ box.appendChild(h('<div class="empty">Писем нет</div>')); return; }
   r.items.forEach(m=>{
     const el=h(`<div class="msg-item ${m.seen?'':'unread'}" tabindex="0" role="button">
-      <div class="msg-top"><span class="msg-from">${esc(m.from||'')}</span><span>${m.has_attach?'📎':''}</span><span class="msg-date">${esc(mailWhen(m.date))}</span></div>
-      <div class="msg-subj">${esc(m.subject||'(без темы)')}</div>
-      <div class="msg-meta"><span class="rp-tag" title="Ящик">${esc(m.account)}</span></div></div>`);
+      <div class="msg-top"><span class="msg-from">${uesc(m.from)}</span><span>${m.has_attach?'📎':''}</span><span class="msg-date">${esc(mailWhen(m.date))}</span></div>
+      <div class="msg-subj">${uesc(m.subject,'(без темы)')}</div>
+      <div class="msg-meta"><span class="rp-tag" title="Ящик">${uesc(m.account)}</span></div></div>`);
     el.onclick=()=>openMailMessage(m.account_id, m.id, m.folder);
     el.onkeydown=(e)=>{ if(e.key==='Enter'){ e.preventDefault(); el.click(); } };
     box.appendChild(el);
@@ -765,7 +774,7 @@ async function mailShowDrafts(accId){
   Mail.drafts.forEach(d=>{
     const el=h(`<div class="msg-item" tabindex="0" role="button">
       <div class="msg-top"><span class="msg-from">${esc(d.to_addrs?'Кому: '+d.to_addrs:'(без получателя)')}</span><span>${d.attachments.length?'📎':''}</span><span class="msg-date">${esc(mailWhen(d.updated_at))}</span></div>
-      <div class="msg-subj">${esc(d.subject||'(без темы)')}</div>
+      <div class="msg-subj">${uesc(d.subject,'(без темы)')}</div>
       ${d.error?`<div class="small rp-red">Не отправлено: ${esc(trunc(d.error,140))}</div>`:''}
       ${d.status==='scheduled'?`<div class="small mail-sched">🕓 Будет отправлено ${esc(fmtDate(d.send_at))}</div>`:''}
       <div class="btn-row" style="margin-top:6px"><button class="btn sm" data-open>✏️ ${d.status==='scheduled'?'Изменить':'Продолжить'}</button>${d.status==='scheduled'?'<button class="btn sm" data-unsched>⏹ Отменить отправку</button>':''}<button class="btn sm ghost" data-del>🗑 Удалить</button></div></div>`);
@@ -862,12 +871,12 @@ async function loadMailMessage(accId, pk){
       <button class="btn sm ghost mail-tb-more" data-c="more" title="Ещё: скачать, заголовки, печать, переслать вложением, правило, блокировка, восстановить" aria-label="Ещё">⋯</button>
     </div>
     <div class="rhead">
-      <div class="rsubj">${esc(hd.subject||'(без темы)')}<span id="mprio"></span></div>
+      <div class="rsubj">${uesc(hd.subject,'(без темы)')}<span id="mprio"></span></div>
       <div id="mtags">${mailTagChips(item.keywords)}</div>
-      <div class="rmeta"><b>От:</b> ${esc(hd.from||'—')} <span id="mfromtags"></span></div>
-      <div class="rmeta"><b>Кому:</b> ${esc(hd.to||'—')}</div>
-      ${hd.cc?`<div class="rmeta"><b>Копия:</b> ${esc(hd.cc)}</div>`:''}
-      <div class="rmeta"><b>Дата:</b> <span title="${esc(hd.date||'')}">${esc(item.date?fmtDate(item.date):(hd.date||''))}</span> · <span class="muted">📁 ${esc(mailFolderLabel(mailFolderInfo(m.folder))||m.folder||'')}</span>${gone?' · <span class="rp-tag" title="Письма в этой папке на сервере больше нет — копия в архиве">нет на сервере</span>':''}</div>
+      <div class="rmeta"><b>От:</b> ${uesc(hd.from,'—')} <span id="mfromtags"></span></div>
+      <div class="rmeta"><b>Кому:</b> ${uesc(hd.to,'—')}</div>
+      ${hd.cc?`<div class="rmeta"><b>Копия:</b> ${uesc(hd.cc)}</div>`:''}
+      <div class="rmeta"><b>Дата:</b> <span title="${esc(hd.date||'')}">${esc(item.date?fmtDate(item.date):(hd.date||''))}</span> · <span class="muted">📁 ${mailFolderHtml(mailFolderInfo(m.folder), m.folder)}</span>${gone?' · <span class="rp-tag" title="Письма в этой папке на сервере больше нет — копия в архиве">нет на сервере</span>':''}</div>
       ${m.journal?`<div class="rmeta small muted" title="Письмо принято по журналированию (SMTP)">📨 Из журнала: ${esc(fmtDate(m.journal.received_at))}, с ${esc(m.journal.ip)}${m.journal.helo?` (${esc(m.journal.helo)})`:''}${m.journal.auth_user?`, вход «${esc(m.journal.auth_user)}»`:''}${m.journal.client_cert?`, сертификат ${esc(m.journal.client_cert)}`:''}${m.journal.tls?', TLS':', без шифрования'}</div>`:''}
     </div>
     <div id="mthread"></div>
@@ -933,7 +942,7 @@ async function loadMailMessage(accId, pk){
     if(seq!==Mail.seqMsg || !t.items || t.items.length<2) return;
     const th=el.querySelector('#mthread');
     th.appendChild(h(`<details class="mail-thread" ${t.items.length<=6?'open':''}><summary>🧵 Переписка: ${t.items.length} ${plural(t.items.length,'письмо','письма','писем')}</summary>
-      ${t.items.map(x=>`<div class="mail-thread-item ${x.current?'cur':''} ${x.seen?'':'unread'} ${x.gone?'gone':''}" data-id="${x.id}" tabindex="0" role="button"><span class="d">${esc(mailWhen(x.date))}</span><span class="f">${esc(trunc(x.from,40))}</span><span class="s">${esc(trunc(x.subject||'(без темы)',80))}</span><span class="muted small">${esc(x.folder)}</span></div>`).join('')}</details>`));
+      ${t.items.map(x=>`<div class="mail-thread-item ${x.current?'cur':''} ${x.seen?'':'unread'} ${x.gone?'gone':''}" data-id="${x.id}" tabindex="0" role="button"><span class="d">${esc(mailWhen(x.date))}</span><span class="f">${esc(trunc(x.from,40))}</span><span class="s">${esc(trunc(x.subject||'(без темы)',80))}</span><span class="muted small">${uesc(x.folder)}</span></div>`).join('')}</details>`));
     th.querySelectorAll('[data-id]').forEach(r=>{ const id=parseInt(r.dataset.id); if(id===pk) return;
       r.onclick=()=>loadMailMessage(accId, id); r.onkeydown=(e)=>{ if(e.key==='Enter') loadMailMessage(accId, id); }; });
   }).catch(()=>{});
@@ -1262,7 +1271,7 @@ async function archivePickerDlg(accId){
       try{
         const r=await api(`/search?q=${encodeURIComponent(q)}&scope=all&limit=50`+(accId?`&account_id=${accId}`:''));
         res.innerHTML=(r.results||[]).map(x=>`<label style="display:flex;gap:8px;align-items:flex-start;padding:6px 10px;border-bottom:1px solid var(--border)"><input type="checkbox" data-id="${x.id}" ${chosen.has(x.id)?'checked':''}>
-          <span style="flex:1"><b>${esc(x.subject||'(без темы)')}</b><div class="small muted">${esc(x.from)} · ${esc(fmtDate(x.date))} · ${esc(x.account_name)}</div></span></label>`).join('') || '<div class="empty small">Ничего не найдено</div>';
+          <span style="flex:1"><b>${uesc(x.subject,'(без темы)')}</b><div class="small muted">${uesc(x.from)} · ${esc(fmtDate(x.date))} · ${uesc(x.account_name)}</div></span></label>`).join('') || '<div class="empty small">Ничего не найдено</div>';
       }catch(e){ res.innerHTML=`<div class="empty small">${esc(e.message)}</div>`; }
     };
     m.body.querySelector('#apgo').onclick=go;
@@ -1598,7 +1607,7 @@ function mailPopAt(pop, anchor, width=280){
 // --- метки
 function mailTagChips(keywords){
   const kws=keywords||[]; if(!kws.length || !Mail.tags.length) return '';
-  const chips=Mail.tags.filter(t=>kws.includes(t.keyword)).map(t=>`<span class="mtag" style="--tag:${esc(t.color)}">${esc(t.name)}</span>`).join('');
+  const chips=Mail.tags.filter(t=>kws.includes(t.keyword)).map(t=>`<span class="mtag" style="--tag:${esc(t.color)}">${mailTagHtml(t.name)}</span>`).join('');
   return chips?`<div class="mtags">${chips}</div>`:'';
 }
 function mailRenderTagList(accId, box){
@@ -1606,7 +1615,7 @@ function mailRenderTagList(accId, box){
   box.appendChild(h('<div class="mail-folders-sep">🏷 Метки</div>'));
   Mail.tags.forEach(t=>{
     const active=Mail.view==='folder' && Mail.filter==='tag:'+t.keyword;
-    const el=h(`<div class="mail-folder mail-tagrow ${active?'active':''}" tabindex="0" role="button" title="Письма папки с меткой «${esc(t.name)}»"><span class="mdot" style="--tag:${esc(t.color)}"></span><span class="fname">${esc(t.name)}</span></div>`);
+    const el=h(`<div class="mail-folder mail-tagrow ${active?'active':''}" tabindex="0" role="button" title="Письма папки с меткой «${esc(t.name)}»"><span class="mdot" style="--tag:${esc(t.color)}"></span><span class="fname">${mailTagHtml(t.name)}</span></div>`);
     el.onclick=()=>{ Mail.view='folder'; Mail.search=null; Mail.offset=0; Mail.filter=active?'all':'tag:'+t.keyword; renderMailFolders(accId); loadMailMessages(accId); };
     el.onkeydown=(e)=>{ if(e.key==='Enter'||e.key===' '){ e.preventDefault(); el.click(); } };
     box.appendChild(el);
@@ -1617,7 +1626,7 @@ function mailTagPicker(anchor, ids){
   const items=Mail.items.filter(m=>ids.includes(m.id));
   const has=(kw)=>items.length && items.every(m=>(m.keywords||[]).includes(kw));
   const pop=h(`<div class="mail-pop" role="menu"><div class="mail-pop-list">
-    ${Mail.tags.map(t=>`<button class="mail-pop-item" data-kw="${esc(t.keyword)}"><span class="mdot" style="--tag:${esc(t.color)}"></span> ${has(t.keyword)?'✓ ':''}${esc(t.name)}</button>`).join('')||'<div class="muted small" style="padding:8px">Меток нет</div>'}
+    ${Mail.tags.map(t=>`<button class="mail-pop-item" data-kw="${esc(t.keyword)}"><span class="mdot" style="--tag:${esc(t.color)}"></span> ${has(t.keyword)?'✓ ':''}${mailTagHtml(t.name)}</button>`).join('')||'<div class="muted small" style="padding:8px">Меток нет</div>'}
     <button class="mail-pop-item muted" data-cfg>⚙️ Настроить метки…</button></div></div>`);
   pop.querySelectorAll('[data-kw]').forEach(b=>b.onclick=async()=>{
     pop.remove();
@@ -1860,7 +1869,7 @@ async function composeTemplateMenu(anchor, w, body, touch){
   let list=[]; try{ list=(await api('/webmail/templates')).items||[]; }catch(e){ return toastErr(e); }
   mailClosePops();
   const pop=h(`<div class="mail-pop" role="menu"><div class="mail-pop-list">
-    ${list.map(t=>`<button class="mail-pop-item" data-t="${t.id}" title="${esc(t.subject||'')}">📄 ${esc(t.name)}</button>`).join('')||'<div class="muted small" style="padding:8px">Шаблонов пока нет</div>'}
+    ${list.map(t=>`<button class="mail-pop-item" data-t="${t.id}" title="${esc(t.subject||'')}">📄 ${uesc(t.name)}</button>`).join('')||'<div class="muted small" style="padding:8px">Шаблонов пока нет</div>'}
     <button class="mail-pop-item" data-save>💾 Сохранить это письмо как шаблон…</button>
     <button class="mail-pop-item muted" data-cfg>⚙️ Все шаблоны…</button></div></div>`);
   pop.querySelectorAll('[data-t]').forEach(b=>b.onclick=()=>{

@@ -205,6 +205,11 @@ def run_maintenance(svc) -> Dict[str, int]:
         out["ldap_disabled"] = int(ldap_sync_users(svc).get("disabled") or 0)
     except Exception:  # noqa: BLE001
         log.exception("Сверка пользователей с каталогом LDAP не удалась")
+    try:
+        from .sso import disable_idle as sso_disable_idle
+        out["sso_idle_disabled"] = sso_disable_idle(svc)
+    except Exception:  # noqa: BLE001
+        log.exception("Проверка давно не входивших через единый вход не удалась")
     if any(out.values()):
         log.info("Обслуживание: %s", ", ".join(f"{k}={v}" for k, v in out.items() if v))
     return out

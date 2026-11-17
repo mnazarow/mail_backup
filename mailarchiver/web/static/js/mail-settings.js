@@ -184,7 +184,7 @@ async function mailTagsPane(pane, accId){
 async function mailTemplatesPane(pane){
   const d=await api('/webmail/templates');
   pane.innerHTML=`<p class="small muted" style="margin-top:0">Шаблоны — ваши (их не видят другие пользователи). Вставить шаблон — кнопка «📄 Шаблон» в окне письма.</p>
-    <div class="mail-rules">${d.items.map(t=>`<div class="mail-rule" data-id="${t.id}"><div class="mail-rule-t"><b>${esc(t.name)}</b><div class="small muted">${esc(t.subject||'без темы')} · ${esc(trunc((h('<div>'+t.body+'</div>').textContent||'').trim(),90))}</div></div>
+    <div class="mail-rules">${d.items.map(t=>`<div class="mail-rule" data-id="${t.id}"><div class="mail-rule-t"><b>${esc(t.name)}</b><div class="small muted">${uesc(t.subject,'без темы')} · ${esc(trunc((h('<div>'+t.body+'</div>').textContent||'').trim(),90))}</div></div>
       <span class="btn-row"><button class="btn sm ghost" data-ed>✏️</button><button class="btn sm ghost danger" data-del>🗑</button></span></div>`).join('')||'<div class="empty small">Шаблонов пока нет</div>'}</div>
     <div class="btn-row mset-foot"><button class="btn primary" data-new>＋ Шаблон</button></div>`;
   const reload=()=>mailTemplatesPane(pane);

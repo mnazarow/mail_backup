@@ -157,6 +157,12 @@ SNOOZE_FOLDER = "Отложенные"
 #: Архив .zip выбранных писем: писем и объём (несжатый).
 ZIP_MAX_MESSAGES = 2000
 ZIP_MAX_BYTES = 2 * 1024 ** 3
+#: Архивов .zip, которые одновременно собираются и скачиваются: у одного пользователя и всего (1.25.0) —
+#: временные файлы лежат на диске данных, пока архив не скачан.
+ZIP_PER_USER = 2
+ZIP_TOTAL = 4
+_ZIP_LOCK = threading.Lock()
+_ZIP_BUSY: Dict[str, int] = {}
 MAX_TEMPLATES = 200
 MAX_BOOK = 5000
 
@@ -1263,6 +1269,48 @@ def _bg_problem(svc, account, role: str) -> str:
     return ""
 
 
+def _author_problem(svc, owner: str, account) -> str:
+    """Может ли автор черновика сейчас писать из ящика (1.25.0): права проверяются в момент отправки, а не
+    только при планировании — снятый доступ, увольнение, передача ящика или отключённая учётная запись
+    отменяют запланированное письмо."""
+    kind, _sep, rest = (owner or "").partition(":")
+    if kind == "mailbox":
+        sub, _sep, ident = rest.partition(":")
+        try:
+            num = int(ident)
+        except ValueError:
+            return "автор письма не определён"
+        if sub == "acc":
+            if int(account.id) != num:
+                return "ящик автора — другой"
+            if account.employee_id:
+                return "ящик теперь числится за сотрудником"
+            return ""
+        if sub != "emp":
+            return "автор письма не определён"
+        status = svc.db.scalar("SELECT status FROM employees WHERE id=?", (num,))
+        if status is None:
+            return "сотрудника-автора больше нет в справочнике"
+        if status != "active":
+            return "автор письма не числится работающим"
+        if account.employee_id and int(account.employee_id) == num:
+            return ""
+        from .delegation import delegated_for_employee
+        rights = delegated_for_employee(svc.db, num).get(int(account.id))
+        if rights == "full":
+            return ""
+        return ("у автора письма только чтение этого ящика" if rights == "read"
+                else "у автора письма больше нет доступа к этому ящику")
+    user = svc.db.get_user_by_name(rest) if rest else None
+    if user is None:
+        return "учётной записи автора письма больше нет"
+    if user["disabled"]:
+        return "учётная запись автора письма отключена"
+    if user["role"] != "admin":
+        return "у автора письма больше нет прав администратора"
+    return ""
+
+
 def send_due(svc) -> int:
     now = datetime.now(timezone.utc).isoformat()
     rows = svc.db.query("SELECT * FROM webmail_drafts WHERE status='scheduled' AND send_at<=? ORDER BY send_at LIMIT 50",
@@ -1271,7 +1319,7 @@ def send_due(svc) -> int:
     for row in rows:
         acc = svc.db.get_account(int(row["account_id"]))
         role, _sep, actor = (row["actor"] or "").partition(":")
-        problem = _bg_problem(svc, acc, role)
+        problem = _bg_problem(svc, acc, role) or _author_problem(svc, row["owner"], acc)
         if problem:
             svc.db.execute("UPDATE webmail_drafts SET status='draft', send_at=NULL, error=?, updated_at=? WHERE id=?",
                            (f"Запланированная отправка не состоялась: {problem}.", utcnow_iso(), int(row["id"])))
@@ -1306,31 +1354,110 @@ def _zip_name(name: str, used: set) -> str:
     return candidate
 
 
-def zip_messages(svc, account: Account, ids: Sequence[int]):
+class ZipBusy(ValidationError):
+    code = "zip_busy"
+
+
+class _SlotFile:
+    """Временный файл архива: место в очереди .zip освобождается, когда файл закрыт (скачан или брошен)."""
+
+    def __init__(self, fh, release):
+        self._fh, self._release = fh, release
+
+    def read(self, n=-1):
+        return self._fh.read(n)
+
+    def seek(self, *a):
+        return self._fh.seek(*a)
+
+    def tell(self):
+        return self._fh.tell()
+
+    def close(self):
+        try:
+            self._fh.close()
+        finally:
+            self._release()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _zip_slot(who: str):
+    """Занять место для архива .zip (не больше ZIP_PER_USER на пользователя и ZIP_TOTAL всего). → освобождение."""
+    who = who or "?"
+    with _ZIP_LOCK:
+        if _ZIP_BUSY.get(who, 0) >= ZIP_PER_USER or sum(_ZIP_BUSY.values()) >= ZIP_TOTAL:
+            raise ZipBusy("Сейчас уже собираются другие архивы .zip — дождитесь, пока они скачаются, и повторите.")
+        _ZIP_BUSY[who] = _ZIP_BUSY.get(who, 0) + 1
+    done = [False]
+
+    def release():
+        with _ZIP_LOCK:
+            if done[0]:
+                return
+            done[0] = True
+            left = _ZIP_BUSY.get(who, 0) - 1
+            if left > 0:
+                _ZIP_BUSY[who] = left
+            else:
+                _ZIP_BUSY.pop(who, None)
+    return release
+
+
+def _zip_room(svc, need: int) -> None:
+    """Хватит ли места на диске данных: архив не должен съесть запас «Не начинать копирование, если свободно
+    меньше» (иначе встанет копирование всех ящиков)."""
+    from .util import disk_free_bytes, human_size
+    try:
+        reserve = max(0, int(svc.rt("storage", "min_free_space_mb") or 0)) * 1024 * 1024
+    except (TypeError, ValueError):
+        reserve = 0
+    free = disk_free_bytes(_tmp_dir(svc))
+    if free - int(need) < reserve:
+        raise ValidationError(f"Для архива .zip не хватает места на диске данных: нужно до {human_size(need)}, "
+                              f"свободно {human_size(free)} (запас для копирования — {human_size(reserve)}). "
+                              f"Выберите меньше писем.")
+
+
+def zip_messages(svc, account: Account, ids: Sequence[int], *, who: str = ""):
     """Выбранные письма — файлами .eml в архиве .zip. → открытый временный файл (удаляется при закрытии)."""
     ids = list(dict.fromkeys(int(i) for i in ids))[:ZIP_MAX_MESSAGES]
     rows = list(svc.db.messages_by_ids(int(account.id), ids))
     if not rows:
         raise ValidationError("Письма не найдены.")
-    if sum(int(r["size"] or 0) for r in rows) > ZIP_MAX_BYTES:
+    total = sum(int(r["size"] or 0) for r in rows)
+    if total > ZIP_MAX_BYTES:
         raise ValidationError("Выбрано больше 2 ГБ писем — скачайте их частями или выгрузкой ящика.")
-    fh = tempfile.TemporaryFile(dir=_tmp_dir(svc))
-    used: set = set()
-    with zipfile.ZipFile(fh, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
-        for r in sorted(rows, key=lambda x: (x["internaldate"] or "", x["id"])):
-            date = (r["internaldate"] or "")[:10]
-            name = _zip_name(f"{date} {r['subject'] or 'без темы'}.eml", used)
-            with svc.store.open_message(int(account.id), r["stored_path"]) as src, zf.open(name, "w") as dst:
-                while True:
-                    chunk = src.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    dst.write(chunk)
-    fh.seek(0)
-    return fh
+    _zip_room(svc, total)
+    release = _zip_slot(who)
+    fh = None
+    try:
+        fh = tempfile.TemporaryFile(dir=_tmp_dir(svc))
+        used: set = set()
+        with zipfile.ZipFile(fh, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+            for r in sorted(rows, key=lambda x: (x["internaldate"] or "", x["id"])):
+                date = (r["internaldate"] or "")[:10]
+                name = _zip_name(f"{date} {r['subject'] or 'без темы'}.eml", used)
+                with svc.store.open_message(int(account.id), r["stored_path"]) as src, zf.open(name, "w") as dst:
+                    while True:
+                        chunk = src.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        dst.write(chunk)
+        fh.seek(0)
+        return _SlotFile(fh, release)
+    except BaseException:
+        if fh is not None:
+            fh.close()
+        release()
+        raise
 
 
-def zip_attachments(svc, account: Account, row):
+def zip_attachments(svc, account: Account, row, *, who: str = ""):
     """Все вложения письма (кроме картинок в тексте) — архивом .zip."""
     from .mailview import attachment_from_source, summarize_source
     stored = row["stored_path"]
@@ -1340,20 +1467,29 @@ def zip_attachments(svc, account: Account, row):
     atts = [a for a in parsed.get("attachments") or [] if not a.get("inline")]
     if not atts:
         raise ValidationError("В письме нет вложений.")
-    fh = tempfile.TemporaryFile(dir=_tmp_dir(svc))
-    used: set = set()
-    with zipfile.ZipFile(fh, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
-        for a in atts:
-            att = attachment_from_source(opener, size, int(a["index"]))
-            if att is None:
-                continue
-            name, _ctype, chunks, _length = att
-            with zf.open(_zip_name(name or a["filename"], used), "w") as dst:
-                for chunk in chunks:
-                    dst.write(chunk)
-    fh.seek(0)
+    _zip_room(svc, size)
+    release = _zip_slot(who)
+    fh = None
+    try:
+        fh = tempfile.TemporaryFile(dir=_tmp_dir(svc))
+        used: set = set()
+        with zipfile.ZipFile(fh, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+            for a in atts:
+                att = attachment_from_source(opener, size, int(a["index"]))
+                if att is None:
+                    continue
+                name, _ctype, chunks, _length = att
+                with zf.open(_zip_name(name or a["filename"], used), "w") as dst:
+                    for chunk in chunks:
+                        dst.write(chunk)
+        fh.seek(0)
+    except BaseException:
+        if fh is not None:
+            fh.close()
+        release()
+        raise
     subject = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', " ", row["subject"] or "").strip()[:80] or "Вложения"
-    return fh, f"{subject}.zip"
+    return _SlotFile(fh, release), f"{subject}.zip"
 
 
 # ===========================================================================

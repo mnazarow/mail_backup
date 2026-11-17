@@ -545,10 +545,16 @@ def engines() -> List["Engine"]:
 class Engine:
     """Пул соединений с одной базой (и схемой) PostgreSQL и каталог её таблиц."""
 
-    def __init__(self, url: str, pool_size: int = 20) -> None:
+    def __init__(self, url: str, pool_size: int = 20, lock_timeout_ms: int = 0) -> None:
         self.url = url
         self.conninfo, self.schema = split_url(url)
         self.pool_size = max(2, int(pool_size))
+        #: сколько ждать блокировку (как busy_timeout SQLite; 0 — без предела) — 1.25.0
+        self.lock_timeout_ms = max(0, int(lock_timeout_ms or 0))
+        #: общая блокировка записи — своя у каждой схемы (1.25.0): службы в разных схемах одной базы не ждут
+        #: друг друга
+        import zlib
+        self.write_key = WRITE_LOCK_KEY + 2 + 2 * (zlib.crc32(self.schema.encode("utf-8")) % 1_000_000_007)
         self._pool = None
         self._lock = threading.Lock()
         self._cols: Dict[str, List[str]] = {}
@@ -572,8 +578,13 @@ class Engine:
 
     def _kwargs(self) -> Dict[str, Any]:
         import psycopg
-        return {"autocommit": True, "cursor_factory": psycopg.ClientCursor,
-                "options": f"-c search_path={self.schema},public -c TimeZone=UTC"}
+        # 1.25.0: блокировку (в том числе общую блокировку записи) ждать не дольше busy_timeout, как SQLite, —
+        # зависшая транзакция другого процесса даёт ошибку «database is locked», а не вечное ожидание; соединение,
+        # забытое посреди транзакции, сервер закрывает через полчаса (её блокировки освобождаются)
+        options = f"-c search_path={self.schema},public -c TimeZone=UTC -c idle_in_transaction_session_timeout=1800000"
+        if self.lock_timeout_ms:
+            options += f" -c lock_timeout={self.lock_timeout_ms}"
+        return {"autocommit": True, "cursor_factory": psycopg.ClientCursor, "options": options}
 
     def _prepare(self) -> None:
         """Схема, функции и сравнение без учёта регистра — один раз на базу."""
@@ -759,7 +770,7 @@ class Session:
         try:
             conn.execute("BEGIN")
             if immediate:
-                conn.execute("SELECT pg_advisory_xact_lock(%s)", (WRITE_LOCK_KEY,))
+                conn.execute("SELECT pg_advisory_xact_lock(%s)", (self.engine.write_key,))
         except BaseException:
             ctx.__exit__(None, None, None)
             raise

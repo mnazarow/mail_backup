@@ -65,7 +65,7 @@ def test_sign_encrypt_and_decrypt(box, smtp):
         assert r.returncode == 0, r.stderr
     # шифрование: без сертификата получателя — нельзя
     pk, pc, _p, ppem = _cert("petrov@x.ru", "Пётр Петров")
-    d = wm.create_draft(svc, acc, "admin:adm", {"to_addrs": "petrov@x.ru", "subject": "Секрет", "body": "<p>Пароль 123</p>"})
+    d = wm.create_draft(svc, acc, "admin:adm", {"to_addrs": "petrov@x.ru", "subject": "Секрет", "body": "<p>Пароль SECRET-7f3a</p>"})
     wm.update_draft(svc, d["id"], "admin:adm", {"smime_encrypt": True, "smime_sign": True})
     with pytest.raises(ValidationError) as ei:
         wm.send(svc, acc, d["id"], "admin:adm")
@@ -75,7 +75,7 @@ def test_sign_encrypt_and_decrypt(box, smtp):
     raw = smtp.sent[-1]["data"]
     msg = email.message_from_bytes(raw, policy=policy.default)
     assert msg.get_content_type() == "application/pkcs7-mime" and msg["Subject"] == "Секрет"
-    assert b"123" not in raw
+    assert b"SECRET-7f3a" not in raw      # «-» в base64 не бывает: совпасть случайно с шифротекстом не может
     inner = pkcs7.pkcs7_decrypt_smime(raw, pc, pk, [])            # получатель читает
     assert b"multipart/signed" in inner
     mine = wsec.decrypt(svc, acc, raw)                            # и отправитель — свою копию

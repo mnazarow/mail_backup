@@ -62,6 +62,9 @@ DEFAULTS: Dict[str, Any] = {
         "require_2fa": False,          # True — администраторы обязаны включить двухфакторный вход
         "mailbox_login": True,         # вход сотрудников в веб-интерфейс по email и паролю своего ящика
         "imap_ssl_verify": True,       # проверять TLS-сертификат IMAP-сервера
+        # учётные записи единого входа (OIDC, SAML), не входившие через поставщика столько дней, отключаются
+        # вместе с API-токенами (войдёт снова — включится); 0 — не отключать (1.25.0)
+        "sso_inactive_days": 30,
     },
     "paths": {
         "data_dir": "",               # корень данных; если пусто — определяется автоматически
@@ -201,6 +204,7 @@ DEFAULTS: Dict[str, Any] = {
         "web_push": False,             # разрешить сотрудникам включать уведомления на своих устройствах
         "web_push_preview": True,      # показывать в уведомлении отправителя и тему (иначе — «Новое письмо»)
         "web_push_poll_min": 5,        # ящик без IMAP IDLE: проверять «Входящие» раз в столько минут
+        "web_push_idle_days": 90,      # подписка устройства, с которого столько дней не входили в архив, удаляется (0 — нет), 1.25.0
         "web_push_hosts": ["fcm.googleapis.com", "push.services.mozilla.com", "push.apple.com",
                            "notify.windows.com"],   # службы доставки браузеров, куда архиву можно слать
         "web_push_contact": "",        # адрес для служб доставки (mailto: или https://; '' — адрес сервера)
@@ -275,6 +279,9 @@ DEFAULTS: Dict[str, Any] = {
         "operator_values": [],        # группы/роли операторов
         "employee_login": False,      # остальные — сотрудники: архив своих ящиков по адресу email
         "use_userinfo": False,        # дополнять данные из userinfo (если групп нет в id_token)
+        # вход сотрудника по адресу без утверждения email_verified (Entra ID, ADFS его не присылают) — только
+        # если адреса у поставщика задаёт администратор, а не сам пользователь (1.25.0)
+        "trust_unverified_email": False,
         "button_text": "Войти через единый вход",
         "redirect_uri": "",           # '' — <server.public_url или адрес запроса>/api/auth/oidc/callback
         "verify_ssl": True,
@@ -432,6 +439,7 @@ VALUE_RANGES: Dict[str, tuple] = {
     "security.min_password_length": (4, 128),
     "security.max_login_attempts": (1, 1000),
     "security.lockout_minutes": (1, 1440),
+    "security.sso_inactive_days": (0, 3650),
     # storage
     "storage.min_free_space_mb": (0, 10_000_000),
     # backup
@@ -482,6 +490,7 @@ VALUE_RANGES: Dict[str, tuple] = {
     "journal.max_size_mb": (1, 500),
     "webmail.send_limit_hour": (0, 100000),
     "webmail.web_push_poll_min": (1, 60),
+    "webmail.web_push_idle_days": (0, 3650),
     "audit.keep_days": (0, 36500),
     "audit.syslog_port": (1, 65535),
     "cases.export_keep_days": (0, 36500),

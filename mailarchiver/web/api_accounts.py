@@ -258,12 +258,16 @@ def update_account(request: Request, account_id: int, body: AccountBody, user: d
 
 @router.post("/accounts/{account_id}/logout-sessions")
 def logout_mailbox_sessions(request: Request, account_id: int, user: dict = Depends(auth_mod.require_admin)):
-    """Завершить сеансы сотрудника, вошедшего в интерфейс по паролю этого ящика."""
+    """Завершить сеансы сотрудника, вошедшего в интерфейс по паролю этого ящика, и выключить уведомления на
+    устройствах, включённые этим входом (1.25.0)."""
+    from ..webpush import forget_logins
     svc = svc_dep(request)
     acc = svc.require_account(_bounded_id(account_id))
     closed = svc.db.delete_mailbox_sessions(account_id)
-    svc.db.add_audit(user["username"], "account_logout_sessions", f"{acc.name}: {closed}")
-    return {"ok": True, "closed": closed}
+    devices = forget_logins(svc.db, [int(account_id)], reason="«Завершить сеансы»")
+    svc.db.add_audit(user["username"], "account_logout_sessions",
+                     f"{acc.name}: {closed}" + (f"; уведомления выключены на устройствах: {devices}" if devices else ""))
+    return {"ok": True, "closed": closed, "devices": devices}
 
 
 @router.post("/accounts/{account_id}/exclude-folders")
@@ -1095,13 +1099,18 @@ VIEW_AUDIT_TTL_S = 3600
 
 
 def _audit_view(svc, user: dict, account_id: int, pk: int, what: str) -> None:
-    """Кто из персонала читал чужие письма (1.21.0): просмотр, вложение, исходный файл — в аудит.
+    """Кто читал чужие письма (1.21.0): просмотр, вложение, исходный файл — в аудит.
 
-    Сотрудник в своём ящике не записывается; одно и то же действие с письмом — не чаще раза в час.
+    Сотрудник в своём ящике не записывается, а в чужом, открытом ему администратором (общий,
+    делегированный — 1.25.0), — записывается под его логином; одно и то же действие с письмом — не чаще
+    раза в час.
     """
-    if user.get("role") == "mailbox" or not bool(svc.rt("audit", "message_views")
-                                                 if svc.rt("audit", "message_views") is not None else True):
+    if not bool(svc.rt("audit", "message_views") if svc.rt("audit", "message_views") is not None else True):
         return
+    if user.get("role") == "mailbox":
+        if auth_mod.mailbox_rights(user, int(account_id)) == "own":
+            return
+        what += " (доступ к чужому ящику)"
     key = (user.get("username") or "", int(account_id), int(pk), what)
     now = time.monotonic()
     with _VIEWS_LOCK:

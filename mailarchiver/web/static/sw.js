@@ -7,8 +7,15 @@ self.addEventListener('install', () => self.skipWaiting());
 self.addEventListener('activate', (event) => event.waitUntil(self.clients.claim()));
 
 function safeUrl(u){
-  // только адрес этого же сайта: «/#/mail…»
-  return (typeof u === 'string' && u.startsWith('/') && !u.startsWith('//')) ? u : '/#/mail';
+  // только адрес этого же сайта: «/#/mail…». «//сайт» и «/\сайт» браузер читает как адрес другого сайта
+  // (обратную косую черту — как прямую), поэтому второй символ — не косая черта; управляющие символы — нет.
+  if (typeof u !== 'string' || !u.startsWith('/') || /^\/[\\/]/.test(u) || /[\u0000-\u001f\\]/.test(u)) return '/#/mail';
+  try {
+    const url = new URL(u, self.location.origin);
+    return url.origin === self.location.origin ? url.pathname + url.search + url.hash : '/#/mail';
+  } catch (e) {
+    return '/#/mail';
+  }
 }
 
 self.addEventListener('push', (event) => {

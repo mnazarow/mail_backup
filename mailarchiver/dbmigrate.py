@@ -21,6 +21,7 @@
 """
 from __future__ import annotations
 
+import re
 import sqlite3
 import time
 from typing import Callable, Dict, List, Optional
@@ -49,9 +50,14 @@ def _converter(dtype: str, fixed: List[int]):
         def conv(v):
             if v is None or isinstance(v, int):
                 return v
+            if isinstance(v, (bytes, bytearray)):
+                fixed[0] += 1
+                return None
+            text = str(v).strip()
             try:
-                return int(float(v)) if not isinstance(v, (bytes, bytearray)) else None
-            except (TypeError, ValueError):
+                # целое строкой — без float (точность больших чисел, 1.25.0), дробное — с отбрасыванием части
+                return int(text) if re.fullmatch(r"[+-]?\d+", text) else int(float(text))
+            except (TypeError, ValueError, OverflowError):
                 fixed[0] += 1
                 return None
         return conv
@@ -78,7 +84,10 @@ def _converter(dtype: str, fixed: List[int]):
         if isinstance(v, (bytes, bytearray)):
             v = bytes(v).decode("utf-8", "replace")
         v = v if isinstance(v, str) else str(v)
-        return v.replace("\x00", "") if "\x00" in v else v
+        if "\x00" in v:
+            fixed[0] += 1                 # символ NUL в тексте PostgreSQL не хранит — убирается (и считается)
+            return v.replace("\x00", "")
+        return v
     return conv
 
 

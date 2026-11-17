@@ -444,11 +444,22 @@ def consume(svc, saml_response: str, request=None, now: Optional[float] = None) 
     if not aid or not remember_once(svc, "saml_assertion", aid, max(noa - now, 0) + CLOCK_SKEW_S + 60):
         raise SamlError("это утверждение уже использовано (повтор ответа)")
     attrs = _attributes(assertion)
-    name_id = _text(subject.find("saml:NameID", NS)) if subject is not None else ""
+    nid = subject.find("saml:NameID", NS) if subject is not None else None
+    name_id = _text(nid)
+    nid_format = (nid.get("Format") or "") if nid is not None else ""
+    transient = nid_format.endswith(":transient")
     uattr = str(svc.rt("saml", "username_attribute") or "").strip()
+    if transient and not uattr:
+        # одноразовый NameID меняется при каждом входе — каждый раз была бы новая учётная запись (1.25.0)
+        raise SamlError("поставщик передал одноразовый NameID (transient): по нему не узнать пользователя при "
+                        "следующем входе. Настройте у поставщика постоянный NameID (persistent или адрес почты) "
+                        "или укажите «Атрибут имени пользователя»")
     username = ((attrs.get(uattr) or attrs.get(uattr.lower()) or [""])[0] if uattr else name_id).strip()[:200]
     if not username:
         raise SamlError("поставщик не передал имя пользователя" + (f" (атрибут {uattr})" if uattr else " (NameID)"))
+    # постоянный идентификатор у поставщика (1.25.0): NameID с форматом; одноразовый — тогда имя из атрибута
+    subject_id = (f"saml|{issuer}|attr:{uattr}|{username}" if transient or not name_id
+                  else f"saml|{issuer}|{nid_format or 'unspecified'}|{name_id}")
     eattr = str(svc.rt("saml", "email_attribute") or "").strip()
     email = ""
     for n in ([eattr] if eattr else list(EMAIL_ATTRS)):
@@ -463,7 +474,7 @@ def consume(svc, saml_response: str, request=None, now: Optional[float] = None) 
     role = role_from(groups, svc.rt("saml", "admin_values"), svc.rt("saml", "operator_values"),
                      bool(svc.rt("saml", "employee_login")), email.strip().lower())
     return {"username": username, "email": email.strip().lower(), "role": role, "in_response_to": in_resp,
-            "groups": groups[:50], "assertion_id": aid}
+            "groups": groups[:50], "assertion_id": aid, "subject": subject_id[:500]}
 
 
 def park(svc, info: Dict) -> str:

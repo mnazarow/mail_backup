@@ -206,6 +206,8 @@ Excel), действие и параметры — программа снача
 | `mailarchiver replica-ssh-key` | показать (при первом вызове — создать) SSH-ключ службы для копии по rsync |
 | `mailarchiver replica-pull --to КАТАЛОГ` | скачать копию вне сервера после аварии (`--dir ПАПКА` или `--s3-…`, `--only-db`) |
 | `mailarchiver restore-snapshot СНИМОК` | восстановить базу из снимка (`--key ФАЙЛ`, `--force`) |
+| `mailarchiver db-migrate --to АДРЕС` | перенести базу службы из SQLite в PostgreSQL |
+| `mailarchiver push-reset-key` | создать ключ уведомлений Web Push заново (если сменился `secret.key`) |
 | `mailarchiver version` | версия |
 
 Остальное — через веб-интерфейс и REST API (схема — `/api/docs`, только для администратора).

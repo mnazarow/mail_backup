@@ -79,8 +79,11 @@ def _check_url(url: str, what: str) -> str:
     return url
 
 
-def _http(svc, url: str, data: Optional[Dict[str, str]] = None, auth: Optional[Tuple[str, str]] = None) -> Any:
-    _check_url(url, "адрес поставщика")
+def _http(svc, url: str, data: Optional[Dict[str, str]] = None, auth: Optional[Tuple[str, str]] = None,
+          bearer: str = "", what: str = "адрес поставщика") -> Any:
+    """Запрос к поставщику: только https (кроме этой машины), без перенаправлений (заголовок с секретом клиента
+    или токеном доступа не уходит на другой адрес), проверка сертификата — по ``oidc.verify_ssl``."""
+    _check_url(url, what)
     headers = {"Accept": "application/json", "User-Agent": "MailArchiver"}
     body = None
     if data is not None:
@@ -89,13 +92,15 @@ def _http(svc, url: str, data: Optional[Dict[str, str]] = None, auth: Optional[T
     if auth is not None:
         headers["Authorization"] = "Basic " + base64.b64encode(
             f"{urllib.parse.quote(auth[0], safe='')}:{urllib.parse.quote(auth[1], safe='')}".encode()).decode()
+    elif bearer:
+        headers["Authorization"] = f"Bearer {bearer}"
     ctx = ssl.create_default_context()
     if not bool(svc.rt("oidc", "verify_ssl") if svc.rt("oidc", "verify_ssl") is not None else True):
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
 
     class _NoRedirect(urllib.request.HTTPRedirectHandler):
-        def redirect_request(self, *a, **k):        # перенаправления с секретом клиента не нужны
+        def redirect_request(self, *a, **k):        # перенаправления с секретом или токеном не нужны
             return None
     opener = urllib.request.build_opener(_NoRedirect, urllib.request.HTTPSHandler(context=ctx))
     req = urllib.request.Request(url, data=body, headers=headers, method="POST" if body is not None else "GET")
@@ -309,8 +314,21 @@ def _values(v) -> List[str]:
     return _sso_values(v)
 
 
+def verified_email(svc, claims: Dict) -> str:
+    """Адрес для входа сотрудника: только подтверждённый поставщиком (``email_verified``). Поставщики, которые
+    этого утверждения не присылают (Entra ID, ADFS), — только с ``oidc.trust_unverified_email`` (1.25.0: раньше
+    отсутствие утверждения считалось подтверждением)."""
+    email = str(claims.get("email") or "").strip().lower()
+    flag = claims.get("email_verified")
+    if isinstance(flag, str):
+        flag = flag.strip().lower() == "true"
+    if flag is True or (flag is None and bool(svc.rt("oidc", "trust_unverified_email"))):
+        return email
+    return ""
+
+
 def role_of(svc, claims: Dict) -> str:
-    email = claims.get("email") if claims.get("email_verified", True) else ""
+    email = verified_email(svc, claims)
     return role_from(_values(_claim(claims, str(svc.rt("oidc", "role_claim") or "groups"))),
                      svc.rt("oidc", "admin_values"), svc.rt("oidc", "operator_values"),
                      bool(svc.rt("oidc", "employee_login")), str(email or ""))
@@ -355,18 +373,22 @@ def finish(svc, query: Dict[str, str], cookie: str, request) -> Dict:
     username = str(_claim(claims, ucl) or claims.get("email") or claims.get("sub") or "").strip()[:200]
     if not username:
         raise OidcError(f"в данных пользователя нет {ucl}")
-    return {"username": username, "email": str(claims.get("email") or "").strip().lower(),
-            "name": str(claims.get("name") or ""), "role": role_of(svc, claims), "sub": claims.get("sub")}
+    sub = str(claims.get("sub") or "").strip()
+    if not sub:
+        raise OidcError("в id_token нет sub")
+    return {"username": username, "email": verified_email(svc, claims),
+            "name": str(claims.get("name") or ""), "role": role_of(svc, claims), "sub": sub,
+            # постоянный идентификатор у поставщика: учётная запись архива привязывается к нему (1.25.0)
+            "subject": f"oidc|{str(claims.get('iss') or '').rstrip('/')}|{sub}"}
 
 
 def _http_bearer(svc, url: str, token: str) -> Dict:
-    _check_url(url, "userinfo")
-    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:  # noqa: S310 - адрес проверен выше
-            return json.loads(resp.read(MAX_RESPONSE).decode("utf-8"))
-    except (urllib.error.URLError, OSError, ValueError) as exc:
-        raise OidcError(f"userinfo: {exc}") from None
+    """userinfo — тем же способом, что остальные запросы к поставщику (1.25.0: раньше — с перенаправлениями,
+    которые уносили токен доступа на другой адрес, и без учёта ``oidc.verify_ssl``)."""
+    out = _http(svc, url, bearer=token, what="userinfo")
+    if not isinstance(out, dict):
+        raise OidcError("userinfo: поставщик прислал не объект JSON")
+    return out
 
 
 def check(svc) -> Dict:

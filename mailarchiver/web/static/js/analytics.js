@@ -870,7 +870,7 @@ async function viewMailAnalytics(c){
 
   // Крупнейшие письма
   if(d.largest.length){
-    const rows=d.largest.map(m=>`<tr><td>${esc(trunc(m.subject,48))}<div class="muted small">${esc(trunc(m.from,42))}</div></td><td>${esc(m.folder)}</td><td>${esc(m.size_h)}</td><td class="small muted">${fmtDateShort(m.date)}</td></tr>`).join('');
+    const rows=d.largest.map(m=>`<tr><td>${uesc(trunc(m.subject,48))}<div class="muted small">${uesc(trunc(m.from,42))}</div></td><td>${uesc(m.folder)}</td><td>${esc(m.size_h)}</td><td class="small muted">${fmtDateShort(m.date)}</td></tr>`).join('');
     c.appendChild(h(`<div class="card an-card"><h3>🏋️ Крупнейшие письма</h3><div class="table-wrap"><table class="tbl"><thead><tr><th>Тема / отправитель</th><th>Папка</th><th>Размер</th><th>Дата</th></tr></thead><tbody>${rows}</tbody></table></div></div>`));
   }
 

@@ -153,7 +153,8 @@ class Database:
         self._plain_cache: Dict[Tuple[int, str], str] = {}
         #: «sqlite» или «postgresql» (1.24.0)
         self.dialect = "postgresql" if pgcompat.is_url(path) else "sqlite"
-        self._pg = pgcompat.Engine(path, pool_size) if self.dialect == "postgresql" else None
+        self._pg = (pgcompat.Engine(path, pool_size, lock_timeout_ms=busy_timeout_ms)
+                    if self.dialect == "postgresql" else None)
 
     @property
     def is_pg(self) -> bool:
@@ -433,6 +434,9 @@ class Database:
             ("users", "auth_source", "TEXT NOT NULL DEFAULT 'local'"),
             # кто отключил: admin — вручную (каталог не включает обратно), ldap — сверка с каталогом (1.21.0)
             ("users", "disabled_by", "TEXT NOT NULL DEFAULT ''"),
+            # единый вход: постоянный идентификатор у поставщика и время последнего входа через него (1.25.0)
+            ("users", "sso_subject", "TEXT NOT NULL DEFAULT ''"),
+            ("users", "last_sso_at", "TEXT NOT NULL DEFAULT ''"),
             # письма, которых в папке на сервере больше нет (удалены, перенесены) — почтовый клиент их
             # не показывает, архив хранит (1.17.0)
             ("messages", "gone", "INTEGER NOT NULL DEFAULT 0"),
@@ -1491,11 +1495,19 @@ class Database:
             logins = _split_logins(known[0] if known else "") | {(row["username"] or "").lower()}
             conn.execute("UPDATE employees SET known_logins=?, had_account=1, updated_at=? WHERE id=?",
                          (_join_logins(logins), utcnow_iso(), employee_id))
+        if previous is None or int(previous) != int(employee_id):
+            # уведомления на устройства прежнего владельца (или того, кто входил паролем ничьего ящика) —
+            # больше не ему (1.25.0)
+            from .webpush import forget_logins
+            forget_logins(self, [int(account_id)], reason="ящик передан другому сотруднику")
         return int(previous) if previous is not None and int(previous) != int(employee_id) else None
 
     def unlink_employee_account(self, account_id: int) -> None:
-        """Ящик больше не числится за сотрудником (сам ящик и его архив остаются)."""
+        """Ящик больше не числится за сотрудником (сам ящик и его архив остаются). Уведомления на устройства,
+        включённые входом паролем этого ящика, выключаются (1.25.0)."""
         self.execute("UPDATE accounts SET employee_id=NULL WHERE id=?", (account_id,))
+        from .webpush import forget_logins
+        forget_logins(self, [int(account_id)], reason="ящик отвязан от сотрудника")
 
     def remember_employee_logins(self, employee_id: int, logins) -> None:
         """Добавить логины в known_logins сотрудника (ящики по ним синхронизация больше не заводит)."""

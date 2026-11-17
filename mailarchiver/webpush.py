@@ -10,7 +10,10 @@
 Новая почта замечается так же, как в открытом клиенте: соединение IMAP IDLE с ящиком (если сервер умеет
 и включено «Новая почта сразу»), иначе проверка «Входящих» раз в ``webmail.web_push_poll_min`` минут.
 Подписка принадлежит сотруднику, вошедшему паролем ящика; кому что слать, считается на каждой отправке:
-уволенный сотрудник или снятый администратором доступ к общему ящику прекращают уведомления сразу.
+уволенный сотрудник, ящик, переданный другому сотруднику или выключенный, снятый администратором доступ к
+общему ящику прекращают уведомления сразу (1.25.0: подписка помнит сотрудника, за которым ящик входа числился
+при подписке). «Завершить сеансы» ящика снимает и его подписки; подписка устройства, с которого сотрудник не
+входил в архив ``webmail.web_push_idle_days`` дней, удаляется.
 
 Только для сотрудников: администратор чужие письма видит в архиве, уведомления о них ему не нужны.
 """
@@ -47,7 +50,9 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (
     created_at       TEXT NOT NULL DEFAULT '',
     last_ok_at       TEXT NOT NULL DEFAULT '',
     last_error       TEXT NOT NULL DEFAULT '',
-    failures         INTEGER NOT NULL DEFAULT 0
+    failures         INTEGER NOT NULL DEFAULT 0,
+    employee_id      INTEGER,                   -- за кем ящик входа числился при подписке (1.25.0)
+    seen_at          TEXT NOT NULL DEFAULT ''   -- когда сотрудник последний раз входил в архив (1.25.0)
 );
 CREATE INDEX IF NOT EXISTS idx_push_subscriptions_login ON push_subscriptions(login_account_id);
 CREATE TABLE IF NOT EXISTS push_watermarks (
@@ -77,6 +82,18 @@ _LAST_POLL: Dict[int, float] = {}
 
 def ensure_schema(conn) -> None:
     conn.executescript(SCHEMA)
+    have = {r[1] for r in conn.execute("PRAGMA table_info(push_subscriptions)").fetchall()}
+    added = False
+    for col, decl in (("employee_id", "INTEGER"), ("seen_at", "TEXT NOT NULL DEFAULT ''")):
+        if col not in have:
+            conn.execute(f"ALTER TABLE push_subscriptions ADD COLUMN {col} {decl}")
+            added = True
+    if added:
+        # подписки прежних версий: сотрудник — нынешний владелец ящика входа, «входил» — сейчас
+        conn.execute("UPDATE push_subscriptions SET employee_id=(SELECT a.employee_id FROM accounts a "
+                     "WHERE a.id = push_subscriptions.login_account_id) WHERE employee_id IS NULL")
+        conn.execute("UPDATE push_subscriptions SET seen_at=? WHERE seen_at=''", (utcnow_iso(),))
+        conn.commit()
 
 
 def _b64e(data: bytes) -> str:
@@ -95,9 +112,17 @@ def enabled(svc) -> bool:
 # ---------------------------------------------------------------------------
 #  Ключ VAPID сервера
 # ---------------------------------------------------------------------------
+KEY_BROKEN_HINT = ("Если ключ шифрования базы (secret.key) сменился навсегда, создайте ключ уведомлений "
+                   "заново: sudo mailarchiver push-reset-key — сотрудникам придётся снова включить уведомления.")
+_KEY_ERROR_LOGGED = [False]
+
+
 def _private_key(svc):
     """Ключ P-256, которым архив подписывает запросы к службам доставки (создаётся один раз, хранится
-    в базе зашифрованным)."""
+    в базе зашифрованным).
+
+    Не расшифровался (1.25.0) — ни ключ, ни подписки не трогаются: если вернуть прежний secret.key, всё
+    заработает как было; если ключ базы сменился навсегда — ``mailarchiver push-reset-key``."""
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric import ec
     with _KEY_LOCK:
@@ -105,11 +130,17 @@ def _private_key(svc):
         if stored:
             try:
                 pem = svc.db.secret.decrypt(stored).encode("ascii")
-                return serialization.load_pem_private_key(pem, password=None)
-            except Exception:  # noqa: BLE001 - ключ шифрования базы сменили: прежние подписки не годятся
-                log.warning("Ключ VAPID не расшифровался — создаётся новый; сотрудникам нужно заново включить "
-                            "уведомления.")
-                svc.db.execute("DELETE FROM push_subscriptions")
+                key = serialization.load_pem_private_key(pem, password=None)
+                _KEY_ERROR_LOGGED[0] = False
+                return key
+            except Exception:  # noqa: BLE001 - ключ шифрования базы сменили
+                if not _KEY_ERROR_LOGGED[0]:
+                    _KEY_ERROR_LOGGED[0] = True
+                    log.error("Ключ уведомлений (VAPID) не расшифровывается ключом базы — уведомления не "
+                              "отправляются. %s", KEY_BROKEN_HINT)
+                raise ValidationError("Ключ уведомлений сервера не расшифровывается — уведомления временно не "
+                                      "работают. Сообщите администратору.", hint=KEY_BROKEN_HINT,
+                                      code="push_key") from None
         key = ec.generate_private_key(ec.SECP256R1())
         pem = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
                                 serialization.NoEncryption()).decode("ascii")
@@ -120,6 +151,16 @@ def _private_key(svc):
 def _raw_public(pub) -> bytes:
     from cryptography.hazmat.primitives import serialization
     return pub.public_bytes(serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint)
+
+
+def reset_key(svc) -> int:
+    """Создать ключ VAPID заново (``mailarchiver push-reset-key``): прежние подписки удаляются — браузеры
+    подписаны на старый ключ. → сколько подписок удалено."""
+    with _KEY_LOCK:
+        cur = svc.db.execute("DELETE FROM push_subscriptions")
+        svc.db.execute("DELETE FROM meta WHERE key='webpush_vapid'")
+    _private_key(svc)
+    return int(cur.rowcount or 0)
 
 
 def public_key(svc) -> str:
@@ -233,6 +274,83 @@ def scope_of(svc, login_account_id: int) -> List[int]:
     return [int(i) for i in ids]
 
 
+def _login_owner(svc, login_account_id: int) -> Tuple[bool, Optional[int], str]:
+    """Можно ли сейчас слать уведомления вошедшему паролем ящика ``login_account_id``.
+    → (можно, сотрудник-владелец ящика или None, почему нельзя)."""
+    acc = svc.db.get_account(int(login_account_id))
+    if acc is None:
+        return False, None, "ящик удалён"
+    if not acc.enabled:
+        return False, None, f"ящик «{acc.name}» выключен"
+    emp_id = int(acc.employee_id) if acc.employee_id else None
+    if emp_id is not None:
+        status = svc.db.scalar("SELECT status FROM employees WHERE id=?", (emp_id,))
+        if status != "active":
+            return False, emp_id, "сотрудник не числится работающим"
+    return True, emp_id, ""
+
+
+def _idle_days(svc) -> int:
+    try:
+        return max(0, int(svc.rt("webmail", "web_push_idle_days") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _still_valid(svc, sub, owners: Dict[int, Tuple[bool, Optional[int], str]]) -> str:
+    """'' — подписка действует; иначе — почему её пора удалить."""
+    login = int(sub["login_account_id"])
+    if login not in owners:
+        owners[login] = _login_owner(svc, login)
+    ok, emp_id, why = owners[login]
+    if not ok:
+        return why
+    keys = sub.keys() if hasattr(sub, "keys") else []
+    sub_emp = sub["employee_id"] if "employee_id" in keys else emp_id
+    if (int(sub_emp) if sub_emp is not None else None) != emp_id:
+        return "ящик входа передан другому сотруднику"
+    days = _idle_days(svc)
+    seen = (sub["seen_at"] if "seen_at" in keys else "") or sub["created_at"] or ""
+    if days and seen:
+        try:
+            when = datetime.fromisoformat(str(seen).replace("Z", "+00:00"))
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) - when > timedelta(days=days):
+                return f"с устройства не входили в архив больше {days} дн."
+        except ValueError:
+            pass
+    return ""
+
+
+def touch(svc, login_account_id: int) -> None:
+    """Сотрудник вошёл в архив паролем ящика: его подписки (сделанные из любого его ящика) — «на связи»."""
+    try:
+        logins = _logins_of(svc, int(login_account_id))
+        marks = ",".join("?" * len(logins))
+        svc.db.execute(f"UPDATE push_subscriptions SET seen_at=? WHERE login_account_id IN ({marks})",
+                       (utcnow_iso(), *logins))
+    except Exception:  # noqa: BLE001 - вход важнее отметки
+        log.debug("Отметка входа для подписок не записана", exc_info=True)
+
+
+def forget_logins(db, account_ids, *, reason: str = "") -> int:
+    """Удалить подписки, сделанные входом паролем этих ящиков (передача ящика, «Завершить сеансы»,
+    увольнение). → сколько удалено."""
+    ids = [int(i) for i in account_ids or []]
+    if not ids:
+        return 0
+    marks = ",".join("?" * len(ids))
+    try:
+        cur = db.execute(f"DELETE FROM push_subscriptions WHERE login_account_id IN ({marks})", tuple(ids))
+    except Exception:  # noqa: BLE001 - таблицы ещё нет (очень старая база)
+        return 0
+    n = int(cur.rowcount or 0)
+    if n:
+        log.info("Уведомления на устройствах выключены (%s): подписок %s", reason or "доступ закрыт", n)
+    return n
+
+
 def subscribe(svc, user: dict, endpoint: str, p256dh: str, auth: str, account_ids: Optional[List[int]] = None,
               user_agent: str = "") -> Dict:
     if not enabled(svc):
@@ -240,6 +358,9 @@ def subscribe(svc, user: dict, endpoint: str, p256dh: str, auth: str, account_id
     endpoint = check_endpoint(svc, endpoint)
     encrypt(p256dh, auth, b"check")                     # ключи браузера годятся
     login = int(user["account_id"])
+    ok, emp_id, why = _login_owner(svc, login)
+    if not ok:
+        raise ValidationError(f"Уведомления недоступны: {why}.", code="push_denied")
     allowed = scope_of(svc, login)
     ids = [int(i) for i in (account_ids if account_ids is not None else allowed) if int(i) in allowed][:50]
     if not ids:
@@ -248,12 +369,14 @@ def subscribe(svc, user: dict, endpoint: str, p256dh: str, auth: str, account_id
                           (login, endpoint)) or 0)
     if n >= MAX_DEVICES:
         raise ValidationError(f"Уведомления включены уже на {n} устройствах — выключите их на старых.")
+    now = utcnow_iso()
     svc.db.execute("INSERT INTO push_subscriptions(endpoint, p256dh, auth, login_account_id, account_ids, device, "
-                   "created_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(endpoint) DO UPDATE SET p256dh=excluded.p256dh, "
-                   "auth=excluded.auth, login_account_id=excluded.login_account_id, account_ids=excluded.account_ids, "
-                   "device=excluded.device, failures=0, last_error=''",
+                   "created_at, employee_id, seen_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(endpoint) DO UPDATE SET "
+                   "p256dh=excluded.p256dh, auth=excluded.auth, login_account_id=excluded.login_account_id, "
+                   "account_ids=excluded.account_ids, device=excluded.device, employee_id=excluded.employee_id, "
+                   "seen_at=excluded.seen_at, failures=0, last_error=''",
                    (endpoint, p256dh.strip(), auth.strip(), login, json.dumps(ids), _device(user_agent)[:80],
-                    utcnow_iso()))
+                    now, emp_id, now))
     for aid in ids:
         _init_watermark(svc, aid)
     svc.db.add_audit(str(user.get("username") or ""), "webpush_subscribe",
@@ -275,11 +398,14 @@ def unsubscribe(svc, user: dict, endpoint: str) -> Dict:
 def _logins(svc, user: dict) -> List[int]:
     """Ящики, вход паролем которых — тот же сотрудник: подписку, сделанную из другого его ящика, тоже видно
     и можно снять."""
-    login = int(user["account_id"])
+    return _logins_of(svc, int(user["account_id"]))
+
+
+def _logins_of(svc, login: int) -> List[int]:
     own = {int(r["id"]) for r in svc.db.query("SELECT a2.id FROM accounts a JOIN accounts a2 "
                                               "ON a2.employee_id = a.employee_id WHERE a.id=? AND a.employee_id "
-                                              "IS NOT NULL", (login,))}
-    return sorted(own | {login})
+                                              "IS NOT NULL", (int(login),))}
+    return sorted(own | {int(login)})
 
 
 def state(svc, user: dict, endpoint: str = "") -> Dict:
@@ -400,8 +526,14 @@ def _subscribers(svc) -> Dict[int, List]:
     """{ящик: подписки, которым о нём можно сообщать}; подписки сотрудников без доступа удаляются."""
     out: Dict[int, List] = {}
     scopes: Dict[int, List[int]] = {}
+    owners: Dict[int, Tuple[bool, Optional[int], str]] = {}
     for sub in svc.db.query("SELECT * FROM push_subscriptions"):
         login = int(sub["login_account_id"])
+        why = _still_valid(svc, sub, owners)
+        if why:
+            svc.db.execute("DELETE FROM push_subscriptions WHERE id=?", (int(sub["id"]),))
+            log.info("Подписка на уведомления (%s) удалена: %s", sub["device"] or "устройство", why)
+            continue
         if login not in scopes:
             scopes[login] = scope_of(svc, login)
         allowed = scopes[login]

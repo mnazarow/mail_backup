@@ -48,18 +48,20 @@ class IdP:
 
     def response(self, *, in_response_to, acs, audience, name_id="anna", groups=("admins",), email="anna@x.ru",
                  sign="assertion", issuer=IDP_ID, not_after=None, recipient=None, assertion_id=None,
-                 status="urn:oasis:names:tc:SAML:2.0:status:Success", key=None, raw_name_id=None, tamper=None):
+                 status="urn:oasis:names:tc:SAML:2.0:status:Success", key=None, raw_name_id=None, tamper=None,
+                 name_format="", extra_attrs=None):
         now = time.time()
         not_after = not_after if not_after is not None else now + 300
         aid = assertion_id or "_" + uuid.uuid4().hex
         attrs = "".join(f'<saml:AttributeValue>{g}</saml:AttributeValue>' for g in groups)
         irt = f' InResponseTo="{in_response_to}"' if in_response_to else ""
         name_xml = raw_name_id if raw_name_id is not None else name_id
+        fmt_attr = f' Format="{name_format}"' if name_format else ""
         placeholder = f'<ds:Signature xmlns:ds="{DS}" Id="placeholder"></ds:Signature>'
         assertion = (
             f'<saml:Assertion xmlns:saml="{A}" ID="{aid}" Version="2.0" IssueInstant="{_iso(now)}">'
             f'<saml:Issuer>{issuer}</saml:Issuer>{placeholder if sign == "assertion" else ""}'
-            f'<saml:Subject><saml:NameID>{name_xml}</saml:NameID>'
+            f'<saml:Subject><saml:NameID{fmt_attr}>{name_xml}</saml:NameID>'
             f'<saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer">'
             f'<saml:SubjectConfirmationData{irt} NotOnOrAfter="{_iso(not_after)}" Recipient="{recipient or acs}"/>'
             f'</saml:SubjectConfirmation></saml:Subject>'
@@ -71,7 +73,9 @@ class IdP:
             f'</saml:AuthnContext></saml:AuthnStatement>'
             f'<saml:AttributeStatement><saml:Attribute Name="groups">{attrs}</saml:Attribute>'
             f'<saml:Attribute Name="email"><saml:AttributeValue>{email}</saml:AttributeValue></saml:Attribute>'
-            f'</saml:AttributeStatement></saml:Assertion>')
+            + "".join(f'<saml:Attribute Name="{k}"><saml:AttributeValue>{v}</saml:AttributeValue></saml:Attribute>'
+                      for k, v in (extra_attrs or {}).items()) +
+            '</saml:AttributeStatement></saml:Assertion>')
         resp = (f'<samlp:Response xmlns:samlp="{P}" xmlns:saml="{A}" ID="_r{uuid.uuid4().hex}" Version="2.0" '
                 f'IssueInstant="{_iso(now)}" Destination="{acs}"{irt}><saml:Issuer>{issuer}</saml:Issuer>'
                 f'{placeholder if sign == "response" else ""}'
@@ -309,3 +313,37 @@ def test_metadata_and_check(client, idp, monkeypatch):
     finally:
         srv.shutdown()
     assert re.match(r"^[0-9A-F:]+$", saml.cert_info(idp.pem)["sha256"])
+
+
+# ---------------------------------------------------------------------------
+#  Разбор 16.11 (1.25.0): привязка к постоянному идентификатору, одноразовый NameID
+# ---------------------------------------------------------------------------
+TRANSIENT = "urn:oasis:names:tc:SAML:2.0:nameid-format:transient"
+PERSISTENT = "urn:oasis:names:tc:SAML:2.0:nameid-format:persistent"
+
+
+def test_subject_binding_and_transient_name_id(client, idp):
+    client.post("/api/setup", json={"username": "admin", "password": "Sw0rdfish!"})
+    client.post("/api/logout")
+    svc = client.app.state.services
+    _configure(svc, idp)
+    # одноразовый NameID без атрибута имени — отказ с понятной причиной
+    r, _ = _login(client, idp, name_id="_t1a2b3", name_format=TRANSIENT, groups=("Admins",))
+    assert "sso_error" in r.headers["location"]
+    assert svc.db.query_one("SELECT 1 FROM audit WHERE action='login_saml_error' AND detail LIKE '%transient%'")
+    # одноразовый NameID + атрибут имени — входит; привязка — по имени из атрибута
+    _configure(svc, idp, username_attribute="uid")
+    r, _ = _login(client, idp, name_id="_t9", name_format=TRANSIENT, groups=("Admins",), extra_attrs={"uid": "anna"})
+    assert _finish(client, r).status_code == 303 and client.get("/api/me").json()["username"] == "anna"
+    assert svc.db.get_user_by_name("anna")["sso_subject"] == f"saml|{IDP_ID}|attr:uid|anna"
+    client.post("/api/logout")
+    # постоянный NameID: тот же логин у другого пользователя поставщика — отказ
+    _configure(svc, idp, username_attribute="uid")
+    r, _ = _login(client, idp, name_id="p-100", name_format=PERSISTENT, groups=("Admins",), extra_attrs={"uid": "boris"})
+    _finish(client, r)
+    assert svc.db.get_user_by_name("boris")["sso_subject"] == f"saml|{IDP_ID}|{PERSISTENT}|p-100"
+    client.post("/api/logout")
+    r, _ = _login(client, idp, name_id="p-200", name_format=PERSISTENT, groups=("Admins",), extra_attrs={"uid": "boris"})
+    r = _finish(client, r)
+    assert "sso_error" in r.headers["location"] and client.get("/api/me").status_code == 401
+    assert svc.db.query_one("SELECT 1 FROM audit WHERE action='sso_subject_mismatch' AND detail LIKE 'boris:%'")
