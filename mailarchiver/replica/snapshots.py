@@ -630,6 +630,50 @@ def check_pg_snapshot(snapshot_path: str, cipher=None) -> Dict[str, int]:
     return dict(guard.rows)
 
 
+def trial_pg_restore(url: str, snapshot_path: str, cipher=None) -> Dict:
+    """Учебное разворачивание выгрузки (1.27.0): во временную базу на том же сервере PostgreSQL — так же, как
+    ``restore-snapshot`` (``psql``, проверка выгрузки), — подсчёт ящиков и писем, затем база удаляется.
+    → ``{"accounts", "messages", "database"}`` или ``{"skipped": причина}`` (нет права CREATEDB)."""
+    import urllib.parse
+    import uuid
+
+    import psycopg
+
+    from .. import pgcompat
+    conninfo, schema = pgcompat.split_url(url)
+    tmp = f"mailarchiver_drill_{uuid.uuid4().hex[:12]}"
+    try:
+        with psycopg.connect(conninfo, autocommit=True) as conn:
+            try:
+                conn.execute(f'CREATE DATABASE "{tmp}" TEMPLATE template0 ENCODING \'UTF8\'')
+            except psycopg.errors.InsufficientPrivilege:
+                raise
+            except psycopg.Error:
+                conn.execute(f'CREATE DATABASE "{tmp}"')      # кластер не в UTF-8-совместимой локали
+    except psycopg.errors.InsufficientPrivilege:
+        return {"skipped": "у пользователя базы нет права создавать базы (CREATEDB)"}
+    parts = urllib.parse.urlsplit(conninfo)
+    query = urllib.parse.urlencode(urllib.parse.parse_qsl(parts.query) + [("schema", schema)])
+    trial_url = urllib.parse.urlunsplit(parts._replace(path="/" + tmp, query=query))
+    try:
+        restore_pg_snapshot(snapshot_path, trial_url, cipher)
+        engine = pgcompat.Engine(trial_url, 2)
+        try:
+            session = pgcompat.Session(engine)
+            accounts = int(session.execute("SELECT COUNT(*) FROM accounts").fetchone()[0] or 0)
+            messages = int(session.execute("SELECT COUNT(*) FROM messages").fetchone()[0] or 0)
+        finally:
+            engine.close()
+        return {"accounts": accounts, "messages": messages, "database": tmp}
+    finally:
+        try:
+            with psycopg.connect(conninfo, autocommit=True) as conn:
+                conn.execute(f'DROP DATABASE IF EXISTS "{tmp}" WITH (FORCE)')
+        except psycopg.Error as exc:
+            log.warning("Временная база учебного разворачивания %s не удалена: %s — удалите её: DROP DATABASE %s",
+                        tmp, exc, tmp)
+
+
 def restore_pg_snapshot(snapshot_path: str, url: str, cipher=None, *, keep_as: Optional[str] = None) -> int:
     """Развернуть выгрузку PostgreSQL (``….sql.gz[.enc]``) в схему службы из адреса ``url``.
 

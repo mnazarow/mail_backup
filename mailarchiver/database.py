@@ -28,7 +28,21 @@ from .logging_setup import get_logger
 from .security import SecretBox
 from .util import chunked, utcnow_iso
 
-SCHEMA_VERSION = 1
+#: Номер устройства базы. Столбцы и таблицы по-прежнему добавляются по месту (``_migrate``, ``ensure_schema``
+#: модулей); с 1.27.0 база помнит и версии программы, которые её открывали (``meta.app_version``,
+#: ``meta.app_version_max``): после отката программы без отката базы служба предупреждает об этом.
+SCHEMA_VERSION = 2
+
+
+def version_tuple(text: str) -> tuple:
+    """«1.27.0» → (1, 27, 0); непонятное — (0,)."""
+    parts = []
+    for piece in str(text or "").strip().split("."):
+        digits = "".join(ch for ch in piece if ch.isdigit())
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts) or (0,)
 
 log = get_logger("db")
 
@@ -39,7 +53,7 @@ _ENCRYPTED_SETTINGS = {"notifications.smtp_password", "notifications.telegram_bo
                        "notifications.webhook_secret", "employees.source_url_password",
                        "replica.s3_secret_key", "monitoring.metrics_token", "mailadmin.password",
                        "axigen.admin_password", "axigen.ftp_password",
-                       "journal.auth_password", "oidc.client_secret"}
+                       "journal.auth_password", "oidc.client_secret", "settings_backup.password"}
 
 
 #: Выборка сотрудника вместе с ОСНОВНЫМ ящиком и числом всех его ящиков.
@@ -347,6 +361,31 @@ class Database:
             from .sso import ensure_schema as _ensure_sso
             _ensure_sso(conn)
         self._encrypt_plain_settings()
+        self.newer_version = self._note_version()
+
+    #: Версия программы новее этой, которая уже открывала базу ('' — нет).
+    newer_version = ""
+
+    def _note_version(self) -> str:
+        """Запомнить, какая версия открыла базу. Если базу уже открывала более новая — вернуть её номер: программу
+        откатили, а база осталась от новой версии (update.sh при откате возвращает и базу; ручной откат — нет)."""
+        from .version import __version__
+        try:
+            seen = self.get_meta("app_version_max") or ""
+            newer = seen if version_tuple(seen) > version_tuple(__version__) else ""
+            if newer:
+                log.warning("Базу уже открывала более новая версия MailArchiver (%s), а эта — %s: возможности, "
+                            "добавленные после %s, в базе есть, но этой версией не поддерживаются. Обновите программу "
+                            "или верните базу из копии, сделанной до обновления.", newer, __version__, __version__)
+            else:
+                self.set_meta("app_version_max", __version__)
+            self.set_meta("app_version", __version__)
+            if int(self.get_meta("schema_version") or 0) < SCHEMA_VERSION:
+                self.set_meta("schema_version", str(SCHEMA_VERSION))
+            return newer
+        except Exception as exc:  # noqa: BLE001 - отметка версии не должна мешать запуску
+            log.debug("Версия программы в базе не записана: %s", exc)
+            return ""
 
     def _encrypt_plain_settings(self) -> None:
         """Зашифровать секреты-настройки, сохранённые прежними версиями открытым текстом.
@@ -2982,10 +3021,13 @@ class Database:
                 return
 
     def largest_messages(self, account_id: Optional[int] = None, limit: int = 10) -> List[sqlite3.Row]:
+        # Письма без размера — в конце, равные по размеру — по id (1.27.0): в PostgreSQL NULL при DESC шёл первым,
+        # а равные письма меняли порядок от запроса к запросу.
         base = "SELECT account_id, folder, subject, from_addr, size, internaldate FROM messages"
+        order = " ORDER BY (size IS NULL), size DESC, id DESC LIMIT ?"
         if account_id is None:
-            return self.query(base + " ORDER BY size DESC LIMIT ?", (limit,))
-        return self.query(base + " WHERE account_id=? ORDER BY size DESC LIMIT ?", (account_id, limit))
+            return self.query(base + order, (limit,))
+        return self.query(base + " WHERE account_id=?" + order, (account_id, limit))
 
     def distinct_folder_count(self, account_id: Optional[int] = None) -> int:
         if account_id is None:

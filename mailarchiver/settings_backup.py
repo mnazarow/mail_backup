@@ -58,7 +58,12 @@ MIN_PASSWORD = 10
 #: Копии, которые служба делает сама перед восстановлением: каталог в каталоге данных и сколько хранить.
 AUTO_DIR = "settings-backups"
 AUTO_KEEP = 10
-_AUTO_RE = re.compile(r"^before-restore-(\d{8}-\d{6})(?:-(\d{1,3}))?\.json$")
+#: before-restore — перед восстановлением; daily — ежедневная копия с паролем копий настроек (уходит в копию вне
+#: сервера), daily-local — ежедневная без пароля, ключом secret.key (только на сервере); 1.27.0.
+_AUTO_RE = re.compile(r"^(before-restore|daily-local|daily)-(\d{8}-\d{6})(?:-(\d{1,3}))?\.json$")
+DAILY_KINDS = ("daily", "daily-local")
+#: Ежедневная копия — не чаще, чем раз в столько секунд (её делают снимок базы и копия вне сервера).
+DAILY_EVERY_S = 20 * 3600
 #: scrypt: ~32 МБ памяти и доля секунды на попытку — перебор паролей дорог.
 _SCRYPT = {"n": 2 ** 15, "r": 8, "p": 1}
 NOTES_LIMIT = 40
@@ -689,6 +694,7 @@ class _Restorer:
         self.mailbox_logout: set = set()
         self.push_forget: set = set()
         self.tags_seeded: set = set()
+        self.dismissed: set = set()          # сотрудники, которых копия отметила уволенными
 
     # -- общее ---------------------------------------------------------------------------------------
     def tally(self, spec: Spec) -> _Tally:
@@ -870,6 +876,8 @@ class _Restorer:
             if "totp_secret_enc" in changed:
                 self.conn.execute("UPDATE users SET totp_last_step=0, totp_pending_enc='' WHERE id=?",
                                   (int(where["id"]),))
+        if spec.table == "employees" and "status" in changed and changed["status"] != "active":
+            self.dismissed.add(int(where["id"]))
         if spec.table == "accounts":
             acc_id = int(where["id"])
             if set(changed) & {"password_enc", "auth_type", "enabled", "employee_id", "server_id"}:
@@ -1143,6 +1151,7 @@ def restore(svc, data: Dict[str, Any], *, mode: str = "add", sections: Optional[
     if not dry_run and auto_backup:
         report["auto_backup"] = save_auto_backup(svc)
     saved = None
+    dismissed: set = set()
     if plan and not dry_run:
         saved = _save_settings(svc, plan)
         report["notice"] = _notice(saved)
@@ -1163,6 +1172,7 @@ def restore(svc, data: Dict[str, Any], *, mode: str = "add", sections: Optional[
                 else:
                     r.table(spec, rows)
             r.finish()
+            dismissed = set(r.dismissed)
             for table, tally in r.tallies.items():
                 report["tables"][table] = tally.as_dict()
             if dry_run:
@@ -1187,6 +1197,14 @@ def restore(svc, data: Dict[str, Any], *, mode: str = "add", sections: Optional[
     totals = {k: sum(int(t.get(k) or 0) for t in report["tables"].values())
               for k in ("added", "updated", "same", "kept", "skipped")}
     report["totals"] = totals
+    if not dry_run and dismissed:
+        # копия отметила сотрудника уволенным — как при увольнении: сеансы, уведомления, запланированные письма
+        from .employees import revoke_employee_access
+        for emp_id in sorted(dismissed):
+            try:
+                revoke_employee_access(svc, emp_id, reason="сотрудник отмечен уволенным при восстановлении настроек")
+            except Exception:  # noqa: BLE001
+                log.exception("Доступ сотрудника #%s после восстановления настроек не закрыт", emp_id)
     if not dry_run:
         if hasattr(svc, "scheduler") and (totals["added"] or totals["updated"]):
             try:
@@ -1216,23 +1234,72 @@ def auto_dir(cfg) -> str:
     return os.path.join(cfg.data_dir, AUTO_DIR)
 
 
-def save_auto_backup(svc) -> str:
-    """Копия нынешних настроек (всё, зашифровано ключом из secret.key) — перед восстановлением."""
+def _write_auto(svc, kind: str, data: bytes, keep: int) -> str:
     folder = ensure_dir(auto_dir(svc.cfg), 0o700)
-    data, _summary = build(svc, local=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    name = f"before-restore-{stamp}.json"
+    name = f"{kind}-{stamp}.json"
     n = 1
     while os.path.exists(os.path.join(folder, name)):
         n += 1
-        name = f"before-restore-{stamp}-{n}.json"
+        name = f"{kind}-{stamp}-{n}.json"
     atomic_write_bytes(os.path.join(folder, name), data, mode=0o600)
-    for old in list_auto(svc.cfg)[AUTO_KEEP:]:
+    for old in [a for a in list_auto(svc.cfg) if a["kind"] == kind][max(1, keep):]:
         try:
             os.unlink(old["path"])
         except OSError:
             pass
     return name
+
+
+def save_auto_backup(svc) -> str:
+    """Копия нынешних настроек (всё, зашифровано ключом из secret.key) — перед восстановлением."""
+    data, _summary = build(svc, local=True)
+    return _write_auto(svc, "before-restore", data, AUTO_KEEP)
+
+
+def _daily_password(svc) -> str:
+    try:
+        return str(_rt(svc)("settings_backup", "password") or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def save_daily(svc) -> Dict[str, Any]:
+    """Ежедневная копия настроек (1.27.0): с паролем копий настроек (``settings_backup.password``) — читается
+    им и без secret.key, поэтому годится для копии вне сервера; без пароля — ключом из secret.key."""
+    password = _daily_password(svc)
+    data, summary = build(svc, password=password) if password else build(svc, local=True)
+    try:
+        keep = int(_rt(svc)("settings_backup", "keep") or 14)
+    except (TypeError, ValueError):
+        keep = 14
+    name = _write_auto(svc, "daily" if password else "daily-local", data, keep)
+    log.info("Ежедневная копия настроек: %s (%s).", name, "с паролем" if password else "ключом secret.key")
+    return {"name": name, "size": len(data), "password": bool(password), "counts": summary["counts"]}
+
+
+def maybe_daily(svc, *, max_age_s: float = DAILY_EVERY_S) -> Optional[Dict[str, Any]]:
+    """Сделать ежедневную копию, если она включена и последней больше ``max_age_s`` (снимок базы, копия вне
+    сервера). Ошибка не мешает тому, кто вызвал: она в журнале и в возвращаемом ``error``."""
+    try:
+        if not bool(_rt(svc)("settings_backup", "enabled")):
+            return None
+        last = next((a for a in list_auto(svc.cfg) if a["kind"] in DAILY_KINDS), None)
+        if last is not None:
+            age = (datetime.now(timezone.utc) - datetime.fromisoformat(last["created_at"])).total_seconds()
+            if age < max_age_s:
+                return None
+        return save_daily(svc)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("Ежедневная копия настроек не сделана")
+        return {"error": getattr(exc, "message", None) or str(exc)}
+
+
+def daily_age_s(cfg) -> Optional[float]:
+    last = next((a for a in list_auto(cfg) if a["kind"] in DAILY_KINDS), None)
+    if last is None:
+        return None
+    return (datetime.now(timezone.utc) - datetime.fromisoformat(last["created_at"])).total_seconds()
 
 
 def list_auto(cfg) -> List[Dict[str, Any]]:
@@ -1251,9 +1318,9 @@ def list_auto(cfg) -> List[Dict[str, Any]]:
             size = os.path.getsize(path)
         except OSError:
             continue
-        created = datetime.strptime(m.group(1), "%Y%m%d-%H%M%S").replace(tzinfo=timezone.utc)
+        created = datetime.strptime(m.group(2), "%Y%m%d-%H%M%S").replace(tzinfo=timezone.utc)
         out.append({"name": name, "path": path, "size": size, "created_at": created.isoformat(),
-                    "_o": (m.group(1), int(m.group(2) or 0))})
+                    "kind": m.group(1), "_o": (m.group(2), int(m.group(3) or 0))})
     out.sort(key=lambda x: x["_o"], reverse=True)
     for item in out:
         del item["_o"]

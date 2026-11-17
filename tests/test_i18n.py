@@ -59,6 +59,11 @@ vm.runInContext(`
   out.nested = i18nLookup('Все входящие: 3 письма в 2 ящиках (из архива — новые письма появятся после проверки почты в каждом ящике).');
   out.server = i18nLookup('Папки «Проекты» на сервере нет.');
   out.unknown = i18nLookup('Совсем новая строка');
+  out.garbled = [i18nLookup('Exchange Online через Microsoft Graph: учётные записи'), i18nLookup('Отчёт в папке проекта')];
+  out.glued = [i18nLookup('всего: 3 · уволено: 1'), i18nLookup('ср. письмо 551 Б'), i18nLookup('активных: 5'),
+               i18nLookup('— всё: ящики, письма, настройки, пользователи, удаление.'), i18nLookup('Сотрудник: совсем новое')];
+  out.name = i18nLookup('Ящик: Иванов Иван (филиал СПб)');
+  out.icon = i18nLookup('🏢 Вход через LDAP / Active Directory');
   out.plural = plural(1, 'письмо', 'письма', 'писем') + '/' + plural(5, 'письмо', 'письма', 'писем');
   globalThis.__out = JSON.stringify(out);
 `, ctx);
@@ -87,6 +92,14 @@ def test_runtime_translation(tmp_path):
     assert out["nested"].startswith("All inboxes: 3 messages in 2 mailboxes")
     assert out["server"] == "The folder “Проекты” is not on the server."
     assert out["unknown"] is None
+    # 1.27.0: короткий шаблон («{} ч{}», «{} в {}», «всего: {}») не переводит кусок чужой фразы — смеси языков нет
+    assert out["garbled"] == [None, None]
+    # фраза каталога + значение, части через «·», тире впереди и точка в конце (склеено в коде)
+    assert out["glued"][:4] == ["total: 3 · dismissed: 1", "avg. message 551 B", "active: 5",
+                                "— everything: mailboxes, messages, settings, users, deletion."]
+    assert out["glued"][4] is None
+    assert out["name"] == "Mailbox: Иванов Иван (филиал СПб)"   # имя с заглавной — подстановка
+    assert out["icon"] == "🏢 Sign-in via LDAP / Active Directory"
     assert out["plural"] == "письмо/писем"
 
 
@@ -102,3 +115,49 @@ def test_user_content_is_not_translated():
         assert bad not in mail, bad
     for good in ("uesc(r.subject,'(без темы)')", "uesc(hd.from,'—')", "mailFolderHtml(", "mailTagHtml("):
         assert good in mail, good
+
+
+_NODE_BUCKETS = r"""
+const vm = require('vm'), fs = require('fs');
+const ctx = {
+  localStorage: {getItem: () => null, setItem(){}}, navigator: {language: 'en-GB'}, location: {reload(){}},
+  document: {cookie: '', documentElement: {setAttribute(){}}, addEventListener(){}, createTreeWalker(){ return {nextNode(){ return null; }}; }},
+  NodeFilter: {SHOW_ELEMENT: 1, SHOW_TEXT: 4, FILTER_ACCEPT: 1, FILTER_REJECT: 2},
+};
+vm.createContext(ctx);
+for (const f of process.argv.slice(2)) vm.runInContext(fs.readFileSync(f, 'utf8'), ctx, {filename: f});
+vm.runInContext(`
+  i18nInit('en'); i18nBuild();
+  const linear = s => { for (const p of I18N.pats) if (p.re.exec(s)) return p.idx; return -1; };
+  const samples = [];
+  for (const k of Object.keys(I18N_EN)) {
+    if (k.indexOf('{}') < 0) continue;
+    samples.push(k.replace(/\{\}/g, 'Ж7'), k.replace(/\{\}/g, ''), k.replace(/\{\}/g, '«Входящие» 3'),
+                 'Ж ' + k.replace(/\{\}/g, '5'), k.replace(/\{\}/g, '5') + ' ж');
+  }
+  const bad = [];
+  for (const s of samples) {
+    const m = i18nMatch(s), want = linear(s);
+    if ((m ? m.p.idx : -1) !== want) bad.push(s);
+  }
+  const t0 = Date.now();
+  for (let r = 0; r < 3; r++) for (const s of samples) { I18N.cache.clear(); i18nLookup(s); }
+  globalThis.__out = JSON.stringify({n: samples.length, bad: bad.slice(0, 5), ms: (Date.now() - t0) / 3,
+                                     cached: i18nLookup(samples[0]) === i18nLookup(samples[0])});
+`, ctx);
+console.log(ctx.__out);
+"""
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="нет node")
+def test_pattern_buckets_match_linear_scan(tmp_path):
+    """1.27.0: шаблонов больше тысячи — поиск идёт по корзинам (первый знак начала, последний знак конца), а
+    находить должен тот же шаблон, что и перебор всех по порядку «длинные раньше»."""
+    js = os.path.join(ROOT, "mailarchiver", "web", "static", "js")
+    script = tmp_path / "buckets.js"
+    script.write_text(_NODE_BUCKETS, encoding="utf-8")
+    res = subprocess.run(["node", str(script), os.path.join(js, "i18n-en.js"), os.path.join(js, "i18n.js")],
+                         capture_output=True, text=True, timeout=120)
+    assert res.returncode == 0, res.stderr
+    out = json.loads(res.stdout)
+    assert out["n"] > 4000 and out["bad"] == [] and out["cached"]

@@ -749,6 +749,51 @@ def match_ids(db, query: str) -> set:
     return {int(r[0]) for r in db.query(sql, (q,))} if q else set()
 
 
+#: Поиск в PostgreSQL, новые письма первыми (1.27.0). Число писем под запрос (tsquery) планировщик не знает: для
+#: слова из половины писем он ждал сотни и собирал по индексу GIN их все, чтобы отсортировать (6 с на 1,5 млн
+#: писем), а для редкого слова, наоборот, перебирал все письма с конца (1 с). Поэтому так: письма выбранных ящиков,
+#: если их немного, — с конца, со сверкой каждого; иначе сначала последние _PG_WINDOW писем с конца (частое слово
+#: найдётся здесь), а за ними — по индексу GIN (редкое слово). Сверка «CASE … = 1» — чтобы планировщик не взял
+#: для неё индекс GIN.
+_PG_WINDOW = 50_000
+_PG_CANDIDATES = 300_000
+_PG_BATCH = 2_000
+
+
+def _pg_newest(db, fcols: str, match: str, where: List[str], args: List, ids: Optional[List[int]],
+               need: int) -> List:
+    """Первые ``need`` писем под запрос ``match`` и отбор ``where`` — новые первыми (по номеру письма)."""
+    hit = "(CASE WHEN f.tsv @@ CAST(? AS tsquery) THEN 1 ELSE 0 END) = 1"
+    joins = "JOIN messages m ON m.id = f.rowid JOIN accounts a ON a.id = m.account_id"
+    filt = "".join(" AND " + w for w in where)
+    if ids is not None:
+        many = int(db.scalar(f"SELECT COALESCE(SUM(messages), 0) FROM folder_totals WHERE account_id IN "
+                             f"({','.join('?' * len(ids))})", tuple(int(i) for i in ids)) or 0)
+        if many <= _PG_CANDIDATES:
+            return db.query(f"SELECT {fcols} FROM (SELECT m.id FROM messages m WHERE {' AND '.join(where)} "
+                            f"ORDER BY m.id DESC OFFSET 0) c JOIN {FTS_TABLE} f ON f.rowid = c.id {joins} "
+                            f"WHERE {hit} ORDER BY c.id DESC LIMIT ?", (*args, match, need))
+    top = db.scalar(f"SELECT MAX(rowid) FROM {FTS_TABLE}")
+    if top is None:
+        return []
+    lo = int(top) - _PG_WINDOW
+    rows = db.query(f"SELECT {fcols} FROM {FTS_TABLE} f {joins} WHERE f.rowid > ? AND {hit}{filt} "
+                    f"ORDER BY f.rowid DESC LIMIT ?", (lo, match, *args, need))
+    if len(rows) >= need or lo <= 0:
+        return rows
+    # Дальше — по индексу GIN: сначала номера писем под запрос (в SQL с ними планировщик опять брал бы перебор
+    # с конца или слияние со всей таблицей), затем сами письма — порциями номеров, новые первыми.
+    found = sorted((int(r[0]) for r in db.query(f"SELECT rowid FROM {FTS_TABLE} WHERE tsv @@ CAST(? AS tsquery)",
+                                                 (match,)) if int(r[0]) <= lo), reverse=True)
+    for start in range(0, len(found), _PG_BATCH):
+        if len(rows) >= need:
+            break
+        part = "{" + ",".join(str(i) for i in found[start:start + _PG_BATCH]) + "}"
+        rows += db.query(f"SELECT {fcols} FROM {FTS_TABLE} f {joins} WHERE f.rowid = ANY(CAST(? AS BIGINT[])){filt} "
+                         f"ORDER BY f.rowid DESC LIMIT ?", (part, *args, need - len(rows)))
+    return rows
+
+
 def search(svc, query: str, *, account_ids: Optional[Iterable[int]] = None, folder: str = "",
            date_from: str = "", date_to: str = "", with_attachments: bool = False,
            order: str = "date", offset: int = 0, limit: int = PAGE) -> Dict:
@@ -782,9 +827,10 @@ def search(svc, query: str, *, account_ids: Optional[Iterable[int]] = None, fold
         return {"results": [], "more": False, "fts": use_fts, "empty_query": True}
     cols = ("m.id, m.account_id, m.folder, m.internaldate, m.subject, m.from_addr, m.has_attach, m.size, "
             "a.name AS account_name")
+    pg_newest = False
     if use_fts and pg:
-        sql = (f"SELECT {cols}, f.subject AS f_subject, f.addrs AS f_addrs, f.attach AS f_attach, "
-               f"f.body AS f_body FROM {FTS_TABLE} f JOIN messages m ON m.id = f.rowid "
+        fcols = f"{cols}, f.subject AS f_subject, f.addrs AS f_addrs, f.attach AS f_attach, f.body AS f_body"
+        sql = (f"SELECT {fcols} FROM {FTS_TABLE} f JOIN messages m ON m.id = f.rowid "
                f"JOIN accounts a ON a.id = m.account_id WHERE f.tsv @@ CAST(? AS tsquery)")
         params = [match] + args
         if where:
@@ -793,7 +839,7 @@ def search(svc, query: str, *, account_ids: Optional[Iterable[int]] = None, fold
             sql += " ORDER BY ts_rank(f.tsv, CAST(? AS tsquery)) DESC, f.rowid DESC"
             params.append(match)
         else:
-            sql += " ORDER BY f.rowid DESC"
+            pg_newest = True
     elif use_fts:
         sql = (f"SELECT {cols}, snippet({FTS_TABLE}, -1, char(2), char(3), '…', 12) AS snip "
                f"FROM {FTS_TABLE} JOIN messages m ON m.id = {FTS_TABLE}.rowid "
@@ -816,7 +862,10 @@ def search(svc, query: str, *, account_ids: Optional[Iterable[int]] = None, fold
     sql += " LIMIT ? OFFSET ?"
     params += [limit + 1, offset]
     try:
-        rows = db.query(sql, tuple(params))
+        if pg_newest:
+            rows = _pg_newest(db, fcols, match, where, args, ids, offset + limit + 1)[offset:]
+        else:
+            rows = db.query(sql, tuple(params))
     except Exception as exc:  # noqa: BLE001 - синтаксис FTS5, который не удалось собрать
         from .errors import ValidationError
         raise ValidationError(f"Не удалось выполнить поиск: {exc}",

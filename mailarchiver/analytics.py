@@ -456,6 +456,57 @@ def system_analytics(svc, account_id: Optional[int] = None, *, days: int = 90) -
 # ===========================================================================
 #  АНАЛИТИКА ПИСЕМ (по метаданным индекса)
 # ===========================================================================
+#: Дата в индексе в обычном виде — UTC из ``isoformat()``, ГГГГ-ММ-ДДTЧЧ:ММ:СС+00:00: такие даты аналитика писем
+#: считает по часам в базе, остальные разбирает по одной. В SQLite — GLOB (с проверкой цифр, минуты и секунды
+#: 00–59). В PostgreSQL — LIKE с учётом регистра (``~~``: слово LIKE там стало бы медленным ILIKE): регулярное
+#: выражение читало 1,5 млн дат 1,5 с; цифры часа проверяются по каждой группе, а минуты и секунды — нет (их пишет
+#: только isoformat, ошибиться в них может лишь база, исправленная руками).
+_CANON_GLOB = "'[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-5][0-9]:[0-5][0-9]+00:00'"
+_CANON_LIKE = "'____-__-__T__:__:__+00:00'"
+
+
+#: Порция индекса (по id) для запросов аналитики писем с длинным ответом (отправители, темы). В SQLite —
+#: короткие запросы (при database.wal: false долгий читающий запрос держал бы запись); PostgreSQL на порции
+#: меньше трети таблицы всё равно читает её целиком, поэтому там порции крупнее.
+_AGG_CHUNK_IDS = 200_000
+_AGG_CHUNK_IDS_PG = 1_000_000
+
+
+def _id_chunks(db, account_id: Optional[int], step: Optional[int] = None):
+    """Полуинтервалы (lo, hi] по id писем — порции для запросов аналитики."""
+    if step is None:
+        step = _AGG_CHUNK_IDS_PG if db.is_pg else _AGG_CHUNK_IDS
+    if account_id is None:
+        row = db.query("SELECT MIN(id) AS lo, MAX(id) AS hi FROM messages")[0]
+    else:
+        row = db.query("SELECT MIN(id) AS lo, MAX(id) AS hi FROM messages WHERE account_id=?", (account_id,))[0]
+    if row["lo"] is None:
+        return
+    start, hi = int(row["lo"]) - 1, int(row["hi"])
+    while start < hi:
+        end = min(start + step, hi)
+        yield start, end
+        start = end
+
+
+def _median_size(db, account_id: Optional[int], total: int, nulls: int, negs: int) -> int:
+    """Размер письма посередине (как ``sorted(размеры)[n // 2]``, без размера — 0) запросом к базе: письма с
+    отрицательным размером, затем без размера (нули), затем остальные по возрастанию."""
+    if not total:
+        return 0
+    k = total // 2
+    acc = "" if account_id is None else "account_id = ? AND "
+    args = () if account_id is None else (account_id,)
+    if k < negs:
+        rows = db.query(f"SELECT size FROM messages WHERE {acc}size < 0 ORDER BY size LIMIT 1 OFFSET ?", args + (k,))
+    elif k < negs + nulls:
+        return 0
+    else:
+        rows = db.query(f"SELECT size FROM messages WHERE {acc}size >= 0 ORDER BY size LIMIT 1 OFFSET ?",
+                        args + (k - negs - nulls,))
+    return int(rows[0]["size"]) if rows else 0
+
+
 def mail_analytics(svc, account_id: Optional[int] = None, use_cache: bool = True) -> Dict:
     db = svc.db
     # Индекс обходим ПОТОКОМ: прежняя выборка списком занимала ~140 МБ на
@@ -465,7 +516,6 @@ def mail_analytics(svc, account_id: Optional[int] = None, use_cache: bool = True
         cached = _mail_cache_get(("mail", account_id), expected)
         if cached is not None:
             return cached
-    rows = db.iter_index_rows_for_analytics(account_id)
     total = 0
     try:
         local_tz = svc.local_tz()
@@ -495,71 +545,169 @@ def mail_analytics(svc, account_id: Optional[int] = None, use_cache: bool = True
     dmin_dt: Optional[datetime] = None
     dmax_dt: Optional[datetime] = None
 
-    for r in rows:
-        total += 1
-        size = r["size"] or 0
+    def add_date(dt: datetime, n: int) -> None:
+        # Часы, дни недели и месяцы — по часам ПОЛЬЗОВАТЕЛЯ: в UTC рабочий
+        # день 9–17 по Москве выглядел как 06–14.
+        by_year[dt.strftime("%Y")] += n
+        by_month[dt.strftime("%Y-%m")] += n
+        wd = dt.weekday()
+        by_weekday[wd] += n
+        by_hour[dt.hour] += n
+        heat[wd][dt.hour] += n
+
+    def add_exact(value, n: int) -> None:
+        """Дата разбирается как прежде — сама по себе (n писем с одинаковой датой)."""
+        nonlocal dmin_dt, dmax_dt
+        dt = _parse_dt(value)
+        if not dt:
+            return
+        dt = dt.astimezone(local_tz)
+        if dmin_dt is None or dt < dmin_dt:
+            dmin_dt = dt
+        if dmax_dt is None or dt > dmax_dt:
+            dmax_dt = dt
+        add_date(dt, n)
+
+    # Индекс считается в базе (1.27.0): группами по папке, отправителю, теме и часу, а не построчно в Python —
+    # на 1,5 млн писем построчный расчёт шёл 18–21 с. Порциями по id — короткими запросами: долгий читающий
+    # запрос при database.wal: false держал бы запись (бэкап), и память ограничена порцией. Итог тот же, что у
+    # построчного расчёта, вплоть до порядка равных по частоте (первое появление — по id письма).
+    size_sql = "COALESCE(size, 0)"
+    cols = [f"SUM({size_sql}) AS bytes", "MIN(id) AS first",
+            "SUM(CASE WHEN COALESCE(has_attach, 0) <> 0 THEN 1 ELSE 0 END) AS attach",
+            "SUM(CASE WHEN size IS NULL THEN 1 ELSE 0 END) AS nulls",
+            "SUM(CASE WHEN size < 0 THEN 1 ELSE 0 END) AS negs"]
+    for i, (lo, hi, _label) in enumerate(_SIZE_EDGES):
+        cond = f"{size_sql} >= {int(lo)}" + ("" if hi == float("inf") else f" AND {size_sql} < {int(hi)}")
+        cols.append(f"SUM(CASE WHEN {cond} THEN 1 ELSE 0 END) AS b{i}")
+    flag_args = (",\\Seen,", ",\\Flagged,", ",\\Answered,", ",\\Draft,")
+    for i in range(len(flag_args)):
+        cols.append(f"SUM(CASE WHEN instr(',' || COALESCE(flags, '') || ',', ?) > 0 THEN 1 ELSE 0 END) AS f{i}")
+    canon = f"internaldate ~~ {_CANON_LIKE}" if db.is_pg else f"internaldate GLOB {_CANON_GLOB}"
+    # самая ранняя и поздняя дата обычного вида — побайтно: в PostgreSQL MIN/MAX строк сравнивал бы их по правилам языка
+    idate = 'internaldate COLLATE "C"' if db.is_pg else "internaldate"
+    # Запросы с коротким ответом (папки, часы) — по всему индексу сразу: они идут секунду-две.
+    acc = "" if account_id is None else " AND account_id = ?"
+    aargs = () if account_id is None else (account_id,)
+    nulls = negs = 0
+    # папки, размеры, флаги, вложения
+    rows = db.query(f"SELECT COALESCE(folder, '') AS folder, COUNT(*) AS n, {', '.join(cols)} "
+                    f"FROM messages WHERE 1=1{acc} GROUP BY COALESCE(folder, '')", flag_args + aargs)
+    for r in sorted(rows, key=lambda r: r["first"]):
+        n = int(r["n"])
+        total += n
+        size = int(r["bytes"] or 0)
         total_bytes += size
-        sizes.append(size)
-        # размер → корзина
-        for i, (lo, hi, _label) in enumerate(_SIZE_EDGES):
-            if lo <= size < hi:
-                size_buckets[i] += 1
-                break
-        # флаги
-        fl = (r["flags"] or "").split(",")
-        if "\\Seen" in fl:
-            seen += 1
-        if "\\Flagged" in fl:
-            flagged += 1
-        if "\\Answered" in fl:
-            answered += 1
-        if "\\Draft" in fl:
-            draft += 1
-        if r["has_attach"]:
-            with_attach += 1
-        # папка
+        nulls += int(r["nulls"] or 0)
+        negs += int(r["negs"] or 0)
+        for i in range(len(_SIZE_EDGES)):
+            size_buckets[i] += int(r[f"b{i}"] or 0)
+        seen += int(r["f0"] or 0)
+        flagged += int(r["f1"] or 0)
+        answered += int(r["f2"] or 0)
+        draft += int(r["f3"] or 0)
+        with_attach += int(r["attach"] or 0)
         fld = r["folder"] or "—"
-        by_folder_cnt[fld] += 1
+        by_folder_cnt[fld] += n
         by_folder_bytes[fld] += size
-        # отправитель / домен — один разбор адреса на письмо (с кэшем)
-        frm = r["from_addr"] or ""
-        em, name, dom = _addr_parts(frm)
-        if em:
-            senders[em] += 1
-            if name and em not in sender_names:
-                sender_names[em] = name
-        if dom:
-            domains[dom] += 1
-        # дата → год/месяц/день недели/час/тепловая карта
-        dt = _parse_dt(r["internaldate"])
-        if dt:
-            # Часы, дни недели и месяцы — по часам ПОЛЬЗОВАТЕЛЯ: в UTC рабочий
-            # день 9–17 по Москве выглядел как 06–14.
-            dt = dt.astimezone(local_tz)
-            if dmin_dt is None or dt < dmin_dt:
-                dmin_dt = dt
-            if dmax_dt is None or dt > dmax_dt:
-                dmax_dt = dt
-            by_year[dt.strftime("%Y")] += 1
-            by_month[dt.strftime("%Y-%m")] += 1
-            wd = dt.weekday()
-            by_weekday[wd] += 1
-            by_hour[dt.hour] += 1
-            heat[wd][dt.hour] += 1
+    # Даты обычного вида (UTC из isoformat) — по часам. Час, который в местном поясе не ложится в один час
+    # целиком (смещение в полчаса, местное среднее время до 1920-х), — по самим датам (ниже, порциями).
+    detail = set()
+    ym_cache: Dict = {}
+    canon_min = canon_max = None
+    rows = db.query(f"SELECT substr(internaldate, 1, 13) AS h, COUNT(*) AS n, MIN({idate}) AS lo, "
+                    f"MAX({idate}) AS hi FROM messages WHERE {canon}{acc} GROUP BY substr(internaldate, 1, 13)",
+                    aargs)
+    for r in rows:
+        h = str(r["h"])
+        whole = False
+        if h.isascii() and h[0:4].isdigit() and h[5:7].isdigit() and h[8:10].isdigit() and h[11:13].isdigit():
+            try:
+                start = datetime(int(h[0:4]), int(h[5:7]), int(h[8:10]), int(h[11:13]), tzinfo=timezone.utc)
+                local = start.astimezone(local_tz)
+                off = local.utcoffset()
+                whole = (off == (start + timedelta(seconds=3599)).astimezone(local_tz).utcoffset()
+                         and not off.total_seconds() % 3600)
+            except (ValueError, OverflowError):
+                whole = False
+        if not whole:
+            detail.add(h)
+            continue
+        n = int(r["n"])
+        key = (local.year, local.month)
+        ym = ym_cache.get(key)
+        if ym is None:
+            ym = ym_cache[key] = (local.strftime("%Y"), local.strftime("%Y-%m"))
+        by_year[ym[0]] += n
+        by_month[ym[1]] += n
+        wd = local.weekday()
+        by_weekday[wd] += n
+        by_hour[local.hour] += n
+        heat[wd][local.hour] += n
+        lo, hi = str(r["lo"]), str(r["hi"])
+        if canon_min is None or lo < canon_min:
+            canon_min = lo
+        if canon_max is None or hi > canon_max:
+            canon_max = hi
+    # Запросы с ответом размером с индекс (отправители, темы, даты другого вида) — порциями по id.
+    for lo_id, hi_id in _id_chunks(db, account_id):
+        where = "id > ? AND id <= ?" + acc
+        wargs = (lo_id, hi_id) + aargs
+        if not db.is_pg:
+            # медиана размера: в SQLite быстрее прочитать размеры, чем сортировать их запросом
+            sizes.extend(int(r["s"]) for r in db.query(f"SELECT {size_sql} AS s FROM messages WHERE {where}",
+                                                      wargs))
+        # отправитель / домен — один разбор на группу одинаковых заголовков From
+        rows = db.query(f"SELECT from_addr, COUNT(*) AS n, MIN(id) AS first FROM messages WHERE {where} "
+                        f"GROUP BY from_addr", wargs)
+        for r in sorted(rows, key=lambda r: r["first"]):
+            n = int(r["n"])
+            em, name, dom = _addr_parts(r["from_addr"] or "")
+            if em:
+                senders[em] += n
+                if name and em not in sender_names:
+                    sender_names[em] = name
+            if dom:
+                domains[dom] += n
         # тема → префиксы (Re/Fwd) и слова
-        subj = (r["subject"] or "").strip()
-        if not subj or subj == "(без темы)":
-            empty_subject += 1
-        else:
+        rows = db.query(f"SELECT subject, COUNT(*) AS n, MIN(id) AS first FROM messages WHERE {where} "
+                        f"GROUP BY subject", wargs)
+        for r in sorted(rows, key=lambda r: r["first"]):
+            n = int(r["n"])
+            subj = (r["subject"] or "").strip()
+            if not subj or subj == "(без темы)":
+                empty_subject += n
+                continue
             if _SUBJ_PREFIX_RE.match(subj):
                 if re.match(r"^\s*(fwd?|переслать|пересл)", subj, re.IGNORECASE):
-                    forward_cnt += 1
+                    forward_cnt += n
                 else:
-                    reply_cnt += 1
+                    reply_cnt += n
             for w in _WORD_RE.findall(subj.lower()):
                 if w in STOPWORDS or w.isdigit():
                     continue
-                subject_words[w] += 1
+                subject_words[w] += n
+        if detail:
+            rows = db.query(f"SELECT internaldate, COUNT(*) AS n FROM messages WHERE {where} AND {canon} "
+                            f"GROUP BY internaldate", wargs)
+            for r in rows:
+                if str(r["internaldate"])[:13] in detail:
+                    add_exact(r["internaldate"], int(r["n"]))
+        # даты другого вида — каждая разбирается сама
+        rows = db.query(f"SELECT internaldate, COUNT(*) AS n FROM messages WHERE {where} "
+                        f"AND internaldate IS NOT NULL AND NOT ({canon}) GROUP BY internaldate",
+                        wargs)
+        for r in rows:
+            add_exact(r["internaldate"], int(r["n"]))
+    for value in (canon_min, canon_max):
+        if value is not None:
+            add_exact(value, 0)
+    if db.is_pg:
+        median = _median_size(db, account_id, total, nulls, negs)
+    else:
+        sorted_sizes = sorted(sizes)
+        median = sorted_sizes[len(sorted_sizes) // 2] if sorted_sizes else 0
+        del sorted_sizes
 
     # Полный помесячный ряд (без «дыр») между первым и последним месяцем.
     month_series: List[Dict] = []
@@ -583,9 +731,6 @@ def mail_analytics(svc, account_id: Optional[int] = None, use_cache: bool = True
                 y += 1
             guard += 1
 
-    sorted_sizes = sorted(sizes)
-    median = sorted_sizes[len(sorted_sizes) // 2] if sorted_sizes else 0
-    del sorted_sizes
     dmin = dmin_dt.isoformat() if dmin_dt else None
     dmax = dmax_dt.isoformat() if dmax_dt else None
     span_days = ((dmax_dt - dmin_dt).days + 1) if (dmin_dt and dmax_dt) else 0

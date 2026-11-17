@@ -64,6 +64,13 @@ async function viewDashboard(c){
         и перезапустите службу — либо осознанно выключите шифрование.</div>
       ${isAdmin()?'<a class="btn small" href="#/settings" style="margin-top:10px">Открыть настройки</a>':''}</div>`));
   }
+  // Базу уже открывала более новая версия программы: программу откатили, а базу — нет (1.27.0).
+  if(s.db_newer_version){
+    c.appendChild(h(`<div class="card" style="margin-bottom:16px;border-color:var(--warn)">
+      <div class="section-title"><h3>⚠️ База от более новой версии</h3></div>
+      <div>Базу уже открывала версия ${esc(s.db_newer_version)}, а сейчас работает ${esc(s.version)}. Возможности, добавленные после ${esc(s.version)}, в базе есть, но этой версией не поддерживаются.</div>
+      <div class="muted small" style="margin-top:6px">Обновите программу до ${esc(s.db_newer_version)} или новее — либо верните базу из копии, сделанной до обновления (update.sh при откате делает это сам).</div></div>`));
+  }
   // Копия вне сервера включена, но давно не обновлялась или завершилась ошибкой.
   if(s.replica_alert){
     c.appendChild(h(`<div class="card" style="margin-bottom:16px;border-color:var(--warn)">
@@ -280,8 +287,8 @@ async function viewEmployees(c){
     const tr=h(`<tr>
       <td><strong>${uesc(e.full_name)}</strong>${e.external_id?`<div class="muted small">таб. № ${esc(e.external_id)}</div>`:''}</td>
       <td class="small">${esc(e.email||'—')}</td>
-      <td class="small">${esc(e.position||'—')}</td>
-      <td class="small">${esc(e.department||'—')}</td>
+      <td class="small">${uesc(e.position,'—')}</td>
+      <td class="small">${uesc(e.department,'—')}</td>
       <td>${box}</td>
       <td><span class="badge ${e.status==='active'?'success':'queued'}" ${e.dismissed_at?`title="Уволен ${esc(fmtDate(e.dismissed_at))}"`:''}>${e.status==='active'?'работает':'уволен'}</span>${e.status!=='active'&&e.account_hold_until?`<div class="small muted" title="Архив ящика не удаляется по сроку хранения">🔒 ${e.account_hold_until==='9999-12-31'?'бессрочно':'до '+esc(holdDate(e.account_hold_until))}</div>`:''}</td>
       <td style="text-align:right;white-space:nowrap">

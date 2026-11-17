@@ -312,7 +312,7 @@ def cmd_replica_pull(args) -> int:
         _data_dir_must_be_usable(cfg)
     target = build_target(SimpleNamespace(cfg=cfg), values)
     print(f"Копия: {target.describe()}")
-    print(f"Куда:  {dest}" + (" (только снимки базы)" if args.only_db else ""))
+    print(f"Куда:  {dest}" + (" (только снимки базы и копии настроек)" if args.only_db else ""))
     try:
         res = pull(target, dest, include_mail=not args.only_db)
     finally:
@@ -633,8 +633,26 @@ def cmd_check_config(args) -> int:
         print(f"Замечание: каталога данных {cfg.data_dir} нет. Новую установку его создаёт install.sh; "
               f"служба, уже установленная скриптом, без него не запустится. Если данные лежат на "
               f"отдельном диске — проверьте, что он подключён (lsblk -f, findmnt; пул ZFS — zpool import).")
-    print("Конфигурация корректна ✓" + (" (есть предупреждения)" if cfg.warnings or denied else ""))
+    newer = _db_newer_version(cfg) if not denied else ""
+    if newer:
+        print(f"Предупреждение: базу уже открывала более новая версия MailArchiver ({newer}), а эта — {__version__}. "
+              f"Обновите программу или верните базу из копии, сделанной до обновления.")
+    print("Конфигурация корректна ✓" + (" (есть предупреждения)" if cfg.warnings or denied or newer else ""))
     return 0
+
+
+def _db_newer_version(cfg) -> str:
+    """Версия программы новее этой, которая уже открывала базу (1.27.0). Только файл SQLite и только чтение:
+    check-config не ходит по сети (PostgreSQL — предупреждение в журнале и на дашборде службы)."""
+    from .database import version_tuple
+    try:
+        if cfg.db_url or not os.path.exists(cfg.db_path):
+            return ""
+        rows = _ro_rows(cfg, "SELECT value FROM meta WHERE key='app_version_max'")
+    except Exception:  # noqa: BLE001 - нет базы, нет таблицы, нет доступа
+        return ""
+    seen = str(rows[0][0]) if rows else ""
+    return seen if version_tuple(seen) > version_tuple(__version__) else ""
 
 
 def _denied_note(cfg, denied: list, config_arg) -> str:
@@ -701,7 +719,7 @@ def main(argv=None) -> int:
 
     p = sub.add_parser("replica-pull", help="скачать копию вне сервера (восстановление после аварии)")
     p.add_argument("--to", metavar="КАТАЛОГ", help="куда скачать (по умолчанию — каталог данных)")
-    p.add_argument("--only-db", action="store_true", help="только снимки базы")
+    p.add_argument("--only-db", action="store_true", help="только снимки базы и копии настроек")
     p.add_argument("--dir", metavar="ПАПКА", help="копия в сетевой папке (если настроек нет в базе)")
     p.add_argument("--s3-endpoint", metavar="URL", help="копия в S3: адрес хранилища")
     p.add_argument("--s3-bucket"); p.add_argument("--s3-prefix"); p.add_argument("--s3-region")

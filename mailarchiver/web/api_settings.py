@@ -198,7 +198,9 @@ def settings_backup_info(request: Request, user: dict = Depends(auth_mod.require
     svc = svc_dep(request)
     return {"sections": [{"name": k, "title": v, "protected_only": k in sb.PROTECTED_ONLY}
                          for k, v in sb.SECTIONS.items()],
-            "auto": [{k: a[k] for k in ("name", "created_at", "size")} for a in sb.list_auto(svc.cfg)],
+            "auto": [{k: a[k] for k in ("name", "created_at", "size", "kind")} for a in sb.list_auto(svc.cfg)],
+            "daily": {"enabled": bool(svc.rt("settings_backup", "enabled")),
+                      "password": bool(svc.rt("settings_backup", "password"))},
             "min_password": sb.MIN_PASSWORD}
 
 
@@ -231,6 +233,8 @@ def settings_backup_restore(request: Request, file: Optional[UploadFile] = File(
     else:
         raise ValidationError("Выберите файл копии настроек.")
     info = sb.describe(data)
+    if auto and info["needs_password"] and not password:
+        password = str(svc.rt("settings_backup", "password") or "")     # ежедневная копия — паролем из настроек
     opened = sb.open_backup(data, password=password or "", box=svc.db.secret)
     chosen = [p.strip() for p in str(sections or "").split(",") if p.strip()] or None
     dry = str(dry_run).strip().lower() not in ("false", "0", "no", "")

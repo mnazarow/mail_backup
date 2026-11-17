@@ -353,6 +353,17 @@ def test_drill_restores_snapshot_on_trial(services):
     res = drill.run(svc)
     assert res["ok"], res
     assert "Снимок базы" in res["summary"] and "ящиков 1" in res["summary"]
+    if svc.db.is_pg:
+        # выгрузка разворачивается во временную базу (1.27.0); без права CREATEDB — только чтение
+        assert "во временную базу PostgreSQL" in res["summary"]
+        assert not svc.db.scalar("SELECT 1 FROM pg_database WHERE datname LIKE 'mailarchiver_drill_%'")
+        real = snapshots.trial_pg_restore
+        snapshots.trial_pg_restore = lambda *a, **k: {"skipped": "нет права (проверка)"}
+        try:
+            res = drill.run(svc)
+        finally:
+            snapshots.trial_pg_restore = real
+        assert res["ok"] and "не развёрнут: нет права (проверка)" in res["summary"]
     assert not [n for n in os.listdir(svc.cfg.tmp_dir) if n.startswith("drill-")]
     # повреждённый снимок — проблема и уведомление
     with open(info["path"], "r+b") as fh:
@@ -397,3 +408,110 @@ def test_damaged_rows_are_skipped(servers):
     assert "этой версии неизвестен" in notes and "целым числом" in notes and "только в config.yaml" in notes
     acc = next(a for a in svc.db.list_accounts() if a.username == "new@y.ru")
     assert acc.enabled and svc.db.scalar("SELECT job_type FROM schedules") == "backup_all"
+
+
+# ---------------------------------------------------------------------------
+#  Ежедневная копия настроек (1.27.0)
+# ---------------------------------------------------------------------------
+def test_daily_settings_copy(services, tmp_path):
+    from mailarchiver import maintenance
+    from mailarchiver.replica.runner import ReplicaRunner, build_target, pull
+    svc = services
+    # без пароля — ключом secret.key, только на сервере; второй раз за сутки — не делается
+    made = sb.maybe_daily(svc)
+    assert made and not made["password"] and made["name"].startswith("daily-local-")
+    assert sb.maybe_daily(svc) is None
+    assert sb.open_backup(sb.read_auto(svc.cfg, made["name"]), box=svc.db.secret)["secrets"]
+    # пароль короче 10 символов не принимается
+    from mailarchiver.config import coerce_setting
+    with pytest.raises(ValueError, match="не короче 10"):
+        coerce_setting("settings_backup.password", "short")
+    svc.set_rt("settings_backup", "password", "daily copy password")
+    assert svc.db.scalar("SELECT value FROM settings WHERE key='settings_backup.password'").count("daily") == 0
+    made = sb.maybe_daily(svc, max_age_s=0)
+    assert made["password"] and made["name"].startswith("daily-")
+    data = sb.read_auto(svc.cfg, made["name"])
+    assert sb.describe(data)["needs_password"]
+    assert sb.open_backup(data, password="daily copy password")["secrets"]
+    # хранится не больше keep копий каждого вида
+    svc.set_rt("settings_backup", "keep", 2)
+    for _ in range(3):
+        sb.save_daily(svc)
+    assert len([a for a in sb.list_auto(svc.cfg) if a["kind"] == "daily"]) == 2
+    # копия вне сервера получает только копии с паролем; replica-pull возвращает их в settings-backups
+    dest = tmp_path / "replica"
+    dest.mkdir()
+    svc.set_rt("replica", "target", "dir")
+    svc.set_rt("replica", "dir_path", str(dest))
+    assert ReplicaRunner(svc).run()["status"] == "success"
+    remote = sorted(os.listdir(dest / "settings"))
+    assert len(remote) == 2 and all(n.startswith("daily-") and "local" not in n for n in remote)
+    out = tmp_path / "restored"
+    pull(build_target(svc), str(out), include_mail=False)
+    assert sorted(os.listdir(out / "settings-backups")) == remote
+    # ежечасное обслуживание делает копию, когда последняя старше суток; выключенная — не делает
+    for item in sb.list_auto(svc.cfg):
+        os.unlink(item["path"])
+    assert maintenance.run_maintenance(svc)["settings_backup"] == 1
+    svc.set_rt("settings_backup", "enabled", False)
+    for item in sb.list_auto(svc.cfg):
+        os.unlink(item["path"])
+    assert maintenance.run_maintenance(svc)["settings_backup"] == 0 and not sb.list_auto(svc.cfg)
+
+
+def test_daily_copy_restores_with_stored_password(servers):
+    c = servers("one")
+    svc = c.app.state.services
+    assert c.put("/api/settings", json={"values": {"settings_backup.password": "daily copy password",
+                                                   "retention.keep_days": 77}}).status_code == 200
+    made = sb.save_daily(svc)
+    assert c.put("/api/settings", json={"values": {"retention.keep_days": 5}}).status_code == 200
+    info = c.get("/api/settings-backup").json()
+    assert info["daily"] == {"enabled": True, "password": True}
+    assert info["auto"][0]["kind"] == "daily"
+    r = c.post("/api/settings-backup/restore", data={"auto": made["name"], "mode": "update", "dry_run": "false"})
+    assert r.status_code == 200, r.text
+    assert svc.rt("retention", "keep_days") == 77
+
+
+# ---------------------------------------------------------------------------
+#  Версия программы в базе (1.27.0)
+# ---------------------------------------------------------------------------
+def test_database_remembers_newer_version(services, capsys):
+    from mailarchiver import database
+    from mailarchiver.__main__ import main
+    from mailarchiver.version import __version__
+    svc = services
+    assert svc.db.get_meta("app_version") == __version__ and svc.db.get_meta("app_version_max") == __version__
+    assert int(svc.db.get_meta("schema_version")) == database.SCHEMA_VERSION and not svc.db.newer_version
+    assert database.version_tuple("1.27.0") > database.version_tuple("1.9.9") > database.version_tuple("x")
+    svc.db.set_meta("app_version_max", "9.0.0")                  # базу открывала версия новее — откат
+    svc.db.init_schema()
+    assert svc.db.newer_version == "9.0.0" and svc.db.get_meta("app_version_max") == "9.0.0"
+    if not svc.db.is_pg:
+        assert main(["check-config"]) == 0
+        assert "более новая версия MailArchiver (9.0.0)" in capsys.readouterr().out
+    from mailarchiver.web.api_state import state
+    from types import SimpleNamespace
+    req = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(services=svc)))
+    svc.scheduler = SimpleNamespace(running=lambda: False)
+    svc.queue = SimpleNamespace(max_workers=lambda: 1)
+    assert state(req, {"role": "admin", "username": "a"})["db_newer_version"] == "9.0.0"
+    assert state(req, {"role": "mailbox", "account_id": 0, "username": "u"})["db_newer_version"] == ""
+
+
+def test_restore_marking_dismissed_closes_access(servers):
+    """Копия отмечает сотрудника уволенным — как при увольнении: сеансы его ящиков закрываются."""
+    c = servers("one")
+    made = _fill_source(c)
+    svc = c.app.state.services
+    data, _ = sb.build(svc, password=BACKUP_PW)
+    opened = sb.open_backup(data, password=BACKUP_PW)
+    for row in opened["sections"]["employees"]["employees"]:
+        if row["external_id"] == "T-1":
+            row["status"] = "dismissed"
+    svc.db.create_session("mbtok", 0, "2099-01-01T00:00:00+00:00", "", "", role="mailbox", account_id=made["a"])
+    rep = sb.restore(svc, opened, mode="update", sections=["employees"], actor="cli", auto_backup=False)
+    assert rep["tables"]["employees"]["updated"] == 1
+    assert svc.db.scalar("SELECT status FROM employees WHERE id=?", (made["emp"],)) == "dismissed"
+    assert not svc.db.query_one("SELECT 1 FROM sessions WHERE token='mbtok'")

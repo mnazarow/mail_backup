@@ -53,6 +53,8 @@ log = get_logger("replica")
 ACCOUNT_DIR_RE = re.compile(r"^account_\d+$")
 QUARANTINE_DIR_RE = re.compile(r"^(account_\d+)_old_")
 DB_GROUP = "db"
+#: Копии настроек с паролем (1.27.0) — в копии вне сервера папка settings/.
+SETTINGS_GROUP = "settings"
 KNOWN_HOSTS_NAME = "replica_known_hosts"
 SSH_KEY_NAME = "replica_ssh_key"
 #: Сколько ошибок подробно показывать в журнале задания.
@@ -144,6 +146,8 @@ def readme_text(svc) -> str:
         "  db/         — снимки базы MailArchiver (индекс писем, ящики, настройки).",
         "                Снимки *.enc зашифрованы тем же ключом, что и письма; *.sig —",
         "                подписи снимков (проверяются ключом secret.key при восстановлении).",
+        "  settings/   — ежедневные копии настроек, зашифрованные паролем копий настроек",
+        "                (их открывает пароль и без secret.key: mailarchiver settings-restore).",
         "",
         "Ключей здесь НЕТ — и это правильно. Для восстановления понадобятся:",
         "  * secret.key из каталога данных (им зашифрованы пароли ящиков);",
@@ -471,6 +475,7 @@ class ReplicaRunner:
             need_verify = self._ensure_marker(target)
             if bool(self.cfg.get("include_db")):
                 self._snapshot()
+                self._settings_copy()
             self._check_cancel()
             if isinstance(target, RsyncTarget):
                 self._run_rsync(target)
@@ -482,6 +487,8 @@ class ReplicaRunner:
                                         "с архивом.")
                 self._sync_mailboxes(target, verify)
                 self._sync_snapshots(target, verify)
+                if bool(self.cfg.get("include_db")):
+                    self._sync_group(target, verify, SETTINGS_GROUP, self._settings_files())
                 self._put_readme(target)
                 self._apply_deletes(target)
                 if verify:
@@ -552,6 +559,31 @@ class ReplicaRunner:
         else:
             snaps = snapshots.list_snapshots(self.svc.cfg)
             self.stats["snapshot"] = snaps[0]["name"] if snaps else ""
+
+    def _settings_copy(self) -> None:
+        """Ежедневная копия настроек (1.27.0) — до отправки, чтобы в копию ушла сегодняшняя."""
+        from .. import settings_backup
+        made = settings_backup.maybe_daily(self.svc)
+        if made and made.get("error"):
+            self._error(f"Копия настроек не сделана: {made['error']}")
+        elif made:
+            self._event("INFO", f"Сделана копия настроек {made['name']}"
+                                + ("." if made["password"] else " (без пароля копий настроек — в копию вне "
+                                                                "сервера не уходит)."))
+
+    def _settings_files(self) -> Dict[str, Tuple[int, int, str]]:
+        """Копии настроек с паролем: путь в копии → (размер, mtime_ns, путь на диске)."""
+        from .. import settings_backup
+        out: Dict[str, Tuple[int, int, str]] = {}
+        for item in settings_backup.list_auto(self.svc.cfg):
+            if item["kind"] != "daily":
+                continue
+            try:
+                st = os.stat(item["path"])
+            except OSError:
+                continue
+            out[f"{SETTINGS_GROUP}/{item['name']}"] = (st.st_size, st.st_mtime_ns, item["path"])
+        return out
 
     # -- сетевая папка и S3 -------------------------------------------------------------------
     def _walk_account(self, name: str) -> Dict[str, Tuple[int, int, str]]:
@@ -732,17 +764,22 @@ class ReplicaRunner:
                 except OSError:
                     continue
                 local[f"{DB_GROUP}/{snap['name']}{suffix}"] = (st.st_size, st.st_mtime_ns, snap["path"] + suffix)
+        self._sync_group(target, verify, DB_GROUP, local)
+
+    def _sync_group(self, target: ReplicaTarget, verify: bool, group: str,
+                    local: Dict[str, Tuple[int, int, str]]) -> None:
+        """Папка копии, где лежит ровно то, что сейчас на сервере (снимки базы, копии настроек)."""
         if verify:
-            remote = dict(target.list(DB_GROUP + "/"))
-            self.db.replica_replace_group(DB_GROUP, [(rel, DB_GROUP, v[0], v[1]) for rel, v in local.items()
-                                                     if remote.get(rel) == v[0]])
+            remote = dict(target.list(group + "/"))
+            self.db.replica_replace_group(group, [(rel, group, v[0], v[1]) for rel, v in local.items()
+                                                  if remote.get(rel) == v[0]])
             uploads = [rel for rel, v in local.items() if remote.get(rel) != v[0]]
             stale = [rel for rel in remote if rel not in local]
         else:
-            state = self.db.replica_state_group(DB_GROUP)
+            state = self.db.replica_state_group(group)
             uploads = [rel for rel, v in local.items() if state.get(rel) != (v[0], v[1])]
             stale = [rel for rel in state if rel not in local]
-        self._upload(target, DB_GROUP, uploads, local)
+        self._upload(target, group, uploads, local)
         if stale and local:
             # Старые снимки в копии чистим всегда (их столько же, сколько на сервере),
             # но только если свежий снимок уже есть — иначе копия осталась бы без базы.
@@ -838,6 +875,16 @@ class ReplicaRunner:
                 stats = parse_rsync_stats(out)
                 self.stats["files_up"] += stats["files"]
                 self.stats["bytes_up"] += stats["bytes"]
+        from .. import settings_backup
+        if bool(self.cfg.get("include_db")) and self._settings_files():
+            # копии настроек с паролем (1.27.0); без пароля и «перед восстановлением» — только на сервере
+            code, out = target.sync_dir(settings_backup.auto_dir(self.svc.cfg), SETTINGS_GROUP, delete=True,
+                                        excludes=[".*", "before-restore-*", "daily-local-*"],
+                                        cancel=self._cancelled, what="копии настроек")
+            if code == -1:
+                raise JobCancelled("Прервано.")
+            if code not in (0, 24):
+                self._error(target.error_text(code, out))
         self._progress(2, 3, "Инструкция…")
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, suffix=".txt") as fh:
             fh.write(readme_text(self.svc))
@@ -867,7 +914,9 @@ def pull(target: ReplicaTarget, dest_dir: str, *, echo=print, include_mail: bool
         raise ReplicaError(
             "Копию по SSH возвращайте самим rsync.",
             hint=f"Например: rsync -a {target.remote_path('mailboxes')}/ {os.path.join(dest_dir, 'mailboxes')}/ "
-                 f"и rsync -a {target.remote_path(DB_GROUP)}/ {os.path.join(dest_dir, 'snapshots')}/")
+                 f"и rsync -a {target.remote_path(DB_GROUP)}/ {os.path.join(dest_dir, 'snapshots')}/ "
+                 f"(копии настроек: rsync -a {target.remote_path(SETTINGS_GROUP)}/ "
+                 f"{os.path.join(dest_dir, 'settings-backups')}/)")
     files = 0
     size_total = 0
     skipped = 0
@@ -875,7 +924,8 @@ def pull(target: ReplicaTarget, dest_dir: str, *, echo=print, include_mail: bool
     if marker is None:
         raise ReplicaError(f"В {target.describe()} нет копии MailArchiver (не найдена метка .mailarchiver-replica).",
                            hint="Проверьте путь (бакет, префикс) к копии.")
-    plan = [(DB_GROUP + "/", snapshots.SNAP_DIRNAME)]
+    from ..settings_backup import AUTO_DIR
+    plan = [(DB_GROUP + "/", snapshots.SNAP_DIRNAME), (SETTINGS_GROUP + "/", AUTO_DIR)]
     if include_mail:
         plan.insert(0, ("mailboxes/", "mailboxes"))
     for prefix, local_sub in plan:

@@ -210,6 +210,10 @@ def run_maintenance(svc) -> Dict[str, int]:
         out["sso_idle_disabled"] = sso_disable_idle(svc)
     except Exception:  # noqa: BLE001
         log.exception("Проверка давно не входивших через единый вход не удалась")
+    # ежедневная копия настроек (1.27.0): ошибки — в журнале, обслуживанию не мешают
+    from .settings_backup import maybe_daily
+    made = maybe_daily(svc)
+    out["settings_backup"] = 1 if made and not made.get("error") else 0
     if any(out.values()):
         log.info("Обслуживание: %s", ", ".join(f"{k}={v}" for k, v in out.items() if v))
     return out

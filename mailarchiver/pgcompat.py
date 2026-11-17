@@ -151,6 +151,29 @@ def _value(v):
     return v
 
 
+#: Типы PostgreSQL (OID), значения которых psycopg отдаёт уже такими же, как SQLite: int, float, str.
+_PLAIN_OIDS = frozenset({18, 19, 20, 21, 23, 25, 26, 700, 701, 705, 1042, 1043})
+
+
+def _rows(cur) -> List[Row]:
+    """Строки результата → :class:`Row`. Через :func:`_value` проходят только столбцы, которым это нужно
+    (numeric, bool, bytea, даты): перевод каждого значения подряд занимал больше времени, чем сам запрос, —
+    на аналитике 1,5 млн писем это были секунды (1.27.0)."""
+    desc = cur.description
+    idx = _index_of([d.name for d in desc])
+    conv = [i for i, d in enumerate(desc) if d.type_code not in _PLAIN_OIDS]
+    data = cur.fetchall()
+    if not conv:
+        return [Row(r, idx) for r in data]
+    out = []
+    for r in data:
+        vals = list(r)
+        for i in conv:
+            vals[i] = _value(vals[i])
+        out.append(Row(vals, idx))
+    return out
+
+
 class Cursor:
     """Результат запроса (всё уже прочитано): ``fetchone``/``fetchall``/итерация, ``rowcount``, ``lastrowid``."""
 
@@ -494,7 +517,10 @@ _SETUP_SQL = [
     # функции SQLite, которых нет в PostgreSQL
     "CREATE OR REPLACE FUNCTION public.ma_lower(text) RETURNS text LANGUAGE sql IMMUTABLE PARALLEL SAFE "
     "AS $$ SELECT lower($1 COLLATE \"und-x-icu\") $$",
-    "CREATE OR REPLACE FUNCTION public.julianday(text) RETURNS double precision LANGUAGE sql IMMUTABLE "
+    # STABLE, как и приведение к timestamptz внутри (зависит от часового пояса сеанса): объявленная IMMUTABLE,
+    # функция не подставлялась в запрос и вызывалась на каждую строку — длительность 45 000 заданий в аналитике
+    # системы считалась 0,3 с (1.27.0)
+    "CREATE OR REPLACE FUNCTION public.julianday(text) RETURNS double precision LANGUAGE sql STABLE PARALLEL SAFE "
     "AS $$ SELECT extract(epoch FROM $1::timestamptz) / 86400.0 + 2440587.5 $$",
     "CREATE OR REPLACE FUNCTION public.instr(text, text) RETURNS integer LANGUAGE sql IMMUTABLE "
     "AS $$ SELECT strpos($1, $2) $$",
@@ -848,8 +874,7 @@ class Session:
                 return Cursor([], 0, None, None)
             rows: List[Row] = []
             if cur.description is not None:
-                idx = _index_of([d.name for d in cur.description])
-                rows = [Row(tuple(_value(v) for v in r), idx) for r in cur.fetchall()]
+                rows = _rows(cur)
             lastrowid = None
             if want_id and rows:
                 lastrowid = rows[-1][0]
@@ -896,8 +921,7 @@ class Session:
             cur = conn.execute(sql, params or None)
             rows = []
             if cur.description is not None:
-                idx = _index_of([d.name for d in cur.description])
-                rows = [Row(tuple(_value(v) for v in r), idx) for r in cur.fetchall()]
+                rows = _rows(cur)
             return Cursor(rows, cur.rowcount, None, cur.description)
         return self._run(go)
 

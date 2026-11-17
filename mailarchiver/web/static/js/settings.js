@@ -222,9 +222,12 @@ async function settingsBackupDlg(unsaved){
   let info; try{ info=await api('/settings-backup'); }catch(e){ return toastErr(e); }
   const minPw=info.min_password||10;
   const secChecks=(prefix, list, on)=>list.map(s=>`<label class="small" style="display:inline-flex;gap:6px;align-items:center;margin:2px 14px 2px 0"><input type="checkbox" data-${prefix}="${esc(s.name)}" ${on(s)?'checked':''}> ${esc(s.title)}${s.protected_only?' <span class="muted">(только с паролем)</span>':''}</label>`).join('');
-  const autoRows=()=> (info.auto||[]).length
-    ? `<table class="tbl"><tbody>${info.auto.map(a=>`<tr><td>${fmtDate(a.created_at)}</td><td class="muted small">${fmtBytes(a.size)}</td><td style="text-align:right"><button class="btn sm" data-auto="${esc(a.name)}">Проверить возврат</button></td></tr>`).join('')}</tbody></table>`
-    : '<div class="small muted">Пока нет: служба сохраняет нынешние настройки перед каждым восстановлением.</div>';
+  const SB_KIND={'before-restore':'перед восстановлением', 'daily':'ежедневная (с паролем)', 'daily-local':'ежедневная (ключом secret.key)'};
+  const autoRows=()=>{ const daily=info.daily||{}; return ((info.auto||[]).length
+    ? `<table class="tbl"><tbody>${info.auto.map(a=>`<tr><td>${fmtDate(a.created_at)}</td><td class="small">${esc(SB_KIND[a.kind]||a.kind)}</td><td class="muted small">${fmtBytes(a.size)}</td><td style="text-align:right"><button class="btn sm" data-auto="${esc(a.name)}">Проверить возврат</button></td></tr>`).join('')}</tbody></table>`
+    : '<div class="small muted">Пока нет: служба сохраняет настройки раз в сутки и перед каждым восстановлением.</div>')
+    + (daily.enabled&&!daily.password?'<div class="hint small" style="margin-top:8px">Пароль копий настроек не задан: ежедневные копии шифруются ключом secret.key и в копию вне сервера не уходят. Задайте его в разделе «🗄 Копия настроек» ниже на этой странице.</div>':'')
+    + (!daily.enabled?'<div class="small muted" style="margin-top:8px">Ежедневная копия настроек выключена (раздел «🗄 Копия настроек»).</div>':''); };
   let restoredSomething=false;
   const m=modal('Копия настроек', `
     <h3 style="margin-top:0">⬇ Скачать копию</h3>
@@ -248,7 +251,7 @@ async function settingsBackupDlg(unsaved){
     <div class="btn-row"><button class="btn" id="sb-check">Проверить</button></div>
     <div id="sb-result" style="margin-top:10px"></div>
     <hr style="margin:18px 0;border:0;border-top:1px solid var(--border)">
-    <h3>↩ Настройки перед прошлыми восстановлениями</h3>
+    <h3>↩ Автоматические копии настроек</h3>
     <div id="sb-auto">${autoRows()}</div>`, {wide:true, onClose:()=>{ if(restoredSomething) route(); }});
   const B=m.body, q=(sel)=>B.querySelector(sel);
   const prot=q('#sb-prot');
@@ -453,7 +456,7 @@ async function searchCard(card){
   const box=h(`<div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border)">
     <h4 style="margin:0 0 8px">🔎 Индекс поиска</h4>
     ${st.available?`<div class="small">Проиндексировано <b>${fmtNum(st.indexed)}</b> из ${fmtNum(st.total)} писем (${pct}%).${st.active_job?` Идёт индексация — задание #${st.active_job}.`:(st.pending?' Остальные проиндексируются в фоне (каждые 10 минут).':'')}</div>
-      <div class="small muted" style="margin-top:4px">${st.bodies?('Ищется и по тексту писем'+(st.attachments?' и вложений (PDF, Word, Excel, PowerPoint, OpenDocument, RTF)':'')+'.'):'Текст писем не индексируется — поиск по теме, адресам и вложениям.'}${st.bodies_blocked_by_encryption?' Текст не индексируется, потому что включено шифрование копии.':''}</div>
+      <div class="small muted" style="margin-top:4px">${st.bodies?(st.attachments?'Ищется и по тексту писем и вложений (PDF, Word, Excel, PowerPoint, OpenDocument, RTF).':'Ищется и по тексту писем.'):'Текст писем не индексируется — поиск по теме, адресам и вложениям.'}${st.bodies_blocked_by_encryption?' Текст не индексируется, потому что включено шифрование копии.':''}</div>
       ${st.attachments&&st.attach_messages?`<div class="small muted" style="margin-top:4px">Писем с вложениями: ${fmtNum(st.attach_messages)}; текста вложений в индексе — до ${fmtNum(st.attach_text_kb)} КБ на письмо, то есть база может вырасти до ≈ ${fmtBytes(st.attach_messages*st.attach_text_kb*1024*1.3)} (обычно в разы меньше: у большинства вложений текста немного). Сейчас база занимает ${fmtBytes(st.db_size||0)}.</div>`:''}
       ${st.ocr?`<div class="small muted" style="margin-top:4px">Распознавание сканов и картинок: ${st.ocr_tools&&st.ocr_tools.tesseract?('включено (tesseract'+(st.ocr_tools.pdftoppm?', pdftoppm':' — без pdftoppm сканы в PDF не читаются')+')'):'<b style="color:var(--warn-text)">включено, но на сервере нет программы tesseract</b> — установите пакеты tesseract-ocr и tesseract-ocr-rus'}.</div>`:''}
       ${st.attachments&&st.attach_backfill?`<div class="hint" style="margin-top:8px">У ${fmtNum(st.attach_backfill)} писем, проиндексированных раньше, текст вложений ещё не прочитан. ${st.attach_job?`Читается — задание #${st.attach_job}.`:'Его можно дочитать без перестройки индекса.'}</div>`:''}

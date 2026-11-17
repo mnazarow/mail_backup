@@ -82,6 +82,9 @@ def state(request: Request, user: dict = Depends(auth_mod.require_user)):
         # оператор видит сам факт: он следит за копированием)
         "encryption_blocked": _encryption_banner(svc, user),
         "replica_alert": _replica_alert(svc) if user.get("role") in roles.STAFF_ROLES else "",
+        # базу уже открывала более новая версия программы — откат без отката базы (1.27.0)
+        "db_newer_version": (getattr(svc.db, "newer_version", "") or "") if user.get("role") in roles.STAFF_ROLES
+        else "",
         # сервер Axigen требует внимания (недоступен, очередь, лицензия…) — только администратору
         "axigen_alerts": _axigen_alerts(svc) if user.get("role") == roles.ROLE_ADMIN else [],
         # подключённые почтовые серверы требуют внимания — тоже только администратору

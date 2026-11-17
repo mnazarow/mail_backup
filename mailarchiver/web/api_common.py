@@ -43,7 +43,7 @@ SECRET_SETTINGS = {"notifications.smtp_password", "notifications.telegram_bot_to
                    "notifications.webhook_secret", "employees.source_url_password",
                    "replica.s3_secret_key", "monitoring.metrics_token", "mailadmin.password",
                    "axigen.admin_password", "axigen.ftp_password",
-                   "journal.auth_password", "oidc.client_secret"}
+                   "journal.auth_password", "oidc.client_secret", "settings_backup.password"}
 #: Секрет, который уходит на адрес из настроек: при смене адреса его нужно ввести заново
 #: (иначе администратор архива мог бы перенаправить пароль администратора почты на свой сервер).
 SECRET_BOUND_TO = {"axigen.admin_password": "axigen.host", "axigen.ftp_password": "axigen.host",

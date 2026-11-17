@@ -217,3 +217,43 @@ def test_mailbox_user_searches_only_own_mailbox(client):
     assert [r["account_id"] for r in res["results"]] == [a]
     st = client.get("/api/search/status").json()
     assert st["total"] == 0                                  # общих счётчиков архива сотруднику не видно
+
+
+def test_newest_first_paths_agree(services, monkeypatch):
+    """1.27.0, PostgreSQL: поиск «новые первыми» идёт тремя путями — по письмам выбранных ящиков, по последним
+    письмам с конца, дальше по индексу GIN. Каждый находит то же и в том же порядке, что и один запрос по всему
+    индексу (в SQLite путь один — проверяется то же самое)."""
+    import mailarchiver.search as S
+    svc = services
+    a, b = _accounts(svc)
+    uid = 0
+    for i in range(30):
+        for acc in (a, b):
+            uid += 1
+            words = ["счёт" if i % 2 else "акт", "оплата" if i % 3 else "сверка", f"номер{i}"]
+            _add(svc, acc, uid, _msg(" ".join(words), " ".join(words) + " текст письма"), " ".join(words),
+                 days_ago=i, attach=i % 4 == 0, folder="INBOX" if i % 5 else "Архив")
+    index_pending(svc)
+    queries = [("счет", {}), ("счет оплата", {}), ("номер7", {}), ("акт", {"account_ids": [a]}),
+               ("акт", {"account_ids": [a, b], "folder": "Архив"}), ("оплата", {"with_attachments": True}),
+               ("текст", {"date_from": (datetime.now().date() - timedelta(days=12)).isoformat()}),
+               ("нетакогослова", {})]
+
+    def run():
+        out = []
+        for q, kw in queries:
+            for offset in (0, 3):
+                res = search(svc, q, offset=offset, limit=4, **kw)
+                out.append(([r["id"] for r in res["results"]], res["more"]))
+        return out
+    monkeypatch.setattr(S, "_PG_CANDIDATES", -1)
+    monkeypatch.setattr(S, "_PG_WINDOW", 10 ** 9)
+    want = run()                                   # одно окно на весь индекс — как прежний запрос
+    assert want[0][0] and want[0][1]
+    monkeypatch.setattr(S, "_PG_WINDOW", 5)        # окно мало — остальное по индексу GIN, порциями номеров
+    monkeypatch.setattr(S, "_PG_BATCH", 3)
+    assert run() == want
+    monkeypatch.setattr(S, "_PG_WINDOW", 0)
+    assert run() == want
+    monkeypatch.setattr(S, "_PG_CANDIDATES", 10 ** 9)   # по письмам выбранных ящиков
+    assert run() == want

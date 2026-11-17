@@ -20,7 +20,10 @@ function niceStep(v){ const p=Math.pow(10,Math.floor(Math.log10(v))); const n=v/
  *  прежний расчёт давал подписи «1, 1, 1, 0» (0,75 и 0,5 округлялись до 1). */
 function niceMax(v){ v=Math.max(1,v); const step=Math.max(1, Math.ceil(niceStep(v/4))); return step*4; }
 function rr(ctx,x,y,w,h,r){ if(h<0){y+=h;h=-h;} r=Math.max(0,Math.min(r,h/2,w/2)); ctx.beginPath(); ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r); ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath(); }
-function cEmpty(ctx,W,H){ ctx.fillStyle=cvar('--text-dim','#888'); ctx.textAlign='center'; ctx.font='13px sans-serif'; ctx.fillText('Нет данных',W/2,H/2); }
+function cEmpty(ctx,W,H){ ctx.fillStyle=cvar('--text-dim','#888'); ctx.textAlign='center'; ctx.font='13px sans-serif'; ctx.fillText(t('Нет данных'),W/2,H/2); }
+/** Подпись на графике: canvas не видит перевод страницы — подписи переводятся здесь (1.27.0). raw — имена ящиков,
+ *  отделов, отправителей и папок: это данные, их не переводят. */
+function cLab(s, opts){ s=String(s==null?'':s); return opts&&opts.raw ? s : t(s); }
 function drawInto(container, height, fn){
   container.innerHTML=''; const cv=document.createElement('canvas'); container.appendChild(cv);
   const dpr=window.devicePixelRatio||1;
@@ -43,8 +46,8 @@ function chartVBars(container, items, opts={}){
       const bh=plotH*(d.value/max), x=padL+i*bw+bw*0.15, w=Math.max(1,bw*0.7), y=padT+plotH-bh;
       ctx.fillStyle=opts.colorByIndex?CHART_COLORS[i%CHART_COLORS.length]:color; rr(ctx,x,y,w,bh,3); ctx.fill();
       ctx.fillStyle=dim; ctx.textAlign='center'; ctx.font='10px sans-serif';
-      if(opts.rotate){ ctx.save(); ctx.translate(x+w/2,H-padB+11); ctx.rotate(-Math.PI/4); ctx.textAlign='right'; ctx.fillText(trunc(d.label,10),0,0); ctx.restore(); }
-      else { const step=Math.max(1,Math.ceil(n/(W>560?24:8))); if(i%step===0||n<=12) ctx.fillText(d.label,x+w/2,H-padB+14); }
+      if(opts.rotate){ ctx.save(); ctx.translate(x+w/2,H-padB+11); ctx.rotate(-Math.PI/4); ctx.textAlign='right'; ctx.fillText(trunc(cLab(d.label,opts),10),0,0); ctx.restore(); }
+      else { const step=Math.max(1,Math.ceil(n/(W>560?24:8))); if(i%step===0||n<=12) ctx.fillText(cLab(d.label,opts),x+w/2,H-padB+14); }
     });
   });
 }
@@ -62,9 +65,9 @@ function chartHBars(container, items, opts={}){
     labelW=Math.min(labelW+6, opts.labelW||210); const valW=opts.valW||52, barX=labelW+8, barW=Math.max(20,W-barX-valW-4);
     items.forEach((d,i)=>{
       const y=7+i*rowH, bh=rowH*0.6, by=y+(rowH-bh)/2;
-      ctx.fillStyle=dim; ctx.textAlign='left'; ctx.font='12px sans-serif'; ctx.fillText(trunc(d.label,chars),0,by+bh*0.72);
+      ctx.fillStyle=dim; ctx.textAlign='left'; ctx.font='12px sans-serif'; ctx.fillText(trunc(cLab(d.label,opts),chars),0,by+bh*0.72);
       ctx.fillStyle=opts.colorByIndex?CHART_COLORS[i%CHART_COLORS.length]:color; const w=Math.max(2,barW*(d.value/max)); rr(ctx,barX,by,w,bh,3); ctx.fill();
-      ctx.fillStyle=txt; ctx.font='11px sans-serif'; ctx.textAlign='left'; ctx.fillText(opts.fmt?opts.fmt(d):fmtNum(d.value), barX+w+5, by+bh*0.72);
+      ctx.fillStyle=txt; ctx.font='11px sans-serif'; ctx.textAlign='left'; ctx.fillText(t(opts.fmt?opts.fmt(d):fmtNum(d.value)), barX+w+5, by+bh*0.72);
     });
   });
 }
@@ -82,7 +85,7 @@ function chartLine(container, items, opts={}){
     ctx.beginPath(); items.forEach((d,i)=>{ const x=xat(i),y=yat(d.value); i?ctx.lineTo(x,y):ctx.moveTo(x,y); }); ctx.strokeStyle=color; ctx.lineWidth=2; ctx.stroke();
     if(n<=40){ items.forEach((d,i)=>{ ctx.beginPath(); ctx.arc(xat(i),yat(d.value),2.4,0,7); ctx.fillStyle=color; ctx.fill(); }); }
     ctx.fillStyle=dim; ctx.font='10px sans-serif'; const step=Math.max(1,Math.ceil(n/(W>620?12:6)));
-    items.forEach((d,i)=>{ if(i%step===0||i===n-1){ ctx.textAlign = i===0?'left':(i===n-1?'right':'center'); ctx.fillText(d.label,xat(i),H-padB+15); } });
+    items.forEach((d,i)=>{ if(i%step===0||i===n-1){ ctx.textAlign = i===0?'left':(i===n-1?'right':'center'); ctx.fillText(cLab(d.label,opts),xat(i),H-padB+15); } });
   });
 }
 function chartDonut(container, slices, opts={}){
@@ -95,7 +98,7 @@ function chartDonut(container, slices, opts={}){
     slices.forEach((d,i)=>{ const ang=2*Math.PI*(d.value||0)/total; if(ang>0){ ctx.beginPath(); ctx.moveTo(cx,cy); ctx.arc(cx,cy,r,a,a+ang); ctx.closePath(); ctx.fillStyle=d.color||CHART_COLORS[i%CHART_COLORS.length]; ctx.fill(); } a+=ang; });
     ctx.beginPath(); ctx.arc(cx,cy,ri,0,7); ctx.fillStyle=cvar('--bg-elev','#fff'); ctx.fill();
     ctx.fillStyle=cvar('--text','#222'); ctx.textAlign='center'; ctx.font='700 19px sans-serif'; ctx.fillText(fmtNum(total),cx,cy+1);
-    ctx.fillStyle=cvar('--text-dim','#888'); ctx.font='11px sans-serif'; ctx.fillText(opts.centerLabel||'всего',cx,cy+17);
+    ctx.fillStyle=cvar('--text-dim','#888'); ctx.font='11px sans-serif'; ctx.fillText(t(opts.centerLabel||'всего'),cx,cy+17);
   });
 }
 function donutLegend(slices){ const tot=slices.reduce((s,d)=>s+(d.value||0),0)||1; return `<div class="an-legend">${slices.map((d,i)=>`<span class="lg"><span class="dot" style="background:${d.color||CHART_COLORS[i%CHART_COLORS.length]}"></span>${esc(d.label)} <b>${fmtNum(d.value)}</b> · ${Math.round(100*(d.value||0)/tot)}%</span>`).join('')}</div>`; }
@@ -108,7 +111,7 @@ function chartHeat(container, matrix, rowLabels, opts={}){
     let max=opts.max||1; matrix.forEach(r=>r.forEach(v=>{ if(v>max)max=v; }));
     for(let r=0;r<rows;r++){
       for(let c=0;c<cols;c++){ const v=matrix[r][c]; ctx.fillStyle= v? hexA(base,0.14+0.86*(v/max)) : cvar('--bg-soft','#eee'); ctx.fillRect(padL+c*gw+1,padT+r*gh+1,gw-2,gh-2); }
-      ctx.fillStyle=dim; ctx.textAlign='right'; ctx.font='10px sans-serif'; ctx.fillText(rowLabels[r],padL-4,padT+r*gh+gh*0.66);
+      ctx.fillStyle=dim; ctx.textAlign='right'; ctx.font='10px sans-serif'; ctx.fillText(cLab(rowLabels[r],opts),padL-4,padT+r*gh+gh*0.66);
     }
     ctx.fillStyle=dim; ctx.textAlign='center'; ctx.font='9px sans-serif';
     for(let c=0;c<cols;c+=3){ ctx.fillText(String(c).padStart(2,'0'),padL+c*gw+gw/2,H-4); }
@@ -118,7 +121,7 @@ function wordCloud(items, opts={}){
   if(!items.length) return '<div class="an-empty-hint">Нет данных</div>';
   const max=Math.max(...items.map(w=>w.value)), min=Math.min(...items.map(w=>w.value));
   const lo=opts.min||13, hi=opts.max||30;
-  return `<div class="an-cloud">${items.map((w,i)=>{ const t=max===min?1:(w.value-min)/(max-min); const sz=(lo+(hi-lo)*t).toFixed(1); const col=CHART_COLORS[i%CHART_COLORS.length]; return `<span class="w" title="${fmtNum(w.value)}" style="font-size:${sz}px;color:${hexA(col,0.55+0.45*t)};font-weight:${400+Math.round(t*3)*100}">${esc(w.label)}</span>`; }).join('')}</div>`;
+  return `<div class="an-cloud">${items.map((w,i)=>{ const t=max===min?1:(w.value-min)/(max-min); const sz=(lo+(hi-lo)*t).toFixed(1); const col=CHART_COLORS[i%CHART_COLORS.length]; return `<span class="w" translate="no" title="${fmtNum(w.value)}" style="font-size:${sz}px;color:${hexA(col,0.55+0.45*t)};font-weight:${400+Math.round(t*3)*100}">${esc(w.label)}</span>`; }).join('')}</div>`;
 }
 // реестр перерисовки при resize/смене темы
 function registerCharts(list){ State.redraw=()=>list.forEach(fn=>{ try{fn();}catch(e){} }); }
@@ -214,7 +217,7 @@ async function viewAnalytics(c){
     // (с учётом devicePixelRatio — за предел canvas в Safari, график просто
     // не рисовался). Полный список всё равно есть в разделе «Почтовые ящики».
     const accTop=[...d.accounts].sort((a,b)=>(b.messages||0)-(a.messages||0)).slice(0,20);
-    reg(()=>chartHBars($('#accBars',stCard), accTop.map(a=>({label:a.name,value:a.messages})), {colorByIndex:true, height:Math.max(90,accTop.length*32), labelChars:20}));
+    reg(()=>chartHBars($('#accBars',stCard), accTop.map(a=>({label:a.name,value:a.messages})), {raw:true, colorByIndex:true, height:Math.max(90,accTop.length*32), labelChars:20}));
     if(d.accounts.length>accTop.length){
       stCard.appendChild(h(`<div class="muted small">Показаны 20 самых крупных ящиков из ${fmtNum(d.accounts.length)}.</div>`));
     }
@@ -322,7 +325,7 @@ function renderDedup(body, r, st, redraws){
   if(top){
     const add=(fn)=>{ fn(); redraws.push(fn); };
     add(()=>chartHBars($('#ddTypes',box), r.by_type, {colorByIndex:true, labelChars:22, valW:70, fmt:x=>x.value_h, height:Math.max(80,r.by_type.length*27+14)}));
-    add(()=>chartHBars($('#ddBoxes',box), r.by_account, {colorByIndex:true, labelChars:22, valW:70, fmt:x=>x.value_h, height:Math.max(80,r.by_account.length*27+14)}));
+    add(()=>chartHBars($('#ddBoxes',box), r.by_account, {raw:true, colorByIndex:true, labelChars:22, valW:70, fmt:x=>x.value_h, height:Math.max(80,r.by_account.length*27+14)}));
     registerCharts(redraws);
   }
 }
@@ -341,10 +344,10 @@ const RP_KINDS=[['0','Только личные'],['0,4','Личные и иск
 function fmtDur(s){
   if(s==null || isNaN(s)) return '—';
   s=Math.max(0,Math.round(s));
-  if(s<60) return s+' с';
-  if(s<3600) return Math.round(s/60)+' мин';
-  if(s<86400){ const hh=Math.floor(s/3600), mm=Math.round((s%3600)/60); return hh+' ч'+(mm?' '+mm+' мин':''); }
-  const d=Math.floor(s/86400), hh=Math.round((s%86400)/3600); return d+' д'+(hh?' '+hh+' ч':'');
+  if(s<60) return t('{} с', s);
+  if(s<3600) return t('{} мин', Math.round(s/60));
+  if(s<86400){ const hh=Math.floor(s/3600), mm=Math.round((s%3600)/60); return mm?t('{} ч {} мин', hh, mm):t('{} ч', hh); }
+  const d=Math.floor(s/86400), hh=Math.round((s%86400)/3600); return hh?t('{} д {} ч', d, hh):t('{} д', d);
 }
 function fmtPct(v){ return v==null?'—':(Number(v).toLocaleString(UI_LOCALE,{maximumFractionDigits:1})+'%'); }
 /** Изменение к прошлому периоду: стрелка и цвет — «хорошо» или «плохо» (better: 'up' | 'down'). */
@@ -402,7 +405,7 @@ function chartStack(container, items, series, opts={}){
       let y=padT+plotH; const x=padL+i*bw+bw*0.14, w=Math.max(1,bw*0.72);
       d.values.forEach((v,j)=>{ if(!v) return; const bh=plotH*(v/max); y-=bh; ctx.fillStyle=series[j].color; ctx.fillRect(x,y,w,bh); });
       ctx.fillStyle=dim; ctx.textAlign='center'; ctx.font='10px sans-serif';
-      const step=Math.max(1,Math.ceil(n/(W>620?16:7))); if(i%step===0||n<=10) ctx.fillText(d.label,x+w/2,H-padB+14);
+      const step=Math.max(1,Math.ceil(n/(W>620?16:7))); if(i%step===0||n<=10) ctx.fillText(cLab(d.label,opts),x+w/2,H-padB+14);
     });
     geo={padL,bw,n};
   });
@@ -430,7 +433,7 @@ function chartMulti(container, labels, series, opts={}){
       if(n<=45) s.values.forEach((v,i)=>{ if(v==null) return; ctx.beginPath(); ctx.arc(xat(i),yat(v),2.3,0,7); ctx.fillStyle=s.color; ctx.fill(); });
     });
     ctx.fillStyle=dim; ctx.font='10px sans-serif'; const step=Math.max(1,Math.ceil(n/(W>620?12:6)));
-    labels.forEach((l,i)=>{ if(i%step===0||i===n-1){ ctx.textAlign = i===0?'left':(i===n-1?'right':'center'); ctx.fillText(l,xat(i),H-padB+15); } });
+    labels.forEach((l,i)=>{ if(i%step===0||i===n-1){ ctx.textAlign = i===0?'left':(i===n-1?'right':'center'); ctx.fillText(cLab(l,opts),xat(i),H-padB+15); } });
     geo={padL,plotW,n};
   });
   chartTipAttach(container,(x)=>{ if(!geo) return ''; const i=geo.n<=1?0:Math.round((x-geo.padL)/(geo.plotW/(geo.n-1))); if(i<0||i>=geo.n) return '';
@@ -461,7 +464,7 @@ async function viewReplies(c){
       <label>Период <select id="rpPeriod">${opt(RP_PERIODS,RP.period)}</select></label>
       <span id="rpDates" ${RP.period==='custom'?'':'hidden'}><input type="date" id="rpFrom" value="${esc(RP.from)}" aria-label="С"> — <input type="date" id="rpTo" value="${esc(RP.to)}" aria-label="По"></span>
       <label>Ящик <select id="rpAcc"><option value="">${meta.is_admin?'Все ящики':'Все мои ящики'}</option>${meta.accounts.map(a=>`<option value="${a.id}" ${String(a.id)===String(RP.acc)?'selected':''}>${esc(a.name)}</option>`).join('')}</select></label>
-      ${meta.is_admin&&meta.departments.length?`<label>Отдел <select id="rpDep"><option value="">Все отделы</option>${meta.departments.map(d=>`<option ${d===RP.dep?'selected':''}>${esc(d)}</option>`).join('')}</select></label>`:''}
+      ${meta.is_admin&&meta.departments.length?`<label>Отдел <select id="rpDep"><option value="">Все отделы</option>${meta.departments.map(d=>`<option translate="no" ${d===RP.dep?'selected':''}>${esc(d)}</option>`).join('')}</select></label>`:''}
       <span class="spacer" style="flex:1"></span>
       <a class="btn ghost sm" href="${docsHref('replies')}">📖 Как считается</a>
       <button class="btn ghost sm" id="rpRefresh">↻ Обновить</button>
@@ -650,8 +653,8 @@ function rpAccounts(body, d, meta, reg, C){
   body.appendChild(card);
   const slow=d.accounts.filter(a=>a.median_s!=null).sort((a,b)=>b.median_s-a.median_s).slice(0,12);
   const over=d.accounts.filter(a=>a.overdue).sort((a,b)=>b.overdue-a.overdue).slice(0,12);
-  reg(()=>chartHBars($('#rpAccSlow',card), slow.map(a=>({label:a.name, value:Math.round(a.median_s/360)/10})), {labelChars:26, color:C.late, fmt:x=>String(x.value).replace('.',',')+' ч'}));
-  reg(()=>chartHBars($('#rpAccOver',card), over.map(a=>({label:a.name, value:a.overdue})), {labelChars:26, color:C.overdue}));
+  reg(()=>chartHBars($('#rpAccSlow',card), slow.map(a=>({label:a.name, value:Math.round(a.median_s/360)/10})), {raw:true, labelChars:26, color:C.late, fmt:x=>String(x.value).replace('.',',')+' ч'}));
+  reg(()=>chartHBars($('#rpAccOver',card), over.map(a=>({label:a.name, value:a.overdue})), {raw:true, labelChars:26, color:C.overdue}));
   const maxIn=Math.max(1,...d.accounts.map(a=>a.count));
   const draw=()=>{
     const q=RP.accText.trim().toLowerCase();
@@ -669,12 +672,12 @@ function rpDepartments(body, d, reg, C){
   const card=h(`<div class="card an-card"><h3>🏢 Сравнение отделов</h3>
     <div class="grid cols-2"><div><div class="muted small">Отвечено, %</div><div class="an-chart" id="rpDepRate"></div></div><div><div class="muted small">Медиана ответа, ч</div><div class="an-chart" id="rpDepMed"></div></div></div>
     <div class="table-wrap" style="margin-top:12px"><table class="tbl"><thead><tr><th>Отдел</th><th>Ящиков</th><th>Входящих</th><th>Отвечено</th><th>В срок</th><th>Медиана</th><th>90% быстрее</th><th>Без ответа</th><th>Срок вышел</th><th>Исходящих</th><th>Нам ответили</th></tr></thead><tbody>
-    ${d.departments.map(x=>`<tr class="rp-click" data-dep="${esc(x.name)}"><td><b>${esc(x.name)}</b></td><td>${fmtNum(x.accounts)}</td><td>${fmtNum(x.count)}</td><td>${fmtPct(x.answered_pct)}</td><td>${fmtPct(x.sla_pct)}</td><td>${fmtDur(x.median_s)}</td><td>${fmtDur(x.p90_s)}</td><td>${fmtNum(x.unanswered)}</td><td class="${x.overdue?'rp-red':''}">${fmtNum(x.overdue)}</td><td>${fmtNum(x.out)}</td><td>${fmtPct(x.out_replied_pct)}</td></tr>`).join('')}
+    ${d.departments.map(x=>`<tr class="rp-click" data-dep="${esc(x.name)}"><td><b>${uesc(x.name)}</b></td><td>${fmtNum(x.accounts)}</td><td>${fmtNum(x.count)}</td><td>${fmtPct(x.answered_pct)}</td><td>${fmtPct(x.sla_pct)}</td><td>${fmtDur(x.median_s)}</td><td>${fmtDur(x.p90_s)}</td><td>${fmtNum(x.unanswered)}</td><td class="${x.overdue?'rp-red':''}">${fmtNum(x.overdue)}</td><td>${fmtNum(x.out)}</td><td>${fmtPct(x.out_replied_pct)}</td></tr>`).join('')}
     </tbody></table></div></div>`);
   body.appendChild(card);
   const deps=d.departments.slice(0,15);
-  reg(()=>chartHBars($('#rpDepRate',card), deps.map(x=>({label:x.name, value:Math.round(x.answered_pct||0)})), {colorByIndex:true, fmt:x=>x.value+'%'}));
-  reg(()=>chartHBars($('#rpDepMed',card), deps.map(x=>({label:x.name, value:Math.round((x.median_s||0)/360)/10})), {color:C.late, fmt:x=>String(x.value).replace('.',',')+' ч'}));
+  reg(()=>chartHBars($('#rpDepRate',card), deps.map(x=>({label:x.name, value:Math.round(x.answered_pct||0)})), {raw:true, colorByIndex:true, fmt:x=>x.value+'%'}));
+  reg(()=>chartHBars($('#rpDepMed',card), deps.map(x=>({label:x.name, value:Math.round((x.median_s||0)/360)/10})), {raw:true, color:C.late, fmt:x=>String(x.value).replace('.',',')+' ч'}));
   $$('tr[data-dep]',card).forEach(tr=>tr.onclick=()=>{ if(!RP.meta||!RP.meta.is_admin) return; RP.dep=tr.dataset.dep; RP.acc=''; route(); });
 }
 /** Строки таблицы: первые 10, остальные — по «Показать все». */
@@ -726,7 +729,7 @@ function rpThreads(body, d, reg, C){
       <div class="kpi"><div class="k-label">Самая длинная</div><div class="k-value">${fmtNum(th.max_len)}</div><div class="k-sub">писем</div></div></div>
     <div class="grid cols-2"><div><div class="muted small">Сколько писем в цепочке</div><div class="an-chart" id="rpThH"></div></div>
     <div><div class="muted small">Самые длинные (щелчок — открыть последнее письмо)</div><div class="table-wrap"><table class="tbl"><thead><tr><th>Тема</th><th>Писем</th><th>Длилась</th><th>Последнее</th></tr></thead><tbody>
-      ${th.longest.map((x,i)=>`<tr class="rp-click" data-i="${i}"><td>${esc(trunc(x.subject||'(без темы)',60))}<div class="muted small">входящих ${fmtNum(x.incoming)} · исходящих ${fmtNum(x.outgoing)} · ящиков ${fmtNum(x.mailboxes)}</div></td><td>${fmtNum(x.messages)}</td><td>${fmtDur(x.duration_s)}</td><td class="small muted">${fmtDate(new Date(x.last_ts*1000).toISOString())}</td></tr>`).join('')||'<tr><td colspan="4" class="muted">Нет цепочек</td></tr>'}
+      ${th.longest.map((x,i)=>`<tr class="rp-click" data-i="${i}"><td>${uesc(trunc(x.subject,60),'(без темы)')}<div class="muted small">входящих ${fmtNum(x.incoming)} · исходящих ${fmtNum(x.outgoing)} · ящиков ${fmtNum(x.mailboxes)}</div></td><td>${fmtNum(x.messages)}</td><td>${fmtDur(x.duration_s)}</td><td class="small muted">${fmtDate(new Date(x.last_ts*1000).toISOString())}</td></tr>`).join('')||'<tr><td colspan="4" class="muted">Нет цепочек</td></tr>'}
     </tbody></table></div></div></div></div>`);
   body.appendChild(card);
   reg(()=>chartVBars($('#rpThH',card), th.hist, {height:220, color:'#7c5cff'}));
@@ -755,7 +758,7 @@ function rpLists(wrap, meta){
     const answered=['late','answered','out_replied'].includes(RP.list);
     $('#rpLAgeH',card).textContent=answered?'Ответ через':'Ждёт';
     $('#rpLTotal',card).textContent=`${fmtNum(total)} ${plural(total,'письмо','письма','писем')}`;
-    $('#rpLBody',card).innerHTML=items.map((x,i)=>`<tr class="rp-click" data-i="${i}"><td class="small">${fmtDate(x.date)}</td><td>${esc(trunc(x.account_name,28))}<div class="muted small">${esc(trunc(x.folder,28))}</div></td><td>${esc(trunc(x.peer||x.from,40))}${x.kind?`<div class="muted small">${esc(x.kind_label)}</div>`:''}</td><td>${esc(trunc(x.subject||'(без темы)',70))}${x.is_reply?' <span class="muted small" title="Это ответ на другое письмо">↩</span>':''}</td><td class="${answered?'':'rp-red'}">${fmtDur(answered?x.delay_s:x.age_s)}${x.by_subject?' <span class="rp-tag" title="Ответ написан новым письмом — найден по теме и собеседнику">по теме</span>':''}</td></tr>`).join('')||'<tr><td colspan="5" class="muted">Писем нет — отлично.</td></tr>';
+    $('#rpLBody',card).innerHTML=items.map((x,i)=>`<tr class="rp-click" data-i="${i}"><td class="small">${fmtDate(x.date)}</td><td>${uesc(trunc(x.account_name,28))}<div class="muted small">${uesc(trunc(x.folder,28))}</div></td><td>${uesc(trunc(x.peer||x.from,40))}${x.kind?`<div class="muted small">${esc(x.kind_label)}</div>`:''}</td><td>${uesc(trunc(x.subject,70),'(без темы)')}${x.is_reply?' <span class="muted small" title="Это ответ на другое письмо">↩</span>':''}</td><td class="${answered?'':'rp-red'}">${fmtDur(answered?x.delay_s:x.age_s)}${x.by_subject?' <span class="rp-tag" title="Ответ написан новым письмом — найден по теме и собеседнику">по теме</span>':''}</td></tr>`).join('')||'<tr><td colspan="5" class="muted">Писем нет — отлично.</td></tr>';
     $('#rpLMore',card).hidden=items.length>=total;
     $$('#rpLBody tr[data-i]',card).forEach(tr=>tr.onclick=()=>{ const x=items[parseInt(tr.dataset.i)]; if(x) openMailMessage(x.account_id, x.id, x.folder); });
     $('#rpCsv',card).href=csvHref();
@@ -857,15 +860,15 @@ async function viewMailAnalytics(c){
     <div class="card"><h3>👤 Топ отправителей</h3><div class="an-chart" id="maSenders"></div></div>
     <div class="card"><h3>🌐 Топ доменов</h3><div class="an-chart" id="maDomains"></div></div></div>`);
   c.appendChild(sdCard);
-  reg(()=>chartHBars($('#maSenders',sdCard), d.top_senders.slice(0,15), {colorByIndex:true, labelChars:30, labelW:250, height:Math.max(90,Math.min(15,d.top_senders.length)*28)}));
-  reg(()=>chartHBars($('#maDomains',sdCard), d.top_domains, {colorByIndex:true, labelChars:26, height:Math.max(90,d.top_domains.length*28)}));
+  reg(()=>chartHBars($('#maSenders',sdCard), d.top_senders.slice(0,15), {raw:true, colorByIndex:true, labelChars:30, labelW:250, height:Math.max(90,Math.min(15,d.top_senders.length)*28)}));
+  reg(()=>chartHBars($('#maDomains',sdCard), d.top_domains, {raw:true, colorByIndex:true, labelChars:26, height:Math.max(90,d.top_domains.length*28)}));
 
   // Папки + слова темы
   const ffCard=h(`<div class="grid cols-2 an-card">
     <div class="card"><h3>🗂️ Папки</h3><div class="an-chart" id="maFolders"></div></div>
     <div class="card"><h3>🔤 Частые слова в темах</h3><div id="maWords"></div></div></div>`);
   c.appendChild(ffCard);
-  reg(()=>chartHBars($('#maFolders',ffCard), d.folders, {colorByIndex:true, labelChars:20, height:Math.max(90,d.folders.length*28), fmt:x=>fmtNum(x.value)+' · '+x.bytes_h, valW:120}));
+  reg(()=>chartHBars($('#maFolders',ffCard), d.folders, {raw:true, colorByIndex:true, labelChars:20, height:Math.max(90,d.folders.length*28), fmt:x=>fmtNum(x.value)+' · '+x.bytes_h, valW:120}));
   $('#maWords',ffCard).innerHTML=wordCloud(d.subject_words);
 
   // Крупнейшие письма
@@ -929,7 +932,7 @@ function renderDeep(wrap, dp, redraws){
   const add=(fn)=>{ fn(); redraws.push(fn); };
   add(()=>chartHBars($('#dpExt',box), at.by_ext, {colorByIndex:true, labelChars:14, height:Math.max(80,at.by_ext.length*26)}));
   add(()=>chartHBars($('#dpType',box), at.by_type, {colorByIndex:true, labelChars:34, labelW:260, height:Math.max(80,at.by_type.length*26)}));
-  add(()=>chartHBars($('#dpTo',box), rc.top_domains, {colorByIndex:true, labelChars:26, height:Math.max(80,rc.top_domains.length*26)}));
+  add(()=>chartHBars($('#dpTo',box), rc.top_domains, {raw:true, colorByIndex:true, labelChars:26, height:Math.max(80,rc.top_domains.length*26)}));
   add(()=>{ chartDonut($('#dpBody',box), bd.kinds, {height:170,centerLabel:'писем'}); $('#dpBodyLeg',box).innerHTML=donutLegend(bd.kinds); });
   add(()=>{ chartDonut($('#dpLang',box), bd.languages, {height:170,centerLabel:'писем'}); $('#dpLangLeg',box).innerHTML=donutLegend(bd.languages); });
   $('#dpWords',box).innerHTML=wordCloud(bd.top_words, {min:13, max:34});

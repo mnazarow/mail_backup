@@ -219,6 +219,13 @@ DEFAULTS: Dict[str, Any] = {
         "syslog_tls_verify": True,     # для tls — проверять сертификат сервера
         "syslog_hostname": "",         # имя узла в сообщениях ('' — имя сервера)
     },
+    "settings_backup": {
+        # Ежедневная копия настроек (1.27.0): вместе со снимком базы, в каталоге settings-backups; с паролем —
+        # и в копию вне сервера (читается паролем без secret.key)
+        "enabled": True,
+        "keep": 14,                    # сколько ежедневных копий хранить
+        "password": "",               # пароль копий (секрет; пусто — шифруются ключом secret.key)
+    },
     "drill": {
         # Проверка восстановления (1.21.0): случайные письма каждого ящика читаются и сверяются
         "enabled": True,
@@ -501,6 +508,7 @@ VALUE_RANGES: Dict[str, tuple] = {
     "search.ocr_time_s": (5, 1800),
     "webmail.rules_interval_min": (0, 1440),
     "replica.db_snapshot_keep": (0, 365),
+    "settings_backup.keep": (1, 365),
     "replica.max_delete_percent": (0, 100),
     "replica.parallel": (1, 32),
     "replica.verify_every_days": (0, 365),
@@ -709,6 +717,8 @@ def coerce_setting(full_key: str, value):
         parse_work_hours(out, strict=True)
     if full_key == "storage.encryption_key_file" and out and not os.path.isabs(out):
         raise ValueError("Путь к файлу ключа должен быть абсолютным (например /etc/mailarchiver/storage.key).")
+    if full_key == "settings_backup.password" and out and len(out) < 10:
+        raise ValueError("Пароль копий настроек — не короче 10 символов.")
     if full_key == "server.public_url" and out and not out.lower().startswith(("http://", "https://")):
         raise ValueError("Внешний URL должен начинаться с http:// или https://.")
     if full_key in ("replica.dir_path", "replica.ssh_key_file") and out and not os.path.isabs(out):

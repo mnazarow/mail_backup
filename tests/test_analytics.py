@@ -152,3 +152,63 @@ def test_daily_series_has_no_gaps(services):
     series = svc.db.daily_series(days=7)
     assert len(series) == 7
     assert series[0]["messages"] == 5 and all(r["messages"] == 0 for r in series[1:])
+
+
+def _tricky_index(svc):
+    """Индекс с неудобными для расчёта группами случаями: пустые и NULL-поля, разные виды дат и заголовков From,
+    флаги-«почти совпадения», равные частоты (порядок первого появления), даты до 1920 года."""
+    import random
+    rnd = random.Random(7)
+    aid = svc.db.create_account(models.Account(name="T", host="h", port=993, username="u", password="p"))
+    aid2 = svc.db.create_account(models.Account(name="T2", host="h", port=993, username="u2", password="p"))
+    froms = ["Иван <ivan@aa.ru>", "ivan@aa.ru", "IVAN@AA.RU", "\"Пётр, отдел\" <petr@bb.com>", "", None,
+             "кто-то без адреса", "Анна <anna@aa.ru>", "Анна Иванова <anna@aa.ru>", "x@y", "<z@q.org>"]
+    subjects = ["Отчёт", "Re: Отчёт", "RE[2]: Отчёт", "Fwd: Договор", "Пересл: договор", "", None, "(без темы)",
+                "  Счёт 2024 оплата  ", "оплата", "Отв: счёт", "fw: test", "abc def ghi"]
+    flags = ["", None, "\\Seen", "\\Seen,\\Flagged", "\\SeenX", "\\Answered,\\Draft", "x,\\Seen", "\\Flagged "]
+    dates = ["2024-01-01T09:30:00+00:00", "2024-03-31T00:59:59+00:00", "2024-03-31T01:00:00+00:00",
+             "2024-10-27T00:30:00+00:00", "1900-01-01T10:15:00+00:00", "1918-06-01T12:00:00+00:00",
+             "2025-06-15T23:59:59Z", "2025-06-15T23:59:59.250000+00:00", "2025-06-15T10:00:00+03:00",
+             "2025-06-15T10:00:00", "garbage", "", None, "2024-02-30T10:00:00+00:00",
+             "2026-12-31T23:30:00+00:00", "1969-12-31T23:59:59+00:00", "2024-01-01T1a:00:00+00:00",
+             "2024-01-01T10:00:00+00:0Z", "２０２４-01-01T10:00:00+00:00"]
+    if not svc.db.is_pg:
+        # минуты и секунды даты обычного вида PostgreSQL не проверяет (их пишет только isoformat)
+        dates += ["2024-01-01T10:61:00+00:00", "2024-01-01T10:5x:00+00:00"]
+    folders = ["INBOX", "Работа", "", None, "—", "Sent"]
+    sizes = [None, 0, -5, 10 * 1024 - 1, 10 * 1024, 1024 * 1024, 11 * 1024 * 1024, 300]
+    uid = 0
+    for _ in range(400):
+        uid += 1
+        svc.db.add_message_index(rnd.choice([aid, aid, aid2]), rnd.choice(folders) or "", 1000, uid,
+                                 f"<{uid}@ex>", rnd.choice(sizes), rnd.choice(dates), rnd.choice(flags) or "",
+                                 f"x/{uid}", f"h{uid}", subject=rnd.choice(subjects) or "",
+                                 from_addr=rnd.choice(froms) or "", has_attach=rnd.choice([0, 1]))
+    # поля, которые индекс не пишет сам: NULL в теме, отправителе, флагах и размере
+    svc.db.execute("UPDATE messages SET subject=NULL, from_addr=NULL WHERE uid % 13 = 0")
+    svc.db.execute("UPDATE messages SET flags=NULL, size=NULL WHERE uid % 11 = 0")
+    return aid
+
+
+def test_mail_analytics_matches_rowwise_calculation(services, monkeypatch):
+    """1.27.0: аналитика писем считается в базе группами и порциями по id — итог тот же, что у прежнего
+    построчного расчёта (tests/analytics_rowwise.py), в том числе в поясах со сменой времени и смещением
+    в полчаса, при равных частотах и при порции меньше числа писем."""
+    from zoneinfo import ZoneInfo
+    import analytics_rowwise
+    svc = services
+    aid = _tricky_index(svc)
+    for chunk in (7, 1000):
+        monkeypatch.setattr(A, "_AGG_CHUNK_IDS", chunk)
+        monkeypatch.setattr(A, "_AGG_CHUNK_IDS_PG", chunk)
+        for tz in ("UTC", "Europe/Moscow", "Europe/Berlin", "Asia/Kolkata", "America/St_Johns"):
+            monkeypatch.setattr(svc, "local_tz", lambda tz=tz: ZoneInfo(tz))
+            for acc in (None, aid):
+                got = A.mail_analytics(svc, account_id=acc, use_cache=False)
+                want = analytics_rowwise.rowwise_mail_analytics(svc, account_id=acc)
+                got.pop("generated_at"), want.pop("generated_at")
+                assert got == want, (chunk, tz, acc)
+                assert got["overview"]["messages"] == svc.db.count_messages(acc)
+    # крупнейшие письма: без размера — в конце (в PostgreSQL NULL при DESC шёл первым), равные — по id
+    largest = A.mail_analytics(svc, use_cache=False)["largest"]
+    assert largest[0]["size"] == 11 * 1024 * 1024 and all(x["size"] for x in largest)

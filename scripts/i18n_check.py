@@ -7,7 +7,8 @@
 
 Строки берутся из исходников так же, как их видит пользователь: текст между тегами разметки и
 подсказки (placeholder, title, aria-label, alt) из строк и шаблонов JS, а также сообщения об ошибках и
-подсказки из модулей сервера, которые показывает «Почта». Подстановка ``${…}`` / ``{…}`` — «{}».
+подсказки из модулей сервера и справка к параметрам (с 1.27.0 — весь интерфейс). Подстановка ``${…}`` /
+``{…}`` — «{}».
 Каталог — mailarchiver/web/static/js/i18n-en.js (ключ — русская строка, значение — английская).
 """
 from __future__ import annotations
@@ -21,12 +22,13 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 JS_DIR = os.path.join(ROOT, "mailarchiver", "web", "static", "js")
-#: Что переведено: вход и оболочка, «Почта», сообщения сервера для «Почты».
-JS_FILES = ("app.js", "mail.js", "mail-settings.js")
-PY_FILES = ("mailarchiver/webmail.py", "mailarchiver/webmail_dav.py", "mailarchiver/webmail_more.py",
-            "mailarchiver/webmail_secure.py", "mailarchiver/webmail_tools.py", "mailarchiver/web/webmail_api.py",
-            "mailarchiver/web/auth.py", "mailarchiver/web/api_auth.py", "mailarchiver/web/api_common.py",
-            "mailarchiver/web/api_state.py")
+#: Что переведено: с 1.24.0 — вход и оболочка, «Почта», сообщения сервера для «Почты»; с 1.27.0 — весь
+#: интерфейс (все файлы static/js, кроме самого перевода), сообщения об ошибках всех модулей сервера и справка
+#: к параметрам (web/i18n.py).
+JS_FILES = tuple(sorted(n for n in os.listdir(JS_DIR) if n.endswith(".js") and not n.startswith("i18n")))
+PY_FILES = tuple(sorted(os.path.relpath(os.path.join(d, n), ROOT)
+                        for d, _dirs, files in os.walk(os.path.join(ROOT, "mailarchiver"))
+                        if "__pycache__" not in d for n in files if n.endswith(".py")))
 #: Части строк, которые не переводятся: буквы раскладки в справке по клавишам.
 IGNORE = {"о", "л", "к", "ф", "а", "г", "м", "д", "у"}
 CYR = re.compile(r"[А-Яа-яЁё]")
@@ -174,6 +176,102 @@ def py_keys(path: str) -> list:
     return keys
 
 
+#: Строки, которые сервер отдаёт интерфейсу (1.27.0): значения словарей и именованных аргументов с такими
+#: ключами (подписи, заголовки, описания, подсказки) и константы с такими окончаниями имён — названия и описания
+#: почтовых серверов, действий над ящиками, категорий ответов, типов вложений, подписи аналитики.
+UI_KEYS = frozenset({"title", "label", "description", "hint", "help", "placeholder", "caption", "text", "summary",
+                     "what", "note", "recommend", "example", "unit", "short", "desc", "tip", "warning", "confirm",
+                     "button", "group", "section"})
+UI_CLASS_ATTRS = frozenset({"label", "summary", "title", "hint", "note", "setup", "password_rule", "limits",
+                            "warning", "description", "desc", "what"})
+UI_NAME_RE = re.compile(r"(TITLES?|DESCRIPTIONS?|LABELS?|HINTS?|_RU|CAPS|CAPABILITIES|FIELDS|ACTIONS|NAMES|TEXTS?|GROUPS?"
+                        r"|MODES|SECTIONS|SHORT)$")
+#: Вызовы, чьи строки показывает «Очередь и задания»: ход задания и его итог.
+UI_CALLS = frozenset({"progress", "_progress", "set_progress", "report_progress", "step", "note_event", "event"})
+#: Функции, чей ответ — причина для интерфейса («почему недоступно»): строки из их return тоже показываются.
+UI_FUNC_RE = re.compile(r"(unavailable|available|reason|problem|why)", re.I)
+
+
+def py_ui_keys(path: str) -> list:
+    """Подписи и описания, которые модуль сервера отдаёт интерфейсу (не сообщения журнала и не справка CLI)."""
+    if os.path.basename(path) == "__main__.py":
+        return []
+    with open(path, encoding="utf-8") as fh:
+        tree = ast.parse(fh.read())
+    keys = []
+
+    def add(node):
+        t = _text_of(node)
+        if t and CYR.search(t):
+            t = re.sub(r"\x00+", "{}", re.sub(r"\s+", " ", t)).strip()
+            if t not in keys:
+                keys.append(t)
+
+    def add_all(node):
+        """Строки выражения целиком: склейка и f-строка — одной строкой с «{}», а не по кускам."""
+        if _text_of(node) is not None:
+            add(node)
+            return
+        for child in ast.iter_child_nodes(node):
+            add_all(child)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Dict):
+            for k, v in zip(node.keys, node.values):
+                if isinstance(k, ast.Constant) and k.value in UI_KEYS:
+                    add(v)
+        elif isinstance(node, ast.Call):
+            name = getattr(node.func, "id", None) or getattr(node.func, "attr", None) or ""
+            if name in ("add_argument", "add_parser", "debug", "info", "warning", "error", "exception"):
+                continue
+            if name in UI_CALLS:
+                for arg in node.args:
+                    add_all(arg)
+            for kw in node.keywords:
+                if kw.arg in UI_KEYS:
+                    add(kw.value)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if any(UI_NAME_RE.search(getattr(t, "id", None) or getattr(t, "attr", None) or "") for t in targets):
+                add_all(node.value)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and UI_FUNC_RE.search(node.name):
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Return) and sub.value is not None:
+                    add_all(sub.value)
+        elif isinstance(node, ast.ClassDef):
+            # описание почтового сервера в классе драйвера: название, что умеет, шаги настройки, правила паролей
+            for st in node.body:
+                if isinstance(st, (ast.Assign, ast.AnnAssign)) and st.value is not None:
+                    targets = st.targets if isinstance(st, ast.Assign) else [st.target]
+                    if any(getattr(t, "id", None) in UI_CLASS_ATTRS for t in targets):
+                        add_all(st.value)
+    return keys
+
+
+def help_keys() -> list:
+    """Справка к параметрам и полям форм (web/i18n.py): названия разделов, параметров, пояснения и советы."""
+    sys.path.insert(0, ROOT)
+    from mailarchiver.web import i18n as help_mod
+    keys = []
+
+    def add(text):
+        if isinstance(text, str):
+            t = re.sub(r"\s+", " ", text).strip()
+            if t and CYR.search(t) and t not in keys:
+                keys.append(t)
+    for sec in help_mod.SETTINGS_SECTIONS:
+        add(sec.get("title"))
+    for group in help_mod.all_help().values():
+        if not isinstance(group, dict):
+            continue
+        for item in group.values():
+            if isinstance(item, dict):
+                for field in ("title", "help", "recommend", "example", "default"):
+                    add(item.get(field))
+            else:
+                add(item)
+    return keys
+
+
 def catalog() -> dict:
     with open(os.path.join(JS_DIR, "i18n-en.js"), encoding="utf-8") as fh:
         text = fh.read()
@@ -185,8 +283,16 @@ def all_keys() -> list:
     keys = []
     for name in JS_FILES:
         keys += [k for k in js_keys(os.path.join(JS_DIR, name)) if k not in keys]
+    seen = set(keys)
     for rel in PY_FILES:
-        keys += [k for k in py_keys(os.path.join(ROOT, rel)) if k not in keys]
+        for k in py_keys(os.path.join(ROOT, rel)) + py_ui_keys(os.path.join(ROOT, rel)):
+            if k not in seen:
+                seen.add(k)
+                keys.append(k)
+    for k in help_keys():
+        if k not in seen:
+            seen.add(k)
+            keys.append(k)
     return [k for k in keys if k not in IGNORE]
 
 

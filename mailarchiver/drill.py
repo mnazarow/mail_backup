@@ -85,6 +85,22 @@ def _snapshot_drill(svc, event=None) -> Dict:
         accounts, messages = rows.get("accounts", 0), rows.get("messages", 0)
         out["info"] = (f"снимок {name} прочитан целиком (выгрузка PostgreSQL, проверка как перед psql): ящиков "
                        f"{accounts}, писем {messages}")
+        # и разворачивается во временную базу на том же сервере (1.27.0), как restore-snapshot
+        try:
+            trial = snapshots.trial_pg_restore(svc.cfg.db_url, snap["path"], cipher)
+        except Exception as exc:  # noqa: BLE001 - psql или сервер базы не приняли снимок
+            out["problems"].append(f"снимок {name} не разворачивается во временную базу: "
+                                   f"{getattr(exc, 'message', None) or exc}")
+            return out
+        if trial.get("skipped"):
+            out["info"] += f"; во временную базу не развёрнут: {trial['skipped']}"
+        else:
+            if (trial["accounts"], trial["messages"]) != (accounts, messages):
+                out["problems"].append(f"снимок {name}: в выгрузке ящиков {accounts} и писем {messages}, а "
+                                       f"развёрнуто {trial['accounts']} и {trial['messages']}")
+                return out
+            out["info"] = (f"снимок {name} развёрнут на пробу во временную базу PostgreSQL (psql, база удалена): "
+                           f"ящиков {accounts}, писем {messages}")
     else:
         tmp_dir = svc.cfg.tmp_dir
         os.makedirs(tmp_dir, exist_ok=True)
@@ -180,6 +196,14 @@ def run(svc, *, progress=None, cancelled=None, event=None) -> Dict:
                 notes.append(f"{what}: последний раз {age.days} дн. назад")
         except Exception as exc:  # noqa: BLE001 - сведения о копиях — дополнение
             log.debug("%s: состояние не проверено: %s", what, exc)
+    try:
+        from . import settings_backup
+        if bool(svc.rt("settings_backup", "enabled")):
+            age = settings_backup.daily_age_s(svc.cfg)
+            if age is not None and age > 2 * 86400:     # первую делает ежечасное обслуживание
+                notes.append(f"копия настроек: последний раз {int(age // 86400)} дн. назад")
+    except Exception as exc:  # noqa: BLE001
+        log.debug("копия настроек: состояние не проверено: %s", exc)
     snap: Dict = {"name": "", "problems": [], "notes": [], "info": ""}
     if (cancelled is None or not cancelled()) and _enabled(svc, "snapshot"):
         try:
